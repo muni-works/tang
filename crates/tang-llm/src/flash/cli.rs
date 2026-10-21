@@ -2005,13 +2005,39 @@ pub fn bench_panel(args: &[String]) -> Result<()> {
 /// with the true continuation (from the first run) put into a random chain half the time.
 /// Tokens must be identical. Then speed on the prompt: none, suffix chain, suffix forest.
 pub fn tree_check(args: &[String]) -> Result<()> {
-    use super::tree::Forest;
-    use crate::draft::{Calibration, DraftConfig, Global, Session, COST_CUDA};
     let a = parse(args)?;
-    let ids = prompt_ids(&a)?;
     let mut e = load_coder(&a)?;
     ensure!(e.temperature == 0.0, "tree-check is greedy");
-    let n = a.n.max(16);
+    // TANG_TREE_PROMPTS=DIR: every file in DIR (sorted) as a chat prompt, one load.
+    let prompts: Vec<(String, Vec<u32>)> = match std::env::var("TANG_TREE_PROMPTS") {
+        Ok(dir) => {
+            let mut fs: Vec<PathBuf> = std::fs::read_dir(&dir)?
+                .map(|d| Ok(d?.path()))
+                .collect::<Result<_>>()?;
+            fs.sort();
+            fs.iter()
+                .map(|f| {
+                    let text = std::fs::read_to_string(f)?;
+                    let ids = super::tokenize::encode_chat(&a.path, &text, a.think)?;
+                    Ok((f.file_name().unwrap().to_string_lossy().into_owned(), ids))
+                })
+                .collect::<Result<_>>()?
+        }
+        Err(_) => vec![("prompt".into(), prompt_ids(&a)?)],
+    };
+    let mut ok = true;
+    for (name, ids) in &prompts {
+        println!("== {name} ({} prompt tokens)", ids.len());
+        ok &= tree_check_one(&mut e, ids, a.n.max(16))?;
+    }
+    ensure!(ok, "tree-check failed");
+    Ok(())
+}
+
+fn tree_check_one(e: &mut Coder, ids: &[u32], n: usize) -> Result<bool> {
+    use super::tree::Forest;
+    use crate::draft::{Calibration, DraftConfig, Global, Session, COST_CUDA};
+    let ids = ids.to_vec();
     e.reset();
     let mut cur = e.prefill(&ids, MAX_T, None)?;
     let mut greedy = vec![cur];
@@ -2095,6 +2121,5 @@ pub fn tree_check(args: &[String]) -> Result<()> {
             got as f64 / steps as f64
         );
     }
-    ensure!(ok, "tree-check failed");
-    Ok(())
+    Ok(ok)
 }
