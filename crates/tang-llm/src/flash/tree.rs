@@ -187,19 +187,19 @@ mod tests {
 
     #[test]
     fn layout_offsets_and_segments() {
-        let f = Forest::new(vec![vec![10, 11, 12], vec![20, 21], vec![30]]);
+        let f = Forest::new(vec![vec![10, 11], vec![20, 21], vec![30]]);
         let (rows, segs) = f.layout(5, 100);
-        assert_eq!(segs, vec![(0, 4), (4, 3), (7, 2)]);
+        assert_eq!(segs, vec![(0, 3), (3, 3), (6, 2)]);
         let pos: Vec<usize> = rows.iter().map(|r| r.pos).collect();
-        assert_eq!(pos, vec![100, 101, 102, 103, 100, 101, 102, 100, 101]);
+        assert_eq!(pos, vec![100, 101, 102, 100, 101, 102, 100, 101]);
         let off: Vec<usize> = rows.iter().map(|r| r.off).collect();
-        assert_eq!(off, vec![0, 0, 0, 0, 0, 3, 3, 0, 5]);
+        assert_eq!(off, vec![0, 0, 0, 0, 2, 2, 0, 4]);
         // Window keys never collide: cache index pos + off is unique past the root.
         let mut idx: Vec<usize> = rows.iter().filter(|r| r.pos > 100).map(|r| r.pos + r.off).collect();
         idx.sort();
         idx.dedup();
-        assert_eq!(idx.len(), 6);
-        assert_eq!(f.off(2), 5);
+        assert_eq!(idx.len(), 5);
+        assert_eq!(f.off(2), 4);
     }
 
     #[test]
