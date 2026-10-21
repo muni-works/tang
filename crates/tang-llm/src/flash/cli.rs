@@ -1999,3 +1999,99 @@ pub fn bench_panel(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `flash-tree-check` (qwen3next): is tree verification lossless? Decodes `-n` greedy tokens
+/// one at a time, then again with forests of draft chains (`flash::tree`): random junk chains,
+/// with the true continuation (from the first run) put into a random chain half the time.
+/// Tokens must be identical. Then speed on the prompt: none, suffix chain, suffix forest.
+pub fn tree_check(args: &[String]) -> Result<()> {
+    use super::tree::Forest;
+    use crate::draft::{Calibration, DraftConfig, Global, Session, COST_CUDA};
+    let a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "tree-check is greedy");
+    let n = a.n.max(16);
+    e.reset();
+    let mut cur = e.prefill(&ids, MAX_T, None)?;
+    let mut greedy = vec![cur];
+    while greedy.len() < n {
+        cur = e.step(cur)?;
+        greedy.push(cur);
+    }
+    let vocab = e.hp.n_vocab as u64;
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    e.reset();
+    let mut out = vec![e.prefill(&ids, MAX_T, None)?];
+    let mut windows = 0usize;
+    while out.len() < n {
+        let at = out.len();
+        let k = 1 + (rand() % 3) as usize;
+        let mut chains: Vec<Vec<u32>> = (0..k)
+            .map(|_| (0..1 + rand() % 3).map(|_| (rand() % vocab) as u32).collect())
+            .collect();
+        if rand() % 2 == 0 && at < greedy.len() {
+            let len = 1 + (rand() % 4) as usize;
+            let good = greedy[at..(at + len).min(greedy.len())].to_vec();
+            let slot = (rand() as usize) % (chains.len() + 1);
+            chains.insert(slot, good);
+        }
+        let f = Forest::new(chains);
+        let cur = *out.last().unwrap();
+        let emitted = e.verify_forest(cur, &f)?;
+        windows += 1;
+        out.extend(emitted);
+    }
+    out.truncate(n);
+    let ok = out == greedy;
+    let first_bad = out.iter().zip(&greedy).position(|(x, y)| x != y);
+    println!(
+        "tree-check: {} ({n} tokens in {windows} windows; first difference {first_bad:?})",
+        if ok { "PASS (tokens identical)" } else { "FAIL" }
+    );
+    // Speed: none / suffix chain / suffix forest.
+    let cfg = DraftConfig::new(COST_CUDA);
+    let global = Global::new(0, None);
+    for mode in ["none", "chain", "forest"] {
+        e.reset();
+        let mut cur = e.prefill(&ids, MAX_T, None)?;
+        let cost: Vec<f32> = (0..=MAX_T).map(|k| cfg.cost(k.max(1))).collect();
+        let mut sess = Session::new(&cfg, &global, Calibration::default(), cost, &ids);
+        sess.push(cur);
+        let (mut got, mut steps) = (1usize, 0usize);
+        let t0 = Instant::now();
+        while got < n {
+            let room = (MAX_T - 1).min(n - got);
+            let chains: Vec<Vec<u32>> = match mode {
+                "none" => Vec::new(),
+                "chain" => vec![sess.propose(room).tokens],
+                _ => sess
+                    .branches(&cfg, &global, 3, room)
+                    .into_iter()
+                    .map(|d| d.tokens)
+                    .collect(),
+            };
+            let em = e.verify_forest(cur, &Forest::new(chains))?;
+            for &t in &em {
+                sess.push(t);
+            }
+            got += em.len();
+            cur = *em.last().unwrap();
+            steps += 1;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "{mode:>6}: {:.0} tok/s, {:.2} tokens a window",
+            got as f64 / dt,
+            got as f64 / steps as f64
+        );
+    }
+    ensure!(ok, "tree-check failed");
+    Ok(())
+}
