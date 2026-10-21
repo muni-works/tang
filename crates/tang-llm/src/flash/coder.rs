@@ -850,6 +850,8 @@ pub struct Coder {
     pub use_graphs: bool,
     pub last: WinStats,
     pub last_commit_ms: f64,
+    /// The last tree window's winner: (chain, accepted drafts).
+    pub last_tree: (usize, usize),
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
@@ -1139,6 +1141,7 @@ impl Coder {
             use_graphs: true,
             last: WinStats::default(),
             last_commit_ms: 0.0,
+            last_tree: (0, 0),
             load_report,
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
@@ -1460,6 +1463,7 @@ impl Coder {
         let st = WinStats { t, ..Default::default() };
         let targets = self.run_staged(st, w0, t, true, nchunk, sg.len(), None)?;
         let (b, m) = forest.accept(&targets);
+        self.last_tree = (b, m);
         let out = forest.emitted(&targets, (b, m));
         let tc = Instant::now();
         self.commit_tree(segs[b].0, m + 1, pos0, forest.off(b))?;

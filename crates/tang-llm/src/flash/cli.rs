@@ -2029,7 +2029,7 @@ pub fn tree_check(args: &[String]) -> Result<()> {
     };
     e.reset();
     let mut out = vec![e.prefill(&ids, MAX_T, None)?];
-    let mut windows = 0usize;
+    let (mut windows, mut moved) = (0usize, 0usize);
     while out.len() < n {
         let at = out.len();
         let k = 1 + (rand() % 3) as usize;
@@ -2046,13 +2046,16 @@ pub fn tree_check(args: &[String]) -> Result<()> {
         let cur = *out.last().unwrap();
         let emitted = e.verify_forest(cur, &f)?;
         windows += 1;
+        // Windows won by a chain past the first with drafts kept: K/V moved down.
+        moved += (e.last_tree.0 > 0 && e.last_tree.1 > 0) as usize;
         out.extend(emitted);
     }
     out.truncate(n);
     let ok = out == greedy;
     let first_bad = out.iter().zip(&greedy).position(|(x, y)| x != y);
     println!(
-        "tree-check: {} ({n} tokens in {windows} windows; first difference {first_bad:?})",
+        "tree-check: {} ({n} tokens in {windows} windows, {moved} won by a later chain; first \
+         difference {first_bad:?})",
         if ok { "PASS (tokens identical)" } else { "FAIL" }
     );
     // Speed: none / suffix chain / suffix forest.
