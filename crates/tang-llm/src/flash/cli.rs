@@ -2014,6 +2014,7 @@ pub fn tree_check(args: &[String]) -> Result<()> {
             let mut fs: Vec<PathBuf> = std::fs::read_dir(&dir)?
                 .map(|d| Ok(d?.path()))
                 .collect::<Result<_>>()?;
+            fs.retain(|f| !f.file_name().unwrap().to_string_lossy().starts_with('.'));
             fs.sort();
             fs.iter()
                 .map(|f| {
