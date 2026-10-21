@@ -1470,6 +1470,8 @@ impl Coder {
         self.tokens.push(cur);
         self.tokens.extend_from_slice(&forest.chains[b][..m]);
         self.last_commit_ms = tc.elapsed().as_secs_f64() * 1e3;
+        // Refill the MTP chain from the winning chain's rows (no-op without MTP).
+        self.mtp_after_window(pos0, segs[b].0, &out)?;
         Ok(out)
     }
 

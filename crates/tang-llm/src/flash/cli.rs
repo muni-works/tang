@@ -2088,7 +2088,13 @@ fn tree_check_one(e: &mut Coder, ids: &[u32], n: usize) -> Result<bool> {
     // Speed: none / suffix chain / suffix forest.
     let cfg = DraftConfig::new(COST_CUDA);
     let global = Global::new(0, None);
-    for mode in ["none", "chain", "forest"] {
+    let modes: &[&str] = if e.has_mtp() {
+        e.use_mtp = true;
+        &["none", "chain", "forest", "mtp", "mtp-forest"]
+    } else {
+        &["none", "chain", "forest"]
+    };
+    for &mode in modes {
         e.reset();
         let mut cur = e.prefill(&ids, MAX_T, None)?;
         let cost: Vec<f32> = (0..=MAX_T).map(|k| cfg.cost(k.max(1))).collect();
@@ -2101,6 +2107,12 @@ fn tree_check_one(e: &mut Coder, ids: &[u32], n: usize) -> Result<bool> {
             let chains: Vec<Vec<u32>> = match mode {
                 "none" => Vec::new(),
                 "chain" => vec![sess.propose(room).tokens],
+                "mtp" => vec![e.mtp_last.iter().take(room).map(|x| x.0).collect()],
+                "mtp-forest" => {
+                    let mut c = vec![e.mtp_last.iter().take(room).map(|x| x.0).collect()];
+                    c.extend(e.mtp_alt.map(|(t, _)| vec![t]));
+                    c
+                }
                 _ => sess
                     .branches(&cfg, &global, 3, room)
                     .into_iter()
