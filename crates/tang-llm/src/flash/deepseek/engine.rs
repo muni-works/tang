@@ -332,6 +332,11 @@ pub struct GpuModel {
     /// Expert parallelism ([`super::ep`]): the routed experts this rank runs. Others are
     /// skipped in `moe` and never uploaded. All of them when unsharded.
     pub owns_expert: Box<dyn Fn(usize) -> bool>,
+    /// EP ranks (1 off EP); with `sh_split` each rank folds in its 1/world slice of the shared
+    /// expert (gate/up rows, down's K) and the all-reduce sums the slices (relaxed order).
+    pub ep_world: usize,
+    /// `DS_MOE_SH_SPLIT=0`: the shared expert on rank 0 alone (exact).
+    pub sh_split: bool,
     /// Expert parallelism: combines the routed partial sum `y` ([t][d] f32, the buffer and its
     /// element count) across ranks in place, before the shared expert is added. A host
     /// callback enqueueing on the stream: a step that has one is not captured (to capture
@@ -479,6 +484,8 @@ impl GpuModel {
             sh: Cell::new(None),
             zero_rows: DevBuf::from_slice(&vec![0f32; 8 * c.dim])?,
             moe_sh: std::env::var("DS_MOE_SH").map_or(true, |v| v != "0"),
+            ep_world: 1,
+            sh_split: std::env::var("DS_MOE_SH_SPLIT").map_or(true, |v| v != "0"),
             router_exact: std::env::var("DS_ROUTER_EXACT").is_ok_and(|v| v == "1"),
             next_hc: None,
             pend_mixes: None,
@@ -2137,7 +2144,7 @@ impl GpuModel {
         tab: &MoeTab,
         t: usize,
         topk: usize,
-    ) -> Result<Option<[Rc<DevW>; 3]>> {
+    ) -> Result<Option<([DsW; 3], bool)>> {
         if !self.moe_sh || t > 8 {
             return Ok(None);
         }
@@ -2155,7 +2162,61 @@ impl GpuModel {
             self.cpu.cfg.dim,
             tab.inter,
         );
-        Ok(ok.then_some(ws))
+        if !ok {
+            return Ok(None);
+        }
+        let (rank, world) = (self.obs.rank.get(), self.ep_world);
+        let (a, b, c) = (ws[0].v, ws[1].v, ws[2].v);
+        let sl = tab.inter / world.max(1);
+        // the slice: whole 32-row/column scale blocks (fp8), whole groups (both)
+        if !self.sh_split || world <= 1 || tab.inter % (32 * world) != 0 || a.fmt != 2 || c.fmt != 2
+        {
+            return Ok(Some(([a, b, c], rank == 0)));
+        }
+        let rows = |w: DsW| {
+            let mut v = w;
+            v.rows = sl as i32;
+            v.w += (rank * sl * w.cols as usize) as u64;
+            v.s += ((rank * sl / 32) * (w.cols as usize / 32)) as u64;
+            v
+        };
+        let key = format!("{pe}.w2.weight#rank{rank}of{world}");
+        let c2 = match self.w.borrow().get(&key) {
+            Some(w) => Some(w.v),
+            None => None,
+        };
+        let c2 = match c2 {
+            Some(v) => v,
+            None => {
+                // down's K slice [d][sl] (and its [d / 32][sl / 32] scales), copied once
+                let (d, k) = (c.rows as usize, c.cols as usize);
+                let wb = DevBuf::alloc(d * sl)?;
+                let sb = DevBuf::alloc(d.div_ceil(32) * (sl / 32))?;
+                for (dst, src, r, w, pitch, c0) in [
+                    (wb.ptr, c.w, d, sl, k, rank * sl),
+                    (sb.ptr, c.s, d.div_ceil(32), sl / 32, k / 32, rank * sl / 32),
+                ] {
+                    let (ri, wi, pi, ci) = (r as i32, w as i32, pitch as i32, c0 as i32);
+                    unsafe {
+                        self.k.go(
+                            "ds_copy2d",
+                            blocks(r * w, 256),
+                            B256,
+                            0,
+                            &self.s,
+                            args![dst, src, ri, wi, pi, ci],
+                        )?
+                    };
+                }
+                let mut v = c;
+                (v.w, v.s, v.cols) = (wb.ptr, sb.ptr, sl as i32);
+                self.w
+                    .borrow_mut()
+                    .insert(key, Rc::new(DevW::from_parts(wb, Some(sb), v)));
+                v
+            }
+        };
+        Ok(Some(([rows(a), rows(b), c2], true)))
     }
 
     /// The routed experts' partial sum y [t][d] by the grouped kernels: plan (live local
@@ -2175,7 +2236,7 @@ impl GpuModel {
         rows: Buf,
         rw: Buf,
         planned: Option<Buf>,
-        sh: Option<[Rc<DevW>; 3]>,
+        sh: Option<([DsW; 3], bool)>,
         preq: bool,
     ) -> Result<(Buf, bool)> {
         let d = self.cpu.cfg.dim;
@@ -2208,15 +2269,14 @@ impl GpuModel {
             self.qdq(x, t * d)?
         };
         let lim = self.cpu.cfg.swiglu_limit;
-        if let Some(ws) = sh {
-            let on = self.obs.rank.get() == 0;
+        if let Some((ws, on)) = sh {
             let h = self.fbuf((n + t) * inter)?;
             self.k.moe_gu_sh(
                 &self.s,
                 tab.fmt,
                 (tab.w1.ptr, tab.w3.ptr, elist.ptr),
                 (off.ptr, rows.ptr, rw.ptr),
-                (&ws[0].v, &ws[1].v, on),
+                (&ws[0], &ws[1], on),
                 if preq { 0 } else { x.ptr },
                 h.ptr,
                 (t, n, slots, inter, d),
@@ -2229,7 +2289,7 @@ impl GpuModel {
                 &self.s,
                 tab.fmt,
                 (tab.w2.ptr, elist.ptr, off.ptr),
-                (&ws[2].v, on),
+                (&ws[2], on),
                 h.ptr,
                 part.ptr,
                 (t, n, slots, d, inter),

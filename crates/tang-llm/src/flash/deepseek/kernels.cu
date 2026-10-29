@@ -477,6 +477,14 @@ extern "C" __global__ void ds_hc_sinkhorn(const float* x, const float* mixes, in
 
 // ---- the rest of the forward -------------------------------------------------------------
 
+// dst [rows][w] bytes = src [rows][pitch] bytes at column c0 (a weight's column slice).
+extern "C" __global__ void ds_copy2d(unsigned char* dst, const unsigned char* src, int rows, int w, int pitch,
+                                     int c0) { DS_PDL_ENTRY
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * w) return;
+    dst[i] = src[(i / w) * pitch + c0 + i % w];
+}
+
 extern "C" __global__ void ds_copy(float* dst, const float* src, long long n) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
@@ -1884,13 +1892,18 @@ DS_MOE_KS(3)
 // expert is fp8 where the routed ones are fp4), GU over x's codes in token order into
 // h[n + ti], down from hc rows n.. into part[n + ti] for ds_moe_reduce's `sh` term. The
 // routed slots are ds_moe_ks_*_f F's exactly.
+// The shared expert's row items when its gate/up is this rank's slice of `rows` (8 a warp tile).
+// `shs` (h's row stride, the full intermediate) places a slice's h rows where the full
+// expert's would be, so the down's K slice reads them at the same pitch.
+__device__ __forceinline__ int moe_sh_nbr(int rows, int S) { return (rows + 8 * (8 / S) - 1) / (8 * (8 / S)); }
 #define DS_MOE_KS_SH(F, SF)                                                                                    \
     extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_gu_f##F##_s##SF(                              \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
         const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
-        int n) { DS_PDL_ENTRY                                                                                                \
+        int n, int shs) { DS_PDL_ENTRY                                                                          \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
-            lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * s1.rows, t, 1, 0, lim, S, 1, nbr, 0, 0, 0);     \
+            lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * shs, t, 1, 0, lim, S, 1, moe_sh_nbr(s1.rows, S), \
+                           0, 0, 0, 0, shs);                                                                    \
             return;                                                                                             \
         }                                                                                                       \
         int e = elist[blockIdx.y];                                                                              \
@@ -1903,10 +1916,10 @@ DS_MOE_KS(3)
     }                                                                                                           \
     extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_down_f##F##_s##SF(                            \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
-        float* part, int S, int nbr, DsW s2, int t, int n) { DS_PDL_ENTRY                                                    \
+        float* part, int S, int nbr, DsW s2, int t, int n, int shs) { DS_PDL_ENTRY                              \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
-            lin_mma<SF, 0>(s2, s2, hc + (long long)n * s2.cols, hsc + (long long)n * (s2.cols / 32),           \
-                           part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0);                    \
+            lin_mma<SF, 0>(s2, s2, hc + (long long)n * shs, hsc + (long long)n * (shs / 32),                    \
+                           part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, shs);               \
             return;                                                                                             \
         }                                                                                                       \
         int e = elist[blockIdx.y];                                                                              \
@@ -1944,10 +1957,12 @@ __device__ __forceinline__ int moe_kp_live(const int* elist, const int* off, int
     __syncthreads();
     return nl;
 }
-// block b's unit range [lo, hi) of su cost-2 units then the rest at cost 1
-__device__ __forceinline__ void moe_kp_range(int su, int units, int* lo, int* hi) {
-    long long C = 2LL * su + (units - su), G = gridDim.x, b = blockIdx.x;
-    auto at = [&](long long c) -> int { return c <= 2LL * su ? (int)((c + 1) / 2) : (int)(su + c - 2LL * su); };
+// block b's unit range [lo, hi): su shared units at cost cs, then the routed ones at cost cr
+__device__ __forceinline__ void moe_kp_range(int su, int units, int cs, int cr, int* lo, int* hi) {
+    long long S0 = (long long)cs * su, C = S0 + (long long)cr * (units - su), G = gridDim.x, b = blockIdx.x;
+    auto at = [&](long long c) -> int {
+        return c <= S0 ? (int)((c + cs - 1) / cs) : (int)(su + (c - S0 + cr - 1) / cr);
+    };
     *lo = at(b * C / G);
     *hi = min(units, at((b + 1) * C / G));
 }
@@ -1955,18 +1970,19 @@ __device__ __forceinline__ void moe_kp_range(int su, int units, int* lo, int* hi
     extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_kp_gu_f##F##_s##SF(                  \
         const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,    \
         const unsigned char* xc, const float* xsc, float* h, float lim, int S, int nbr, DsW s1, DsW s3, int t, \
-        int n, int cap) { DS_PDL_ENTRY                                                                          \
+        int n, int shs, int cap) { DS_PDL_ENTRY                                                                 \
         __shared__ int sl[64];                                                                                  \
-        int nl = moe_kp_live(elist, off, cap, sl), su = t > 0 ? nbr : 0, lo, hi;                                \
-        moe_kp_range(su, su + nl * nbr, &lo, &hi);                                                              \
+        int nl = moe_kp_live(elist, off, cap, sl), nbs = moe_sh_nbr(s1.rows, S), su = t > 0 ? nbs : 0, lo, hi;  \
+        /* cost an item: its weight bytes (fp8 2, fp4 1) */                                                     \
+        moe_kp_range(su, su + nl * nbr, SF == 3 ? 1 : 2, F == 3 ? 1 : 2, &lo, &hi);                             \
         int prev = -2;                                                                                          \
         for (int u = lo; u < hi; u++) {                                                                         \
             int sidx = u < su ? -1 : (u - su) / nbr, item = u < su ? u : (u - su) % nbr;                        \
             bool staged = sidx == prev;                                                                         \
             prev = sidx;                                                                                        \
             if (sidx < 0) {                                                                                     \
-                lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * s1.rows, t, 1, 0, lim, S, 1, nbr, 0, 0, 0,  \
-                               0, 0, item, staged);                                                             \
+                lin_mma<SF, 1>(s1, s3, xc, xsc, h + (long long)n * shs, t, 1, 0, lim, S, 1, nbs, 0, 0, 0, 0,    \
+                               shs, item, staged);                                                              \
                 continue;                                                                                       \
             }                                                                                                   \
             int e = sl[sidx], o = off[e], m = off[e + 1] - o;                                                   \
@@ -1977,18 +1993,21 @@ __device__ __forceinline__ void moe_kp_range(int su, int units, int* lo, int* hi
     }                                                                                                           \
     extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_kp_down_f##F##_s##SF(                \
         const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc,           \
-        float* part, int S, int nbr, DsW s2, int t, int n, int cap) { DS_PDL_ENTRY                              \
+        float* part, int S, int nbr, DsW s2, int t, int n, int shs, int cap) { DS_PDL_ENTRY                     \
         __shared__ int sl[64];                                                                                  \
         int nl = moe_kp_live(elist, off, cap, sl), su = t > 0 ? nbr : 0, lo, hi;                                \
-        moe_kp_range(su, su + nl * nbr, &lo, &hi);                                                              \
+        /* cost an item: its weight bytes, shared (its K slice, SF) vs routed (F) */                           \
+        int kr = nl > 0 ? w2s[sl[0]].cols : s2.cols;                                                            \
+        int cs = max(1, (int)((8LL * s2.cols * (SF == 3 ? 1 : 2)) / ((long long)kr * (F == 3 ? 1 : 2))));      \
+        moe_kp_range(su, su + nl * nbr, cs, 8, &lo, &hi);                                                       \
         int prev = -2;                                                                                          \
         for (int u = lo; u < hi; u++) {                                                                         \
             int sidx = u < su ? -1 : (u - su) / nbr, item = u < su ? u : (u - su) % nbr;                        \
             bool staged = sidx == prev;                                                                         \
             prev = sidx;                                                                                        \
             if (sidx < 0) {                                                                                     \
-                lin_mma<SF, 0>(s2, s2, hc + (long long)n * s2.cols, hsc + (long long)n * (s2.cols / 32),       \
-                               part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, 0, 0, item,     \
+                lin_mma<SF, 0>(s2, s2, hc + (long long)n * shs, hsc + (long long)n * (shs / 32),                \
+                               part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, shs, 0, item,   \
                                staged);                                                                         \
                 continue;                                                                                       \
             }                                                                                                   \

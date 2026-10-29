@@ -670,12 +670,18 @@ mod tests {
             pool.push((a.1, b.1, c.1));
             keep.extend(a.0.into_iter().chain(b.0).chain(c.0));
         }
+        // DS_SH_SPLIT=w: the shared expert as one rank's 1/w slice (gate/up rows, down's K)
+        let shw: usize = std::env::var("DS_SH_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let ish = inter / shw;
         let mut shs = vec![];
         for c in 0..2u64 {
             let (s1, s3, s2) = (
-                bytes_w(inter, d, 2, c * 7 + 50),
-                bytes_w(inter, d, 2, c * 7 + 51),
-                bytes_w(d, inter, 2, c * 7 + 52),
+                bytes_w(ish, d, 2, c * 7 + 50),
+                bytes_w(ish, d, 2, c * 7 + 51),
+                bytes_w(d, ish, 2, c * 7 + 52),
             );
             shs.push((s1.1, s3.1, s2.1));
             keep.extend(s1.0.into_iter().chain(s3.0).chain(s2.0));
@@ -781,8 +787,8 @@ mod tests {
                 us[j] = time(&s, 5, || Ok(gr.launch(&s)?))? / reps as f32;
             }
             let bytes = live * (2 * slot(inter, d, 3) + slot(d, inter, 3))
-                + 2 * slot(inter, d, 2)
-                + slot(d, inter, 2);
+                + 2 * slot(ish, d, 2)
+                + slot(d, ish, 2);
             Ok((us[0], us[1], live, bytes))
         };
         println!("| live | gu µs | down µs | GB/s | % of 3350 |");

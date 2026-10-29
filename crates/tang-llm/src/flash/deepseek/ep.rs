@@ -131,6 +131,7 @@ impl EpGroup {
                     let init = || -> Result<GpuModel> {
                         let mut m = GpuModel::open_on(&dir, dev)?;
                         m.obs.rank.set(rank);
+                        m.ep_world = world;
                         m.owns_expert = Box::new(move |e| owner(e, world) == rank);
                         m.moe_reduce = match backend {
                             Backend::Host => {
