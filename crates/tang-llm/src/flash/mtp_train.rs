@@ -237,7 +237,10 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         .create_new(true)
         .write(true)
         .open(a.out.join("metrics.jsonl"))?;
-    evaluate(dev, &mut w, &seqs, &valid, &hp, &a, offset, &mut log)?;
+    let cache = tape::DeviceCache::default();
+    evaluate(
+        dev, &mut w, &seqs, &valid, &hp, &a, offset, &mut log, &cache,
+    )?;
     let mut deck: Vec<usize> = Vec::new();
     let mut seen = 0usize;
     for local in 1..=a.steps {
@@ -245,7 +248,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         let now = Instant::now();
         let lr = a.lr_at(step);
         w.optimizer.lr = lr;
-        let (mut fwd, mut bwd) = (0.0, 0.0);
+        let (mut fwd, mut bwd, mut obj) = (0.0, 0.0, 0.0);
         let mut acc: std::collections::BTreeMap<String, Vec<f32>> = Default::default();
         let mut loss = vec![0.0; a.depth];
         let mut kl = vec![0.0; a.depth];
@@ -266,11 +269,13 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
             let b = s.batch(start, a.seq)?;
             picked.push(serde_json::json!([s.path, start]));
             let t0 = Instant::now();
-            let mut t = tape::Tape::new(dev);
+            let mut t = tape::Tape::with_cache(dev, &cache);
             leaves = w.leafs(&mut t);
             let logits = model::forward(&mut t, &mut w, &leaves, &b, &hp, a.depth)?;
             let teacher = target(&mut t, &w, &leaves, &b, &hp)?;
+            let to = Instant::now();
             let o = model::objective_with(&t, &w, &logits, teacher, &b, a.recipe(), a.burn)?;
+            obj += to.elapsed().as_secs_f64();
             ensure!(o.ce.iter().all(|v| v.is_finite()), "nonfinite loss");
             fwd += t0.elapsed().as_secs_f64();
             let t1 = Instant::now();
@@ -307,11 +312,11 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         let norm = w.update(&leaves, grads, a.clip)?;
         let upd = t2.elapsed().as_secs_f64();
         seen += rows;
-        let metric = serde_json::json!({"kind":"train","step":step,"lr":lr,"windows":picked,"rows":rows,"rows_seen":seen,"ce":loss,"kl":kl,"accepted":accepted,"target_agree":agree,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64(),"forward_s":fwd,"backward_s":bwd,"update_s":upd});
+        let metric = serde_json::json!({"kind":"train","step":step,"lr":lr,"windows":picked,"rows":rows,"rows_seen":seen,"ce":loss,"kl":kl,"accepted":accepted,"target_agree":agree,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64(),"forward_s":fwd,"backward_s":bwd,"update_s":upd,"objective_s":obj});
         writeln!(log, "{metric}")?;
         log.flush()?;
         eprintln!(
-            "step {step}: CE {}, grad {norm:.3}, lr {lr:.2e}, {:.2}s (fwd {fwd:.1} bwd {bwd:.1} upd {upd:.1})",
+            "step {step}: CE {}, grad {norm:.3}, lr {lr:.2e}, {:.2}s (fwd {fwd:.1} of which loss {obj:.1}, bwd {bwd:.1}, upd {upd:.1})",
             loss.iter()
                 .map(|l| format!("{l:.4}"))
                 .collect::<Vec<_>>()
@@ -319,7 +324,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
             now.elapsed().as_secs_f64()
         );
         if local % a.eval_every == 0 || local == a.steps {
-            evaluate(dev, &mut w, &seqs, &valid, &hp, &a, step, &mut log)?;
+            evaluate(dev, &mut w, &seqs, &valid, &hp, &a, step, &mut log, &cache)?;
             let dir = a.out.join(format!("step-{step:06}"));
             std::fs::create_dir(&dir)?;
             checkpoint(&dir, &w, step, rng)?;
@@ -380,6 +385,7 @@ fn evaluate<D: ComputeDevice>(
     a: &Args,
     step: usize,
     log: &mut FileLike,
+    cache: &tape::DeviceCache<D>,
 ) -> Result<()> {
     let mut loss = vec![0.0; a.depth];
     let mut kl = vec![0.0; a.depth];
@@ -397,7 +403,7 @@ fn evaluate<D: ComputeDevice>(
                 (s.ids.len() - a.seq) * window / (a.eval_windows - 1)
             };
             let b = s.batch(start, a.seq)?;
-            let mut t = tape::Tape::new(dev);
+            let mut t = tape::Tape::with_cache(dev, cache);
             let leaves = w.leafs(&mut t);
             let lg = model::forward(&mut t, w, &leaves, &b, hp, a.depth)?;
             let teacher = target(&mut t, w, &leaves, &b, hp)?;

@@ -558,39 +558,47 @@ pub fn objective_with<D: ComputeDevice>(
     }
     for (d, &id) in logits.iter().enumerate() {
         let rows = rows0 - d;
+        use rayon::prelude::*;
         let mut g = vec![0.0; rows * vocab];
-        let mut q = vec![0.0f64; vocab];
-        for r in burn..rows {
-            let target = labels[d][r];
-            let row = &t.data(id)[r * vocab..(r + 1) * vocab];
-            let (mx, z) = softmax(row);
-            let lse = mx + z.ln();
-            o.ce[d] += lse - row[target] as f64;
-            o.hits[d] += usize::from(best[d][r] == target);
+        let data = t.data(id);
+        // Rows are independent: (ce, kl) per row, gradient row written in place.
+        let per_row: Vec<(f64, f64)> = g
+            .par_chunks_mut(vocab)
+            .enumerate()
+            .filter(|(r, _)| *r >= burn)
+            .map(|(r, gr)| {
+                let target = labels[d][r];
+                let row = &data[r * vocab..(r + 1) * vocab];
+                let (mx, z) = softmax(row);
+                let lse = mx + z.ln();
+                let ce = lse - row[target] as f64;
+                let weight = weights[d][r] / total_weight;
+                let mut kl = 0.0;
+                // Teacher row r+d+1 of the residual; the target tensor starts at row 1.
+                let trow = tl.map(|tl| &tl[(r + d) * vocab..(r + d + 1) * vocab]);
+                let (tm, tz) = trow.map_or((0.0, 1.0), softmax);
+                for j in 0..vocab {
+                    let p = (row[j] as f64 - mx).exp() / z;
+                    let mut gj = p - f64::from(j == target);
+                    if let Some(trow) = trow {
+                        let q = (trow[j] as f64 - tm).exp() / tz;
+                        if q > 0.0 {
+                            kl += q * (q.ln() - (row[j] as f64 - lse));
+                        }
+                        gj += recipe.soft * (p - q);
+                    }
+                    gr[j] = (gj * weight) as f32;
+                }
+                (ce, kl)
+            })
+            .collect();
+        for (i, (ce, kl)) in per_row.into_iter().enumerate() {
+            let r = burn + i;
+            o.ce[d] += ce;
+            o.kl[d] += kl;
+            o.hits[d] += usize::from(best[d][r] == labels[d][r]);
             o.totals[d] += 1;
             o.accepted[d] += usize::from((0..=d).all(|e| best[e][r] == labels[e][r]));
-            if let Some(tl) = tl {
-                // Teacher row r+d+1 of the residual; the target tensor starts at row 1.
-                let trow = &tl[(r + d) * vocab..(r + d + 1) * vocab];
-                let (tm, tz) = softmax(trow);
-                let mut kl = 0.0;
-                for j in 0..vocab {
-                    q[j] = (trow[j] as f64 - tm).exp() / tz;
-                    if q[j] > 0.0 {
-                        kl += q[j] * (q[j].ln() - (row[j] as f64 - lse));
-                    }
-                }
-                o.kl[d] += kl;
-            }
-            let weight = weights[d][r] / total_weight;
-            for j in 0..vocab {
-                let p = (row[j] as f64 - mx).exp() / z;
-                let mut gj = p - f64::from(j == target);
-                if tl.is_some() && recipe.soft != 0.0 {
-                    gj += recipe.soft * (p - q[j]);
-                }
-                g[r * vocab + j] = (gj * weight) as f32;
-            }
         }
         o.ce[d] /= o.totals[d] as f64;
         o.kl[d] /= o.totals[d] as f64;
