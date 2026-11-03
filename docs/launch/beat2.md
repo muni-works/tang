@@ -1,18 +1,23 @@
 # Beat 2 launch post: cram (draft)
 
-Status: DRAFT. Beat 2 is the announced "cram + the H200 result" slot. `{{…}}` marks a number
-that was not measured in time; the HTML comment above it says what would fill it. Nothing in
-here may be stronger than its receipt. Editor notes are HTML comments and get stripped before
-publishing.
+Status: DRAFT. Beat 2 was announced as the "cram + the H200 result" slot. The H200 part
+turned out to be impossible with the current code (there is no CUDA KV decoder — see "what
+it won't claim"), so this draft ships the measured cram story and says so plainly. `{{…}}`
+marks a number that was not measured in time; the HTML comment above it says what would fill
+it. Nothing in here may be stronger than its receipt. Editor notes are HTML comments and get
+stripped before publishing.
 
-Every number below was measured on **one Apple M4 Max, single thread, 2026-11-03**, on six
-small float32 arrays (two of them real weights pulled from a local Qwen3-1.7B checkpoint),
-with cram-codec built from this repo at `{{SHA}}`. The committed gates (Silesia container
-gate, the held-out SDRBench quality gate, the KV in-loop study) ran on the studio Linux box
-and a different M4 earlier in October — those numbers are cited as such, not re-measured.
+Every number below was measured twice on 2026-11-03: once on **an Apple M4 Max (single
+thread)** and once on **an Intel i9-12900K with an RTX 3090 (24 threads; GPU via
+Vulkan/wgpu)**, both at commit `07a737b7`, on the same six float32 arrays (two of them real
+weights from a local Qwen3-1.7B checkpoint). The two machines produce **byte-identical
+streams**, which is the point of the codec and the strongest result in this post. The
+committed gates (Silesia container gate, held-out SDRBench quality gate, KV in-loop study)
+ran on the same Linux box and a different M4 earlier in October — cited as such, not
+re-measured.
 
-<!-- If the launch waits for the H200 run, fill MEW_* from bench/ on mew and re-date the
-method line. If Beat 2 ships without it, keep the M4 numbers and the placeholders. -->
+<!-- H200: cannot be measured, and the post now says why (no CUDA tkv_decode). If a CUDA
+kernel lands before publish, add it; otherwise this stays as written. -->
 
 ---
 
@@ -55,22 +60,28 @@ machine behind it, and the "won't claim" section says what is not true.
 
 ## What the numbers say
 
-Six arrays, one bound (`rmse = 0.01` for all), one machine (Apple M4 Max, single thread,
-2026-11-03). "best lossless" is the smallest of zstd-19, xz-9 and brotli-11. cram's lossy
-arm is the wavelet codec (the portfolio pick on these arrays), measured at the same bound.
+Six arrays, one bound (`rmse = 0.01` for all), measured on the i9-12900K (mew) with the
+M4 Max agreeing to the byte. "best lossless" is the smallest of zstd-19, xz-9 and
+brotli-11. cram's lossy arm is the wavelet codec (the portfolio pick on these arrays),
+measured at the same bound.
 
 | array | in bytes | best lossless | bytes | ratio | cram-lossy | bytes | ratio | lossless ÷ cram |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | KV-K (8×1024×128, synthetic) | 4,194,304 | xz-9 3,836,972 | 1.09× | | 934,768 | **4.49×** | 4.10× |
 | KV-V (same shape, synthetic) | 4,194,304 | brotli 3,832,558 | 1.09× | | 932,808 | **4.50×** | 4.11× |
-| hidden states (128×2048, synthetic) | 1,048,576 | brotli 964,626 | 1.09× | | 284,557 | **3.68×** | 3.39× |
+| hidden states (128×2048, synthetic) | 1,048,576 | brotli 964,826 | 1.09× | | 284,522 | **3.69×** | 3.39× |
 | MLP down-proj biases (real weights) | 786,432 | xz-9 225,716 | 3.48× | | 72,802 | **10.80×** | 3.10× |
 | embedding scales (real weights, 19.4 MB) | 19,447,808 | xz-9 5,352,776 | 3.63× | | 124,938 | **155.7×** | 42.8× |
-| layernorm weight (real, 1024 vals) | 4,096 | brotli 2,036 | 2.01× | | 165 | **24.8×** | 12.3× |
+| layernorm weight (real, 2048 values) | 8,192 | brotli 2,108 | 3.89× | | 295 | **27.8×** | 7.15× |
 
 <!-- The two synthetic arrays are labeled synthetic in NOTES.md. Real KV dumps from a model
 run are {{MEW_KV_DUMP}}; the committed bench/tensors corpus ran on mew. If we publish before
 re-running on real KV, the post says "KV-like synthetic" and does not. -->
+
+**Both machines produced the same bytes.** KV-K: 934,768 on the M4 Max and 934,768 on the
+i9-12900K. Same for every row. That's not a coincidence to note in passing — it's the
+guarantee the crate makes, and the reason the browser, CPU and GPU decoders can be held to
+one hash.
 
 What this actually says:
 
@@ -89,15 +100,16 @@ What this actually says:
 
 ### Speeds, stated plainly
 
-Single thread on the M4 Max, same arrays:
+Single thread, same arrays, on both machines:
 
-- cram wavelet encode: 0.4–1.1 MB/s (it searches for the smallest stream; encode is the
-  slow direction and we haven't optimized it).
-- cram wavelet decode: 48–105 MB/s (0.089 s for the 4 MiB KV field; 120 ms for 19 MB).
-- zstd-3: ~250–900 MB/s encode, ~1.1–1.4 GB/s decode. xz-9: ~2–9 MB/s encode. brotli-11:
-  ~1–2 MB/s encode.
-- The KV codec's dedicated streaming path: encode 50–58 ms for 4 MiB, decode 45–49 ms
-  (≈45 ns/value, ~21 M values/s single-thread CPU).
+- cram wavelet encode: 0.3–0.6 MB/s on the 12900K, 0.4–1.1 on the M4 Max (it searches for
+  the smallest stream; encode is the slow direction and we haven't optimized it).
+- cram wavelet decode: 42–133 MB/s (0.089 s for the 4 MiB KV field on the M4; 0.238 s for
+  the 19 MB embedding scales on the 12900K).
+- zstd-3: 130–690 MB/s encode, 0.7–1.4 GB/s decode. xz-9: 2–6 MB/s encode. brotli-11:
+  ~0.9–2 MB/s encode.
+- The KV codec's dedicated streaming path: encode 70–82 ms for 4 MiB, decode 58–63 ms on
+  the 12900K (58–60 ns/value); 45–49 ms on the M4 Max (45–47 ns/value).
 
 So: **cram loses to zstd on pure speed, wins on bytes at a stated error.** If your
 pipeline only cares about throughput on incompressible floats, use zstd. If you're paying
@@ -122,27 +134,42 @@ reimplementation on synthetic fields, not the committed result; the committed on
 generation was 1.8–5.5× slower than bf16 steps. The verdict is written down in the same
 survey: cram's KV codec is for *storing and moving* caches — decompress once on load
 (prefix-cache hit, node migration) — not for decoding every step. Any claim that this
-speeds up your context window would be wrong, and we're not making it.
+speeds up your context window would be wrong, and we're not making it. That kernel is Metal
+only, which is also why there is no H200 version of this measurement.
 
-### The GPU decode path (tc-gpu), measured here
+### The GPU decode path (tc-gpu), measured on two GPUs
 
-The `gpu` feature compiles the tc-gpu stream's WGSL kernels with wgpu. On this M4 Max,
-Metal backend, decoding a 4 MiB KV field at PSNR 60:
+The `gpu` feature compiles the tc-gpu stream's WGSL kernels with wgpu. Decoding a 4 MiB
+KV-like field at PSNR 60:
 
-- **0.25 GB/s** GPU kernels, **0.21 GB/s** end-to-end (parse + upload + kernels +
-  readback) — vs **0.05 GB/s** for the CPU single-thread decode of the same stream.
-- On the 19 MB embedding-scales field: **1.71 GB/s** GPU kernels, **0.96 GB/s** end-to-end.
-- `gpu_bit_identical: true` on every run: the GPU and CPU decoders produce the same bits.
-- Random access is real and measured: decoding a 64-cell box (1/64th of the KV field)
-  takes 2.6 ms with 8 threads, vs 10 ms for the whole field.
+- M4 Max (Metal): **0.25 GB/s** GPU kernels, **0.21 GB/s** end-to-end.
+- RTX 3090 (Vulkan): **0.29 GB/s** kernels, **0.20 GB/s** end-to-end.
+- Both against **~0.05 GB/s** for the CPU single-thread decode of the same stream.
+- `gpu_bit_identical: true` on every run, on both GPUs: same bits as the CPU decoder.
 
-That end-to-end number is not the "GB/s decode" figure from the cram.sh draft (1.1–1.7
-GB/s on 512³ fields — the big-field regime, with fixed per-dispatch cost amortized).
-Small fields are dispatch-bound; the README says so and so do our numbers.
+Small fields are dispatch-bound — that's why those numbers look unimpressive. The big-field
+regime is where the design pays off. On a 512³ f32 field (512 MiB, 4.3–4.6 bits/value at
+60 dB) on the RTX 3090, brick size dominates:
 
-<!-- The H200 number this beat was announced with is {{H200_KV_GBPS}}: tc-gpu decode of a
-full model KV slice on the H200. It needs the GPU box on mew. Until it exists, this post
-carries only the M4 numbers above. -->
+| brick | GPU kernels | GPU end-to-end | CPU 16-thread |
+|---|---:|---:|---:|
+| 128³ | 0.79 GB/s | 0.51 GB/s | 0.58 GB/s |
+| 64³ | 3.58 GB/s | 0.97 GB/s | 0.58 GB/s |
+| 32³ | 4.51 GB/s | 1.08 GB/s | 0.56 GB/s |
+| 16³ | **5.60 GB/s** | **1.10 GB/s** | 0.48 GB/s |
+
+Two things to read carefully. **The kernel is 5.6 GB/s at 16³ bricks — 11× the 16-thread CPU
+decode.** The end-to-end number plateaus at ~1.1 GB/s because 0.27 s of the 0.49 s total is
+*readback*: moving 512 MiB back to the host over PCIe. So "1.1 GB/s" is what you get when you
+copy the decoded field to RAM; the codec itself is not the limit. Any number that quotes
+only one of these without saying which is being sloppy — including ours if we ever do it.
+
+Random access is real: a 64³ box out of the 512³ field decodes in **5.7 ms** (16 threads) at
+brick 16, i.e. 1/512th of the work.
+
+<!-- H200: see "what it won't claim". There is no CUDA kv decode, so no H200 KV number exists
+to fill in; tc-gpu above runs on any Vulkan device including an H200, but that is a field
+codec, not a KV-cache-in-attention result. -->
 
 ## What it won't claim
 
@@ -151,19 +178,26 @@ carries only the M4 numbers above. -->
   than zstd"; it's a different tool for float arrays with an error budget.
 - **No image codec claims in this post.** The crate has an image path (img.rs, tools/
   coolchic) and it's promising, but we didn't measure it for Beat 2, so it isn't here.
-- **The learned-model GPU path is unverified on this machine.** TCG3 with the pretrained
-  net fails to compile its pipeline on this Metal config ("compute function exceeds
-  available stack space"). The static path passes bit-identity; the learned path did not
-  run here at all.
-- **No cross-vendor GPU table.** One GPU (M4 Max / Metal). The WebGPU browser gate
-  (285/285 byte-identical, Oct 20) is committed, but its throughput numbers are not
-  reproduced today.
-- **The "H200 result" is not in this post.** Beat 2 was announced as "cram + the H200
-  result". The H200 run isn't measured; the post ships without it rather than with a
-  guess. If the run lands before publish, it goes in with its method and this section
-  shrinks.
-- **Encode speed is not a selling point.** 0.4–1.1 MB/s single-thread. If you need to
-  compress 100 GB of arrays tonight, that's ~30 hours; plan for it or use `--fast`
+- **The learned-model GPU path is unverified.** TCG3 with the pretrained net fails to
+  compile its pipeline on the M4's Metal config ("compute function exceeds available stack
+  space"). The static path passes bit-identity on both GPUs; the learned path did not run
+  here at all.
+- **The "H200 result" cannot be produced from this code.** Beat 2 was announced as "cram +
+  the H200 result". The KV GPU decoder (`tkv_decode`) exists only as a Metal kernel;
+  `ComputeDevice::tkv_decode` is `unimplemented!("tkv_decode is implemented for Metal
+  only")`. There is no CUDA implementation, so an H200 can run the field codec (tc-gpu,
+  above) but **cannot decode a KV cache in the attention loop**. That is a named piece of
+  work, not a measurement we could rent: write the CUDA `tkv_decode` and rerun the
+  in-loop study on an H200. The post ships without the number rather than with a guess.
+- **No cross-vendor GPU table.** Two GPUs, both consumer/workstation class (M4 Max, RTX
+  3090). The WebGPU browser gate (285/285 byte-identical, Oct 20) is committed, but its
+  throughput numbers are not reproduced today.
+- **A real defect found while measuring.** The lossy portfolio allocates ~184 GB and aborts
+  on a 151936×32 field (the Tucker candidate on a very long, thin 2-D field). Wavelet alone
+  handles it fine in 2.7 s. It's filed, not hidden; until it's fixed, `--codec wavelet` is
+  the safe path for that shape.
+- **Encode speed is not a selling point.** 0.3–1.1 MB/s single-thread. If you need to
+  compress 100 GB of arrays tonight, that's 25–90 hours; plan for it or use `--fast`
   (still slow, less search).
 
 ## Try it
