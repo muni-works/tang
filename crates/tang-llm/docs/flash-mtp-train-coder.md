@@ -132,3 +132,21 @@ distribution is `softmax(output · h)` with the frozen head the trainer already 
 `argmax(output · h)` equals the dumped token; it should be ~all rows, Q4 trunk vs f16 `h`).
 
 Pilot-2 command: as pilot 1 plus `--beta .6 --vat --soft 1`, from the borrowed head.
+
+### Pilot 2 result (H200, shared GPU; 500 steps from the borrowed head, `--beta .6 --vat --soft 1`)
+
+Held-out live chain, k=3, 20 prompts × 2000 tokens:
+
+| head | d1 | d2-cum | d3-cum | tokens/window |
+| --- | --- | --- | --- | --- |
+| borrowed | 78.2% | 58.0% | 40.0% | 2.76 |
+| pilot 1 (β .8, hard CE) | 82.3% | 64.6% | 48.3% | 2.95 |
+| pilot 2 (β .6, VAT, soft) | 82.2% | 64.5% | 48.2% | 2.95 |
+
+Train 88 min, eval 22 min. Identical within noise; the held-out curves (CE, teacher hits) track
+pilot 1 step for step. The recipe pieces that were missing (VAT weights, soft targets) do not
+move this head; the pieces that matter in FastMTP (shared recursive head, self-conditioning,
+self-generated data, decayed multi-step loss) were already there. What differs from the papers
+is scale: 500 steps × one 24-row window is ~12k loss rows, ~3% of one pass over the 180-prompt
+dump (FastMTP: 3 epochs over 389k samples, batch 64, lr 5e-5). Next lever: batch (many windows
+per step) and lr/steps, then more prompts — not the loss.
