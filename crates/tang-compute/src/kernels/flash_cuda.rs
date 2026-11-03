@@ -1095,7 +1095,13 @@ __device__ __forceinline__ void gdn_step_body(
     const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
     const unsigned int* __restrict__ win, unsigned int commit, float eps,
     unsigned int* __restrict__ YQ, unsigned int quant, const float* __restrict__ H0,
-    const float* __restrict__ Wc) {
+    const float* __restrict__ Wc, unsigned int pr0 = 0, unsigned int plen = 0, unsigned int r0 = 0) {
+    // Path rows (tree windows): path index i is window row i < plen ? pr0 + i : r0 + i - plen
+    // (identity when plen = r0 = 0). The first plen rows are a parent chain's prefix: they
+    // advance the state but their outputs belong to that chain's segment and aren't written.
+    // commit & 2: state only (a commit replay), no outputs; the state arithmetic is unchanged.
+    #define GDN_ROW(i) ((i) < plen ? pr0 + (i) : r0 + (i) - plen)
+    const bool outs = !(commit & 2);
     __shared__ float sq[8][128], sk[8][128], sv[8][128], sz[8][128];
     __shared__ float sg[8], sb[8];
     __shared__ float red[4][128];
@@ -1117,7 +1123,7 @@ __device__ __forceinline__ void gdn_step_body(
         #pragma unroll
         for (unsigned int i = 0; i < 11; i++) {
             unsigned int p = t0 + i;
-            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)(p - 3) * stride + ch] : 0.0f));
+            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)GDN_ROW(p - 3) * stride + ch] : 0.0f));
         }
         #pragma unroll
         for (unsigned int t = 0; t < 8; t++) {
@@ -1138,23 +1144,23 @@ __device__ __forceinline__ void gdn_step_body(
             if (rg == 0) sq[t][j] = v;
             else if (rg == 1) sk[t][j] = v;
             else if (rg == 2) sv[t][j] = v;
-            else sz[t][j] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + j];
+            else if (outs) sz[t][j] = P[(u64)GDN_ROW(t0 + t) * stride + GDN_Z + hv * 128 + j];
         }
     } else {
         for (unsigned int i = tid; i < nn * 128; i += 512) {
             unsigned int t = i >> 7, jj = i & 127;
-            const float* hh = Hc + (u64)(t0 + t) * GDN_CONV;
+            const float* hh = Hc + (u64)GDN_ROW(t0 + t) * GDN_CONV;
             sq[t][jj] = hh[hk * 128 + jj];
             sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
             sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
-            sz[t][jj] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + jj];
+            sz[t][jj] = P[(u64)GDN_ROW(t0 + t) * stride + GDN_Z + hv * 128 + jj];
         }
     }
     if (tid < nn) {
-        float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
+        float a = P[(u64)GDN_ROW(t0 + tid) * stride + GDN_A + hv] + DT[hv];
         float sp = a > 20.0f ? a : log1pf(expf(a));
         sg[tid] = expf(sp * SA[hv]);
-        sb[tid] = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
+        sb[tid] = sigm(P[(u64)GDN_ROW(t0 + tid) * stride + GDN_B + hv]);
     }
     __syncthreads();
     for (unsigned int t = 0; t < nn; t++) {
@@ -1169,6 +1175,13 @@ __device__ __forceinline__ void gdn_step_body(
         __syncthreads();
         float skj = ((red[0][j] + red[1][j]) + red[2][j]) + red[3][j];
         float d = (sv[t][j] - skj) * sb[t];
+        if (!outs || t0 + t < plen) {
+            // No output for this row: the state update alone (the same fmas as below).
+            #pragma unroll
+            for (int r = 0; r < 32; r++) st[r] = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
+            __syncthreads();
+            continue;
+        }
         p = 0.0f;
         #pragma unroll
         for (int r = 0; r < 32; r++) {
@@ -1188,7 +1201,7 @@ __device__ __forceinline__ void gdn_step_body(
             float ss = ((red2[0] + red2[1]) + red2[2]) + red2[3];
             float rs = 1.0f / sqrtf(ss / 128.0f + eps);
             float y = o * rs * NW[j] * GDN_GATE(sz[t][j]);
-            Y[(u64)(t0 + t) * GDN_V + hv * 128 + j] = y;
+            Y[(u64)GDN_ROW(t0 + t) * GDN_V + hv * 128 + j] = y;
             if (quant) quant_chunk(y, YQ, T, GDN_V, t0 + t, hv * 4 + (j >> 5), j & 31);
         }
         __syncthreads();
@@ -1198,6 +1211,7 @@ __device__ __forceinline__ void gdn_step_body(
         #pragma unroll
         for (int r = 0; r < 32; r++) S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j] = st[r];
     }
+    #undef GDN_ROW
 }
 
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
@@ -1226,16 +1240,27 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step(
 // SEG[b][0] .. + SEG[b][1] of the window, all of sequence slot SEG[b][2], keeping SEG[b][3] of
 // them on commit. Its recurrent state and conv history are at Stab[slot] / Htab[slot]. Each
 // segment runs exactly as a lone window of its rows would (the same body). Grid (GDN_HV, nseg).
+//
+// Tree windows (chain-decomposed): SEG[b][3] with bit 31 set packs keep | pr0 << 8 | plen << 16
+// (otherwise it is a plain keep, any size). A chain that
+// branches off another after its first plen rows (window rows pr0 ..) runs those rows first,
+// in its own registers, as the prefix of its path: shared rows are computed once in the
+// window's GEMVs and MoE, and only the cheap recurrence is redone, with no state in HBM.
+// keep counts path rows (prefix included). plen = 0 is the plain segment.
+#define SEG_KEEP(w) ((w) >> 31 ? (w) & 0xffu : (w))
+#define SEG_PR0(w) ((w) >> 31 ? ((w) >> 8) & 0xffu : 0u)
+#define SEG_PLEN(w) ((w) >> 31 ? ((w) >> 16) & 0xffu : 0u)
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step_seg(
     const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, const unsigned int* __restrict__ SEG,
     unsigned int commit, float eps, const float* __restrict__ Wc) {
     const unsigned int* sg = SEG + blockIdx.y * 4;
-    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2];
-    gdn_step_body<true>((float*)Stab[slot], nullptr, P + (u64)r0 * stride, stride, DT, SA, NW,
-                        Y + (u64)r0 * GDN_V, len, sg + 2, commit, eps, nullptr, 0,
-                        (const float*)Htab[slot], Wc);
+    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2], pk = sg[3];
+    const unsigned int plen = SEG_PLEN(pk), win[2] = {0u, SEG_KEEP(pk)};
+    gdn_step_body<true>((float*)Stab[slot], nullptr, P, stride, DT, SA, NW, Y, plen + len, win,
+                        commit, eps, nullptr, 0, (const float*)Htab[slot], Wc, SEG_PR0(pk), plen,
+                        r0);
 }
 
 // fl_gdn_conv_commit per segment (as above). Grid (ceil(GDN_CONV / 256), nseg), block 256.
@@ -1246,14 +1271,15 @@ extern "C" __global__ void fl_gdn_conv_commit_seg(const u64* __restrict__ Htab, 
     unsigned int ch = blockIdx.x * 256 + threadIdx.x;
     if (ch >= GDN_CONV) return;
     float* H0 = (float*)Htab[slot];
-    const float* Pr = P + (u64)r0 * stride;
-    unsigned int n = min(sg[3], len);
+    const unsigned int pk = sg[3], pr0 = SEG_PR0(pk), plen = SEG_PLEN(pk);
+    unsigned int n = min(SEG_KEEP(pk), plen + len);
     float old[3] = {H0[ch], H0[GDN_CONV + ch], H0[2 * GDN_CONV + ch]};
     float nw[3];
     #pragma unroll
     for (unsigned int s = 0; s < 3; s++) {
         unsigned int e = n + s;
-        nw[s] = e < 3 ? old[e] : Pr[(u64)(e - 3) * stride + ch];
+        unsigned int i = e - 3;
+        nw[s] = e < 3 ? old[e] : P[(u64)(i < plen ? pr0 + i : r0 + i - plen) * stride + ch];
     }
     #pragma unroll
     for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];

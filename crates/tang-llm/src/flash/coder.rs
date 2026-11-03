@@ -53,6 +53,23 @@ pub const MAX_SLOTS: usize = 128;
 /// Row record per window row: positions, slots, segments (4 each), tree cache offsets,
 /// tree roots.
 const ROWS_PER_T: usize = 8;
+/// A tree segment's GDN words `[r0, len, slot 0, 1 << 31 | keep | pr0 << 8 | plen << 16]` (the
+/// prefix is the window's first `plen` rows, pr0 = 0; `fl_gdn_conv_step_seg`).
+fn seg_words(s: &super::tree::Seg, keep: usize) -> [u32; 4] {
+    debug_assert!(keep <= 0xff && s.plen + s.len <= MAX_T);
+    [
+        s.r0 as u32,
+        s.len as u32,
+        0,
+        1 << 31 | keep as u32 | (s.plen as u32) << 16,
+    ]
+}
+
+/// GDN step modes: read the state only (a verify window), run and write it (a plain window),
+/// or write it without outputs (a commit replaying the kept rows of a verify window).
+const GDN_VERIFY: u32 = 0;
+const GDN_COMMIT: u32 = 1;
+const GDN_REPLAY: u32 = 3;
 const ROWS_U32: usize = ROWS_PER_T * MAX_T;
 const _: () = assert!(super::tree::MAX_T == MAX_T);
 
@@ -1569,7 +1586,8 @@ impl Coder {
     }
 
     /// Tree verify (`flash::tree`): `cur` and the chains of `forest` as one verify window of slot
-    /// 0, each chain a segment reading the committed state; commits the winning chain and
+    /// 0, the root row once and each chain a segment reading the committed state (later chains
+    /// run the root row as their path's prefix, `tree::Seg`); commits the winning chain and
     /// returns the emitted tokens (its accepted drafts' successors plus the correction), which
     /// equal what plain greedy decoding would emit. Greedy only.
     pub fn verify_forest(&mut self, cur: u32, forest: &super::tree::Forest) -> Result<Vec<u32>> {
@@ -1584,7 +1602,7 @@ impl Coder {
         ensure!(t <= MAX_T, "{t} rows");
         ensure!(pos0 + t <= self.max_ctx, "context {} > max {}", pos0 + t, self.max_ctx);
         let staged: Vec<(usize, usize, u32)> = rows.iter().map(|r| (0, r.pos, r.tok)).collect();
-        let sg: Vec<[u32; 4]> = segs.iter().map(|&(r0, n)| [r0 as u32, n as u32, 0, 0]).collect();
+        let sg: Vec<[u32; 4]> = segs.iter().map(|s| seg_words(s, 0)).collect();
         let w0 = Instant::now();
         self.stage_rows(&staged, &sg)?;
         let n = self.hp.n_embd;
@@ -1600,25 +1618,43 @@ impl Coder {
         self.last_tree = (b, m);
         let out = forest.emitted(&targets, (b, m));
         let tc = Instant::now();
-        self.commit_tree(segs[b].0, m + 1, pos0, forest.off(b))?;
+        self.commit_tree(&segs[b], m + 1, pos0, forest.off(b))?;
         self.tokens.push(cur);
         self.tokens.extend_from_slice(&forest.chains[b][..m]);
         self.last_commit_ms = tc.elapsed().as_secs_f64() * 1e3;
-        // Refill the MTP chain from the winning chain's rows (no-op without MTP).
-        self.mtp_after_window(pos0, segs[b].0, &out)?;
+        // Refill the MTP chain from the winning path's rows (no-op without MTP): a later
+        // chain's path isn't contiguous (root, then its drafts), so gather it to rows 0.. first.
+        let kept = forest.kept_rows(b, m);
+        let r0 = if kept.iter().enumerate().all(|(i, &r)| r == kept[0] + i) {
+            kept[0]
+        } else {
+            if self.mtp_on() {
+                let mh = self.a(&self.mtp.as_ref().unwrap().mh);
+                self.mtp_gather(mh, &kept);
+            }
+            0
+        };
+        self.mtp_after_window(pos0, r0, &out)?;
         Ok(out)
     }
 
-    /// Keep rows `r0 .. r0 + keep` of the last tree window: run their recurrence into slot 0's
-    /// state, then move their window keys (cache `pos0 + 1 + off ..`) down to `pos0 + 1 ..`.
-    fn commit_tree(&mut self, r0: usize, keep: usize, pos0: usize, off: usize) -> Result<()> {
+    /// Keep the first `keep` path rows of segment `seg` of the last tree window: run their
+    /// recurrence into slot 0's state, then move their window keys (cache `pos0 + 1 + off ..`)
+    /// down to `pos0 + 1 ..`.
+    fn commit_tree(
+        &mut self,
+        seg: &super::tree::Seg,
+        keep: usize,
+        pos0: usize,
+        off: usize,
+    ) -> Result<()> {
         let n = self.hp.n_embd;
         let rec = self.io.u32s(Io::rows(n, MAX_T), ROWS_U32);
-        rec[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[r0 as u32, keep as u32, 0, keep as u32]);
+        rec[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&seg_words(seg, keep));
         self.kcopy_on(0, self.a(&self.s.rows), self.io_dev_on(0, Io::rows(n, MAX_T)), ROWS_U32 * 4);
         for layer in &self.layers {
             if let Some(g) = &layer.gdn {
-                self.gdn_step_seg(0, g, layer.w_in.rows, 1, true);
+                self.gdn_step_seg(0, g, layer.w_in.rows, 1, GDN_REPLAY);
                 self.gdn_commit_seg(0, g, layer.w_in.rows, 1);
             }
         }
@@ -1860,7 +1896,7 @@ impl Coder {
         );
         for layer in v.layers {
             if let Some(g) = &layer.gdn {
-                self.gdn_step_seg(w, g, layer.w_in.rows, nseg, true);
+                self.gdn_step_seg(w, g, layer.w_in.rows, nseg, GDN_REPLAY);
                 self.gdn_commit_seg(w, g, layer.w_in.rows, nseg);
             }
         }
@@ -1876,7 +1912,7 @@ impl Coder {
             self.kcopy_on(w, rows_addr, io_rows, ROWS_U32 * 4);
             for layer in st.layers {
                 if let Some(g) = &layer.gdn {
-                    self.gdn_step_seg(w, g, layer.w_in.rows, nseg, true);
+                    self.gdn_step_seg(w, g, layer.w_in.rows, nseg, GDN_REPLAY);
                     self.gdn_commit_seg(w, g, layer.w_in.rows, nseg);
                 }
             }
@@ -3100,7 +3136,7 @@ impl Coder {
                 t,
                 stride,
             );
-            self.gdn_step_seg(w, g, stride, nseg, !verify);
+            self.gdn_step_seg(w, g, stride, nseg, if verify { GDN_VERIFY } else { GDN_COMMIT });
             if !verify {
                 self.gdn_commit_seg(w, g, stride, nseg);
             }
@@ -3239,7 +3275,7 @@ impl Coder {
 
     /// The GDN conv and recurrence in one launch (`commit`: write the state for `win[1]`
     /// tokens), from the stacked projection and the conv history.
-    fn gdn_step(&self, w: usize, g: &GdnL, stride: usize, t: usize, commit: bool) {
+    fn gdn_step(&self, w: usize, g: &GdnL, stride: usize, t: usize, commit: u32) {
         let v = self.stage_view(w);
         let (st, p, sd, dt, sa, nw, y, tu, win, cm, eps, yq, quant, h0, wc) = (
             v.dev.buffer_addr(&g.state),
@@ -3251,7 +3287,7 @@ impl Coder {
             v.dev.buffer_addr(&v.s.y),
             t as u32,
             v.dev.buffer_addr(&v.s.ctl),
-            commit as u32,
+            commit,
             self.eps,
             0u64,
             0u32,
@@ -3293,7 +3329,7 @@ impl Coder {
 
     /// [`gdn_step`](Self::gdn_step) for every segment of the window (`s.rows`): each segment's
     /// rows run against its slot's state and history.
-    fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
+    fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: u32) {
         let v = self.stage_view(w);
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
             v.dev.buffer_addr(&g.stab),
@@ -3305,7 +3341,7 @@ impl Coder {
             v.dev.buffer_addr(&g.norm),
             v.dev.buffer_addr(&v.s.y),
             v.dev.buffer_addr(&v.s.rows) + (2 * self.tw() * 4) as u64,
-            commit as u32,
+            commit,
             self.eps,
             v.dev.buffer_addr(&g.conv),
         );
@@ -3942,7 +3978,7 @@ impl Coder {
             );
             for layer in v.layers {
                 if let Some(g) = &layer.gdn {
-                    self.gdn_step(w, g, layer.w_in.rows, t, true);
+                    self.gdn_step(w, g, layer.w_in.rows, t, GDN_REPLAY);
                     self.gdn_commit(w, g, layer.w_in.rows, t);
                 }
             }
@@ -4516,7 +4552,7 @@ impl Coder {
         );
         for layer in v.layers {
             if let Some(g) = &layer.gdn {
-                self.gdn_step(w, g, layer.w_in.rows, t, true);
+                self.gdn_step(w, g, layer.w_in.rows, t, GDN_REPLAY);
                 self.gdn_commit(w, g, layer.w_in.rows, t);
             }
         }

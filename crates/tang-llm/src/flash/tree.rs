@@ -1,9 +1,12 @@
 //! Tree speculative decoding for the Coder engine: a *forest of chains* sharing the root.
 //!
-//! A verify window holds chains `[cur, d1, d2, …]` back to back (at most `MAX_T` rows). Every
-//! chain repeats `cur`, so each chain is one GDN segment reading the committed state, and rows of
-//! chain b keep their window keys at cache offset `off_b` so chains at the same depth don't
-//! overwrite each other's K/V. See `docs/plans/2026-10-21-qwen3next-tree-spec.md`.
+//! A verify window holds the root `cur` once, then each chain's drafts back to back (at most
+//! `MAX_T` rows). Chains are decomposed SpecLA-style (`docs/plans/coder-specla.md`): chain 0 is
+//! one GDN segment `[cur, d1, …]`; a later chain is a segment of its own drafts whose path starts
+//! with the root row (its prefix), so the root's GEMVs, MoE and attention run once and only the
+//! cheap recurrence repeats. Rows of chain b keep their window keys at cache offset `off_b` so
+//! chains at the same depth don't overwrite each other's K/V. See
+//! `docs/plans/2026-10-21-qwen3next-tree-spec.md`.
 //!
 //! This file is host-side only: the window layout, the accept rule and the shape choice.
 
@@ -27,8 +30,21 @@ pub struct Forest {
     pub chains: Vec<Vec<u32>>,
 }
 
-/// A GDN segment for one chain: (first row, rows).
-pub type Seg = (usize, usize);
+/// A GDN segment for one chain: its own rows `r0 .. r0 + len`, after the first `plen` rows of
+/// the window (the shared prefix, here the root: `plen` is 0 for chain 0, 1 otherwise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seg {
+    pub r0: usize,
+    pub len: usize,
+    pub plen: usize,
+}
+
+impl Seg {
+    /// The window rows of this segment's path, prefix first.
+    pub fn path(&self) -> Vec<usize> {
+        (0..self.plen).chain(self.r0..self.r0 + self.len).collect()
+    }
+}
 
 impl Forest {
     /// Drop empty and duplicate-first-token chains, then trim from the last chain until the
@@ -49,12 +65,12 @@ impl Forest {
         let mut used = 1 + chains[0].len();
         let mut out = vec![chains[0].clone()];
         for c in chains.into_iter().skip(1) {
-            let room = MAX_T.saturating_sub(used + 1);
+            let room = MAX_T.saturating_sub(used);
             if room == 0 {
                 break;
             }
             let c: Vec<u32> = c.into_iter().take(room).collect();
-            used += 1 + c.len();
+            used += c.len();
             out.push(c);
         }
         Self { chains: out }
@@ -64,20 +80,23 @@ impl Forest {
         if self.chains.is_empty() {
             1
         } else {
-            self.chains.iter().map(|c| 1 + c.len()).sum()
+            1 + self.chains.iter().map(|c| c.len()).sum::<usize>()
         }
     }
 
     /// The window rows for root `cur` at `pos0`, and one segment per chain.
     pub fn layout(&self, cur: u32, pos0: usize) -> (Vec<Row>, Vec<Seg>) {
+        let mut rows = vec![Row { tok: cur, pos: pos0, off: 0 }];
         if self.chains.is_empty() {
-            let r = Row { tok: cur, pos: pos0, off: 0 };
-            return (vec![r], vec![(0, 1)]);
+            return (rows, vec![Seg { r0: 0, len: 1, plen: 0 }]);
         }
-        let (mut rows, mut segs, mut off) = (Vec::new(), Vec::new(), 0);
-        for c in &self.chains {
-            segs.push((rows.len(), 1 + c.len()));
-            rows.push(Row { tok: cur, pos: pos0, off: 0 });
+        let (mut segs, mut off) = (Vec::new(), 0);
+        for (b, c) in self.chains.iter().enumerate() {
+            segs.push(if b == 0 {
+                Seg { r0: 0, len: 1 + c.len(), plen: 0 }
+            } else {
+                Seg { r0: rows.len(), len: c.len(), plen: 1 }
+            });
             for (i, &t) in c.iter().enumerate() {
                 rows.push(Row { tok: t, pos: pos0 + 1 + i, off });
             }
@@ -91,12 +110,13 @@ impl Forest {
     pub fn accept(&self, targets: &[u32]) -> (usize, usize) {
         let (_, segs) = self.layout(0, 0);
         let mut best = (0, 0);
-        for (b, &(r0, _)) in segs.iter().enumerate() {
+        for (b, sg) in segs.iter().enumerate() {
             let Some(c) = self.chains.get(b) else { break };
+            let path = sg.path();
             let m = c
                 .iter()
                 .enumerate()
-                .take_while(|&(i, &d)| targets[r0 + i] == d)
+                .take_while(|&(i, &d)| targets[path[i]] == d)
                 .count();
             if m > best.1 {
                 best = (b, m);
@@ -105,11 +125,15 @@ impl Forest {
         best
     }
 
-    /// The emitted tokens for an accept result.
+    /// The emitted tokens for an accept result: the targets of the winner's path rows `0..=m`.
     pub fn emitted(&self, targets: &[u32], (b, m): (usize, usize)) -> Vec<u32> {
+        self.kept_rows(b, m).iter().map(|&r| targets[r]).collect()
+    }
+
+    /// The window rows an accept result keeps (chain `b`'s path rows `0..=m`).
+    pub fn kept_rows(&self, b: usize, m: usize) -> Vec<usize> {
         let (_, segs) = self.layout(0, 0);
-        let r0 = segs[b].0;
-        targets[r0..=r0 + m].to_vec()
+        segs[b].path()[..=m].to_vec()
     }
 
     /// The cache offset of chain `b`'s window keys (what the accepted K/V move back from).
@@ -167,7 +191,8 @@ pub fn choose(p: &[Vec<f32>], cost: &[f32]) -> Vec<usize> {
         if !can {
             return;
         }
-        let base = if b == 0 { 1 } else { used + 1 };
+        // The root row is shared: a later chain costs only its drafts.
+        let base = if b == 0 { 1 } else { used };
         for l in 1..=p[b].len() {
             if base + l > MAX_T || base + l >= cost.len() {
                 break;
@@ -189,11 +214,14 @@ mod tests {
     fn layout_offsets_and_segments() {
         let f = Forest::new(vec![vec![10, 11], vec![20, 21], vec![30]]);
         let (rows, segs) = f.layout(5, 100);
-        assert_eq!(segs, vec![(0, 3), (3, 3), (6, 2)]);
+        let s = |r0, len, plen| Seg { r0, len, plen };
+        assert_eq!(segs, vec![s(0, 3, 0), s(3, 2, 1), s(5, 1, 1)]);
+        assert_eq!(segs[1].path(), vec![0, 3, 4]);
         let pos: Vec<usize> = rows.iter().map(|r| r.pos).collect();
-        assert_eq!(pos, vec![100, 101, 102, 100, 101, 102, 100, 101]);
+        assert_eq!(pos, vec![100, 101, 102, 101, 102, 101]);
         let off: Vec<usize> = rows.iter().map(|r| r.off).collect();
-        assert_eq!(off, vec![0, 0, 0, 0, 2, 2, 0, 4]);
+        assert_eq!(off, vec![0, 0, 0, 2, 2, 4]);
+        assert_eq!(f.rows_len(), rows.len());
         // Window keys never collide: cache index pos + off is unique past the root.
         let mut idx: Vec<usize> = rows.iter().filter(|r| r.pos > 100).map(|r| r.pos + r.off).collect();
         idx.sort();
@@ -205,19 +233,20 @@ mod tests {
     #[test]
     fn new_dedupes_and_fits_max_t() {
         let f = Forest::new(vec![vec![1, 2, 3, 4, 5], vec![1, 9], vec![], vec![7, 8, 9, 10]]);
-        assert_eq!(f.chains, vec![vec![1, 2, 3, 4, 5], vec![7]]);
+        assert_eq!(f.chains, vec![vec![1, 2, 3, 4, 5], vec![7, 8]]);
         assert!(f.rows_len() <= MAX_T);
     }
 
     #[test]
     fn accept_picks_longest_then_lowest() {
         let f = Forest::new(vec![vec![10, 11], vec![20, 21, 22]]);
-        // Targets per row: chain 0 rows 0..3, chain 1 rows 3..7.
-        let t = [10, 99, 0, 20, 21, 50, 0];
-        // Both chains can't be right at depth 1 in reality; accept just measures each.
+        // Rows: root 0, chain 0 drafts 1..3, chain 1 drafts 3..6. The root's target checks
+        // every chain's first draft; here it says 20, so chain 1 wins.
+        let t = [20, 99, 0, 21, 50, 0];
         assert_eq!(f.accept(&t), (1, 2));
         assert_eq!(f.emitted(&t, (1, 2)), vec![20, 21, 50]);
-        assert_eq!(f.accept(&[1, 2, 3, 4, 5, 6, 7]), (0, 0));
+        assert_eq!(f.kept_rows(1, 2), vec![0, 3, 4]);
+        assert_eq!(f.accept(&[1, 2, 3, 4, 5, 6]), (0, 0));
     }
 
     /// A toy deterministic "model": the next token is a hash of the whole prefix. Decoding with
@@ -265,13 +294,13 @@ mod tests {
             let cur = seq[seq.len() - 1];
             let (rows, segs) = f.layout(cur, seq.len() - 1);
             let mut targets = vec![0; rows.len()];
-            for (b, &(r0, len)) in segs.iter().enumerate() {
+            for (b, sg) in segs.iter().enumerate() {
                 let mut ctx = seq.clone();
-                for i in 0..len {
+                for (i, &r) in sg.path().iter().enumerate() {
                     if i > 0 {
                         ctx.push(f.chains[b][i - 1]);
                     }
-                    targets[r0 + i] = next(&ctx);
+                    targets[r] = next(&ctx);
                 }
             }
             let acc = f.accept(&targets);
