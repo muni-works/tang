@@ -4,6 +4,7 @@
 //! Tensor contractions use tang-compute, nonlinear Jacobians use tang-ad. The export preserves
 //! every GGUF directory entry and untouched byte; Q8/BF16/F32 updates keep their original type.
 mod data;
+pub(crate) use data::Sequence;
 mod model;
 mod tape;
 mod weights;

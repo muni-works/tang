@@ -869,6 +869,8 @@ pub struct Coder {
     /// Per-segment commit graphs after a batched verify window, by segment count.
     commit_seg_graphs: Vec<Option<Graph>>,
     pub last_mtp_ms: f64,
+    /// `flash-coder-dump`: MTP training rows (see [`TrainDump`](super::coder_mtp::TrainDump)).
+    train_dump: Option<super::coder_mtp::TrainDump>,
     /// The second GPU of the layer split (`None`: one GPU, everything on `self.dev`).
     peer: Option<Box<Peer>>,
 }
@@ -1157,6 +1159,7 @@ impl Coder {
             slot_chain: vec![Vec::new(); MAX_SLOTS],
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
+            train_dump: None,
             peer,
         };
         let mut c = c;
@@ -3493,7 +3496,30 @@ impl Coder {
             .iter()
             .flat_map(|g| g.3.iter().enumerate().map(move |(i, &k)| (g.0, g.1 + i, k)))
             .collect();
+        // The training dump reads `m.mh` before the pass (it is the pass's `h` input).
+        let keep = match (&self.train_dump, groups) {
+            (Some(_), [(0, pos, _, next)]) => {
+                self.dev.sync();
+                let mh = self.dev.download(&self.mtp.as_ref().unwrap().mh);
+                let toks = self.tokens[*pos..*pos + next.len()].to_vec();
+                Some(self.train_dump.as_mut().unwrap().rows(
+                    *pos,
+                    &toks,
+                    next,
+                    &mh,
+                    self.hp.n_embd,
+                )?)
+            }
+            _ => None,
+        };
         let first = self.mtp_pass(&rows)?;
+        if let (Some(keep), Some(d)) = (&keep, self.train_dump.as_mut()) {
+            for (i, (r, &k)) in rows.iter().zip(keep).enumerate() {
+                if k {
+                    d.draft(r.1, 1, first[i])?;
+                }
+            }
+        }
         if !chain {
             return Ok(out);
         }
@@ -3538,6 +3564,13 @@ impl Coder {
             let d = self.mtp_pass(&rows)?;
             for (o, &x) in out.iter_mut().zip(&d) {
                 o.0.push(x);
+            }
+            if let (Some(keep), Some(dump)) = (&keep, self.train_dump.as_mut()) {
+                // Depth j + 1 of the chain from the group's last row.
+                if *keep.last().unwrap() {
+                    let g = groups[0];
+                    dump.draft(g.1 + g.3.len() - 1, j + 1, d[0])?;
+                }
             }
             last = (0..groups.len()).collect();
         }
@@ -5000,6 +5033,25 @@ impl Coder {
         }
         self.reset();
         Ok(())
+    }
+}
+
+impl Coder {
+    /// Start writing MTP training rows (MTP drafting on, greedy).
+    pub fn start_train_dump(&mut self, d: super::coder_mtp::TrainDump) {
+        self.train_dump = Some(d);
+    }
+
+    /// Stop the dump and flush it; returns the data rows written.
+    pub fn finish_train_dump(&mut self) -> Result<usize> {
+        match self.train_dump.take() {
+            Some(d) => {
+                let n = d.rows;
+                d.finish()?;
+                Ok(n)
+            }
+            None => Ok(0),
+        }
     }
 }
 
