@@ -9,11 +9,11 @@
 use cram_codec::kvcodec::{encode, Kind, KvParams, KvStream};
 use cram_codec::kvgpu::{Batch, Placement};
 use std::time::Instant;
-#[cfg(feature = "metal")]
-use tang_compute::MetalDevice as Device;
+use tang_compute::ComputeDevice;
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
 use tang_compute::CudaComputeDevice as Device;
-use tang_compute::ComputeDevice;
+#[cfg(feature = "metal")]
+use tang_compute::MetalDevice as Device;
 
 fn flag(a: &[String], f: &str) -> Option<String> {
     a.iter().position(|x| x == f).map(|i| a[i + 1].clone())
@@ -40,7 +40,6 @@ fn new_device() -> Device {
 }
 #[cfg(not(any(feature = "metal", feature = "cuda")))]
 use tang_compute::CpuDevice as Device;
-
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

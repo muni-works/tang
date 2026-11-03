@@ -1304,7 +1304,10 @@ impl CudaComputeDevice {
         rope: Option<(&CudaBuffer, &CudaBuffer)>,
         n_lanes: usize,
     ) {
-        assert!(matches!(out.storage(), CudaStorage::F32(_) | CudaStorage::Bf16(_)));
+        assert!(matches!(
+            out.storage(),
+            CudaStorage::F32(_) | CudaStorage::Bf16(_)
+        ));
         let bf16 = out.is_bf16();
         let f = self.kv_func(kvdec_cuda::KVDEC_CUDA, "tkv_decode", bf16);
         let (cs, sn) = rope.map_or((prior, prior), |(c, s)| (c, s));
@@ -1334,7 +1337,10 @@ impl CudaComputeDevice {
         pages: Option<(&CudaBuffer, u32)>,
         p: [u32; 6],
     ) {
-        assert!(matches!(out.storage(), CudaStorage::F32(_) | CudaStorage::Bf16(_)));
+        assert!(matches!(
+            out.storage(),
+            CudaStorage::F32(_) | CudaStorage::Bf16(_)
+        ));
         let bf16 = out.is_bf16();
         let f = self.kv_func(kvdec_cuda::KVDEC_CUDA, "kivi_dequant", bf16);
         let prm = [p[0], p[1], p[2], p[3], p[4], p[5], pages.map_or(0, |x| x.1)];
@@ -1364,8 +1370,6 @@ fn kv_arg_out<'a>(b: &'a CudaBuffer) -> &'a CudaSlice<f32> {
         CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("a KV cache is f32 or bf16"),
     }
 }
-
-
 
 /// Parity against `CpuDevice` (the trait's portable reference implementations). Each test
 /// skips, with a note, when there's no CUDA driver or GPU.
