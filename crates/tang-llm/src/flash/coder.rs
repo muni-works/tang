@@ -3238,7 +3238,7 @@ impl Coder {
                 if let Some(p) = probe.as_deref_mut() {
                     v.dev.sync();
                     p.mixer_out.push(last(v.dev, &v.s.mix));
-                    p.post_moe.push(last(v.dev, &v.s.r));
+                    p.post_mixer.push(last(v.dev, &v.s.r));
                 }
                 let next = if l + 1 < nl {
                     &v.layers[l + 1].attn_norm
