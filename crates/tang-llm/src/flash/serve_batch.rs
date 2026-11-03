@@ -460,7 +460,8 @@ impl FlashServe {
                 }
             }
         }
-        // Decode: every stream with a pending token, MAX_T rows a window.
+        // Decode: every stream with a pending token, MAX_T rows a window (verify windows, with
+        // drafts), or the batch module's width (plain decode, `enable_batch`).
         let ready: Vec<usize> = lanes
             .iter_mut()
             .enumerate()
@@ -470,7 +471,12 @@ impl FlashServe {
             })
             .collect();
         let mtp = self.e.use_mtp();
-        for group in ready.chunks(MAX_T) {
+        let width = if mtp {
+            MAX_T
+        } else {
+            MAX_T.max(self.e.batch_rows())
+        };
+        for group in ready.chunks(width) {
             // Drafts for each stream, cut at an end of turn and the token limit, then the
             // window's spare rows shared out.
             let want: Vec<Vec<u32>> = group

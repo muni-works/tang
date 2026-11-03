@@ -178,6 +178,57 @@ Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA 
 moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, post-mixer norm
 166, attention in/out 260. The stages sum to 4,461 µs, so launch gaps are ~8% of the window.
 
+### Batch decode past 8 rows (2026-11-03, b957a2a9+, H200, explain prompt, ~1.2k context)
+
+`TANG_BATCH_N=64 flash-batch-check`: bitwise PASS at 64 sequences (tokens and logits equal to
+each sequence alone). Graphs, 16 steps:
+
+| B | ms a step | tok/s aggregate | tok/s a stream |
+|---|---|---|---|
+| 1 | 4.03 | 248 | 248 |
+| 2 | 4.73 | 423 | 211 |
+| 4 | 6.49 | 616 | 154 |
+| 8 | 9.86 | 812 | 101 |
+| 16 | 21.99 | 728 | 45 |
+| 32 | 40.53 | 790 | 25 |
+| 64 | 73.90 | 866 | 14 |
+
+Past 8 rows the step grows linearly with B. Eager profile at B=64 (ms a step): expert gate|up
+23.6 (~0.46 GB a layer of distinct experts in 0.49 ms: ~0.94 TB/s), expert down 24.3 (~0.46
+TB/s), GDN in 6.8, GDN conv+step 4.3, GDN out 4.1, attention split-K 2.6, head 1.9, attention
+in 1.7, router 1.6, attention out 1.3. The grouped expert kernels (`cx_moe_gu_g` /
+`cx_moe_down_g`, ~1.75 tokens an expert) and the 32-row K-split GEMVs (`cx_gemvkb`, L2-bound
+re-reading activations per weight row) are the walls.
+
+- **Tensor-core GEMMs for batch windows** (`TANG_CODER_BGEMM=1`: `cx_gemm_dense` +
+  `cx_moe_gemm_*`, the prefill kernels): slower at every B past 8 (B=64: 132.5 vs 78.3 ms
+  eager) and not bitwise. They're tiled for 64 tokens an expert; decode has ~2.
+
+### Streaming grouped experts for batch windows (2026-11-03, H200, explain, ~1.2k context)
+
+`cx_moe_gu_s` / `cx_moe_down_s`: grid (row tiles of 64 / 128 rows, groups of at most 8 pairs),
+each warp walking its rows of one expert with cp.async staging, the group's activations staged
+once a block, and `cx_dotq_m` decoding each Q4_K/Q5_K weight block once for all the group's rows
+(each row's arithmetic the single-row dot's). Bitwise PASS at 64. Graphs, 16 steps:
+
+| B | ms a step | tok/s aggregate | tok/s a stream |
+|---|---|---|---|
+| 1 | 4.03 | 248 | 248 |
+| 2 | 4.74 | 422 | 211 |
+| 4 | 6.51 | 615 | 154 |
+| 8 | 9.86 | 812 | 101 |
+| 16 | 20.01 | 800 | 50 |
+| 32 | 31.04 | 1031 | 32 |
+| 64 | 51.16 | 1251 | 20 |
+
+Eager, B=64 (ms a layer, GB/s from ~367 distinct experts + shared): gate|up 0.57 → 0.29
+(~1.5 TB/s; 0.22 ms / ~2 TB/s on 64-token prompts), down 0.50 → 0.23 (~0.95 TB/s; 0.18 /
+~1.2 TB/s). Ring depth barely matters (gate|up best at 1 stage — occupancy wins; down 2).
+
+- **Plain code sums precomputed per 16 bytes** (dropping 8 of 16 dp4a a row-token, exact): slower
+  (gate|up 0.22 → 0.26 ms), the extra prologue pass costs more than it saves.
+- **Deeper rings / more rows a warp for down** (4/8 stages, 32 rows): flat or worse.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is

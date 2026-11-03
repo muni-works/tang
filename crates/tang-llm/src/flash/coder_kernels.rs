@@ -295,6 +295,68 @@ __device__ __forceinline__ float cx_dotq_half(const unsigned char* w, const unsi
     for (int o = 8; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     return acc;
 }
+// cx_dotq_fast (HALF = 0) / cx_dotq_half (HALF = 1) for m <= 8 activation rows at once
+// (xc + t * xs codes, xd + t * ds scales): each weight block decoded once, then every row's
+// sums, each row's arithmetic and reduction exactly the single-row kernel's (bitwise).
+template <int TY, int HALF>
+__device__ __forceinline__ void cx_dotq_m(const unsigned char* w, const unsigned char* xc, int xs, const float* xd, int ds,
+                                          int k, int m, float* acc) {
+    const int lane = HALF ? (threadIdx.x & 15) : (threadIdx.x & 31);
+    const int BB = TY == 12 ? 144 : 176, QS = TY == 12 ? 16 : 48;
+    const int sbl = lane >> 3, j = (lane & 7) >> 1, l0 = (lane & 1) * 16;
+    #pragma unroll
+    for (int t = 0; t < 8; t++) acc[t] = 0.f;
+    for (int sb = sbl; sb < k / 256; sb += (HALF ? 2 : 4)) {
+        const unsigned char* b = w + sb * BB;
+        const float d = h2f(rd16(b)), dmin = h2f(rd16(b + 2));
+        int s0, m0, s1, m1;
+        scale_min_k4(2 * j, b + 4, s0, m0);
+        scale_min_k4(2 * j + 1, b + 4, s1, m1);
+        const uint4 q = *(const uint4*)(b + QS + j * 32 + l0);
+        uint4 hb = make_uint4(0, 0, 0, 0);
+        if (TY == 13) hb = *(const uint4*)(b + 16 + l0);
+        const int e = sb * 256 + j * 64 + l0;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {hb.x, hb.y, hb.z, hb.w};
+        unsigned lo[4], hi[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            lo[i] = qw[i] & 0x0F0F0F0Fu;
+            hi[i] = (qw[i] >> 4) & 0x0F0F0F0Fu;
+            if (TY == 13) {
+                lo[i] |= ((hw[i] >> (2 * j)) & 0x01010101u) << 4;
+                hi[i] |= ((hw[i] >> (2 * j + 1)) & 0x01010101u) << 4;
+            }
+        }
+        const float ds0 = d * i2f(s0), ds1 = d * i2f(s1);
+        const float dm0 = -dmin * i2f(m0), dm1 = -dmin * i2f(m1);
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= m) break;
+            const unsigned char* xr = xc + (size_t)t * xs;
+            const uint4 x0 = *(const uint4*)(xr + e), x1 = *(const uint4*)(xr + e + 32);
+            const unsigned xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+            int sa = 0, sh = 0, ca = 0, ch = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                sa = __dp4a((int)lo[i], (int)xa[i], sa);
+                sh = __dp4a((int)hi[i], (int)xb[i], sh);
+                ca = __dp4a(0x01010101, (int)xa[i], ca);
+                ch = __dp4a(0x01010101, (int)xb[i], ch);
+            }
+            const float* xdr = xd + t * ds;
+            const float dx0 = xdr[e / 32], dx1 = xdr[e / 32 + 1];
+            acc[t] = fmaf(dx0, fmaf(ds0, i2f(sa), dm0 * i2f(ca)), acc[t]);
+            acc[t] = fmaf(dx1, fmaf(ds1, i2f(sh), dm1 * i2f(ch)), acc[t]);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (t >= m) break;
+        float a = acc[t];
+        for (int o = HALF ? 8 : 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        acc[t] = a;
+    }
+}
 __device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k, int fast) {
     if (fast && (((unsigned long long)w | (unsigned long long)xc) & 15) == 0) {
         if (ty == 12) return cx_dotq_fast<12>(w, xc, xd, k);
@@ -677,6 +739,11 @@ extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, in
 // cx_moe_plan for many pairs (wide prefill windows, up to CX_NP): one block of 1024 threads,
 // an expert histogram, a prefix over the keys, then a scatter. Pairs within a group land in any
 // order, which can't change a result (each pair's dot is its own). Same plan layout.
+// An expert with more than CX_GCHUNK pairs gets one group per CX_GCHUNK of them (batch modules:
+// the shared expert, which every row routes to, would otherwise be one serial group of B pairs).
+#ifndef CX_GCHUNK
+#define CX_GCHUNK (1 << 30)
+#endif
 extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned* ids, int T, int pbase, int n, unsigned* plan) {
     __shared__ int cnt[CX_NE + 1], start[CX_NE + 1], gid[CX_NE + 1], fill[CX_NE + 1];
     __shared__ int ng;
@@ -692,7 +759,7 @@ extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned*
         for (int k = 0; k <= CX_NE; k++) {
             start[k] = at;
             gid[k] = g;
-            if (cnt[k] > 0) { plan[1 + g] = (unsigned)at; g++; }
+            for (int o = 0; o < cnt[k]; o += CX_GCHUNK) { plan[1 + g] = (unsigned)(at + o); g++; }
             at += cnt[k];
         }
         ng = g;
@@ -795,6 +862,483 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
                                                                 const unsigned char* hq, float* out, int T, int r16,
                                                                 int fast, const unsigned* plan) {
     moe_down_grouped_body<2>(d, sd, ids, hq, out, T, r16, fast, plan);
+}
+
+// ---- streaming grouped experts (batch decode: 1-8 tokens an expert) ----
+//
+// cx_moe_gu_g / cx_moe_down_g with each warp owning NR rows of its group's expert (2 a step)
+// instead of 2, the steps' rows staged with cp.async CX_SST steps ahead in a per-warp ring, so a
+// block streams NR * 8 rows with loads in flight while it computes, rather than one short block
+// per 16 rows (which is block-launch-bound at ~2 pairs a group). Every dot is the grouped
+// kernels' (same staged bytes, same cx_dot / cx_dotq_half on them): bitwise equal.
+// Grid (rows / (8 NR), groups), block 256, dynamic smem 8 * CX_SST * 2 * r16 * 16 bytes.
+#ifndef CX_SST
+#define CX_SST 4
+#endif
+#ifndef CX_SST_DOWN
+#define CX_SST_DOWN CX_SST
+#endif
+#ifndef CX_MT
+#define CX_MT 1
+#endif
+#ifndef CX_GCHUNK_S
+#define CX_GCHUNK_S 8
+#endif
+#ifndef CX_SNR_GU
+#define CX_SNR_GU 8
+#endif
+#ifndef CX_SNR_DOWN
+#define CX_SNR_DOWN 16
+#endif
+template <int NR, bool DOWN, int SST>
+__device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    // The group's (at most CX_GCHUNK) activations, staged once a block after the first weight
+    // loads are issued: codes [m][K], then scales [m][K / 32].
+    constexpr int KA = DOWN ? CX_FF : CX_HID;
+    constexpr int ACT16 = (CX_GCHUNK_S * (KA + KA / 8)) / 16;
+    unsigned char* act = (unsigned char*)dsm;
+    float* actd = (float*)(act + CX_GCHUNK_S * KA);
+    uint4* ring = dsm + ACT16 + warp * (SST * 2 * r16);
+    const int row0 = (blockIdx.x * 8 + warp) * NR;
+    constexpr int NS = NR / 2;
+    const unsigned char* wp[SST][2];
+    auto issue = [&](int st) {
+        const int slot = st % SST;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int r = row0 + 2 * st + j;
+            const ExW& m = DOWN ? (shared ? sg : g) : (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u));
+            const int ro = DOWN ? r : (r < CX_FF ? r : r - CX_FF);
+            const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * 2 + j) * r16, lane);
+        }
+        cx_async_commit();
+    };
+    #pragma unroll
+    for (int st = 0; st < SST - 1; st++) {
+        if (st < NS) issue(st); else cx_async_commit();
+    }
+    {
+        const int m = b - a;
+        const float* xdg = (const float*)(xq + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+        for (int i = threadIdx.x; i < m * (KA / 16); i += blockDim.x) {
+            const int q = i / (KA / 16), c = i % (KA / 16);
+            const int p = plan[CX_PLAN_LIST + a + q];
+            const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+            ((uint4*)act)[q * (KA / 16) + c] = *(const uint4*)(xq + (size_t)t * KA + c * 16);
+        }
+        for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
+            const int q = i / (KA / 32), c = i % (KA / 32);
+            const int p = plan[CX_PLAN_LIST + a + q];
+            const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+            actd[q * (KA / 32) + c] = xdg[(size_t)t * (KA / 32) + c];
+        }
+        __syncthreads();
+    }
+    for (int st = 0; st < NS; st++) {
+        if (st + SST - 1 < NS) issue(st + SST - 1); else cx_async_commit();
+        cx_async_wait<SST - 1>();
+        __syncwarp();
+        const int slot = st % SST;
+        const unsigned char* w0 = wp[slot][0];
+        const unsigned char* w1 = wp[slot][1];
+        const int rr0 = row0 + 2 * st;
+        const int mt = b - a;
+        if (DOWN) {
+            const ExW& m = shared ? sg : g;
+            const bool al = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)act) & 15) == 0;
+            if (CX_MT && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && al && mt <= 8) {
+                const int h = lane >> 4;
+                const unsigned char* wh = h ? w1 : w0;
+                float acc[8];
+                if (m.ty == 12) cx_dotq_m<12, 1>(wh, act, CX_FF, actd, CX_FF / 32, CX_FF, mt, acc);
+                else cx_dotq_m<13, 1>(wh, act, CX_FF, actd, CX_FF / 32, CX_FF, mt, acc);
+                if ((lane & 15) == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++)
+                        if (t < mt) out[(size_t)plan[CX_PLAN_LIST + a + t] * CX_HID + rr0 + h] = acc[t];
+                }
+                __syncwarp();
+                continue;
+            }
+            for (int q = a; q < b; q++) {
+                const int p = plan[CX_PLAN_LIST + q];
+                const unsigned char* hcodes = act + (size_t)(q - a) * CX_FF;
+                const float* hd = actd + (q - a) * (CX_FF / 32);
+                const bool aligned = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)hcodes) & 15) == 0;
+                if (fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
+                    const int h = lane >> 4;
+                    const unsigned char* wh = h ? w1 : w0;
+                    const float v = m.ty == 12 ? cx_dotq_half<12>(wh, hcodes, hd, CX_FF) : cx_dotq_half<13>(wh, hcodes, hd, CX_FF);
+                    if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr0 + h] = v;
+                    continue;
+                }
+                const float v0 = cx_dot(m.ty, w0, hcodes, hd, CX_FF, fast);
+                if (lane == 0) out[(size_t)p * CX_HID + rr0] = v0;
+                const float v1 = cx_dot(m.ty, w1, hcodes, hd, CX_FF, fast);
+                if (lane == 0) out[(size_t)p * CX_HID + rr0 + 1] = v1;
+            }
+        } else {
+            int ty[2];
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int r = rr0 + j;
+                ty[j] = (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u)).ty;
+            }
+            const bool al = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)act) & 15) == 0;
+            if (CX_MT && fast && al && mt <= 8 && (ty[0] == 12 || ty[0] == 13) && ty[1] == ty[0]) {
+                float a0[8], a1[8];
+                if (ty[0] == 12) {
+                    cx_dotq_m<12, 0>(w0, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a0);
+                    cx_dotq_m<12, 0>(w1, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a1);
+                } else {
+                    cx_dotq_m<13, 0>(w0, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a0);
+                    cx_dotq_m<13, 0>(w1, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a1);
+                }
+                if (lane == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++) {
+                        if (t >= mt) break;
+                        const size_t p = plan[CX_PLAN_LIST + a + t];
+                        out[p * 2 * CX_FF + rr0] = a0[t];
+                        out[p * 2 * CX_FF + rr0 + 1] = a1[t];
+                    }
+                }
+                __syncwarp();
+                continue;
+            }
+            for (int q = a; q < b; q++) {
+                const int p = plan[CX_PLAN_LIST + q];
+                const unsigned char* xc = act + (size_t)(q - a) * CX_HID;
+                const float* xdq = actd + (q - a) * (CX_HID / 32);
+                const float v0 = cx_dot(ty[0], w0, xc, xdq, CX_HID, fast);
+                if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0] = v0;
+                const float v1 = cx_dot(ty[1], w1, xc, xdq, CX_HID, fast);
+                if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0 + 1] = v1;
+            }
+        }
+        __syncwarp();
+    }
+    cx_async_wait<0>();
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_s(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int r16,
+                                                              int fast, const unsigned* plan) {
+    moe_stream_body<CX_SNR_GU, false, CX_SST>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_s(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int r16,
+                                                                int fast, const unsigned* plan) {
+    moe_stream_body<CX_SNR_DOWN, true, CX_SST_DOWN>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan);
+}
+
+// ---- grouped experts on int8 tensor cores for batch windows (<= 8 tokens a group) ----
+//
+// SwapAB: each warp owns 16 rows of its group's expert (M), the group's <= 8 tokens are N, and
+// K steps 32 weights (one Q4_K / Q5_K sub-block) a mma.sync m16n8k32 s8. A lane loads its rows'
+// nibbles straight from global as 32-bit words (one superblock of loads in flight ahead of the
+// math), the tokens' codes, scales and per-32 code sums sit in shared memory, and each sub-block's
+// int32 result gets the row's scale and min in the epilogue:
+// acc += dx * (d sc * dot - dmin m * sum(x)). Not the per-pair dot's summation order: gated by
+// flash-batch-check's tolerance mode. Other weight types (the shared expert's Q8_0) take the
+// per-token cx_dot. Grid (rows / 128, groups), block 256.
+__device__ __forceinline__ void mma_s8_16832(int* d, const unsigned* a, unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+#else
+    d[0] = d[1] = d[2] = d[3] = 0;
+#endif
+}
+// One superblock of a row's operands for this lane: d, dmin, the 12 scale bytes, and the qs
+// words at tig*4 and 16 + tig*4 of each of the 4 sub-block pairs (and qh's for Q5_K).
+struct SbK { float d, dm; unsigned sc[3]; unsigned q[4][2]; unsigned h[2]; };
+template <int TY>
+__device__ __forceinline__ void sbk_load(const unsigned char* b, int tig, SbK& o) {
+    const int QS = TY == 12 ? 16 : 48;
+    o.d = h2f(rd16(b));
+    o.dm = h2f(rd16(b + 2));
+    o.sc[0] = *(const unsigned*)(b + 4);
+    o.sc[1] = *(const unsigned*)(b + 8);
+    o.sc[2] = *(const unsigned*)(b + 12);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        o.q[j][0] = *(const unsigned*)(b + QS + j * 32 + tig * 4);
+        o.q[j][1] = *(const unsigned*)(b + QS + j * 32 + 16 + tig * 4);
+    }
+    if (TY == 13) {
+        o.h[0] = *(const unsigned*)(b + 16 + tig * 4);
+        o.h[1] = *(const unsigned*)(b + 16 + 16 + tig * 4);
+    } else {
+        o.h[0] = o.h[1] = 0;
+    }
+}
+// scale_min_k4 on the 12 scale bytes held as three words (sub-block j a compile-time constant).
+__device__ __forceinline__ void scale_min_w(int j, const unsigned* sc, int& s, int& m) {
+    auto by = [&](int i) { return (int)((sc[i >> 2] >> ((i & 3) * 8)) & 0xFFu); };
+    if (j < 4) { s = by(j) & 63; m = by(j + 4) & 63; }
+    else { s = (by(j + 4) & 0xF) | ((by(j - 4) >> 6) << 4); m = (by(j + 4) >> 4) | ((by(j) >> 6) << 4); }
+}
+template <int TY, bool DOWN>
+__device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsigned char* wb, int rb, int m,
+                                             const unsigned char* act, const float* actd, const int* asum,
+                                             float acc[4]) {
+    constexpr int K = DOWN ? CX_FF : CX_HID;
+    constexpr int NSB = K / 256;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const int BB = TY == 12 ? 144 : 176;
+    const int na = 2 * tig, nb = 2 * tig + 1;
+    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+    SbK ra, rb2, na_, nb_;
+    sbk_load<TY>(wa, tig, ra);
+    sbk_load<TY>(wb, tig, rb2);
+    // Token g's B operand base (rows past m read token 0's codes: their columns are dropped).
+    const unsigned char* xg = act + (size_t)(g < m ? g : 0) * K;
+    for (int sb = 0; sb < NSB; sb++) {
+        if (sb + 1 < NSB) {
+            sbk_load<TY>(wa + (sb + 1) * BB, tig, na_);
+            sbk_load<TY>(wb + (sb + 1) * BB, tig, nb_);
+        }
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int j = s >> 1, hi = s & 1;
+            unsigned a[4];
+            #pragma unroll
+            for (int w = 0; w < 2; w++) {
+                unsigned qa = hi ? (ra.q[j][w] >> 4) & 0x0F0F0F0Fu : ra.q[j][w] & 0x0F0F0F0Fu;
+                unsigned qb = hi ? (rb2.q[j][w] >> 4) & 0x0F0F0F0Fu : rb2.q[j][w] & 0x0F0F0F0Fu;
+                if (TY == 13) {
+                    qa |= ((ra.h[w] >> s) & 0x01010101u) << 4;
+                    qb |= ((rb2.h[w] >> s) & 0x01010101u) << 4;
+                }
+                a[w * 2] = qa;
+                a[w * 2 + 1] = qb;
+            }
+            const int e = sb * 256 + s * 32;
+            const unsigned b0 = *(const unsigned*)(xg + e + tig * 4);
+            const unsigned b1 = *(const unsigned*)(xg + e + 16 + tig * 4);
+            int d[4];
+            mma_s8_16832(d, a, b0, b1);
+            int s0, m0, s1, m1;
+            scale_min_w(s, ra.sc, s0, m0);
+            scale_min_w(s, rb2.sc, s1, m1);
+            const float da = ra.d * i2f(s0), ma = ra.dm * i2f(m0);
+            const float db = rb2.d * i2f(s1), mb = rb2.dm * i2f(m1);
+            const int blk = e / 32;
+            if (na < m) {
+                const float dx = actd[na * (K / 32) + blk], sx = i2f(asum[na * (K / 32) + blk]);
+                acc[0] = fmaf(dx, fmaf(da, i2f(d[0]), -ma * sx), acc[0]);
+                acc[2] = fmaf(dx, fmaf(db, i2f(d[2]), -mb * sx), acc[2]);
+            }
+            if (nb < m) {
+                const float dx = actd[nb * (K / 32) + blk], sx = i2f(asum[nb * (K / 32) + blk]);
+                acc[1] = fmaf(dx, fmaf(da, i2f(d[1]), -ma * sx), acc[1]);
+                acc[3] = fmaf(dx, fmaf(db, i2f(d[3]), -mb * sx), acc[3]);
+            }
+        }
+        if (sb + 1 < NSB) { ra = na_; rb2 = nb_; }
+    }
+}
+template <bool DOWN>
+__device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                             const unsigned char* xq, float* out, int T, int fast,
+                                             const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    constexpr int KA = DOWN ? CX_FF : CX_HID;
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi], m = b - a;
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    unsigned char* act = (unsigned char*)dsm;
+    float* actd = (float*)(act + 8 * KA);
+    int* asum = (int*)(actd + 8 * (KA / 32));
+    __shared__ int pair_s[8];
+    const float* xdg = (const float*)(xq + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+    if (threadIdx.x < 8) pair_s[threadIdx.x] = threadIdx.x < m ? (int)plan[CX_PLAN_LIST + a + threadIdx.x] : 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < m * (KA / 16); i += blockDim.x) {
+        const int q = i / (KA / 16), c = i % (KA / 16);
+        const int p = pair_s[q];
+        const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+        ((uint4*)act)[i] = *(const uint4*)(xq + (size_t)t * KA + c * 16);
+    }
+    for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
+        const int q = i / (KA / 32), c = i % (KA / 32);
+        const int p = pair_s[q];
+        const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+        actd[i] = xdg[(size_t)t * (KA / 32) + c];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
+        const uint4 v0 = ((const uint4*)act)[2 * i], v1 = ((const uint4*)act)[2 * i + 1];
+        int sx = 0;
+        sx = __dp4a((int)v0.x, 0x01010101, sx); sx = __dp4a((int)v0.y, 0x01010101, sx);
+        sx = __dp4a((int)v0.z, 0x01010101, sx); sx = __dp4a((int)v0.w, 0x01010101, sx);
+        sx = __dp4a((int)v1.x, 0x01010101, sx); sx = __dp4a((int)v1.y, 0x01010101, sx);
+        sx = __dp4a((int)v1.z, 0x01010101, sx); sx = __dp4a((int)v1.w, 0x01010101, sx);
+        asum[i] = sx;
+    }
+    __syncthreads();
+    const int r0 = (blockIdx.x * 8 + warp) * 16;
+    const int gq = lane >> 2, tig = lane & 3;
+    const ExW& mw = DOWN ? (shared ? sg : g) : (shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u));
+    const int ro = DOWN ? r0 : (r0 < CX_FF ? r0 : r0 - CX_FF);
+    const size_t ostride = DOWN ? CX_HID : 2 * CX_FF;
+    const unsigned char* wbase = (const unsigned char*)mw.base + (size_t)e * mw.estride;
+    if (mw.ty == 12 || mw.ty == 13) {
+        const unsigned char* wa = wbase + (size_t)(ro + gq) * mw.row_bytes;
+        const unsigned char* wb = wa + (size_t)8 * mw.row_bytes;
+        float acc[4];
+        if (mw.ty == 12) moe_mma_rows<12, DOWN>(wa, wb, 0, m, act, actd, asum, acc);
+        else moe_mma_rows<13, DOWN>(wa, wb, 0, m, act, actd, asum, acc);
+        if (2 * tig < m) {
+            out[(size_t)pair_s[2 * tig] * ostride + r0 + gq] = acc[0];
+            out[(size_t)pair_s[2 * tig] * ostride + r0 + gq + 8] = acc[2];
+        }
+        if (2 * tig + 1 < m) {
+            out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq] = acc[1];
+            out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq + 8] = acc[3];
+        }
+        return;
+    }
+    // Other types: the per-pair dot, a row at a time.
+    for (int r = 0; r < 16; r++) {
+        const unsigned char* w = wbase + (size_t)(ro + r) * mw.row_bytes;
+        for (int q = 0; q < m; q++) {
+            const float v = cx_dot(mw.ty, w, act + (size_t)q * KA, actd + q * (KA / 32), KA, fast);
+            if (lane == 0) out[(size_t)pair_s[q] * ostride + r0 + r] = v;
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_m(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int r16,
+                                                              int fast, const unsigned* plan) {
+    moe_mma_body<false>(g, u, sg, su, ids, xq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_m(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int r16,
+                                                                int fast, const unsigned* plan) {
+    moe_mma_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
+}
+
+// ---- dense Q8X (Q8_0 repacked) on int8 tensor cores for batch windows ----
+//
+// A warp owns 16 rows of one segment (M) and all T <= 64 tokens (up to 8 n-tiles of 8); K steps
+// 32 (one Q8_0 block) a mma.sync m16n8k32 s8 per n-tile, the rows' codes read straight from
+// global as the A fragment (prefetched a 256-wide chunk ahead), the tokens' codes and scales
+// staged in shared memory per chunk; acc += dx * dw * dot. Grid (rows / 64, splits), block 128.
+// splits > 1: each split covers k / splits columns and writes partials [split][t][rows];
+// cx_mma_q8x_red sums them in split order (deterministic). Not the GEMV's summation order.
+#define MQ_KC 256
+extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, int nseg, const unsigned char* xq, int k,
+                                                             float* out, int ostride, int T, int splits, float* part,
+                                                             int rows_total) {
+    __shared__ uint4 xs[64 * MQ_KC / 16];
+    __shared__ float xds[64 * (MQ_KC / 32)];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const int NT = (T + 7) / 8;
+    int row = (blockIdx.x * 4 + warp) * 16, s = 0;
+    const int growrow = row;
+    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+    const bool ok = s < nseg;
+    const Seg sg = ok ? segs[s] : segs[0];
+    const unsigned char* wa = (const unsigned char*)sg.w + (size_t)(row + g) * sg.row_bytes;
+    const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
+    const float* xdb = (const float*)(xq + (size_t)XQ8_T * k);
+    const int ks = k / splits, kb = blockIdx.y * ks;
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
+    for (int k0 = kb; k0 < kb + ks; k0 += MQ_KC) {
+        unsigned af[8][4];
+        float dwa[8], dwb[8];
+        if (ok) {
+            #pragma unroll
+            for (int st = 0; st < 8; st++) {
+                const int e = k0 + st * 32;
+                af[st][0] = *(const unsigned*)(wa + e + tig * 4);
+                af[st][1] = *(const unsigned*)(wb + e + tig * 4);
+                af[st][2] = *(const unsigned*)(wa + e + 16 + tig * 4);
+                af[st][3] = *(const unsigned*)(wb + e + 16 + tig * 4);
+                dwa[st] = h2f(rd16(wa + k + (e / 32) * 2));
+                dwb[st] = h2f(rd16(wb + k + (e / 32) * 2));
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < T * (MQ_KC / 16); i += blockDim.x) {
+            const int t = i / (MQ_KC / 16), c = i % (MQ_KC / 16);
+            xs[i] = *(const uint4*)(xq + (size_t)t * k + k0 + c * 16);
+        }
+        for (int i = threadIdx.x; i < T * (MQ_KC / 32); i += blockDim.x) {
+            const int t = i / (MQ_KC / 32), c = i % (MQ_KC / 32);
+            xds[i] = xdb[(size_t)t * (k / 32) + k0 / 32 + c];
+        }
+        __syncthreads();
+        if (!ok) continue;
+        const unsigned char* xsb = (const unsigned char*)xs;
+        #pragma unroll
+        for (int st = 0; st < 8; st++) {
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                if (nt >= NT) break;
+                const int tg = nt * 8 + g;
+                const unsigned char* xr = xsb + (size_t)(tg < T ? tg : 0) * MQ_KC + st * 32;
+                const unsigned b0 = *(const unsigned*)(xr + tig * 4), b1 = *(const unsigned*)(xr + 16 + tig * 4);
+                int d[4];
+                mma_s8_16832(d, af[st], b0, b1);
+                const int t0 = nt * 8 + 2 * tig, t1 = t0 + 1;
+                const float x0 = t0 < T ? xds[t0 * (MQ_KC / 32) + st] : 0.f;
+                const float x1 = t1 < T ? xds[t1 * (MQ_KC / 32) + st] : 0.f;
+                acc[nt][0] = fmaf(x0 * dwa[st], i2f(d[0]), acc[nt][0]);
+                acc[nt][1] = fmaf(x1 * dwa[st], i2f(d[1]), acc[nt][1]);
+                acc[nt][2] = fmaf(x0 * dwb[st], i2f(d[2]), acc[nt][2]);
+                acc[nt][3] = fmaf(x1 * dwb[st], i2f(d[3]), acc[nt][3]);
+            }
+        }
+    }
+    if (!ok) return;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        if (nt >= NT) break;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int t = nt * 8 + 2 * tig + j;
+            if (t >= T) continue;
+            if (splits == 1) {
+                out[(size_t)t * ostride + sg.out_off + row + g] = acc[nt][j];
+                out[(size_t)t * ostride + sg.out_off + row + g + 8] = acc[nt][2 + j];
+            } else {
+                float* pp = part + ((size_t)blockIdx.y * T + t) * rows_total + growrow + g;
+                pp[0] = acc[nt][j];
+                pp[8] = acc[nt][2 + j];
+            }
+        }
+    }
+}
+// Sum cx_mma_q8x's split partials in split order into out. Grid (rows_total / 128, T), block 128.
+extern "C" __global__ void cx_mma_q8x_red(const Seg* segs, int nseg, const float* part, int splits, int rows_total,
+                                          int T, float* out, int ostride) {
+    const int gr = blockIdx.x * 128 + threadIdx.x, t = blockIdx.y;
+    if (gr >= rows_total) return;
+    int row = gr, s = 0;
+    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+    float v = 0.f;
+    for (int z = 0; z < splits; z++) v += part[((size_t)z * T + t) * rows_total + gr];
+    out[(size_t)t * ostride + segs[s].out_off + row] = v;
 }
 
 // ---- grouped expert GEMM on tensor cores (wide prefill) ----
@@ -1037,9 +1581,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_gemm_dense(const Seg* segs,
 // activation formats as fe_gemv8 (int8 codes for quantized rows, f32 for F32/BF16 rows), so
 // it drops in for it; at T = 1 a 2048-row matrix gets 8192 warps instead of 1024.
 template <int T, int TY>
-__device__ __forceinline__ void dotk8(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+__device__ __forceinline__ void dotk8(const unsigned char* w, const unsigned char* xq, const float* xd, int k, int k0, int k1, float* acc) {
     const int lane = threadIdx.x & 31;
-    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
     for (int e0 = k0 + lane * 8; e0 < k1; e0 += 256) {
         int w0, w1;
         float dw, mw;
@@ -1078,9 +1621,8 @@ __device__ __forceinline__ void dotkf(const unsigned char* w, const float* x, in
 // Q8X: Q8_0 rows repacked at load (lossless): [k int8 codes][k / 32 f16 scales], so a lane
 // reads 16 codes with one aligned load. Type id 108. (k / Q) % 512 == 0.
 template <int T>
-__device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+__device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned char* xq, const float* xd, int k, int k0, int k1, float* acc) {
     const int lane = threadIdx.x & 31;
-    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
     const unsigned short* sc = (const unsigned short*)(w + k);
     // Two 512-wide steps a pass, both loads issued before either is used ((k1 - k0) % 1024 == 0
     // at Q <= 2 for k = 2048 / 4096).
@@ -1108,8 +1650,8 @@ __device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned ch
     }
 }
 template <int T, int Q>
-__device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
-    __shared__ float part[8][MAXT];
+__device__ void gemvk_core(const Seg* segs, int nseg, const float* x, const unsigned char* xq, const float* xd, int k, float* out, int ostride) {
+    __shared__ float part[8][T];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = warp / Q, q = warp % Q;
     int row = blockIdx.x * (8 / Q) + j, s = 0;
@@ -1125,17 +1667,17 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
         switch (sg.type) {
             case 30: dotkf<T, 30>(w, x, k, k0, k1, acc); break;
             case 0: dotkf<T, 0>(w, x, k, k0, k1, acc); break;
-            case 108: dotq8x<T>(w, xq, k, k0, k1, acc); break;
-            case 8: dotk8<T, 8>(w, xq, k, k0, k1, acc); break;
-            case 2: dotk8<T, 2>(w, xq, k, k0, k1, acc); break;
-            case 20: dotk8<T, 20>(w, xq, k, k0, k1, acc); break;
-            case 6: dotk8<T, 6>(w, xq, k, k0, k1, acc); break;
-            case 42: dotk8<T, 42>(w, xq, k, k0, k1, acc); break;
-            case 23: dotk8<T, 23>(w, xq, k, k0, k1, acc); break;
-            case 11: dotk8<T, 11>(w, xq, k, k0, k1, acc); break;
-            case 12: dotk8<T, 12>(w, xq, k, k0, k1, acc); break;
-            case 13: dotk8<T, 13>(w, xq, k, k0, k1, acc); break;
-            case 14: dotk8<T, 14>(w, xq, k, k0, k1, acc); break;
+            case 108: dotq8x<T>(w, xq, xd, k, k0, k1, acc); break;
+            case 8: dotk8<T, 8>(w, xq, xd, k, k0, k1, acc); break;
+            case 2: dotk8<T, 2>(w, xq, xd, k, k0, k1, acc); break;
+            case 20: dotk8<T, 20>(w, xq, xd, k, k0, k1, acc); break;
+            case 6: dotk8<T, 6>(w, xq, xd, k, k0, k1, acc); break;
+            case 42: dotk8<T, 42>(w, xq, xd, k, k0, k1, acc); break;
+            case 23: dotk8<T, 23>(w, xq, xd, k, k0, k1, acc); break;
+            case 11: dotk8<T, 11>(w, xq, xd, k, k0, k1, acc); break;
+            case 12: dotk8<T, 12>(w, xq, xd, k, k0, k1, acc); break;
+            case 13: dotk8<T, 13>(w, xq, xd, k, k0, k1, acc); break;
+            case 14: dotk8<T, 14>(w, xq, xd, k, k0, k1, acc); break;
             default: break;
         }
     }
@@ -1153,6 +1695,10 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
         out[(size_t)lane * ostride + segs[s].out_off + row] = v;
     }
 }
+template <int T, int Q>
+__device__ __forceinline__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
+    gemvk_core<T, Q>(segs, nseg, x, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride);
+}
 #define GEMVK_T(T) extern "C" __global__ void __launch_bounds__(256) cx_gemvk_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
     gemvk_body<T, 4>(segs, nseg, x, xq, k, out, ostride); } \
@@ -1166,6 +1712,20 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
     gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
+
+// Batch modules (CX_MAXT > 8): the same K-split GEMV over T rows of a wider window, the rows
+// starting at row t0 of the module's activations. The host passes x, xq (codes), xd (scales)
+// and out already offset to row t0. A row's sum is the narrow kernel's (same lanes, same
+// order, same warp split): T only sets how many rows a block carries.
+#if CX_MAXT > 8
+#define GEMVKB_T(Q, T) extern "C" __global__ void __launch_bounds__(256) cx_gemvkb##Q##_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, const float* xd, int k, float* out, int ostride) { \
+    gemvk_core<T, Q>(segs, nseg, x, xq, xd, k, out, ostride); }
+GEMVKB_T(1, 8) GEMVKB_T(1, 16) GEMVKB_T(1, 32)
+GEMVKB_T(2, 8) GEMVKB_T(2, 16) GEMVKB_T(2, 32)
+GEMVKB_T(4, 8) GEMVKB_T(4, 16) GEMVKB_T(4, 32)
+GEMVKB_T(8, 8) GEMVKB_T(8, 16) GEMVKB_T(8, 32)
+#endif
 
 // Rows of a window may belong to different sequences: row t is at position ROWS[t] of slot
 // ROWS[CX_MAXT + t], whose bf16 K/V caches for this layer are at ktab[slot] / vtab[slot].
