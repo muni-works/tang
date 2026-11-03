@@ -422,6 +422,48 @@ fn coder_cell_matches_engine_chain_and_exports_same_size() {
     }
     drop(t);
 
+    // Pilot-2 recipe: target logits from `output · h`, soft term and VAT weights. The soft
+    // gradient is exactly p - q: with the head's own logits as the target, it vanishes.
+    let mut t = Tape::new(&dev);
+    let leaves = w.leafs(&mut t);
+    let lg = model::forward(&mut t, &mut w, &leaves, &b, &hp(), 3).unwrap();
+    let teacher = model::teacher_logits(&mut t, &w, &leaves, &b, &hp()).unwrap();
+    let recipe = model::Recipe {
+        beta: 0.6,
+        soft: 1.0,
+        vat: true,
+    };
+    let o = model::objective_with(&t, &w, &lg, Some(teacher), &b, recipe, 0).unwrap();
+    assert_eq!(o.totals, vec![5, 4, 3]);
+    assert!(o.kl.iter().all(|v| v.is_finite() && *v >= -1e-9));
+    for d in 0..3 {
+        assert!(o.accepted[d] <= o.hits[d]);
+        if d > 0 {
+            assert!(o.accepted[d] <= o.accepted[d - 1]);
+        }
+    }
+    let grads = t.backward(&o.seeds);
+    for n in w.params.keys() {
+        assert!(grads[leaves[n]]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite()));
+    }
+    let plain = model::objective_with(&t, &w, &lg, None, &b, model::Recipe::plain(0.6), 0).unwrap();
+    let selfsoft = model::Recipe {
+        beta: 0.6,
+        soft: 1.0,
+        vat: false,
+    };
+    // Depth 1 reads target row r for its row r: the head's own logits give KL 0.
+    let own = t.data(lg[0]).to_vec();
+    let own = t.constant(own);
+    let o1 = model::objective_with(&t, &w, &lg[..1], Some(own), &b, selfsoft, 0).unwrap();
+    assert!(o1.kl[0].abs() < 1e-6, "self-KL {}", o1.kl[0]);
+    assert_eq!(o1.seeds[0].1.len(), plain.seeds[0].1.len());
+    drop(t);
+
     // An untouched export is the original file, byte for byte.
     let same = dir.join("same.gguf");
     w.export(&same).unwrap();

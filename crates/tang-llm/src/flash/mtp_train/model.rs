@@ -412,6 +412,59 @@ pub fn forward_full<D: ComputeDevice>(
     }
     Ok(logits)
 }
+/// Loss recipe on top of the recursive teacher-forced chain.
+#[derive(Clone, Copy, Debug)]
+pub struct Recipe {
+    /// Per-depth decay `β^(d-1)` (FastMTP: 0.6).
+    pub beta: f64,
+    /// Weight of the soft term: CE against the target's own next-token distribution
+    /// `softmax(output · h)` (forward KL up to a constant, Soft-MTP / VAT ℓ^soft). 0 = off.
+    pub soft: f64,
+    /// Verification-aware weights (VAT): per window, weight 1 at every depth up to and
+    /// including the first simulated rejection (argmax ≠ teacher token), then the decay
+    /// restarts: `β^(d-k*)` after it. Off: plain `β^(d-1)`.
+    pub vat: bool,
+}
+impl Recipe {
+    pub fn plain(beta: f64) -> Self {
+        Recipe {
+            beta,
+            soft: 0.0,
+            vat: false,
+        }
+    }
+}
+pub struct Objective {
+    /// Hard CE per depth (teacher token), comparable across recipes.
+    pub ce: Vec<f64>,
+    /// KL(target ‖ head) per depth when target logits are given.
+    pub kl: Vec<f64>,
+    pub seeds: Vec<(Id, Vec<f32>)>,
+    pub hits: Vec<usize>,
+    pub totals: Vec<usize>,
+    /// Windows whose argmax matched the teacher at every depth 1..=d (simulated acceptance).
+    pub accepted: Vec<usize>,
+    /// Target logits whose argmax equals the dumped teacher token (sanity of `output · h`).
+    pub teacher_agree: usize,
+}
+/// Target logits for the rows the chain is labelled with: `output · h` over residual rows
+/// 1..len (depth d, row r is labelled by token r+d+2, the target's argmax at row r+d+1).
+pub fn teacher_logits<D: ComputeDevice>(
+    t: &mut Tape<D>,
+    w: &Weights,
+    ids: &BTreeMap<String, Id>,
+    b: &Batch,
+    hp: &Hparams,
+) -> Result<Id> {
+    ensure!(
+        w.kind == Kind::Coder && hp.hc == 1,
+        "target logits need the Coder sidecar (h is the trunk's normed final row)"
+    );
+    let n = hp.n_embd;
+    let rows = b.pos.len() - 1;
+    let h = t.constant(b.h[n..(rows + 1) * n].to_vec());
+    Ok(linear(t, w, ids, h, "output.weight", rows))
+}
 pub fn objective<D: ComputeDevice>(
     t: &Tape<D>,
     w: &Weights,
@@ -420,44 +473,130 @@ pub fn objective<D: ComputeDevice>(
     beta: f64,
     burn: usize,
 ) -> Result<(Vec<f64>, Vec<(Id, Vec<f32>)>, Vec<usize>, Vec<usize>)> {
+    let o = objective_with(t, w, logits, None, b, Recipe::plain(beta), burn)?;
+    Ok((o.ce, o.seeds, o.hits, o.totals))
+}
+fn softmax(row: &[f32]) -> (f64, f64) {
+    let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let z = row.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>();
+    (mx, z)
+}
+fn argmax(row: &[f32]) -> usize {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+        .unwrap()
+        .0
+}
+pub fn objective_with<D: ComputeDevice>(
+    t: &Tape<D>,
+    w: &Weights,
+    logits: &[Id],
+    teacher: Option<Id>,
+    b: &Batch,
+    recipe: Recipe,
+    burn: usize,
+) -> Result<Objective> {
     let depths = logits.len();
-    let denom: f64 = (0..depths).map(|d| beta.powi(d as i32)).sum();
-    let mut losses = vec![0.0; depths];
-    let mut hits = vec![0; depths];
-    let mut totals = vec![0; depths];
-    let mut seeds = Vec::new();
+    let beta = recipe.beta;
     let vocab = w.vocab.len();
+    ensure!(
+        recipe.soft == 0.0 || teacher.is_some(),
+        "soft loss needs target logits"
+    );
+    let rows0 = t.data(logits[0]).len() / vocab;
+    ensure!(burn < rows0 - (depths - 1), "burn-in leaves no loss rows");
+    let mut labels = vec![vec![0usize; rows0]; depths];
+    let mut best = vec![vec![0usize; rows0]; depths];
     for (d, &id) in logits.iter().enumerate() {
-        let rows = t.data(id).len() / vocab;
-        ensure!(burn < rows, "burn-in leaves no loss rows");
-        let mut g = vec![0.0; rows * vocab];
+        let rows = rows0 - d;
         for r in burn..rows {
             let label = b.tokens[r + d + 2];
-            let target = w.vocab.binary_search(&label).map_err(|_| {
+            labels[d][r] = w.vocab.binary_search(&label).map_err(|_| {
                 anyhow::anyhow!("label {label} excluded from vocabulary; use --vocab 0")
             })?;
-            let row = &t.data(id)[r * vocab..(r + 1) * vocab];
-            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-            let z = row.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>();
-            losses[d] += mx + z.ln() - row[target] as f64;
-            let best = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
-                .unwrap()
-                .0;
-            hits[d] += usize::from(best == target);
-            totals[d] += 1;
-            let weight = beta.powi(d as i32) / denom / (rows - burn) as f64;
-            for j in 0..vocab {
-                g[r * vocab + j] =
-                    (((row[j] as f64 - mx).exp() / z - f64::from(j == target)) * weight) as f32;
+            best[d][r] = argmax(&t.data(id)[r * vocab..(r + 1) * vocab]);
+        }
+    }
+    // Per window (row r), per depth: the loss weight before normalisation.
+    let mut weights = vec![vec![0.0f64; rows0]; depths];
+    for r in burn..rows0 {
+        let mut rejected: Option<usize> = None;
+        for d in 0..depths {
+            if r >= rows0 - d {
+                break;
+            }
+            weights[d][r] = match (recipe.vat, rejected) {
+                (true, None) => 1.0,
+                (true, Some(k)) => beta.powi((d - k) as i32),
+                (false, _) => beta.powi(d as i32),
+            };
+            if rejected.is_none() && best[d][r] != labels[d][r] {
+                rejected = Some(d);
             }
         }
-        losses[d] /= totals[d] as f64;
-        seeds.push((id, g));
     }
-    Ok((losses, seeds, hits, totals))
+    let total_weight: f64 = weights.iter().flatten().sum();
+    let mut o = Objective {
+        ce: vec![0.0; depths],
+        kl: vec![0.0; depths],
+        seeds: Vec::new(),
+        hits: vec![0; depths],
+        totals: vec![0; depths],
+        accepted: vec![0; depths],
+        teacher_agree: 0,
+    };
+    let tl = teacher.map(|id| t.data(id));
+    if let Some(tl) = tl {
+        for r in 0..rows0 {
+            let row = &tl[r * vocab..(r + 1) * vocab];
+            if r + 2 < b.tokens.len() {
+                let lab = w.vocab.binary_search(&b.tokens[r + 2]).ok();
+                o.teacher_agree += usize::from(lab == Some(argmax(row)));
+            }
+        }
+    }
+    for (d, &id) in logits.iter().enumerate() {
+        let rows = rows0 - d;
+        let mut g = vec![0.0; rows * vocab];
+        let mut q = vec![0.0f64; vocab];
+        for r in burn..rows {
+            let target = labels[d][r];
+            let row = &t.data(id)[r * vocab..(r + 1) * vocab];
+            let (mx, z) = softmax(row);
+            let lse = mx + z.ln();
+            o.ce[d] += lse - row[target] as f64;
+            o.hits[d] += usize::from(best[d][r] == target);
+            o.totals[d] += 1;
+            o.accepted[d] += usize::from((0..=d).all(|e| best[e][r] == labels[e][r]));
+            if let Some(tl) = tl {
+                // Teacher row r+d+1 of the residual; the target tensor starts at row 1.
+                let trow = &tl[(r + d) * vocab..(r + d + 1) * vocab];
+                let (tm, tz) = softmax(trow);
+                let mut kl = 0.0;
+                for j in 0..vocab {
+                    q[j] = (trow[j] as f64 - tm).exp() / tz;
+                    if q[j] > 0.0 {
+                        kl += q[j] * (q[j].ln() - (row[j] as f64 - lse));
+                    }
+                }
+                o.kl[d] += kl;
+            }
+            let weight = weights[d][r] / total_weight;
+            for j in 0..vocab {
+                let p = (row[j] as f64 - mx).exp() / z;
+                let mut gj = p - f64::from(j == target);
+                if tl.is_some() && recipe.soft != 0.0 {
+                    gj += recipe.soft * (p - q[j]);
+                }
+                g[r * vocab + j] = (gj * weight) as f32;
+            }
+        }
+        o.ce[d] /= o.totals[d] as f64;
+        o.kl[d] /= o.totals[d] as f64;
+        o.seeds.push((id, g));
+    }
+    Ok(o)
 }
 
 pub fn forward<D: ComputeDevice>(

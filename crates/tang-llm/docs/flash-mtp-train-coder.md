@@ -104,3 +104,31 @@ of the engine's chain on a synthetic trunk + sidecar (with/without prefix, depth
 gradients on all trainable tensors, byte-identical untouched export, the engine's sidecar
 contract (`coder_mtp::check_sidecar`, also run by `Coder::load`) on a changed export and an
 equal forward after reload; the dump writer's rows through the trainer's loader.
+
+## Pilot 2: recipe gap analysis
+
+Pilot 1 (500 steps, held-out live chain k=3): d1 78.2→82.3%, d2-cum 58.0→64.6%, d3-cum
+40.0→48.3%, 2.76→2.95 tokens/window; held-out CE flat by step 300. Against the literature:
+
+| piece | source | pilot 1 |
+| --- | --- | --- |
+| one shared head applied recursively, depth 3 | FastMTP | **already** (`forward_full`: one cell, `--depth`) |
+| depth ≥ 2 fed the head's own output hidden state | FastMTP | **already** (`residual = out.r`, the normed `h'` the engine chains) |
+| trained on the target's self-generated text | FastMTP | **already** (`flash-coder-dump` generates greedily with the target; FastMTP samples at T 0.6, greedy matches our greedy serving) |
+| multi-step loss, `β^(k-1)` decay | FastMTP (β 0.6) | **already**, β 0.8 default; `--beta .6` is the paper's |
+| verification-aware weights (full weight up to and including the first simulated rejection, decay restarts after) | VAT | **new**: `--vat` |
+| soft target: CE/KL to the target's own next-token distribution | Soft-MTP, VAT ℓ^soft | **new**: `--soft W` |
+
+VAT note: the paper's main method does not zero positions after the first rejection; it
+restarts the decay there (`ŵ_k = 1` for `k < k*`, `w_{k-k*+1}` after). A hard cutoff is its
+weaker ablation. `--vat` implements the main method, with `w = β^(k-1)`; the simulated
+rejection is the head's current argmax vs the teacher token per window.
+
+Soft targets need no re-dump: `h` in the dump is the trunk's normed final row, so the target's
+distribution is `softmax(output · h)` with the frozen head the trainer already holds
+(`model::teacher_logits`; depth d, row r reads residual row r+d+1). The soft term's gradient is
+`W·(p − q)` added to the hard CE's `p − onehot`. `metrics.jsonl` adds per-depth `kl`,
+`accepted` (windows with argmax = teacher at every depth ≤ d) and `target_agree` (rows whose
+`argmax(output · h)` equals the dumped token; it should be ~all rows, Q4 trunk vs f16 `h`).
+
+Pilot-2 command: as pilot 1 plus `--beta .6 --vat --soft 1`, from the borrowed head.
