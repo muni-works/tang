@@ -4982,6 +4982,33 @@ impl ComputeDevice for CudaComputeDevice {
         )
     }
 
+    fn tkv_decode(
+        &self,
+        stream: &CudaBuffer,
+        lanes: &CudaBuffer,
+        chans: &CudaBuffer,
+        prior: &CudaBuffer,
+        scratch: &CudaBuffer,
+        out: &CudaBuffer,
+        rope: Option<(&CudaBuffer, &CudaBuffer)>,
+        n_lanes: usize,
+    ) {
+        CudaComputeDevice::tkv_decode(
+            self, stream, lanes, chans, prior, scratch, out, rope, n_lanes,
+        );
+    }
+
+    fn kivi_dequant(
+        &self,
+        codes: &CudaBuffer,
+        sz: &CudaBuffer,
+        out: &CudaBuffer,
+        pages: Option<(&CudaBuffer, u32)>,
+        p: [u32; 6],
+    ) {
+        CudaComputeDevice::kivi_dequant(self, codes, sz, out, pages, p);
+    }
+
     fn rope_half_cached(
         &self,
         input: &CudaBuffer,
