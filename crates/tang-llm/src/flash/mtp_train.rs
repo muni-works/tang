@@ -51,9 +51,13 @@ struct Args {
     /// Linear warmup steps; with `--total`, cosine decay to `lr / 10` at that global step.
     warmup: usize,
     total: usize,
+    /// Global step the warmup and cosine start from (a continued run re-warms here).
+    schedule_from: usize,
+    /// Checked after every step: when it exists, checkpoint, export and stop cleanly.
+    stop_file: Option<PathBuf>,
 }
 fn parse(args: &[String]) -> Result<Args> {
-    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --depth 3 --soft 0 --vat --windows 1 --warmup 0 --total 0 --prefix-data DIR --resume DIR --cpu --check-context]";
+    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --depth 3 --soft 0 --vat --windows 1 --warmup 0 --total 0 --schedule-from 0 --stop-file PATH --prefix-data DIR --resume DIR --cpu --check-context]";
     let mut it = args.iter();
     let main = it.next().context(usage)?.into();
     let mtp = it.next().context(usage)?.into();
@@ -83,6 +87,8 @@ fn parse(args: &[String]) -> Result<Args> {
         windows: 1,
         warmup: 0,
         total: 0,
+        schedule_from: 0,
+        stop_file: None,
     };
     while let Some(k) = it.next() {
         if k == "--cpu" {
@@ -111,6 +117,8 @@ fn parse(args: &[String]) -> Result<Args> {
             "--windows" => a.windows = v.parse()?,
             "--warmup" => a.warmup = v.parse()?,
             "--total" => a.total = v.parse()?,
+            "--schedule-from" => a.schedule_from = v.parse()?,
+            "--stop-file" => a.stop_file = Some(v.into()),
             "--out" => a.out = v.into(),
             "--steps" => a.steps = v.parse()?,
             "--seq" => a.seq = v.parse()?,
@@ -227,7 +235,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         rng = restored.1;
     }
     std::fs::create_dir_all(&a.out)?;
-    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"depth":a.depth,"kind":format!("{:?}",w.kind),"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"soft":a.soft,"vat":a.vat,"windows":a.windows,"warmup":a.warmup,"total":a.total,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
+    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"depth":a.depth,"kind":format!("{:?}",w.kind),"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"soft":a.soft,"vat":a.vat,"windows":a.windows,"warmup":a.warmup,"total":a.total,"schedule_from":a.schedule_from,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
     std::fs::write(
         a.out.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -323,12 +331,17 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
                 .join("/"),
             now.elapsed().as_secs_f64()
         );
-        if local % a.eval_every == 0 || local == a.steps {
+        let stop = a.stop_file.as_ref().is_some_and(|f| f.exists());
+        if local % a.eval_every == 0 || local == a.steps || stop {
             evaluate(dev, &mut w, &seqs, &valid, &hp, &a, step, &mut log, &cache)?;
             let dir = a.out.join(format!("step-{step:06}"));
             std::fs::create_dir(&dir)?;
             checkpoint(&dir, &w, step, rng)?;
             w.export(&dir.join("mtp.gguf"))?;
+        }
+        if stop {
+            eprintln!("stop file found: stopped at step {step}");
+            break;
         }
     }
     Ok(())
@@ -337,13 +350,14 @@ impl Args {
     /// Linear warmup over `--warmup` steps, then constant, or cosine to `lr / 10` at
     /// `--total` when given (a global step, so resumed segments continue one schedule).
     fn lr_at(&self, step: usize) -> f64 {
+        let step = step.saturating_sub(self.schedule_from);
         if step <= self.warmup {
             return self.lr * step as f64 / self.warmup.max(1) as f64;
         }
         if self.total == 0 {
             return self.lr;
         }
-        let total = self.total;
+        let total = self.total.saturating_sub(self.schedule_from);
         let x = ((step - self.warmup) as f64 / (total.saturating_sub(self.warmup)).max(1) as f64)
             .min(1.0);
         self.lr * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * x).cos()))
