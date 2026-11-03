@@ -218,3 +218,48 @@ moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, po
   kernel's speed for the length of the overlap. Run references before or after, never during.
 - **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
   which cudarc resolves at load, and nsys isn't installed (apt fails).
+
+### 2026-11-03: verify-window experts at T=8, grouped vs per-pair (negative result)
+
+Stage sweep (`TANG_CODER_STAGES=1 TANG_CODER_STAGES_T=1,8`, explain, ctx 1,299), H100 SXM
+(3.35 TB/s), all variants the same box and build. GB/s is the sweep's own byte count.
+
+| variant | T=1 window | T=8 window | T=8 moe_gu | T=8 moe_down |
+|---|---|---|---|---|
+| per-pair `_d4` / `_d4f` (default) | 4,405 µs | 9,884 µs | 2,105 µs, 321 GB/s (10%) | 2,672 µs, 150 GB/s (4%) |
+| `TANG_CODER_FUSE_SILU=0` (`silu_q` + `_d4`) | **4,355** | **9,604** | 2,101 | **2,237, 179 GB/s** (+102 µs silu_q) |
+| leader-grouped `_x2` (WGROUP=2) | 4,415 | 12,048 | 3,290, 205 GB/s | 3,205, 125 GB/s |
+| leader-grouped `_x4` (WGROUP=4) | 4,413 | 11,623 | 2,677, 252 GB/s | 2,815, 142 GB/s |
+| in-block-scan `_w` / `_wf` (WGROUP=1, H200, iteration 1) | 4,079 | 14,450 (main 9,409) | 2,805 | 6,702, 60 GB/s |
+
+What this says about why grouping lost:
+- **The per-pair path is latency-bound, not byte-bound.** At T=8 the 88 pairs × 2048 rows read
+  about 2× the distinct bytes (mean 43 of 80 routed experts distinct a layer) and still sit at
+  4–10% of peak. Halving the bytes can't help while each block has a few KB in flight.
+- **Iteration 1 (`_w`/`_wf`) put serial work in front of the loads.** Every block rebuilt the
+  group: an O(n²) smem duplicate scan over 80 ids plus 5 `__syncthreads`. The down kernel then
+  quantized h for all M members before issuing a single weight load, and group 0 (shared expert,
+  8 tokens) did 8× the work. down fell to 60 GB/s.
+- **Iteration 2 (`_x`) took out the scan and prologue and it still lost.** Here a warp finds
+  its group with 3 ballots: per-pair grids, non-leaders exit, shared expert in groups of 4. Each
+  warp loads its rows into registers once and loops over the members, reading h from `silu_q`.
+  Bitwise per pair. The loss comes from how the work spreads: about half the blocks exit, so the
+  surviving ~45 groups × 64–128 blocks carry the same per-block bytes as before but each runs M
+  members serially from registers. There are fewer bytes in flight per SM and a longer critical
+  path per block. R=4 (more rows of loads a warp) beats R=2, so it is bytes in flight that
+  matter. A grid y of T·(K+1) with half the blocks dead is the wrong shape.
+- **The fused SiLU prologue in `_d4f` costs at T=8** (and on H100 at T=1 too): 64 blocks a pair
+  each redo the pair's 512 SiLU + int8 then hit a `__syncthreads` before any weight load.
+  Separate `silu_q` + `_d4` saves 435 µs of down for 102 µs of silu_q (−2.8% window at T=8,
+  −1.1% at T=1). This contradicts the H200 dead-end entry above; re-check on H200 before
+  flipping the default.
+- No crossover: the leader kernels match per-pair at T=1 (they aren't used there) and lose at T=8.
+
+For the weight-major streaming rewrite (B=1..64): keep loads independent of any prologue
+(precomputed activations, plan built once in `cx_route` or a tiny kernel, never per block). Size
+the grid by distinct-expert row tiles × enough splits to keep ≥8 blocks/SM resident, not by
+pairs. Software-pipeline the weight loads (cp.async or register double-buffer) so a warp keeps
+loads in flight while it decodes the previous tile. Split the shared expert and any hot expert
+by rows so no block carries 8× the members. nsys works on the RunPod image
+(`/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys`) but gives no stall reasons, and
+ncu still can't inject. Occupancy and stall data were not measured here.
