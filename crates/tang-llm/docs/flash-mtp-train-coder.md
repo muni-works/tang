@@ -1,0 +1,106 @@
+# Recursive MTP training for the Coder engine
+
+`flash-mtp-train` (see `flash-mtp-train.md`) also trains the Qwen3-Next MTP sidecar the Coder
+engine (`qwen3next`, Qwen3-Coder-Next) drafts with (`scripts/qwen3next_mtp_sidecar.py`). The
+trainer detects the sidecar by `mtp.fc.weight`; everything else is the same pipeline:
+residual dumps, recursive self-conditioned cell, same-size GGUF patch export.
+
+The cell, as the engine runs it (`enqueue_mtp`):
+
+```text
+r = fc([rmsnorm(embed(t[p+1]))·enorm | rmsnorm(h_p)·hnorm])          (cx_mtp_in + mtp_fc)
+r += attn_output(sigmoid(gate) · attn(q/k rmsnorm, NeoX rope on 64 dims, at position p+d))
+r += Σ top-10 softmax-renormalised experts + sigmoid(gate_inp_shexp·x) · shared expert
+h' = rmsnorm(r)·norm  → main head; h' is the next depth's h                    (chain on s.x)
+```
+
+`h_p` is `m.mh`: the trunk's final hidden row after the output norm. Trainable: fc, the two
+input norms, attention (q|gate, k, v, o, q/k norms), both layer norms, `mtp.norm`, router,
+shared expert and its gate (17 tensors, ~40M parameters). Routed experts (Q8_0, as served),
+the trunk's embedding and head stay frozen. The loss is the recursive teacher-forced CE at
+depths 1..`--depth` (default 3; 4 works), weighted `β^(d-1)` (`--beta`, default 0.8).
+
+## Build (pod)
+
+```sh
+export PATH=/usr/local/cuda/bin:$PATH CUDA_ROOT=/usr/local/cuda LD_LIBRARY_PATH=/usr/local/cuda/lib64
+cargo build --release -p tang-llm --features cuda,mtp-train
+B=target/release/tang-llm
+TRUNK=/workspace/Qwen3-Coder-Next-UD-Q4_K_XL.gguf     # first shard
+MTP=/workspace/mtp.gguf                               # qwen3next_mtp_sidecar.py output
+```
+
+## 1. Dump
+
+`prompts.jsonl`: one prompt per line (a JSON string or `{"prompt": ...}`), 200 code prompts.
+
+```sh
+$B flash-coder-dump $TRUNK --mtp $MTP --prompts prompts.jsonl --out /workspace/cmtp \
+  -n 2000 --k 3 --max-ctx 8192 2> dump.log
+```
+
+One load; per prompt `i`, greedy with the chat template, drafting with the sidecar's 3-step
+chain (generation is exact either way). `cmtp/data/pNNN` holds every generated row
+(`h.f16`, `ids.u32`), the engine's own drafts (`draft.u32`: position, depth, argmax,
+probability; depth 1 on every row, deeper along each window's chain), `prompt.txt` and
+`gen.txt`. `cmtp/prefix/pNNN` holds every prompt row for `--prefix-data`. Data stops at the
+first `<|im_end|>`/`<|endoftext|>` (`--stop`). Completed prompts are skipped, so rerun the
+same command after an interruption. `pNNN % 10 == 0` (20 of 200) are held out by the trainer.
+
+## 2. Forward oracle (before any training)
+
+```sh
+$B flash-mtp-train $TRUNK $MTP --data /workspace/cmtp/data --prefix-data /workspace/cmtp/prefix \
+  --out /workspace/cmtp/oracle --check-forward --seq 32
+```
+
+Runs the trainer cell on the first 4 windows of 4 held-out prompts with full teacher K/V and
+compares each row's argmax (and probability) with the engine's draft at depth 1, and at
+depths 2..3 where the engine's earlier drafts equal the teacher tokens. PASS needs ≥ 97%
+depth-1 and ≥ 90% deeper agreement (int8 activations and bf16 K/V move near-ties; a port
+error moves most rows). Creates no output. Do not train if it fails.
+
+## 3. Train (pilot)
+
+```sh
+$B flash-mtp-train $TRUNK $MTP --data /workspace/cmtp/data --prefix-data /workspace/cmtp/prefix \
+  --out /workspace/cmtp/run1 --steps 500 --seq 32 --burn 8 --depth 3 --beta .8 \
+  --lr 1e-5 --clip 1 --eval-every 100 2> train.log
+```
+
+`--prefix-data` gives every window its full earlier teacher K/V (as serving has); without it
+windows start cold. Each `step-NNNNNN/` has `mtp.gguf` (a same-size patch of `$MTP`: Q8_0
+matrices requantized, F32 norms, untouched bytes identical) and resumable state
+(`--resume`, new `--out`). `metrics.jsonl` has train CE/hits per depth and fixed held-out
+windows. The routed-expert cache holds all 512 experts dequantized (~6 GB host RAM).
+
+## 4. Evaluate
+
+Measured draft acceptance on the 20 held-out prompts, fixed 3-step chain, same settings for
+both files:
+
+```sh
+for f in $MTP /workspace/cmtp/run1/step-000500/mtp.gguf; do
+  $B flash-coder-dump $TRUNK --mtp $f --prompts prompts.jsonl --eval --held-out \
+    -n 2000 --k 3 > eval-$(basename $(dirname $f)).json
+done
+```
+
+The last stdout line is JSON: per depth `proposed`, `accepted`, `conditional`
+(P(accept d | accepted 1..d-1)) and `cumulative` (per window), plus tokens/window. Then
+check exactness and speed on the serving path with the chosen file:
+
+```sh
+$B flash-spec-test $TRUNK --mtp /workspace/cmtp/run1/step-000500/mtp.gguf --prompt-file P -n 256
+$B flash-bench $TRUNK --mtp /workspace/cmtp/run1/step-000500/mtp.gguf --draft mtp --prompt-file P -n 512
+```
+
+Lower held-out CE alone is not a reason to switch sidecars; acceptance and tok/s are.
+
+## Tests
+
+`cargo test -p tang-llm --features mtp-train --lib coder` (CPU): the cell against a plain loop
+of the engine's chain on a synthetic trunk + sidecar (with/without prefix, depth 3 and 4),
+gradients on all trainable tensors, byte-identical untouched export, the engine's sidecar
+contract (`coder_mtp::check_sidecar`, also run by `Coder::load`) on a changed export and an
+equal forward after reload; the dump writer's rows through the trainer's loader.
