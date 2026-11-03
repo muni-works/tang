@@ -1,8 +1,8 @@
 # Beat 2 launch post: cram (draft)
 
-Status: DRAFT. Beat 2 was announced as the "cram + the H200 result" slot. The H200 part
-turned out to be impossible with the current code (there is no CUDA KV decoder — see "what
-it won't claim"), so this draft ships the measured cram story and says so plainly. `{{…}}`
+Status: DRAFT. Beat 2 was announced as the "cram + the H200 result" slot. Both parts are
+now measured: the cram story below, and the H200 KV decode through the CUDA `tkv_decode`
+port (tang PR #143, merged). `{{…}}`
 marks a number that was not measured in time; the HTML comment above it says what would fill
 it. Nothing in here may be stronger than its receipt. Editor notes are HTML comments and get
 stripped before publishing.
@@ -16,8 +16,9 @@ committed gates (Silesia container gate, held-out SDRBench quality gate, KV in-l
 ran on the same Linux box and a different M4 earlier in October — cited as such, not
 re-measured.
 
-<!-- H200: cannot be measured, and the post now says why (no CUDA tkv_decode). If a CUDA
-kernel lands before publish, add it; otherwise this stays as written. -->
+<!-- H200: measured 2026-11-03 on a rented H200 (EUR-IS-4, datacenter, CUDA host 13.2)
+through the CUDA tkv_decode port (tang PR #143, merged; origin/main 560c44ff). Table in
+"The H200 KV decode numbers". Every line bit_identical:true vs the CPU decoder. -->
 
 ---
 
@@ -134,8 +135,9 @@ reimplementation on synthetic fields, not the committed result; the committed on
 generation was 1.8–5.5× slower than bf16 steps. The verdict is written down in the same
 survey: cram's KV codec is for *storing and moving* caches — decompress once on load
 (prefix-cache hit, node migration) — not for decoding every step. Any claim that this
-speeds up your context window would be wrong, and we're not making it. That kernel is Metal
-only, which is also why there is no H200 version of this measurement.
+speeds up your context window would be wrong, and we're not making it. The in-loop kernel
+exists for Metal and now CUDA (tang PR #143); the H200 numbers below are the decode-only
+bound, not an in-loop result.
 
 ### The GPU decode path (tc-gpu), measured on two GPUs
 
@@ -167,9 +169,34 @@ only one of these without saying which is being sloppy — including ours if we 
 Random access is real: a 64³ box out of the 512³ field decodes in **5.7 ms** (16 threads) at
 brick 16, i.e. 1/512th of the work.
 
-<!-- H200: see "what it won't claim". There is no CUDA kv decode, so no H200 KV number exists
-to fill in; tc-gpu above runs on any Vulkan device including an H200, but that is a field
-codec, not a KV-cache-in-attention result. -->
+<!-- H200 KV decode: measured (below). tc-gpu above runs on any Vulkan device including an
+H200, but that is a field codec, not a KV-cache result; the H200 table is the KV decoder
+itself. -->
+
+### The H200 KV decode numbers (the CUDA tkv_decode port)
+
+The KV decoder's CUDA port (tang PR #143, merged) measured on a rented datacenter H200
+(EUR-IS-4, 60 streams ≈ one cache step per dispatch, 20 reps, every line `bit_identical:
+true` against the CPU reference decoder):
+
+| config | H200 (G values/s) | RTX 3090 | M4 Max (Metal) |
+|---|---:|---:|---:|
+| 8×2048×128 V | 2.70 | 2.38 | 2.12 |
+| 8×2048×128 K | 3.66 | 2.44 | 2.48 |
+| 8×2048×128 V, lane 32 | **7.45** | 1.40 | 2.47 |
+| 8×2048×128 K, lane 32 | **8.57** | 1.52 | 3.20 |
+| 8×2048×128 V, block 512 | 1.16 | 0.78 | 0.83 |
+| 3×2048×64 V / K | 1.84 / 2.26 | 1.01 / 1.13 | 1.21 / 1.43 |
+
+**Compressed-KV decode on a datacenter H200: 2.7–8.6 billion values/s, bit-identical to
+the CPU reference decoder.** Lead with the lane-32 config (8.6 billion/s on K) and say in
+the same breath that the plain-lane config is 2.7–3.7 — don't let the best config stand
+alone. A consumer RTX 3090 does 2.4–2.5 on the same shapes; the CUDA port matches or beats
+Metal per GPU class at wide lanes and loses at narrow ones (the 3090's narrow-lane gap is
+a footnote, not the headline). The kernel is integer/branch-bound, not bandwidth-bound, so
+this is a decode-overhead number — the cost per restore (prefix-cache hit, node migration)
+— not a memory-bandwidth one. Against the CPU decoder (~32–48 ns/value on the same box,
+≈0.02–0.03 billion/s) the GPU is 100× faster.
 
 ## What it won't claim
 
@@ -182,13 +209,12 @@ codec, not a KV-cache-in-attention result. -->
   compile its pipeline on the M4's Metal config ("compute function exceeds available stack
   space"). The static path passes bit-identity on both GPUs; the learned path did not run
   here at all.
-- **The "H200 result" cannot be produced from this code.** Beat 2 was announced as "cram +
-  the H200 result". The KV GPU decoder (`tkv_decode`) exists only as a Metal kernel;
-  `ComputeDevice::tkv_decode` is `unimplemented!("tkv_decode is implemented for Metal
-  only")`. There is no CUDA implementation, so an H200 can run the field codec (tc-gpu,
-  above) but **cannot decode a KV cache in the attention loop**. That is a named piece of
-  work, not a measurement we could rent: write the CUDA `tkv_decode` and rerun the
-  in-loop study on an H200. The post ships without the number rather than with a guess.
+- **What the H200 numbers are, and are not.** Beat 2 was announced as "cram + the H200
+  result". The CUDA `tkv_decode` port (tang PR #143) was measured on a rented H200 (see the
+  table below): a compressed-KV *restore* number, integer/branch-bound, not a memory-bandwidth
+  one, and not a KV-cache-in-the-attention-loop result — the in-loop study above still
+  applies. Still unmeasured, on any GPU: the bf16 destination path, RoPE-on lanes, and
+  `kivi_dequant`'s own bench (the port lists them as untested).
 - **No cross-vendor GPU table.** Two GPUs, both consumer/workstation class (M4 Max, RTX
   3090). The WebGPU browser gate (285/285 byte-identical, Oct 20) is committed, but its
   throughput numbers are not reproduced today.
