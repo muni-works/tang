@@ -145,6 +145,7 @@ impl EpGroup {
                         );
                         stage[rank].store(2, Relaxed);
                         m.obs.rank.set(rank);
+                        m.ep_world = world;
                         m.owns_expert = Box::new(move |e| owner(e, world) == rank);
                         m.moe_reduce = match backend {
                             Backend::Host => {
