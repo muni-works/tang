@@ -88,3 +88,46 @@ state-only replay. Decide in phase 2.
 `flash-spec-test -n 96` on `ids/explain.ids` (all modes SAME), `flash-tcheck` bitwise,
 `flash-tree-check` (PASS, mtp and mtp-forest speed), `flash-aa -n 512 --bw 4800` on
 explain/refactor/write in mtp and oracle modes before and after, T=8 window breakdown.
+
+## The T=8 window budget, and what gets to 5 ms
+
+These numbers come from the docs, not a new measurement. Experts at T=8 are from the
+2026-11-03 H100 stage sweep in `speed-log.md` (window 9,604 µs with `silu_q` + `_d4`). The
+rest is the H200 T=1 stage sweep (window 4,856 µs), scaled to T=8. Measure on H200 in phase 2
+(`TANG_CODER_STAGES=1 TANG_CODER_STAGES_T=1,8`).
+
+| block | T=1 (H200) | T=8 (est.) | what bounds it |
+|---|---|---|---|
+| routed + shared experts (gate\|up, silu_q, down) | 1.68 ms | **~4.4 ms** (2.10 + 0.10 + 2.24) | latency: 88 pairs a layer, a few KB in flight per block, 150–320 GB/s (4–10% of peak) |
+| dense GEMVs (gdn_in, gdn_out, attn in/out, router) | 1.53 ms | ~1.9 ms | bytes, read once per window at any T (K-split GEMV, 1.6 TB/s on gdn_in) |
+| GDN conv+step (36 layers) | 0.24 ms | ~0.5 ms | serial per-token reductions, 8 tokens chained in registers |
+| attention split-K + merge (12 layers) | 0.21 ms | ~0.4 ms | latency, small |
+| top-k, norms, combine (route, norm_q8, moe_add_norm) | 0.67 ms | ~0.9 ms | latency of tiny kernels |
+| head + argmax | 0.17 ms | ~0.2 ms | bytes |
+| launch gaps (~8%) | 0.40 ms | ~0.6 ms | 600+ launches in the graph |
+| commit graph (outside the window) | | ~0.3 ms | 72 launches |
+
+**Experts are almost half the T=8 window, and they are latency-bound, not byte-bound.** The
+distinct expert bytes a T=8 window has to read: ~43 distinct routed experts + shared a layer ×
+~1.77 MB (Q4_K/Q5_K gate\|up 1024×2048 + down 2048×512) × 48 layers ≈ 3.7 GB. That is 0.77 ms
+at the H200's 4.8 TB/s, or ~1.1 ms at a realistic 70%. Today's per-pair kernels take ~4.4 ms and
+read ~2× those bytes (every token-expert pair re-reads its expert).
+
+**The single change worth the most is a weight-major expert kernel for verify windows**: each
+distinct expert streamed once for all the window rows routed to it, with loads independent of any
+prologue (plan built once, activations precomputed). It would cut ~4.4 ms to ~1.2–1.5 ms, about
+−3 ms, giving a ~6.5 ms window. That is the same kernel shape as the batch module's streaming
+grouped experts (`cx_moe_gu_s` / `cx_moe_down_s`, ~1.5 TB/s gate\|up at B=64), but tuned for
+~1.1 rows an expert at T=8. The 2026-11-03 grouping attempts lost because they killed half the
+blocks and serialised members; the streaming kernels don't do that. Run them at T=8
+single-sequence first: if they beat per-pair there, it's mostly a dispatch change. This is the
+coder-batch64 agent's surface, not mine.
+
+Getting from ~6.5 to 5 ms takes the smaller items together:
+- GDN/attention/norm latency at T=8: fold small kernels (~0.5 ms).
+- Launch gaps (~0.3 ms).
+- Delayed commit (~0.3 ms).
+- The forest root-row dedup: no faster window, but more accepted tokens for the same rows.
+
+Nothing on the GDN side alone gets near 5 ms. GDN step + commit together are ~0.8 ms of the
+window.
