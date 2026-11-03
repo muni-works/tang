@@ -46,9 +46,14 @@ struct Args {
     soft: f64,
     /// Verification-aware per-window depth weights.
     vat: bool,
+    /// Windows whose gradients are averaged into one optimizer step.
+    windows: usize,
+    /// Linear warmup steps; with `--total`, cosine decay to `lr / 10` at that global step.
+    warmup: usize,
+    total: usize,
 }
 fn parse(args: &[String]) -> Result<Args> {
-    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --depth 3 --soft 0 --vat --prefix-data DIR --resume DIR --cpu --check-context]";
+    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --depth 3 --soft 0 --vat --windows 1 --warmup 0 --total 0 --prefix-data DIR --resume DIR --cpu --check-context]";
     let mut it = args.iter();
     let main = it.next().context(usage)?.into();
     let mtp = it.next().context(usage)?.into();
@@ -75,6 +80,9 @@ fn parse(args: &[String]) -> Result<Args> {
         depth: 3,
         soft: 0.0,
         vat: false,
+        windows: 1,
+        warmup: 0,
+        total: 0,
     };
     while let Some(k) = it.next() {
         if k == "--cpu" {
@@ -100,6 +108,9 @@ fn parse(args: &[String]) -> Result<Args> {
             "--eval-windows" => a.eval_windows = v.parse()?,
             "--depth" => a.depth = v.parse()?,
             "--soft" => a.soft = v.parse()?,
+            "--windows" => a.windows = v.parse()?,
+            "--warmup" => a.warmup = v.parse()?,
+            "--total" => a.total = v.parse()?,
             "--out" => a.out = v.into(),
             "--steps" => a.steps = v.parse()?,
             "--seq" => a.seq = v.parse()?,
@@ -133,7 +144,8 @@ fn parse(args: &[String]) -> Result<Args> {
             && a.clip > 0.0
             && a.clip.is_finite()
             && a.soft >= 0.0
-            && a.soft.is_finite(),
+            && a.soft.is_finite()
+            && a.windows > 0,
         "invalid training hyperparameters"
     );
     Ok(a)
@@ -215,7 +227,7 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         rng = restored.1;
     }
     std::fs::create_dir_all(&a.out)?;
-    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"depth":a.depth,"kind":format!("{:?}",w.kind),"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"soft":a.soft,"vat":a.vat,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
+    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"depth":a.depth,"kind":format!("{:?}",w.kind),"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"soft":a.soft,"vat":a.vat,"windows":a.windows,"warmup":a.warmup,"total":a.total,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
     std::fs::write(
         a.out.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -226,28 +238,80 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         .write(true)
         .open(a.out.join("metrics.jsonl"))?;
     evaluate(dev, &mut w, &seqs, &valid, &hp, &a, offset, &mut log)?;
+    let mut deck: Vec<usize> = Vec::new();
+    let mut seen = 0usize;
     for local in 1..=a.steps {
         let step = offset + local;
-        let s = &seqs[train[random(&mut rng) as usize % train.len()]];
-        let start = random(&mut rng) as usize % (s.ids.len() - a.seq + 1);
-        let b = s.batch(start, a.seq)?;
         let now = Instant::now();
-        let mut t = tape::Tape::new(dev);
-        let leaves = w.leafs(&mut t);
-        let logits = model::forward(&mut t, &mut w, &leaves, &b, &hp, a.depth)?;
-        let teacher = target(&mut t, &w, &leaves, &b, &hp)?;
-        let o = model::objective_with(&t, &w, &logits, teacher, &b, a.recipe(), a.burn)?;
-        let (loss, hits, totals) = (&o.ce, &o.hits, &o.totals);
-        ensure!(loss.iter().all(|v| v.is_finite()), "nonfinite loss");
-        let grads = t.backward(&o.seeds);
-        drop(t);
+        let lr = a.lr_at(step);
+        w.optimizer.lr = lr;
+        let (mut fwd, mut bwd) = (0.0, 0.0);
+        let mut acc: std::collections::BTreeMap<String, Vec<f32>> = Default::default();
+        let mut loss = vec![0.0; a.depth];
+        let mut kl = vec![0.0; a.depth];
+        let (mut hits, mut totals, mut accepted) =
+            (vec![0; a.depth], vec![0; a.depth], vec![0; a.depth]);
+        let (mut agree, mut rows) = (0, 0);
+        let mut picked = Vec::new();
+        let mut leaves = Default::default();
+        for _ in 0..a.windows {
+            if deck.is_empty() {
+                deck = train.clone();
+                for i in (1..deck.len()).rev() {
+                    deck.swap(i, random(&mut rng) as usize % (i + 1));
+                }
+            }
+            let s = &seqs[deck.pop().unwrap()];
+            let start = random(&mut rng) as usize % (s.ids.len() - a.seq + 1);
+            let b = s.batch(start, a.seq)?;
+            picked.push(serde_json::json!([s.path, start]));
+            let t0 = Instant::now();
+            let mut t = tape::Tape::new(dev);
+            leaves = w.leafs(&mut t);
+            let logits = model::forward(&mut t, &mut w, &leaves, &b, &hp, a.depth)?;
+            let teacher = target(&mut t, &w, &leaves, &b, &hp)?;
+            let o = model::objective_with(&t, &w, &logits, teacher, &b, a.recipe(), a.burn)?;
+            ensure!(o.ce.iter().all(|v| v.is_finite()), "nonfinite loss");
+            fwd += t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let mut grads = t.backward(&o.seeds);
+            drop(t);
+            for (n, &id) in &leaves {
+                if !w.params.contains_key(n) {
+                    continue;
+                }
+                let Some(g) = grads[id].take() else { continue };
+                let e = acc.entry(n.clone()).or_insert_with(|| vec![0.0; g.len()]);
+                for (x, y) in e.iter_mut().zip(&g) {
+                    *x += y / a.windows as f32;
+                }
+            }
+            bwd += t1.elapsed().as_secs_f64();
+            dev.pool_clear();
+            for d in 0..a.depth {
+                loss[d] += o.ce[d] / a.windows as f64;
+                kl[d] += o.kl[d] / a.windows as f64;
+                hits[d] += o.hits[d];
+                totals[d] += o.totals[d];
+                accepted[d] += o.accepted[d];
+            }
+            agree += o.teacher_agree;
+            rows += o.totals[0];
+        }
+        let leaves: std::collections::BTreeMap<String, tape::Id> = leaves;
+        let mut grads = vec![None; leaves.values().max().map_or(0, |&m| m + 1)];
+        for (n, g) in acc {
+            grads[leaves[&n]] = Some(g);
+        }
+        let t2 = Instant::now();
         let norm = w.update(&leaves, grads, a.clip)?;
-        dev.pool_clear();
-        let metric = serde_json::json!({"kind":"train","step":step,"prompt":s.path,"start":start,"prefix_rows":b.prefix.as_ref().map_or(0,|p|p.pos.len()),"ce":loss,"kl":o.kl,"accepted":o.accepted,"target_agree":o.teacher_agree,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64()});
+        let upd = t2.elapsed().as_secs_f64();
+        seen += rows;
+        let metric = serde_json::json!({"kind":"train","step":step,"lr":lr,"windows":picked,"rows":rows,"rows_seen":seen,"ce":loss,"kl":kl,"accepted":accepted,"target_agree":agree,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64(),"forward_s":fwd,"backward_s":bwd,"update_s":upd});
         writeln!(log, "{metric}")?;
         log.flush()?;
         eprintln!(
-            "step {step}: CE {}, grad {norm:.3}, {:.2}s",
+            "step {step}: CE {}, grad {norm:.3}, lr {lr:.2e}, {:.2}s (fwd {fwd:.1} bwd {bwd:.1} upd {upd:.1})",
             loss.iter()
                 .map(|l| format!("{l:.4}"))
                 .collect::<Vec<_>>()
@@ -265,6 +329,20 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
     Ok(())
 }
 impl Args {
+    /// Linear warmup over `--warmup` steps, then constant, or cosine to `lr / 10` at
+    /// `--total` when given (a global step, so resumed segments continue one schedule).
+    fn lr_at(&self, step: usize) -> f64 {
+        if step <= self.warmup {
+            return self.lr * step as f64 / self.warmup.max(1) as f64;
+        }
+        if self.total == 0 {
+            return self.lr;
+        }
+        let total = self.total;
+        let x = ((step - self.warmup) as f64 / (total.saturating_sub(self.warmup)).max(1) as f64)
+            .min(1.0);
+        self.lr * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * x).cos()))
+    }
     fn recipe(&self) -> model::Recipe {
         model::Recipe {
             beta: self.beta,
