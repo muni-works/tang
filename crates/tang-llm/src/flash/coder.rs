@@ -142,6 +142,13 @@ struct Variants {
     /// Batch windows run the streaming grouped expert kernels (`cx_moe_*_s`);
     /// `TANG_CODER_MOE_STREAM=0` for the 16-rows-a-block grouped ones. Bitwise equal.
     stream: bool,
+    /// Batch windows run the experts on int8 tensor cores (`cx_moe_*_m`; not bitwise, gated
+    /// by batch-check's tolerance mode): `TANG_CODER_MOE_MMA=down|gu|all|0` (default down; gate|up is no faster).
+    mma_gu: bool,
+    mma_down: bool,
+    /// Batch windows run Q8X dense matrices on int8 tensor cores (`cx_mma_q8x`; not bitwise),
+    /// `TANG_CODER_DMMA=0` for the K-split GEMVs.
+    dmma: bool,
 }
 
 impl Default for Variants {
@@ -159,6 +166,9 @@ impl Default for Variants {
             attn_fa2: false,
             bgemm: false,
             stream: true,
+            mma_gu: true,
+            mma_down: true,
+            dmma: true,
         }
     }
 }
@@ -180,6 +190,15 @@ impl Variants {
             attn_fa2: !env_is("TANG_CODER_ATTN", "splitk"),
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
+            dmma: !env_is("TANG_CODER_DMMA", "0"),
+            mma_gu: {
+                let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
+                m == "all" || m == "gu"
+            },
+            mma_down: {
+                let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
+                m == "all" || m == "down"
+            },
         }
     }
 }
@@ -343,6 +362,9 @@ struct Dense {
     /// Whether the wide-window GEMM (`cx_gemm_dense`) takes it: every segment a type it
     /// decodes, 16-row aligned.
     gemm_ok: bool,
+    /// Every segment Q8X (type 108), 16-row aligned, k a multiple of 256: batch windows can
+    /// run it on int8 tensor cores (`cx_mma_q8x`).
+    q8x_ok: bool,
 }
 
 /// A routed-expert tensor (`[n_expert][rows][k]`, GGUF type) in VRAM, as the kernels take it.
@@ -431,6 +453,12 @@ struct Kern {
     /// Streaming grouped experts (batch windows): `cx_moe_gu_s` / `cx_moe_down_s`.
     moe_gu_s: Fun,
     moe_down_s: Fun,
+    /// Int8 tensor-core grouped experts (batch windows, not bitwise): `cx_moe_gu_m` / `_down_m`.
+    moe_gu_m: Fun,
+    moe_down_m: Fun,
+    /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
+    mma_q8x: Fun,
+    mma_q8x_red: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -485,6 +513,10 @@ impl Kern {
             moe_down_g: f("cx_moe_down_g")?,
             moe_gu_s: f("cx_moe_gu_s")?,
             moe_down_s: f("cx_moe_down_s")?,
+            moe_gu_m: f("cx_moe_gu_m")?,
+            moe_down_m: f("cx_moe_down_m")?,
+            mma_q8x: f("cx_mma_q8x")?,
+            mma_q8x_red: f("cx_mma_q8x_red")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -582,6 +614,10 @@ impl Kern {
             moe_down_g: f(cm, "cx_moe_down_g")?,
             moe_gu_s: f(cm, "cx_moe_gu_s")?,
             moe_down_s: f(cm, "cx_moe_down_s")?,
+            moe_gu_m: f(cm, "cx_moe_gu_m")?,
+            moe_down_m: f(cm, "cx_moe_down_m")?,
+            mma_q8x: f(cm, "cx_mma_q8x")?,
+            mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -628,6 +664,8 @@ impl Kern {
             self.moe_down_g,
             self.moe_gu_s,
             self.moe_down_s,
+            self.moe_gu_m,
+            self.moe_down_m,
             self.moe_gu_db,
             self.moe_down_db,
             self.fa2,
@@ -782,6 +820,8 @@ struct Wide {
     proj: B,
     /// int8 codes and scales of a dense GEMM's f32 input (`XQ8_T` = rows layout).
     xq: B,
+    /// Split-K partials of the batch module's dense MMA (`DMMA_PART` f32; empty elsewhere).
+    part: B,
 }
 
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
@@ -791,6 +831,9 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
 const BATCH_GCHUNK: usize = 8;
+
+/// The batch module's dense-MMA split-K partials (f32 values: splits x rows x tokens).
+const DMMA_PART: usize = 1 << 22;
 
 /// The streaming grouped expert kernels' shape (`CX_SST`, `CX_SNR_GU`, `CX_SNR_DOWN`): ring
 /// stages a warp, rows a warp for gate|up and for down.
@@ -1866,6 +1909,7 @@ impl Coder {
             io,
             proj,
             xq,
+            part: self.dev.alloc_f32(DMMA_PART),
         });
         Ok(())
     }
@@ -1943,6 +1987,7 @@ impl Coder {
             io,
             proj,
             xq,
+            part: self.dev.alloc_f32(1),
         });
         // The peer's own wide set: the same kernels compiled on its context, its scratch
         // and staging, sized by its layers.
@@ -1995,6 +2040,7 @@ impl Coder {
                 io: pio,
                 proj: prj,
                 xq: pxq,
+                part: p.dev.alloc_f32(1),
             });
             p.ctx.sync()?;
         }
@@ -2367,6 +2413,8 @@ impl Coder {
             (k.moe_down_g, "moe_down"),
             (k.moe_gu_s, "moe_gu"),
             (k.moe_down_s, "moe_down"),
+            (k.moe_gu_m, "moe_gu"),
+            (k.moe_down_m, "moe_down"),
             (k.moe_gemm_gu, "moe_gu"),
             (k.moe_gemm_down, "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
@@ -2572,6 +2620,13 @@ impl Coder {
         // Wide windows: the same GEMV over MAX_T rows at a time, each chunk's int8 made here
         // (fe_q8's rule, the one norm_q8 applies), so every row's sum is the one a narrow window
         // gives it.
+        if t > MAX_T && self.in_batch.get() && self.var.dmma && w.q8x_ok && t <= 64 {
+            if let Some(wd) = v.wide {
+                self.gemm_q8x(wi, wd, w, x, xq, out, t, ostride);
+                self.mark(name);
+                return;
+            }
+        }
         if t > MAX_T && self.in_batch.get() && w.k.is_multiple_of(self.var.kq * 256) && !gemv_v1() {
             if let Some(wd) = v.wide {
                 self.gemv_batch(wi, wd, w, x, xq, out, t, ostride);
@@ -2653,6 +2708,82 @@ impl Coder {
             };
         }
         self.mark(name);
+    }
+
+    /// A batch window's dense Q8X matrix on int8 tensor cores (`cx_mma_q8x`), all `t` rows in
+    /// one pass; K split so a small matrix still fills the GPU (partials summed in order).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q8x(
+        &self,
+        wi: usize,
+        wd: &Wide,
+        w: &Dense,
+        x: u64,
+        xq: Option<u64>,
+        out: u64,
+        t: usize,
+        ostride: usize,
+    ) {
+        let v = self.stage_view(wi);
+        let k = w.k;
+        let ki = k as i32;
+        let xq = match xq {
+            Some(q) => q,
+            None => {
+                let q = v.dev.buffer_addr(&wd.xq);
+                unsafe {
+                    gpu::launch(
+                        wd.k.q8,
+                        ((k / 32) as u32, t as u32, 1),
+                        (32, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![x, q, ki],
+                    )
+                    .expect("fe_q8");
+                }
+                q
+            }
+        };
+        let tiles = w.rows / 16;
+        let mut splits = 1usize;
+        while tiles * splits < 2048
+            && (k / 256).is_multiple_of(splits * 2)
+            && splits * 2 * w.rows * t <= DMMA_PART
+        {
+            splits *= 2;
+        }
+        let (sp, ns, os, ti, si, rt) = (
+            v.dev.buffer_addr(&w.segs),
+            w.nseg,
+            ostride as i32,
+            t as i32,
+            splits as i32,
+            w.rows as i32,
+        );
+        let part = v.dev.buffer_addr(&wd.part);
+        unsafe {
+            gpu::launch(
+                wd.k.mma_q8x,
+                (w.rows.div_ceil(64) as u32, splits as u32, 1),
+                (128, 1, 1),
+                0,
+                v.stream,
+                tang_moe::args![sp, ns, xq, ki, out, os, ti, si, part, rt],
+            )
+            .expect("cx_mma_q8x");
+            if splits > 1 {
+                gpu::launch(
+                    wd.k.mma_q8x_red,
+                    (w.rows.div_ceil(128) as u32, t as u32, 1),
+                    (128, 1, 1),
+                    0,
+                    v.stream,
+                    tang_moe::args![sp, ns, part, si, rt, ti, out, os],
+                )
+                .expect("cx_mma_q8x_red");
+            }
+        }
     }
 
     /// A batch window's GEMV: the batch module's K-split kernels over up to 32 rows a launch,
@@ -3294,6 +3425,15 @@ impl Coder {
                             b[wi]
                         );
                     }
+                } else if self.in_batch.get() && self.var.mma_gu {
+                    self.launch_on(
+                        stream,
+                        v.k.moe_gu_m,
+                        ((2 * ff / 128) as u32, groups, 1),
+                        256,
+                        (BATCH_GCHUNK * (nh + nh / 8 + nh / 8)) as u32,
+                        tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
+                    );
                 } else if self.in_batch.get() && self.var.stream {
                     self.launch_on(
                         stream,
@@ -3330,6 +3470,50 @@ impl Coder {
                         0,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, plan],
                     );
+                } else if self.in_batch.get() && self.var.mma_down {
+                    self.launch_on(
+                        stream,
+                        v.k.moe_down_m,
+                        ((nh / 128) as u32, groups, 1),
+                        256,
+                        (BATCH_GCHUNK * (ff + ff / 8 + ff / 8)) as u32,
+                        tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
+                    );
+                    if env_is("TANG_CODER_MMA_CHECK", "1") {
+                        let tmp = v.dev.alloc_f32(n * nh);
+                        let tp = v.dev.buffer_addr(&tmp);
+                        self.launch_on(
+                            stream,
+                            v.k.moe_down_s,
+                            ((nh / (8 * stream_shape().2)) as u32, groups, 1),
+                            256,
+                            (8 * stream_sst_down() * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                            tang_moe::args![dw, sd, ids, hq, tp, ti, r16d, fastk, plan],
+                        );
+                        v.dev.sync();
+                        let a = v.dev.download(&s.parts);
+                        let b = v.dev.download(&tmp);
+                        let ids_h = v.dev.download(&s.ids);
+                        let mut bad = 0usize;
+                        let mut shown = 0;
+                        let mut worst = 0f64;
+                        for p in 0..n {
+                            for r in 0..nh {
+                                let (x, y) = (a[p * nh + r] as f64, b[p * nh + r] as f64);
+                                let e = (x - y).abs() / y.abs().max(1e-2);
+                                worst = worst.max(e);
+                                if e > 1e-2 {
+                                    bad += 1;
+                                    if shown < 12 {
+                                        shown += 1;
+                                        let ex = if p < t * hp.n_expert_used { ids_h[p].to_bits() as i64 } else { -1 };
+                                        eprintln!("  mma down pair {p} (expert {ex}) row {r}: mma {x} ref {y}");
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("MMA check down: {bad} of {} differ >1%, worst rel {worst:.3e}", n * nh);
+                    }
                 } else if self.in_batch.get() && self.var.stream {
                     self.launch_on(
                         stream,
@@ -4862,8 +5046,13 @@ fn upload_dense(
         && words
             .chunks(6)
             .all(|w| GEMM_TYPES.contains(&w[2]) && (w[3] as usize).is_multiple_of(16));
+    let q8x_ok = k.is_multiple_of(256)
+        && words
+            .chunks(6)
+            .all(|w| w[2] == 108 && (w[3] as usize).is_multiple_of(16));
     Ok(Dense {
         gemm_ok,
+        q8x_ok,
         segs: dev.upload_u32(&words),
         nseg: parts.len() as i32,
         rows: off,

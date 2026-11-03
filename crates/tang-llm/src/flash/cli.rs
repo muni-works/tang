@@ -1660,6 +1660,35 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             e.free_slot(s);
         }
         let mut ok = true;
+        // Tolerance (batch windows past MAX_T may use tensor-core kernels): logits compared
+        // while a sequence's tokens still agree, tokens position by position.
+        let (mut dmax, mut dsum, mut dn, mut tagree, mut ttot) = (0f64, 0f64, 0usize, 0usize, 0usize);
+        for i in 0..nb {
+            let first = (0..steps)
+                .find(|&k| alone[i].0[k] != got[i].0[k])
+                .map_or(steps, |k| k + 1);
+            for (x, y) in alone[i].1[..first * v].iter().zip(&got[i].1[..first * v]) {
+                let d = (*x as f64 - *y as f64).abs();
+                dmax = dmax.max(d);
+                dsum += d;
+                dn += 1;
+            }
+            // Greedy agreement given the same history: steps up to (and including) the first
+            // divergence; the rest have different inputs and aren't counted.
+            tagree += first - usize::from(first <= steps && alone[i].0[first - 1] != got[i].0[first - 1]);
+            ttot += first;
+        }
+        let agree = tagree as f64 / ttot as f64;
+        let tol: f64 = std::env::var("TANG_BATCH_TOL")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.2);
+        println!(
+            "batch-check tolerance: tokens agree {:.2}% ({tagree}/{ttot}, same history), max |dlogit| {dmax:.4}, mean {:.2e} (bar: 99%, mean <= {tol})",
+            100.0 * agree,
+            dsum / dn.max(1) as f64
+        );
+        let tol_ok = nb > super::coder::MAX_T && agree >= 0.99 && dsum / dn.max(1) as f64 <= tol;
         for i in 0..nb {
             let tok_eq = alone[i].0 == got[i].0;
             let bits = alone[i]
@@ -1676,6 +1705,8 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             );
             ok &= tok_eq && bits == 0;
         }
+        let bitwise = ok;
+        ok |= tol_ok;
         // FNV-1a over every batched logit, to compare runs (e.g. TANG_CODER_GROUPED=0 against the
         // grouped default): equal checksums, equal bits.
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1686,7 +1717,13 @@ pub fn batch_check(args: &[String]) -> Result<()> {
         }
         println!(
             "batch-check: {} (logits checksum {h:016x})",
-            if ok { "PASS (bitwise)" } else { "FAIL" }
+            if bitwise {
+                "PASS (bitwise)"
+            } else if ok {
+                "PASS (tolerance)"
+            } else {
+                "FAIL"
+            }
         );
         // With an MTP layer: up to 3 sequences in verify windows with their MTP drafts (the
         // window's spare rows shared out) must give the same tokens as each one alone.
