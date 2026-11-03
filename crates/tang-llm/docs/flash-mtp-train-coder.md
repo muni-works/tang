@@ -150,3 +150,33 @@ self-generated data, decayed multi-step loss) were already there. What differs f
 is scale: 500 steps × one 24-row window is ~12k loss rows, ~3% of one pass over the 180-prompt
 dump (FastMTP: 3 epochs over 389k samples, batch 64, lr 5e-5). Next lever: batch (many windows
 per step) and lr/steps, then more prompts — not the loss.
+
+## Pilot 3: scale (8 windows per step, ~6x faster trainer)
+
+The trainer was CPU-bound at ~8.7 s per 24-row window (one core, GPU idle): every linear
+re-uploaded its weight (the 151k-row head, each routed expert) and attention, norms, gathers,
+sigmoid Jacobians and the loss ran single-threaded. Now frozen weights stay on the device
+across tapes (`tape::DeviceCache`, keyed by the owner's `Arc`), trainable ones upload once per
+tape, and those host ops run on rayon: ~1.45 s per window, same losses to the last printed
+digit. `--windows N` averages N windows' gradients per optimizer step (prompts drawn from a
+shuffled deck), `--warmup`/`--total` give linear warmup then cosine to lr/10 by global step
+(resumable segments continue one schedule).
+
+Run: borrowed head, `--beta .6 --vat --soft 1 --windows 8 --lr 5e-5 --warmup 30 --total 1000`,
+1000 steps, 184k loss rows (15x pilot 1), ~10.5–13 s/step, 3.1 h of step time on a shared
+GPU (~59k rows/h vs pilot 1's ~8.7k/h).
+
+Held-out live chain, k=3, 20 prompts × 2000 tokens:
+
+| head | d1 | d2-cum | d3-cum | tokens/window |
+| --- | --- | --- | --- | --- |
+| borrowed | 78.2% | 58.0% | 40.0% | 2.76 |
+| pilot 1 | 82.3% | 64.6% | 48.3% | 2.95 |
+| pilot 2 | 82.2% | 64.5% | 48.2% | 2.95 |
+| pilot 3, step 1000 | 85.2% | 68.9% | 54.0% | 3.08 |
+
+Intermediate live checks used `-n 500` (first 500 tokens per prompt, a harder slice), so they
+are only comparable to each other: borrowed 71.2/46.4/28.4%, 2.46; pilot 1 76.3/54.7/37.0%,
+2.68; pilot 3 step 400 79.2/57.3/39.0%, 2.75; step 700 79.7/58.8/41.1%, 2.80. The export
+round trip holds: held-out validation from the step-400 GGUF equals the in-memory one within
+requantization (CE .2608 vs .2613 at depth 1).
