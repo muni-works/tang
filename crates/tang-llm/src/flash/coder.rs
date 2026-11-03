@@ -1000,6 +1000,8 @@ impl Coder {
         let mtp_parts = match &mtp_path {
             Some(p) => {
                 let mg = Gguf::open(p).with_context(|| format!("MTP sidecar {}", p.display()))?;
+                super::coder_mtp::check_sidecar(&mg, &hp)
+                    .with_context(|| format!("MTP sidecar {}", p.display()))?;
                 let layer = load_layer(&dev, &mg, &hp, &geo, "mtp.", false, &ba_perm, max_ctx)?;
                 let fc = upload_dense(&dev, &mg, &[(mg.info("mtp.fc.weight")?.clone(), None)])?;
                 ensure!(

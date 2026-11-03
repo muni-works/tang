@@ -1,7 +1,7 @@
 use super::{
     data::Batch,
     tape::{Id, Tape},
-    weights::Weights,
+    weights::{Kind, Weights},
 };
 use crate::flash::reference::Hparams;
 use anyhow::{ensure, Result};
@@ -185,6 +185,9 @@ fn prepare<D: ComputeDevice>(
     tokens: &[u32],
     hp: &Hparams,
 ) -> Result<(Id, Id, Option<Id>)> {
+    if w.kind == Kind::Coder {
+        return prepare_coder(t, w, ids, h, tokens, hp);
+    }
     let (n, hc, rows) = (hp.n_embd, hp.hc, tokens.len());
     let ti = w.main.info("token_embd.weight")?;
     let mut emb = Vec::with_capacity(rows * n);
@@ -206,6 +209,41 @@ fn prepare<D: ComputeDevice>(
     let r = linear(t, w, ids, cat, "nextn.eh_proj.weight", rows * hc);
     let (x, inj) = hc_read(t, w, ids, r, rows, "hc_attn_", hp, true);
     Ok((r, x, inj))
+}
+fn embed(w: &Weights, tokens: &[u32]) -> Result<Vec<f32>> {
+    let ti = w.main.info("token_embd.weight")?;
+    let mut emb = Vec::with_capacity(tokens.len() * ti.row_len());
+    for &tok in tokens {
+        emb.extend(w.main.rows(ti, tok as usize, 1)?);
+    }
+    Ok(emb)
+}
+/// Qwen3-Next: `r = fc([rmsnorm(emb)·enorm | rmsnorm(h)·hnorm])` (`cx_mtp_in` + `mtp_fc`),
+/// `x = rmsnorm(r)·attn_norm`.
+fn prepare_coder<D: ComputeDevice>(
+    t: &mut Tape<D>,
+    w: &Weights,
+    ids: &BTreeMap<String, Id>,
+    h: Id,
+    tokens: &[u32],
+    hp: &Hparams,
+) -> Result<(Id, Id, Option<Id>)> {
+    let (n, rows) = (hp.n_embd, tokens.len());
+    let e = t.constant(embed(w, tokens)?);
+    let e = t.norm(e, ids["enorm.weight"], n, hp.eps);
+    let hn = t.norm(h, ids["hnorm.weight"], n, hp.eps);
+    let packed = t.join(&[e, hn]);
+    let cat = (0..rows)
+        .flat_map(|r| {
+            (0..n)
+                .map(move |j| r * n + j)
+                .chain((0..n).map(move |j| (rows + r) * n + j))
+        })
+        .collect();
+    let cat = t.gather(packed, cat);
+    let r = linear(t, w, ids, cat, "fc.weight", rows);
+    let x = t.norm(r, ids["attn_norm.weight"], n, hp.eps);
+    Ok((r, x, None))
 }
 fn teacher_kv<D: ComputeDevice>(
     t: &mut Tape<D>,
@@ -238,20 +276,20 @@ fn visibility(prefix: usize, counts: &[usize], rows: usize) -> Vec<Vec<usize>> {
         })
         .collect()
 }
+/// Gated attention of one recursive depth: q|gate per head, q/k rmsnorm, partial NeoX RoPE,
+/// `sigmoid(gate) · attn → attn_output`. Returns (output, k, v).
 #[allow(clippy::too_many_arguments)]
-fn cell<D: ComputeDevice>(
+fn attend<D: ComputeDevice>(
     t: &mut Tape<D>,
-    w: &mut Weights,
+    w: &Weights,
     ids: &BTreeMap<String, Id>,
-    h: Id,
-    tokens: &[u32],
+    x: Id,
     pos: &[usize],
     previous: &[(Id, Id)],
     visible: Vec<Vec<usize>>,
     hp: &Hparams,
-) -> Result<CellOut> {
-    let rows = tokens.len();
-    let (r, x, inj) = prepare(t, w, ids, h, tokens, hp)?;
+) -> (Id, Id, Id) {
+    let rows = pos.len();
     let qf = linear(t, w, ids, x, "attn_q.weight", rows);
     let nh = hp.n_head;
     let nkv = hp.n_head_kv;
@@ -287,6 +325,40 @@ fn cell<D: ComputeDevice>(
     let gate = t.nonlinear(gate, false);
     let a = t.mul(a, gate);
     let a = linear(t, w, ids, a, "attn_output.weight", rows);
+    (a, k, v)
+}
+#[allow(clippy::too_many_arguments)]
+fn cell<D: ComputeDevice>(
+    t: &mut Tape<D>,
+    w: &mut Weights,
+    ids: &BTreeMap<String, Id>,
+    h: Id,
+    tokens: &[u32],
+    pos: &[usize],
+    previous: &[(Id, Id)],
+    visible: Vec<Vec<usize>>,
+    hp: &Hparams,
+) -> Result<CellOut> {
+    let rows = tokens.len();
+    let (r, x, inj) = prepare(t, w, ids, h, tokens, hp)?;
+    let (a, k, v) = attend(t, w, ids, x, pos, previous, visible, hp);
+    if w.kind == Kind::Coder {
+        // Plain pre-norm residual; the next depth (and the head) take `rmsnorm(r)·norm`, the
+        // rows the engine's chain gathers from `s.x`.
+        let n = hp.n_embd;
+        let r = t.add(r, a);
+        let x = t.norm(r, ids["post_attention_norm.weight"], n, hp.eps);
+        let y = moe(t, w, ids, x, rows, hp)?;
+        let r = t.add(r, y);
+        let out = t.norm(r, ids["norm.weight"], n, hp.eps);
+        let logits = linear(t, w, ids, out, "output.weight", rows);
+        return Ok(CellOut {
+            r: out,
+            k,
+            v,
+            logits,
+        });
+    }
     let r = hc_write(t, r, a, inj.unwrap(), rows, hp);
     let (x, inj) = hc_read(t, w, ids, r, rows, "hc_ffn_", hp, true);
     let y = moe(t, w, ids, x, rows, hp)?;
@@ -303,30 +375,34 @@ pub fn forward_full<D: ComputeDevice>(
     ids: &BTreeMap<String, Id>,
     b: &Batch,
     hp: &Hparams,
+    depths: usize,
 ) -> Result<Vec<CellOut>> {
     let len = b.pos.len();
     ensure!(
-        len >= 4,
-        "three-step training needs at least four residual rows"
+        depths >= 1 && len > depths,
+        "{depths}-step training needs at least {} residual rows",
+        depths + 1
     );
+    let off = w.kind.pos_offset();
     let width = hp.n_embd * hp.hc;
     let mut residual = t.constant(b.h.clone());
     let mut prev = Vec::new();
     let prefix = if let Some(p) = &b.prefix {
         let h = t.constant(p.h.clone());
         let (_, x, _) = prepare(t, w, ids, h, &p.next_tokens, hp)?;
-        prev.push(teacher_kv(t, w, ids, x, &p.pos, hp));
+        let pos: Vec<_> = p.pos.iter().map(|&q| q + off).collect();
+        prev.push(teacher_kv(t, w, ids, x, &pos, hp));
         p.pos.len()
     } else {
         0
     };
     let mut logits = Vec::new();
     let mut counts = Vec::new();
-    for depth in 1..=3 {
+    for depth in 1..=depths {
         let rows = len - depth;
         let h = t.gather(residual, (0..rows * width).collect());
         let tokens = &b.tokens[depth..depth + rows];
-        let pos: Vec<_> = b.pos[..rows].iter().map(|&p| p + depth - 1).collect();
+        let pos: Vec<_> = b.pos[..rows].iter().map(|&p| p + depth - 1 + off).collect();
         let visible = visibility(prefix, &counts, rows);
         let out = cell(t, w, ids, h, tokens, &pos, &prev, visible, hp)?;
         residual = out.r;
@@ -343,11 +419,12 @@ pub fn objective<D: ComputeDevice>(
     b: &Batch,
     beta: f64,
     burn: usize,
-) -> Result<([f64; 3], Vec<(Id, Vec<f32>)>, [usize; 3], [usize; 3])> {
-    let denom = 1.0 + beta + beta * beta;
-    let mut losses = [0.0; 3];
-    let mut hits = [0; 3];
-    let mut totals = [0; 3];
+) -> Result<(Vec<f64>, Vec<(Id, Vec<f32>)>, Vec<usize>, Vec<usize>)> {
+    let depths = logits.len();
+    let denom: f64 = (0..depths).map(|d| beta.powi(d as i32)).sum();
+    let mut losses = vec![0.0; depths];
+    let mut hits = vec![0; depths];
+    let mut totals = vec![0; depths];
     let mut seeds = Vec::new();
     let vocab = w.vocab.len();
     for (d, &id) in logits.iter().enumerate() {
@@ -389,8 +466,9 @@ pub fn forward<D: ComputeDevice>(
     ids: &BTreeMap<String, Id>,
     b: &Batch,
     hp: &Hparams,
+    depths: usize,
 ) -> Result<Vec<Id>> {
-    Ok(forward_full(t, w, ids, b, hp)?
+    Ok(forward_full(t, w, ids, b, hp, depths)?
         .iter()
         .map(|o| o.logits)
         .collect())
