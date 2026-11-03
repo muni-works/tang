@@ -154,3 +154,13 @@ mlp-down-f32 (786,432 B). The in-crate arms match these byte sizes
   docs/compression-math-survey/tang-compress-kv-decode-speed.md (they ran on
   an M4 Max too, but not by me today).
 - TCG3 GPU decode: fails to compile its pipeline on this Metal config.
+
+### embed-scales lossy result (completed after the table above)
+- `tc --codec wavelet --rmse 0.01` (the portfolio kept hanging on the 19 MB
+  file — job-3 produced nothing in 305 s; wavelet alone finished in 1.07 s):
+  **124,938 B = 0.2056 bpv = 155.7× vs xz-9's 42.8× (3.64× smaller than the
+  best lossless arm), rmse 0.010000, maxabs 0.035, decode 0.120 s.**
+- Caveat recorded: `cram bench` on embed-scales with the lossy arm never
+  finished here (portfolio hangs/trials forever on this 2-D 19 MB field);
+  the wavelet-only run is what I have. The container would still pick the
+  smallest arm.
