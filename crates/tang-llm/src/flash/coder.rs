@@ -149,6 +149,9 @@ struct Variants {
     /// Batch windows run Q8X dense matrices on int8 tensor cores (`cx_mma_q8x`; not bitwise),
     /// `TANG_CODER_DMMA=0` for the K-split GEMVs.
     dmma: bool,
+    /// Narrow windows of 2..8 rows run the streaming grouped expert kernels
+    /// (`TANG_CODER_NSTREAM=1`). Bitwise.
+    nstream: bool,
 }
 
 impl Default for Variants {
@@ -169,6 +172,7 @@ impl Default for Variants {
             mma_gu: true,
             mma_down: true,
             dmma: true,
+            nstream: false,
         }
     }
 }
@@ -191,6 +195,7 @@ impl Variants {
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
             dmma: !env_is("TANG_CODER_DMMA", "0"),
+            nstream: env_is("TANG_CODER_NSTREAM", "1"),
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -365,6 +370,10 @@ struct Dense {
     /// Every segment Q8X (type 108), 16-row aligned, k a multiple of 256: batch windows can
     /// run it on int8 tensor cores (`cx_mma_q8x`).
     q8x_ok: bool,
+    /// With `q8x_ok`: the Q8X segments' own table (segments, count, rows) and the other
+    /// segments as a second matrix.
+    mma: Option<(B, i32, usize)>,
+    rest: Option<Box<Dense>>,
 }
 
 /// A routed-expert tensor (`[n_expert][rows][k]`, GGUF type) in VRAM, as the kernels take it.
@@ -1853,7 +1862,13 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            "{}#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            std::env::var("TANG_CODER_BATCH_DEFS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(|d| format!("#define {}\n", d.replace('=', " ")))
+                .collect::<String>(),
             stream_sst_down(),
             stream_shape().0,
             stream_shape().1,
@@ -2745,43 +2760,49 @@ impl Coder {
                 q
             }
         };
-        let tiles = w.rows / 16;
+        let (mseg, mn, mrows) = w.mma.as_ref().expect("q8x segments");
+        let tiles = mrows / 16;
         let mut splits = 1usize;
         while tiles * splits < 2048
             && (k / 256).is_multiple_of(splits * 2)
-            && splits * 2 * w.rows * t <= DMMA_PART
+            && splits * 2 * mrows * t <= DMMA_PART
         {
             splits *= 2;
         }
         let (sp, ns, os, ti, si, rt) = (
-            v.dev.buffer_addr(&w.segs),
-            w.nseg,
+            v.dev.buffer_addr(mseg),
+            *mn,
             ostride as i32,
             t as i32,
             splits as i32,
-            w.rows as i32,
+            *mrows as i32,
         );
         let part = v.dev.buffer_addr(&wd.part);
         unsafe {
             gpu::launch(
                 wd.k.mma_q8x,
-                (w.rows.div_ceil(64) as u32, splits as u32, 1),
+                (mrows.div_ceil(64) as u32, splits as u32, 1),
                 (128, 1, 1),
                 0,
                 v.stream,
-                tang_moe::args![sp, ns, xq, ki, out, os, ti, si, part, rt],
+                tang_moe::args![sp, ns, xq, ki, out, os, ti, si, part, rt, x],
             )
             .expect("cx_mma_q8x");
             if splits > 1 {
                 gpu::launch(
                     wd.k.mma_q8x_red,
-                    (w.rows.div_ceil(128) as u32, t as u32, 1),
+                    (mrows.div_ceil(128) as u32, t as u32, 1),
                     (128, 1, 1),
                     0,
                     v.stream,
                     tang_moe::args![sp, ns, part, si, rt, ti, out, os],
                 )
                 .expect("cx_mma_q8x_red");
+            }
+        }
+        if let Some(r) = &w.rest {
+            if r.k.is_multiple_of(self.var.kq * 256) {
+                self.gemv_batch(wi, wd, r, x, Some(xq), out, t, ostride);
             }
         }
     }
@@ -3356,7 +3377,17 @@ impl Coder {
         );
         let np = n as u32;
         let many = self.in_wide.get() || self.in_batch.get();
-        if self.var.grouped || many {
+        // Narrow windows of 2..8 rows on the streaming grouped kernels (`TANG_CODER_NSTREAM=1`):
+        // every group is at most 8 pairs there, as the kernels need. Bitwise.
+        let nstream = !many && self.var.nstream && t >= 2;
+        // The streaming kernels' shape: the batch module's (sweepable), else the source defaults.
+        let (sst, snr_gu, snr_down, sst_down) = if self.in_batch.get() {
+            let s = stream_shape();
+            (s.0, s.1, s.2, stream_sst_down())
+        } else {
+            (1, 8, 16, 2)
+        };
+        if self.var.grouped || many || nstream {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
             let pw = 2 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
@@ -3434,13 +3465,13 @@ impl Coder {
                         (BATCH_GCHUNK * (nh + nh / 8 + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
-                } else if self.in_batch.get() && self.var.stream {
+                } else if (self.in_batch.get() && self.var.stream) || nstream {
                     self.launch_on(
                         stream,
                         v.k.moe_gu_s,
-                        ((2 * ff / (8 * stream_shape().1)) as u32, groups, 1),
+                        ((2 * ff / (8 * snr_gu)) as u32, groups, 1),
                         256,
-                        (8 * stream_shape().0 * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        (8 * sst * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
                 } else {
@@ -3514,13 +3545,13 @@ impl Coder {
                         }
                         eprintln!("MMA check down: {bad} of {} differ >1%, worst rel {worst:.3e}", n * nh);
                     }
-                } else if self.in_batch.get() && self.var.stream {
+                } else if (self.in_batch.get() && self.var.stream) || nstream {
                     self.launch_on(
                         stream,
                         v.k.moe_down_s,
-                        ((nh / (8 * stream_shape().2)) as u32, groups, 1),
+                        ((nh / (8 * snr_down)) as u32, groups, 1),
                         256,
-                        (8 * stream_sst_down() * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        (8 * sst_down * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
                     );
                 } else {
@@ -4634,6 +4665,7 @@ impl Coder {
                 Some(("kq", n)) => v.kq = n.parse()?,
                 Some(("fastk", n)) => v.fastk = n.parse()?,
                 Some(("shpar", n)) => v.shared_par = n == "1",
+                Some(("nstream", n)) => v.nstream = n == "1",
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
         }
@@ -5046,13 +5078,38 @@ fn upload_dense(
         && words
             .chunks(6)
             .all(|w| GEMM_TYPES.contains(&w[2]) && (w[3] as usize).is_multiple_of(16));
+    // Batch windows: the Q8X segments on tensor cores (their own segment table), any others
+    // (GDN's Q4_K ssm_ba, a BF16 layer) through the K-split GEMV as a second matrix.
+    let (w108, wrest): (Vec<&[u32]>, Vec<&[u32]>) = words.chunks(6).partition(|w| w[2] == 108);
     let q8x_ok = k.is_multiple_of(256)
-        && words
-            .chunks(6)
-            .all(|w| w[2] == 108 && (w[3] as usize).is_multiple_of(16));
+        && !w108.is_empty()
+        && w108.iter().all(|w| (w[3] as usize).is_multiple_of(16));
+    let mma = q8x_ok.then(|| {
+        let ws: Vec<u32> = w108.iter().flat_map(|w| w.iter().copied()).collect();
+        let rows: usize = w108.iter().map(|w| w[3] as usize).sum();
+        (dev.upload_u32(&ws), w108.len() as i32, rows)
+    });
+    let rest = (q8x_ok && !wrest.is_empty()).then(|| {
+        let ws: Vec<u32> = wrest.iter().flat_map(|w| w.iter().copied()).collect();
+        Box::new(Dense {
+            _w: Vec::new(),
+            segs: dev.upload_u32(&ws),
+            nseg: wrest.len() as i32,
+            rows: wrest.iter().map(|w| w[3] as usize).sum(),
+            k,
+            row16: ((rb + 15).div_ceil(16) + 1) as i32,
+            bytes: 0,
+            gemm_ok: false,
+            q8x_ok: false,
+            mma: None,
+            rest: None,
+        })
+    });
     Ok(Dense {
         gemm_ok,
         q8x_ok,
+        mma,
+        rest,
         segs: dev.upload_u32(&words),
         nseg: parts.len() as i32,
         rows: off,

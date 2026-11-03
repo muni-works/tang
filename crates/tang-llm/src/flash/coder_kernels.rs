@@ -873,10 +873,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 // kernels' (same staged bytes, same cx_dot / cx_dotq_half on them): bitwise equal.
 // Grid (rows / (8 NR), groups), block 256, dynamic smem 8 * CX_SST * 2 * r16 * 16 bytes.
 #ifndef CX_SST
-#define CX_SST 4
+#define CX_SST 1
 #endif
 #ifndef CX_SST_DOWN
-#define CX_SST_DOWN CX_SST
+#define CX_SST_DOWN 2
 #endif
 #ifndef CX_MT
 #define CX_MT 1
@@ -1084,6 +1084,12 @@ __device__ __forceinline__ void sbk_load(const unsigned char* b, int tig, SbK& o
         o.h[0] = o.h[1] = 0;
     }
 }
+#ifndef CX_MMA_PF
+#define CX_MMA_PF 1
+#endif
+#ifndef CX_MMA_MINB
+#define CX_MMA_MINB 1
+#endif
 // scale_min_k4 on the 12 scale bytes held as three words (sub-block j a compile-time constant).
 __device__ __forceinline__ void scale_min_w(int j, const unsigned* sc, int& s, int& m) {
     auto by = [&](int i) { return (int)((sc[i >> 2] >> ((i & 3) * 8)) & 0xFFu); };
@@ -1106,7 +1112,7 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
     // Token g's B operand base (rows past m read token 0's codes: their columns are dropped).
     const unsigned char* xg = act + (size_t)(g < m ? g : 0) * K;
     for (int sb = 0; sb < NSB; sb++) {
-        if (sb + 1 < NSB) {
+        if (CX_MMA_PF && sb + 1 < NSB) {
             sbk_load<TY>(wa + (sb + 1) * BB, tig, na_);
             sbk_load<TY>(wb + (sb + 1) * BB, tig, nb_);
         }
@@ -1130,6 +1136,12 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             const unsigned b1 = *(const unsigned*)(xg + e + 16 + tig * 4);
             int d[4];
             mma_s8_16832(d, a, b0, b1);
+            // Token g's code sum over the block (the quad holds it), then columns 2 tig, 2 tig + 1's.
+            int sq = __dp4a((int)b0, 0x01010101, __dp4a((int)b1, 0x01010101, 0));
+            sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+            sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+            const int sqa = __shfl_sync(0xffffffffu, sq, (2 * tig) * 4);
+            const int sqb = __shfl_sync(0xffffffffu, sq, (2 * tig + 1) * 4);
             int s0, m0, s1, m1;
             scale_min_w(s, ra.sc, s0, m0);
             scale_min_w(s, rb2.sc, s1, m1);
@@ -1137,17 +1149,20 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             const float db = rb2.d * i2f(s1), mb = rb2.dm * i2f(m1);
             const int blk = e / 32;
             if (na < m) {
-                const float dx = actd[na * (K / 32) + blk], sx = i2f(asum[na * (K / 32) + blk]);
+                const float dx = actd[na * (K / 32) + blk], sx = i2f(sqa);
                 acc[0] = fmaf(dx, fmaf(da, i2f(d[0]), -ma * sx), acc[0]);
                 acc[2] = fmaf(dx, fmaf(db, i2f(d[2]), -mb * sx), acc[2]);
             }
             if (nb < m) {
-                const float dx = actd[nb * (K / 32) + blk], sx = i2f(asum[nb * (K / 32) + blk]);
+                const float dx = actd[nb * (K / 32) + blk], sx = i2f(sqb);
                 acc[1] = fmaf(dx, fmaf(da, i2f(d[1]), -ma * sx), acc[1]);
                 acc[3] = fmaf(dx, fmaf(db, i2f(d[3]), -mb * sx), acc[3]);
             }
         }
-        if (sb + 1 < NSB) { ra = na_; rb2 = nb_; }
+        if (sb + 1 < NSB) {
+            if (CX_MMA_PF) { ra = na_; rb2 = nb_; }
+            else { sbk_load<TY>(wa + (sb + 1) * BB, tig, ra); sbk_load<TY>(wb + (sb + 1) * BB, tig, rb2); }
+        }
     }
 }
 template <bool DOWN>
@@ -1183,16 +1198,6 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         actd[i] = xdg[(size_t)t * (KA / 32) + c];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
-        const uint4 v0 = ((const uint4*)act)[2 * i], v1 = ((const uint4*)act)[2 * i + 1];
-        int sx = 0;
-        sx = __dp4a((int)v0.x, 0x01010101, sx); sx = __dp4a((int)v0.y, 0x01010101, sx);
-        sx = __dp4a((int)v0.z, 0x01010101, sx); sx = __dp4a((int)v0.w, 0x01010101, sx);
-        sx = __dp4a((int)v1.x, 0x01010101, sx); sx = __dp4a((int)v1.y, 0x01010101, sx);
-        sx = __dp4a((int)v1.z, 0x01010101, sx); sx = __dp4a((int)v1.w, 0x01010101, sx);
-        asum[i] = sx;
-    }
-    __syncthreads();
     const int r0 = (blockIdx.x * 8 + warp) * 16;
     const int gq = lane >> 2, tig = lane & 3;
     const ExW& mw = DOWN ? (shared ? sg : g) : (shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u));
@@ -1224,12 +1229,12 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         }
     }
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_m(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+extern "C" __global__ void __launch_bounds__(256, CX_MMA_MINB) cx_moe_gu_m(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                               const unsigned char* xq, float* out, int T, int r16,
                                                               int fast, const unsigned* plan) {
     moe_mma_body<false>(g, u, sg, su, ids, xq, out, T, fast, plan);
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_down_m(ExW d, ExW sd, const unsigned* ids,
+extern "C" __global__ void __launch_bounds__(256, CX_MMA_MINB) cx_moe_down_m(ExW d, ExW sd, const unsigned* ids,
                                                                 const unsigned char* hq, float* out, int T, int r16,
                                                                 int fast, const unsigned* plan) {
     moe_mma_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
@@ -1246,7 +1251,7 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_m(ExW d, ExW sd, c
 #define MQ_KC 256
 extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, int nseg, const unsigned char* xq, int k,
                                                              float* out, int ostride, int T, int splits, float* part,
-                                                             int rows_total) {
+                                                             int rows_total, const float* xf) {
     __shared__ uint4 xs[64 * MQ_KC / 16];
     __shared__ float xds[64 * (MQ_KC / 32)];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -1260,13 +1265,61 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
     const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
     const float* xdb = (const float*)(xq + (size_t)XQ8_T * k);
     const int ks = k / splits, kb = blockIdx.y * ks;
+    if (ok && sg.type != 108) {
+        // F32 / BF16 segments (small ones: GDN beta / alpha): a plain dot a row and token at a
+        // time over this split's columns, from the f32 activations.
+        for (int r = 0; r < 16; r++) {
+            const unsigned char* w = (const unsigned char*)sg.w + (size_t)(row + r) * sg.row_bytes;
+            for (int t = 0; t < T; t++) {
+                const float* xr = xf + (size_t)t * k;
+                float a = 0.f;
+                for (int e = kb + lane; e < kb + ks; e += 32) {
+                    const float wv = sg.type == 0 ? ((const float*)w)[e] : bf2f(((const unsigned short*)w)[e]);
+                    a = fmaf(wv, xr[e], a);
+                }
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (lane == 0) {
+                    if (splits == 1) out[(size_t)t * ostride + sg.out_off + row + r] = a;
+                    else part[((size_t)blockIdx.y * T + t) * rows_total + growrow + r] = a;
+                }
+            }
+        }
+    }
+    if (ok && (sg.type == 12 || sg.type == 13)) {
+        // Q4_K / Q5_K segments (GDN's ssm_ba): the expert MMA tile, 8 tokens at a time, whole k;
+        // token group i in split i % splits (the other splits add zeros).
+        const unsigned char* wa = (const unsigned char*)sg.w + (size_t)(row + g) * sg.row_bytes;
+        const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
+        for (int t0 = 0; t0 < T; t0 += 8) {
+            const int m = min(8, T - t0);
+            float a4[4] = {0.f, 0.f, 0.f, 0.f};
+            if ((t0 / 8) % splits == (int)blockIdx.y && k == CX_HID) {
+                if (sg.type == 12) moe_mma_rows<12, false>(wa, wb, 0, m, xq + (size_t)t0 * k, xdb + (size_t)t0 * (k / 32), nullptr, a4);
+                else moe_mma_rows<13, false>(wa, wb, 0, m, xq + (size_t)t0 * k, xdb + (size_t)t0 * (k / 32), nullptr, a4);
+            }
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int t = t0 + 2 * tig + j;
+                if (t >= T) continue;
+                if (splits == 1) {
+                    out[(size_t)t * ostride + sg.out_off + row + g] = a4[j];
+                    out[(size_t)t * ostride + sg.out_off + row + g + 8] = a4[2 + j];
+                } else {
+                    float* pp = part + ((size_t)blockIdx.y * T + t) * rows_total + growrow + g;
+                    pp[0] = a4[j];
+                    pp[8] = a4[2 + j];
+                }
+            }
+        }
+    }
+    const bool mm = ok && sg.type == 108;
     float acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
     for (int k0 = kb; k0 < kb + ks; k0 += MQ_KC) {
         unsigned af[8][4];
         float dwa[8], dwb[8];
-        if (ok) {
+        if (mm) {
             #pragma unroll
             for (int st = 0; st < 8; st++) {
                 const int e = k0 + st * 32;
@@ -1288,7 +1341,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
             xds[i] = xdb[(size_t)t * (k / 32) + k0 / 32 + c];
         }
         __syncthreads();
-        if (!ok) continue;
+        if (!mm) continue;
         const unsigned char* xsb = (const unsigned char*)xs;
         #pragma unroll
         for (int st = 0; st < 8; st++) {
@@ -1310,7 +1363,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
             }
         }
     }
-    if (!ok) return;
+    if (!mm) return;
     #pragma unroll
     for (int nt = 0; nt < 8; nt++) {
         if (nt >= NT) break;
