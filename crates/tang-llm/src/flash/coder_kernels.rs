@@ -677,6 +677,11 @@ extern "C" __global__ void cx_moe_plan(const unsigned* ids, int T, int pbase, in
 // cx_moe_plan for many pairs (wide prefill windows, up to CX_NP): one block of 1024 threads,
 // an expert histogram, a prefix over the keys, then a scatter. Pairs within a group land in any
 // order, which can't change a result (each pair's dot is its own). Same plan layout.
+// An expert with more than CX_GCHUNK pairs gets one group per CX_GCHUNK of them (batch modules:
+// the shared expert, which every row routes to, would otherwise be one serial group of B pairs).
+#ifndef CX_GCHUNK
+#define CX_GCHUNK (1 << 30)
+#endif
 extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned* ids, int T, int pbase, int n, unsigned* plan) {
     __shared__ int cnt[CX_NE + 1], start[CX_NE + 1], gid[CX_NE + 1], fill[CX_NE + 1];
     __shared__ int ng;
@@ -692,7 +697,7 @@ extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned*
         for (int k = 0; k <= CX_NE; k++) {
             start[k] = at;
             gid[k] = g;
-            if (cnt[k] > 0) { plan[1 + g] = (unsigned)at; g++; }
+            for (int o = 0; o < cnt[k]; o += CX_GCHUNK) { plan[1 + g] = (unsigned)(at + o); g++; }
             at += cnt[k];
         }
         ng = g;
@@ -1037,9 +1042,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_gemm_dense(const Seg* segs,
 // activation formats as fe_gemv8 (int8 codes for quantized rows, f32 for F32/BF16 rows), so
 // it drops in for it; at T = 1 a 2048-row matrix gets 8192 warps instead of 1024.
 template <int T, int TY>
-__device__ __forceinline__ void dotk8(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+__device__ __forceinline__ void dotk8(const unsigned char* w, const unsigned char* xq, const float* xd, int k, int k0, int k1, float* acc) {
     const int lane = threadIdx.x & 31;
-    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
     for (int e0 = k0 + lane * 8; e0 < k1; e0 += 256) {
         int w0, w1;
         float dw, mw;
@@ -1078,9 +1082,8 @@ __device__ __forceinline__ void dotkf(const unsigned char* w, const float* x, in
 // Q8X: Q8_0 rows repacked at load (lossless): [k int8 codes][k / 32 f16 scales], so a lane
 // reads 16 codes with one aligned load. Type id 108. (k / Q) % 512 == 0.
 template <int T>
-__device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned char* xq, int k, int k0, int k1, float* acc) {
+__device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned char* xq, const float* xd, int k, int k0, int k1, float* acc) {
     const int lane = threadIdx.x & 31;
-    const float* xd = (const float*)(xq + (size_t)XQ8_T * k);
     const unsigned short* sc = (const unsigned short*)(w + k);
     // Two 512-wide steps a pass, both loads issued before either is used ((k1 - k0) % 1024 == 0
     // at Q <= 2 for k = 2048 / 4096).
@@ -1108,8 +1111,8 @@ __device__ __forceinline__ void dotq8x(const unsigned char* w, const unsigned ch
     }
 }
 template <int T, int Q>
-__device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
-    __shared__ float part[8][MAXT];
+__device__ void gemvk_core(const Seg* segs, int nseg, const float* x, const unsigned char* xq, const float* xd, int k, float* out, int ostride) {
+    __shared__ float part[8][T];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int j = warp / Q, q = warp % Q;
     int row = blockIdx.x * (8 / Q) + j, s = 0;
@@ -1125,17 +1128,17 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
         switch (sg.type) {
             case 30: dotkf<T, 30>(w, x, k, k0, k1, acc); break;
             case 0: dotkf<T, 0>(w, x, k, k0, k1, acc); break;
-            case 108: dotq8x<T>(w, xq, k, k0, k1, acc); break;
-            case 8: dotk8<T, 8>(w, xq, k, k0, k1, acc); break;
-            case 2: dotk8<T, 2>(w, xq, k, k0, k1, acc); break;
-            case 20: dotk8<T, 20>(w, xq, k, k0, k1, acc); break;
-            case 6: dotk8<T, 6>(w, xq, k, k0, k1, acc); break;
-            case 42: dotk8<T, 42>(w, xq, k, k0, k1, acc); break;
-            case 23: dotk8<T, 23>(w, xq, k, k0, k1, acc); break;
-            case 11: dotk8<T, 11>(w, xq, k, k0, k1, acc); break;
-            case 12: dotk8<T, 12>(w, xq, k, k0, k1, acc); break;
-            case 13: dotk8<T, 13>(w, xq, k, k0, k1, acc); break;
-            case 14: dotk8<T, 14>(w, xq, k, k0, k1, acc); break;
+            case 108: dotq8x<T>(w, xq, xd, k, k0, k1, acc); break;
+            case 8: dotk8<T, 8>(w, xq, xd, k, k0, k1, acc); break;
+            case 2: dotk8<T, 2>(w, xq, xd, k, k0, k1, acc); break;
+            case 20: dotk8<T, 20>(w, xq, xd, k, k0, k1, acc); break;
+            case 6: dotk8<T, 6>(w, xq, xd, k, k0, k1, acc); break;
+            case 42: dotk8<T, 42>(w, xq, xd, k, k0, k1, acc); break;
+            case 23: dotk8<T, 23>(w, xq, xd, k, k0, k1, acc); break;
+            case 11: dotk8<T, 11>(w, xq, xd, k, k0, k1, acc); break;
+            case 12: dotk8<T, 12>(w, xq, xd, k, k0, k1, acc); break;
+            case 13: dotk8<T, 13>(w, xq, xd, k, k0, k1, acc); break;
+            case 14: dotk8<T, 14>(w, xq, xd, k, k0, k1, acc); break;
             default: break;
         }
     }
@@ -1153,6 +1156,10 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
         out[(size_t)lane * ostride + segs[s].out_off + row] = v;
     }
 }
+template <int T, int Q>
+__device__ __forceinline__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) {
+    gemvk_core<T, Q>(segs, nseg, x, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride);
+}
 #define GEMVK_T(T) extern "C" __global__ void __launch_bounds__(256) cx_gemvk_t##T( \
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
     gemvk_body<T, 4>(segs, nseg, x, xq, k, out, ostride); } \
@@ -1166,6 +1173,20 @@ __device__ void gemvk_body(const Seg* segs, int nseg, const float* x, const unsi
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
     gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
+
+// Batch modules (CX_MAXT > 8): the same K-split GEMV over T rows of a wider window, the rows
+// starting at row t0 of the module's activations. The host passes x, xq (codes), xd (scales)
+// and out already offset to row t0. A row's sum is the narrow kernel's (same lanes, same
+// order, same warp split): T only sets how many rows a block carries.
+#if CX_MAXT > 8
+#define GEMVKB_T(Q, T) extern "C" __global__ void __launch_bounds__(256) cx_gemvkb##Q##_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, const float* xd, int k, float* out, int ostride) { \
+    gemvk_core<T, Q>(segs, nseg, x, xq, xd, k, out, ostride); }
+GEMVKB_T(1, 8) GEMVKB_T(1, 16) GEMVKB_T(1, 32)
+GEMVKB_T(2, 8) GEMVKB_T(2, 16) GEMVKB_T(2, 32)
+GEMVKB_T(4, 8) GEMVKB_T(4, 16) GEMVKB_T(4, 32)
+GEMVKB_T(8, 8) GEMVKB_T(8, 16) GEMVKB_T(8, 32)
+#endif
 
 // Rows of a window may belong to different sequences: row t is at position ROWS[t] of slot
 // ROWS[CX_MAXT + t], whose bf16 K/V caches for this layer are at ktab[slot] / vtab[slot].

@@ -147,6 +147,14 @@ pub trait ServeEngine {
     fn wide_rows(&self) -> usize {
         0
     }
+    /// Batch decode windows past `MAX_T` rows: build them (`rows` streams a window).
+    fn enable_batch_rows(&mut self, _rows: usize) -> Result<()> {
+        bail!("this engine has no batch windows")
+    }
+    /// The batch decode windows' width (0: none; decode then runs `MAX_T` rows a window).
+    fn batch_rows(&self) -> usize {
+        0
+    }
     /// [`prefill_slot`](Self::prefill_slot) through wide windows.
     fn prefill_slot_wide(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         self.prefill_slot(slot, ids)
@@ -327,6 +335,12 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn enable_batch_rows(&mut self, rows: usize) -> Result<()> {
+        super::coder::Coder::enable_batch(self, rows)
+    }
+    fn batch_rows(&self) -> usize {
+        super::coder::Coder::batch_rows(self)
     }
     fn enable_wide_rows(&mut self, rows: usize) -> Result<()> {
         super::coder::Coder::enable_wide(self, rows)
@@ -773,6 +787,18 @@ impl FlashServe {
                     ", no drafts"
                 }
             );
+            // Past MAX_T streams (no drafts): one batch window for every decoding stream.
+            if me.batch > MAX_T && !me.e.use_mtp() {
+                let rows = me.batch.next_multiple_of(32);
+                let t = Instant::now();
+                match me.e.enable_batch_rows(rows) {
+                    Ok(()) => eprintln!(
+                        "tang-llm: batch decode windows of {rows} rows built in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("tang-llm: no batch windows ({e}); {MAX_T} rows a window"),
+                }
+            }
             // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 2048; 0: off).
             let rows: usize = std::env::var("TANG_SERVE_WIDE")
                 .ok()

@@ -1538,20 +1538,40 @@ pub fn wide_check(args: &[String]) -> Result<()> {
 }
 
 /// `flash-batch-check` (qwen3next): is a sequence's output independent of the batch it decodes
-/// in? Up to 8 sequences (the prompt truncated by different amounts, so their positions differ)
-/// each decode `-n` greedy tokens alone, then all together in one batched step per token, with
-/// the batch order reversed every other step. Tokens and logits must be bitwise equal. Then
-/// decode speed at 1, 2, 4 and 8 sequences (tok/s aggregate and per stream).
+/// in? `TANG_BATCH_N` sequences (default 8; past 8 the batch module of
+/// [`Coder::enable_batch`] is built, 32 or 64 rows) — the prompt truncated by different
+/// amounts, so their positions differ — each decode `-n` greedy tokens alone, then all
+/// together in one batched step per token, with the batch order reversed every other step.
+/// Tokens and logits must be bitwise equal. Then decode speed at 1, 2, 4, … up to N sequences
+/// (tok/s aggregate and per stream). `TANG_BATCH_CTX=8192`: the speed runs first prefill
+/// every sequence to about that many tokens (the prompt repeated, wide prefill windows).
 pub fn batch_check(args: &[String]) -> Result<()> {
-    let a = parse(args)?;
+    let mut a = parse(args)?;
     let ids = prompt_ids(&a)?;
     ensure!(ids.len() > 32, "need a longer prompt");
+    let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let nb = env_n("TANG_BATCH_N").unwrap_or(8).clamp(1, 256);
+    let ctx = env_n("TANG_BATCH_CTX").unwrap_or(0);
+    let steps = a.n.max(8);
+    if a.opts.max_ctx < ctx.max(ids.len()) + 2 * steps + 64 {
+        a.opts.max_ctx = (ctx.max(ids.len()) + 2 * steps + 64).next_multiple_of(1024);
+    }
     let mut e = load_coder(&a)?;
     ensure!(e.temperature == 0.0, "batch-check is greedy");
+    if nb > super::coder::MAX_T {
+        let t0 = std::time::Instant::now();
+        e.enable_batch(nb.next_multiple_of(32))?;
+        eprintln!(
+            "batch module: {} rows ({:.1} s)",
+            e.batch_rows(),
+            t0.elapsed().as_secs_f64()
+        );
+    }
     let v = e.hp.n_vocab;
-    let nb = super::coder::MAX_T.min(8);
-    let seqs: Vec<Vec<u32>> = (0..nb).map(|i| ids[..ids.len() - 3 * i].to_vec()).collect();
-    let steps = a.n.max(8);
+    let half = ids.len() / 2;
+    let seqs: Vec<Vec<u32>> = (0..nb)
+        .map(|i| ids[..ids.len() - (3 * i) % half].to_vec())
+        .collect();
     // TANG_CODER_MOE_SWEEP=0,2,4,8: repeat everything for each expert-kernel variant on one load.
     // Entries are a variant, with `n` for SiLU unfused (`TANG_CODER_FUSE_SILU=0`): "2,4,4n".
     let sweep: Vec<Option<(usize, bool)>> = match std::env::var("TANG_CODER_MOE_SWEEP") {
@@ -1697,12 +1717,33 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             ok &= mok;
         }
         // Speed.
-        for b in [1usize, 2, 4, 8].into_iter().filter(|&b| b <= nb) {
+        if ctx > 0 && e.wide_rows() == 0 {
+            e.enable_wide(256)?;
+        }
+        let mut sizes: Vec<usize> = [1usize, 2, 4, 8, 16, 32, 64, 128, 256]
+            .into_iter()
+            .filter(|&b| b <= nb)
+            .collect();
+        if !sizes.contains(&nb) {
+            sizes.push(nb);
+        }
+        for b in sizes {
             let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
             let mut next: Vec<u32> = Vec::new();
+            let tp = std::time::Instant::now();
             for (i, &s) in slots.iter().enumerate() {
-                next.push(e.prefill_slot(s, &seqs[i])?);
+                let p: Vec<u32> = if ctx > seqs[i].len() {
+                    seqs[i].iter().copied().cycle().take(ctx - i % 64).collect()
+                } else {
+                    seqs[i].clone()
+                };
+                next.push(e.prefill_wide(s, &p)?);
             }
+            let ctx_at = e.slot_tokens(slots[0]).len();
+            eprintln!(
+                "batch {b}: prefilled to ~{ctx_at} tokens in {:.1} s",
+                tp.elapsed().as_secs_f64()
+            );
             let run = |e: &mut Coder, next: &mut Vec<u32>, n: usize| -> Result<()> {
                 for _ in 0..n {
                     let rows: Vec<(usize, u32)> = slots
@@ -1715,15 +1756,19 @@ pub fn batch_check(args: &[String]) -> Result<()> {
                 Ok(())
             };
             run(&mut e, &mut next, 4)?; // capture the graphs
+            e.prof_reset();
             let t0 = std::time::Instant::now();
             run(&mut e, &mut next, steps)?;
             let dt = t0.elapsed().as_secs_f64();
             let agg = (b * steps) as f64 / dt;
             println!(
-                "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream",
+                "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream (context ~{ctx_at})",
                 dt * 1e3 / steps as f64,
                 agg / b as f64
             );
+            if let Some(r) = e.prof_report() {
+                println!("profile at batch {b} ({steps} steps):\n{r}");
+            }
             for &s in &slots {
                 e.free_slot(s);
             }
