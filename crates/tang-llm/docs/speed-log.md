@@ -178,6 +178,32 @@ Stage sweep on that H200 pod (`TANG_CODER_STAGES=1`: each stage alone in a CUDA 
 moe combine+norm 214, attention split-K 207 (154 GB/s), router 176, head 174, post-mixer norm
 166, attention in/out 260. The stages sum to 4,461 µs, so launch gaps are ~8% of the window.
 
+### Batch decode past 8 rows (2026-11-03, b957a2a9+, H200, explain prompt, ~1.2k context)
+
+`TANG_BATCH_N=64 flash-batch-check`: bitwise PASS at 64 sequences (tokens and logits equal to
+each sequence alone). Graphs, 16 steps:
+
+| B | ms a step | tok/s aggregate | tok/s a stream |
+|---|---|---|---|
+| 1 | 4.03 | 248 | 248 |
+| 2 | 4.73 | 423 | 211 |
+| 4 | 6.49 | 616 | 154 |
+| 8 | 9.86 | 812 | 101 |
+| 16 | 21.99 | 728 | 45 |
+| 32 | 40.53 | 790 | 25 |
+| 64 | 73.90 | 866 | 14 |
+
+Past 8 rows the step grows linearly with B. Eager profile at B=64 (ms a step): expert gate|up
+23.6 (~0.46 GB a layer of distinct experts in 0.49 ms: ~0.94 TB/s), expert down 24.3 (~0.46
+TB/s), GDN in 6.8, GDN conv+step 4.3, GDN out 4.1, attention split-K 2.6, head 1.9, attention
+in 1.7, router 1.6, attention out 1.3. The grouped expert kernels (`cx_moe_gu_g` /
+`cx_moe_down_g`, ~1.75 tokens an expert) and the 32-row K-split GEMVs (`cx_gemvkb`, L2-bound
+re-reading activations per weight row) are the walls.
+
+- **Tensor-core GEMMs for batch windows** (`TANG_CODER_BGEMM=1`: `cx_gemm_dense` +
+  `cx_moe_gemm_*`, the prefill kernels): slower at every B past 8 (B=64: 132.5 vs 78.3 ms
+  eager) and not bitwise. They're tiled for 64 tokens an expert; decode has ~2.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is

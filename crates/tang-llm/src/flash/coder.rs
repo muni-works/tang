@@ -2291,7 +2291,14 @@ impl Coder {
     }
 
     fn kname(&self, f: Fun) -> &'static str {
-        let k = &self.k;
+        let n = self.kname_in(&self.k, f);
+        match (n, self.wide_on()) {
+            ("other", Some(w)) => self.kname_in(&w.k, f),
+            _ => n,
+        }
+    }
+
+    fn kname_in(&self, k: &Kern, f: Fun) -> &'static str {
         [
             (k.norm_q8, "norm_q8"),
             (k.route, "route"),

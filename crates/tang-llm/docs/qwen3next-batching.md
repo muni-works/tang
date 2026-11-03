@@ -90,5 +90,22 @@ pattern exists in the codebase.
 
 Correctness gates at every milestone: batch-check, parity and spec-test.
 
+## Status (2026-11-03): batch-64 windows
+
+`Coder::enable_batch(rows)` builds a third module (rows 32..256, next to narrow and wide) and
+`decode_batch` runs up to that many sequences as one window: K-split GEMVs 32 rows a launch
+(`cx_gemvkb`, the narrow `cx_gemvk`'s arithmetic), grouped experts on by default (big groups —
+the shared expert — split into groups of 8), multi-segment GDN, split-K attention for every row,
+head and argmax for every row. `MAX_SLOTS` is 128. `flash serve --batch N` with no drafts groups
+plain decode by the batch width. `flash-batch-check` (`TANG_BATCH_N`, `TANG_BATCH_CTX`) passes
+**bitwise** at 64 sequences.
+
+Speed doesn't follow: 866 tok/s aggregate at 64 (812 at 8), linear in B past 8. The expert
+kernels read distinct experts at ~0.5–0.9 TB/s (target ~2.4) and the 32-row GEMVs are L2-bound.
+Numbers in `speed-log.md`. Next: a bandwidth-bound grouped expert kernel for 1–2 tokens an expert
+(stream weights once, no per-block staging stall; down is the worse half), and dense layers
+that don't re-read activations per weight row (activation tile in shared memory, or an MMA path
+with a tolerance gate).
+
 **Effort:** about 1.5–2 weeks. M1 is mostly plumbing. M2 is the one hard kernel. M3 is
 scheduler work.
