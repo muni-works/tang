@@ -11,6 +11,7 @@ pub mod cli;
 pub mod coder;
 #[cfg(feature = "cuda")]
 pub mod coder_kernels;
+pub mod coder_mtp;
 pub mod deepseek;
 #[cfg(feature = "cuda")]
 pub mod engine;

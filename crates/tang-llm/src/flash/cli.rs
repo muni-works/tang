@@ -1999,3 +1999,189 @@ pub fn bench_panel(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `flash-coder-dump <trunk.gguf> --mtp SIDECAR (--prompts FILE.jsonl | --prompt-dir DIR)
+/// --out DIR [-n 2000] [--k 3] [--chunk 8] [--max-ctx 8192] [--stop 151645,151643]`:
+/// MTP distillation data for the Coder engine. One load; per prompt `i` (chat template,
+/// greedy, drafting with the sidecar's `k`-step chain), `OUT/data/pNNN` (generated rows:
+/// `h.f16`, `ids.u32`, the engine's drafts `draft.u32`, `prompt.txt`, `done`) and
+/// `OUT/prefix/pNNN` (every prompt row, for `flash-mtp-train --prefix-data`). Completed
+/// prompts are skipped, so a killed run resumes. `flash-mtp-train` holds out `pNNN % 10 == 0`.
+pub fn coder_dump(args: &[String]) -> Result<()> {
+    let usage = "flash-coder-dump <trunk.gguf> --mtp SIDECAR (--prompts FILE.jsonl | --prompt-dir DIR) --out DIR [-n 2000] [--k 3] [--chunk 8] [--max-ctx 8192] [--stop 151645,151643] [--eval [--held-out]]";
+    let mut it = args.iter();
+    let trunk = PathBuf::from(it.next().context(usage)?);
+    let (mut mtp, mut out, mut prompts) = (None, None, Vec::<String>::new());
+    let (mut n, mut k, mut chunk, mut max_ctx) = (2000usize, 3usize, 8usize, 8192usize);
+    let mut stop = vec![151_645u32, 151_643];
+    let (mut eval, mut held_out) = (false, false);
+    while let Some(x) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{x} needs a value"));
+        match x.as_str() {
+            "--mtp" => mtp = Some(PathBuf::from(val()?)),
+            "--eval" => eval = true,
+            "--held-out" => held_out = true,
+            "--out" => out = Some(PathBuf::from(val()?)),
+            "-n" => n = val()?.parse()?,
+            "--k" => k = val()?.parse()?,
+            "--chunk" => chunk = val()?.parse()?,
+            "--max-ctx" => max_ctx = val()?.parse()?,
+            "--stop" => {
+                stop = val()?
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<Result<_, _>>()?
+            }
+            "--prompts" => {
+                for line in std::fs::read_to_string(val()?)?.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let v: serde_json::Value = serde_json::from_str(line)?;
+                    prompts.push(match &v {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v["prompt"]
+                            .as_str()
+                            .context("jsonl lines: a string or {\"prompt\": ...}")?
+                            .to_string(),
+                    });
+                }
+            }
+            "--prompt-dir" => {
+                let mut ps: Vec<_> = std::fs::read_dir(val()?)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_file())
+                    .collect();
+                ps.sort();
+                for p in ps {
+                    prompts.push(std::fs::read_to_string(p)?);
+                }
+            }
+            _ => bail!("unknown argument {x}: {usage}"),
+        }
+    }
+    let mtp = mtp.context(usage)?;
+    let out = match out {
+        Some(o) => o,
+        None if eval => PathBuf::new(),
+        None => bail!("{usage}"),
+    };
+    ensure!(!prompts.is_empty(), "no prompts: {usage}");
+    ensure!((1..MAX_T).contains(&k), "--k must be 1..{}", MAX_T - 1);
+    let mut e = Coder::load(
+        &trunk,
+        CoderOpts {
+            max_ctx,
+            mtp: Some(mtp),
+        },
+    )?;
+    eprintln!("{}", e.load_report);
+    e.temperature = 0.0;
+    e.mtp_steps = k;
+    e.warm()?;
+    let g = crate::gguf::Gguf::open(&trunk)?;
+    let tok = super::tokenize::FlashTokenizer::from_gguf(&g)?;
+    let (mut rows, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
+    // Per draft depth: (proposed, accepted); windows and tokens for tokens/window.
+    let mut by_depth = vec![(0usize, 0usize); k];
+    let (mut windows, mut tokens) = (0usize, 0usize);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let name = format!("p{i:03}");
+        if held_out && i % 10 != 0 {
+            continue;
+        }
+        let (data, prefix) = (out.join("data").join(&name), out.join("prefix").join(&name));
+        if !eval && data.join("done").exists() && prefix.join("done").exists() {
+            continue;
+        }
+        for d in [&data, &prefix] {
+            if !eval && d.exists() {
+                std::fs::remove_dir_all(d)?;
+            }
+        }
+        let ids = tok.encode(&tok.chat(prompt, None)?)?;
+        // The chain's K/V runs `k + 1` past the last row; keep it inside the context.
+        let room = max_ctx.saturating_sub(ids.len() + 2 * MAX_T + k + 2);
+        if room < 64 {
+            eprintln!(
+                "{name}: prompt of {} tokens too long for --max-ctx {max_ctx}; skipped",
+                ids.len()
+            );
+            continue;
+        }
+        let limit = n.min(room);
+        e.reset();
+        e.use_mtp = true;
+        if !eval {
+            e.start_train_dump(super::coder_mtp::TrainDump::create(
+                &data,
+                &prefix,
+                ids.len() - 1,
+                &stop,
+            )?);
+        }
+        let t0 = Instant::now();
+        let mut cur = e.prefill(&ids, chunk, None)?;
+        let mut gen = vec![cur];
+        while gen.len() < limit && !stop.contains(&cur) {
+            let drafts: Vec<u32> = e.mtp_last.iter().take(k).map(|d| d.0).collect();
+            let kept = e.verify(cur, &drafts)?;
+            proposed += drafts.len();
+            accepted += kept.len() - 1;
+            for (j, b) in by_depth.iter_mut().enumerate().take(drafts.len()) {
+                b.0 += 1;
+                b.1 += usize::from(kept.len() - 1 > j);
+            }
+            windows += 1;
+            tokens += kept.len();
+            cur = *kept.last().unwrap();
+            gen.extend_from_slice(&kept);
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        if eval {
+            eprintln!(
+                "{name}: prompt {} + {} generated, {secs:.1} s; running draft acceptance {:.3}",
+                ids.len(),
+                gen.len(),
+                accepted as f64 / proposed.max(1) as f64
+            );
+            continue;
+        }
+        let r = e.finish_train_dump()?;
+        rows += r;
+        std::fs::write(data.join("prompt.txt"), prompt)?;
+        std::fs::write(
+            data.join("gen.txt"),
+            gen.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )?;
+        std::fs::write(prefix.join("done"), b"")?;
+        std::fs::write(data.join("done"), b"")?;
+        eprintln!(
+            "{name}: prompt {} + {} generated, {r} rows, {secs:.1} s; running draft acceptance {:.3}",
+            ids.len(),
+            gen.len(),
+            accepted as f64 / proposed.max(1) as f64
+        );
+    }
+    // Per depth j: P(draft j accepted | drafts 1..j-1 accepted), and cumulative from depth 1.
+    let summary = serde_json::json!({
+        "k": k,
+        "windows": windows,
+        "tokens": tokens,
+        "tokens_per_window": tokens as f64 / windows.max(1) as f64,
+        "by_depth": by_depth.iter().enumerate().map(|(j, &(p, a))| serde_json::json!({
+            "depth": j + 1,
+            "proposed": p,
+            "accepted": a,
+            "cumulative": a as f64 / windows.max(1) as f64,
+            "conditional": if j == 0 { a as f64 / p.max(1) as f64 }
+                else { a as f64 / by_depth[j - 1].1.max(1) as f64 },
+        })).collect::<Vec<_>>(),
+    });
+    println!("{summary}");
+    eprintln!("dumped {rows} rows to {}", out.display());
+    Ok(())
+}

@@ -16,11 +16,35 @@ pub struct Weight {
     pub rows: usize,
     pub cols: usize,
 }
+/// Which MTP layer the sidecar holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// DeepSeek-style `blk.{L}.nextn.*` with hyper-connections (Flash-Next).
+    DeepSeek,
+    /// Qwen3-Next `mtp.*` (`scripts/qwen3next_mtp_sidecar.py`) for the Coder engine: plain
+    /// residual, `fc([enorm(emb) | hnorm(h)])`, chained on the `mtp.norm` output.
+    Coder,
+}
+impl Kind {
+    /// The MTP cell of depth `d` (1-based) for the hidden row at position `p` runs at
+    /// `p + d - 1 + pos_offset()`: DeepSeek's at `h`'s own position, the Coder engine's at the
+    /// position of the token it embeds (`mtp_pass` stages `pos + 1`).
+    pub fn pos_offset(self) -> usize {
+        match self {
+            Kind::DeepSeek => 0,
+            Kind::Coder => 1,
+        }
+    }
+}
 pub struct Weights {
+    pub kind: Kind,
+    /// Tensor-name prefix of the MTP layer (`blk.{L}.` or `mtp.`).
+    pub prefix: String,
     pub expert_q4: bool,
+    /// Dequantized routed experts kept (matrices).
+    pub cache_cap: usize,
     pub main: Gguf,
     pub mtp: Gguf,
-    pub layer: usize,
     pub vocab: Vec<u32>,
     pub dense: BTreeMap<String, Weight>,
     pub params: BTreeMap<String, Parameter<f32>>,
@@ -32,10 +56,26 @@ impl Weights {
     pub fn open(main: &Path, mtp: &Path, lr: f64, vocab_lo: usize) -> Result<Self> {
         let main = Gguf::open(main)?;
         let mtp = Gguf::open(mtp)?;
-        let layer = mtp.meta_u64("qwen4exp.block_count")? as usize - 1;
-        let prefix = format!("blk.{layer}.");
+        let kind = if mtp.get("mtp.fc.weight").is_some() {
+            Kind::Coder
+        } else {
+            Kind::DeepSeek
+        };
+        let prefix = match kind {
+            Kind::Coder => {
+                ensure!(
+                    vocab_lo == 0,
+                    "the Coder MTP trains on the full vocabulary (--vocab 0)"
+                );
+                "mtp.".to_string()
+            }
+            Kind::DeepSeek => {
+                let layer = mtp.meta_u64("qwen4exp.block_count")? as usize - 1;
+                format!("blk.{layer}.")
+            }
+        };
         ensure!(
-            mtp.get(&format!("{prefix}nextn.eh_proj.weight")).is_some(),
+            kind == Kind::Coder || mtp.get(&format!("{prefix}nextn.eh_proj.weight")).is_some(),
             "not an MTP file"
         );
         let mut dense = BTreeMap::new();
@@ -99,10 +139,14 @@ impl Weights {
             },
         );
         Ok(Self {
-            expert_q4: true,
+            kind,
+            prefix,
+            // The Coder engine serves the sidecar's Q8_0 experts as they are (`upload_experts`);
+            // Flash-Next requantizes them to Q4_0. 1536 matrices = all 512 Coder experts.
+            expert_q4: kind == Kind::DeepSeek,
+            cache_cap: if kind == Kind::Coder { 1536 } else { 192 },
             main,
             mtp,
-            layer,
             vocab,
             dense,
             params,
@@ -127,15 +171,28 @@ impl Weights {
         if let Some(v) = self.cache.get(&key) {
             return Ok(v.clone());
         }
-        let ti = self.mtp.info(&format!("blk.{}.{name}", self.layer))?;
+        let ti = self.mtp.info(&format!("{}{name}", self.prefix))?;
         // Match the default deployed Q8_0 -> Q4_0 routed expert weights, not a different drafter.
         ensure!(ti.ty == GgmlType::Q8_0, "MTP experts must be Q8_0");
         let width = ti.dims[0] as usize * ti.dims[1] as usize;
         let bytes = width / 32 * 34;
         let raw = &self.mtp.bytes(ti)[e * bytes..(e + 1) * bytes];
-        if !self.expert_q4 {
-            return Ok(Arc::new(self.mtp.expert(ti, e)?));
+        let values = if self.expert_q4 {
+            self.q4(raw, width)?
+        } else {
+            self.mtp.expert(ti, e)?
+        };
+        let value = Arc::new(values);
+        self.cache.insert(key.clone(), value.clone());
+        self.lru.push_back(key);
+        // 192 matrices = 64 expert triplets (~1 GB), in addition to tensors held by this step's tape.
+        while self.lru.len() > self.cache_cap {
+            let old = self.lru.pop_front().unwrap();
+            self.cache.remove(&old);
         }
+        Ok(value)
+    }
+    fn q4(&self, raw: &[u8], width: usize) -> Result<Vec<f32>> {
         let mut values = Vec::with_capacity(width);
         for block in raw.chunks_exact(34) {
             let mut f = [0.0; 32];
@@ -152,15 +209,7 @@ impl Weights {
                     .map(|x| (((x * id + 8.5) as i32).clamp(0, 15) - 8) as f32 * rd),
             );
         }
-        let value = Arc::new(values);
-        self.cache.insert(key.clone(), value.clone());
-        self.lru.push_back(key);
-        // 192 matrices = 64 expert triplets (~1 GB), in addition to tensors held by this step's tape.
-        while self.lru.len() > 192 {
-            let old = self.lru.pop_front().unwrap();
-            self.cache.remove(&old);
-        }
-        Ok(value)
+        Ok(values)
     }
     pub fn update(
         &mut self,
@@ -211,7 +260,7 @@ impl Weights {
         let result = (|| -> Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).open(&temp)?;
             for (n, p) in &self.params {
-                let ti = self.mtp.info(&format!("blk.{}.{n}", self.layer))?;
+                let ti = self.mtp.info(&format!("{}{n}", self.prefix))?;
                 let bytes = encode(ti.ty, p.data.data())?;
                 ensure!(bytes.len() as u64 == ti.nbytes, "export length for {n}");
                 f.seek(SeekFrom::Start(ti.offset))?;
@@ -220,7 +269,7 @@ impl Weights {
             f.sync_all()?;
             let loaded = Gguf::open(&temp)?;
             for (n, p) in &self.params {
-                let ti = loaded.info(&format!("blk.{}.{n}", self.layer))?;
+                let ti = loaded.info(&format!("{}{n}", self.prefix))?;
                 let values = loaded.dequantize(ti)?;
                 ensure!(
                     values.len() == p.data.numel() && values.iter().all(|v| v.is_finite()),
