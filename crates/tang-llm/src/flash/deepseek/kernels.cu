@@ -1895,6 +1895,8 @@ DS_MOE_KS(3)
 // The shared expert's row items when its gate/up is this rank's slice of `rows` (8 a warp tile).
 // `shs` (h's row stride, the full intermediate) places a slice's h rows where the full
 // expert's would be, so the down's K slice reads them at the same pitch.
+// The shared down stays f32 (summed with the routed y, then one bf16 rounding): a K slice's
+// partial can't take the full expert's rounding before the all-reduce, so neither does the full.
 __device__ __forceinline__ int moe_sh_nbr(int rows, int S) { return (rows + 8 * (8 / S) - 1) / (8 * (8 / S)); }
 #define DS_MOE_KS_SH(F, SF)                                                                                    \
     extern "C" __global__ void __launch_bounds__(256, KS_MOE_MINB) ds_moe_ks_gu_f##F##_s##SF(                              \
@@ -1919,7 +1921,7 @@ __device__ __forceinline__ int moe_sh_nbr(int rows, int S) { return (rows + 8 * 
         float* part, int S, int nbr, DsW s2, int t, int n, int shs) { DS_PDL_ENTRY                              \
         if (t > 0 && blockIdx.y == gridDim.y - 1) {                                                             \
             lin_mma<SF, 0>(s2, s2, hc + (long long)n * shs, hsc + (long long)n * (shs / 32),                    \
-                           part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, shs);               \
+                           part + (long long)n * s2.rows, t, 0, 0, 0.f, S, 1, nbr, 0, 0, 0, shs);               \
             return;                                                                                             \
         }                                                                                                       \
         int e = elist[blockIdx.y];                                                                              \
@@ -2007,7 +2009,7 @@ __device__ __forceinline__ void moe_kp_range(int su, int units, int cs, int cr, 
             prev = sidx;                                                                                        \
             if (sidx < 0) {                                                                                     \
                 lin_mma<SF, 0>(s2, s2, hc + (long long)n * shs, hsc + (long long)n * (shs / 32),                \
-                               part + (long long)n * s2.rows, t, 1, 0, 0.f, S, 1, nbr, 0, 0, 0, shs, 0, item,   \
+                               part + (long long)n * s2.rows, t, 0, 0, 0.f, S, 1, nbr, 0, 0, 0, shs, 0, item,   \
                                staged);                                                                         \
                 continue;                                                                                       \
             }                                                                                                   \
