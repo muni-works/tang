@@ -76,6 +76,33 @@ pub struct Settings {
     pub profile: Option<PathBuf>,
 }
 
+/// A request's (temperature, top-k, top-p, presence penalty): what it names, the mode's
+/// defaults for the rest.
+fn request_sampling(mode: SamplingMode, temp0: f32, req: &Request) -> (f32, usize, f32, f32) {
+    let thinking = req.think != Some(false);
+    let card = match (mode, thinking) {
+        (SamplingMode::Greedy, _) => (temp0, 0usize, 1.0f32, 0.0f32),
+        (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
+        (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
+    };
+    let temp = if req.temperature_set {
+        req.sampling.temperature.max(0.0)
+    } else {
+        card.0
+    };
+    let top_k = if req.top_k_set {
+        req.sampling.top_k
+    } else {
+        card.1
+    };
+    let top_p = if req.top_p_set {
+        req.sampling.top_p
+    } else {
+        card.2
+    };
+    (temp, top_k, top_p, req.presence_penalty.unwrap_or(card.3))
+}
+
 /// What the server needs from an engine: the Flash-Next [`Engine`] or the qwen3next
 /// [`Coder`](super::coder::Coder).
 pub trait ServeEngine {
@@ -138,6 +165,20 @@ pub trait ServeEngine {
     }
     fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         bail!("this engine has no sequence slots")
+    }
+    /// Per-row sampling in slot windows: turn it on (startup, `--batch`).
+    fn enable_row_sampling(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Slot `slot`'s sampling for its next request. Engines without per-row sampling refuse a
+    /// sampled one rather than run it greedy.
+    fn set_slot_sampling(&mut self, _slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        ensure!(
+            !s.sampled(),
+            "this engine's batched windows are greedy: temperature {} isn't supported with --batch",
+            s.temperature
+        );
+        Ok(())
     }
     /// Wide prefill windows for sequence slots: build them (`rows` tokens a window).
     fn enable_wide_rows(&mut self, _rows: usize) -> Result<()> {
@@ -335,6 +376,12 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn enable_row_sampling(&mut self) -> Result<()> {
+        super::coder::Coder::enable_row_sampling(self)
+    }
+    fn set_slot_sampling(&mut self, slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        super::coder::Coder::set_slot_sampling(self, slot, s)
     }
     fn enable_batch_rows(&mut self, rows: usize) -> Result<()> {
         super::coder::Coder::enable_batch(self, rows)
@@ -597,6 +644,10 @@ fn hash(ids: &[u32]) -> u64 {
 }
 
 impl FlashServe {
+    fn request_sampling(&self, req: &Request) -> (f32, usize, f32, f32) {
+        request_sampling(self.sampling, self.temp, req)
+    }
+
     pub fn load(s: &Settings) -> Result<Self> {
         let t = Instant::now();
         let saved = s.disk.as_ref().map(|d| d.join(ROUTING));
@@ -778,8 +829,9 @@ impl FlashServe {
                 "--batch needs an engine with sequence slots (qwen3next)"
             );
             me.batch = s.batch.min(me.e.max_slots() - 1);
+            me.e.enable_row_sampling()?;
             eprintln!(
-                "tang-llm: continuous batching: up to {} requests at once (greedy{})",
+                "tang-llm: continuous batching: up to {} requests at once (per-row sampling{})",
                 me.batch,
                 if me.e.use_mtp() {
                     ", MTP drafts"
@@ -1371,28 +1423,7 @@ impl FlashServe {
             .unwrap_or(usize::MAX)
             .min(self.ctx - ids.len() - 1)
             .max(1);
-        let thinking = req.think != Some(false);
-        let card = match (self.sampling, thinking) {
-            (SamplingMode::Greedy, _) => (self.temp, 0usize, 1.0f32, 0.0f32),
-            (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
-            (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
-        };
-        let temp = if req.temperature_set {
-            req.sampling.temperature.max(0.0)
-        } else {
-            card.0
-        };
-        let top_k = if req.top_k_set {
-            req.sampling.top_k
-        } else {
-            card.1
-        };
-        let top_p = if req.top_p_set {
-            req.sampling.top_p
-        } else {
-            card.2
-        };
-        let presence = req.presence_penalty.unwrap_or(card.3);
+        let (temp, top_k, top_p, presence) = self.request_sampling(req);
         self.e.set_sampling(temp, req.sampling.seed as u32);
         if let Some(sp) = self.e.sampler_mut() {
             // top-k 0 (off) keeps the 64 best: the sampler's bound.

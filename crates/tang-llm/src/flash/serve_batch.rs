@@ -13,8 +13,10 @@
 //!   `MAX_T` rows a window). While any stream is decoding, prefill gets `PREFILL_SLICE` tokens a
 //!   chunk and only as much GPU time as decode has had since, so decoders keep about half the
 //!   GPU instead of crawling at a token per prefill chunk.
-//! - **Greedy.** Batched windows sample greedily until the engine has per-row sampling; a
-//!   request that asks for a temperature is logged and runs greedy.
+//! - **Sampling.** Each stream samples with its own temperature / top-k / top-p / seed /
+//!   presence penalty (the engine's per-row sampler; greedy rows are the plain argmax). A
+//!   sampled stream takes no MTP drafts (verification is greedy). An engine without per-row
+//!   sampling refuses a sampled request instead of running it greedy.
 //! - No drafts in batched windows yet (per-slot verify is engine work still to come).
 
 use super::{FlashServe, Memo};
@@ -135,6 +137,8 @@ pub(super) struct Stream {
     prefill_s: f64,
     decode_from: Option<Instant>,
     prefill_only: bool,
+    /// Sampled (temperature > 0): no drafts.
+    sampled: bool,
 }
 
 impl FlashServe {
@@ -258,13 +262,22 @@ impl FlashServe {
             ids.len(),
             self.ctx
         );
-        if req.temperature_set && req.sampling.temperature > 0.0 {
-            eprintln!(
-                "tang-llm: batched windows are greedy; ignoring temperature {}",
-                req.sampling.temperature
-            );
-        }
+        let (temperature, top_k, top_p, presence) = self.request_sampling(req);
+        let samp = crate::flash::sampler::RowSampling {
+            temperature,
+            top_k,
+            top_p,
+            seed: (req.sampling.seed ^ (req.sampling.seed >> 32)) as u32,
+            presence,
+        };
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        // An engine without per-row sampling refuses a sampled request: release the slot.
+        if let Err(e) = self.e.set_slot_sampling(slot, samp) {
+            if let Some(sl) = self.slots.iter_mut().find(|x| x.id == slot) {
+                sl.busy = false;
+            }
+            return Err(e);
+        }
         let mut marks = self.marks(&ids, &text);
         marks.retain(|&(p, _)| p > reused);
         let limit = req
@@ -304,6 +317,7 @@ impl FlashServe {
             prefill_s: 0.0,
             decode_from: None,
             prefill_only: req.prefill_only,
+            sampled: samp.sampled(),
         }))
     }
 
@@ -483,7 +497,7 @@ impl FlashServe {
                 .iter()
                 .map(|&i| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    if !mtp {
+                    if !mtp || s.sampled {
                         return Vec::new();
                     }
                     let room = s.limit.saturating_sub(s.out.len() + 1);

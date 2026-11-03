@@ -1567,6 +1567,12 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             t0.elapsed().as_secs_f64()
         );
     }
+    // TANG_BATCH_ROWSAMP=1: with the per-row sampler built (every row greedy): its kernels run
+    // after the argmax and must leave greedy rows bitwise alone.
+    if std::env::var("TANG_BATCH_ROWSAMP").is_ok_and(|v| v == "1") {
+        e.enable_row_sampling()?;
+        println!("per-row sampler on (all rows greedy)");
+    }
     let v = e.hp.n_vocab;
     let half = ids.len() / 2;
     let seqs: Vec<Vec<u32>> = (0..nb)
@@ -2107,5 +2113,173 @@ pub fn bench_panel(args: &[String]) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `flash-sample-check` (qwen3next): per-row sampling in slot windows. `TANG_BATCH_N` sequences
+/// (default 64; past 8 the batch module), a quarter greedy and the rest sampled with their own
+/// seeds and settings (top-k/top-p, whole-vocabulary Gumbel-max, presence penalty), each
+/// decoding `-n` tokens alone (one-row windows) and then all together (order reversed every
+/// other step). Gates:
+/// - determinism: a sampled sequence's tokens alone equal its tokens in the batch (bitwise
+///   when the batch windows are bitwise, `N <= 8`; past that, the batch-check tolerance bar of
+///   99% agreement given the same history, since tensor-core batch windows move logits by ~1e-3);
+/// - reproducible: the batch run repeated gives identical tokens;
+/// - greedy rows in the mixed batch equal a plain greedy batch's (row sampler leaves them alone);
+/// - temperature 1 with top-k 1 is greedy, token for token (alone);
+/// - temperature 1.5 over the whole vocabulary differs from greedy, and two seeds differ.
+pub fn sample_check(args: &[String]) -> Result<()> {
+    use super::sampler::RowSampling;
+    let mut a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    ensure!(ids.len() > 32, "need a longer prompt");
+    let nb = std::env::var("TANG_BATCH_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(2, 256);
+    let steps = a.n.max(8);
+    if a.opts.max_ctx < ids.len() + 2 * steps + 64 {
+        a.opts.max_ctx = (ids.len() + 2 * steps + 64).next_multiple_of(1024);
+    }
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "sample-check needs the engine greedy");
+    if nb > super::coder::MAX_T {
+        e.enable_batch(nb.next_multiple_of(32))?;
+    }
+    e.enable_row_sampling()?;
+    // TANG_BATCH_ALL=1: one-row steps through the batch module too (`Coder::batch_all`).
+    e.batch_all = std::env::var("TANG_BATCH_ALL").is_ok_and(|v| v == "1");
+    let half = ids.len() / 2;
+    let seqs: Vec<Vec<u32>> = (0..nb)
+        .map(|i| ids[..ids.len() - (3 * i) % half].to_vec())
+        .collect();
+    let cfg = |i: usize| -> RowSampling {
+        let seed = 0x1000 + 7919 * i as u32;
+        match i % 4 {
+            0 => RowSampling::greedy(),
+            1 => RowSampling { temperature: 0.8, top_k: 20, top_p: 0.95, seed, presence: 0.0 },
+            2 => RowSampling { temperature: 1.0, top_k: 0, top_p: 1.0, seed, presence: 0.0 },
+            _ => RowSampling { temperature: 0.7, top_k: 20, top_p: 0.8, seed, presence: 1.5 },
+        }
+    };
+    // One sequence alone (one-row windows).
+    let alone = |e: &mut Coder, s: &[u32], c: RowSampling| -> Result<Vec<u32>> {
+        let slot = e.alloc_slot()?;
+        e.set_slot_sampling(slot, c)?;
+        let mut next = e.prefill_slot(slot, s)?;
+        let mut toks = vec![next];
+        for _ in 1..steps {
+            next = e.decode_batch(&[(slot, next)])?[0];
+            toks.push(next);
+        }
+        e.free_slot(slot);
+        Ok(toks)
+    };
+    // All together.
+    let batched = |e: &mut Coder, cfgs: &[RowSampling]| -> Result<Vec<Vec<u32>>> {
+        let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+        let mut next = Vec::new();
+        for (i, s) in seqs.iter().enumerate() {
+            e.set_slot_sampling(slots[i], cfgs[i])?;
+            next.push(e.prefill_slot(slots[i], s)?);
+        }
+        let mut got: Vec<Vec<u32>> = next.iter().map(|&k| vec![k]).collect();
+        let t0 = Instant::now();
+        for step in 1..steps {
+            let order: Vec<usize> = if step % 2 == 0 {
+                (0..nb).collect()
+            } else {
+                (0..nb).rev().collect()
+            };
+            let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
+            let out = e.decode_batch(&rows)?;
+            for (r, &i) in order.iter().enumerate() {
+                next[i] = out[r];
+                got[i].push(out[r]);
+            }
+        }
+        eprintln!(
+            "batch of {nb}: {:.2} ms a step",
+            t0.elapsed().as_secs_f64() * 1e3 / (steps - 1) as f64
+        );
+        for &s in &slots {
+            e.free_slot(s);
+        }
+        Ok(got)
+    };
+    let cfgs: Vec<RowSampling> = (0..nb).map(cfg).collect();
+    let solo: Vec<Vec<u32>> = (0..nb)
+        .map(|i| alone(&mut e, &seqs[i], cfgs[i]))
+        .collect::<Result<_>>()?;
+    let mixed = batched(&mut e, &cfgs)?;
+    let again = batched(&mut e, &cfgs)?;
+    let plain = batched(&mut e, &vec![RowSampling::greedy(); nb])?;
+    let mut all_ok = true;
+    // Determinism.
+    let (mut same_seq, mut agree, mut tot, mut nsampled) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..nb {
+        let first = (0..steps).find(|&k| solo[i][k] != mixed[i][k]);
+        if cfgs[i].sampled() {
+            nsampled += 1;
+            same_seq += usize::from(first.is_none());
+        }
+        let n = first.map_or(steps, |k| k + 1);
+        agree += n - usize::from(first.is_some());
+        tot += n;
+        println!(
+            "seq {i} ({}): alone vs batched {}",
+            if cfgs[i].sampled() {
+                format!("T {} k {} p {} pres {}", cfgs[i].temperature, cfgs[i].top_k, cfgs[i].top_p, cfgs[i].presence)
+            } else {
+                "greedy".into()
+            },
+            first.map_or("identical".to_string(), |k| format!("DIFFER at token {k}"))
+        );
+    }
+    let rate = agree as f64 / tot as f64;
+    let det_ok = if nb <= super::coder::MAX_T || e.batch_all {
+        same_seq == nsampled && rate == 1.0
+    } else {
+        rate >= 0.99
+    };
+    println!(
+        "determinism (alone vs batched): {same_seq}/{nsampled} sampled sequences identical, tokens agree {:.2}% given the same history ({}) : {}",
+        100.0 * rate,
+        if nb <= super::coder::MAX_T || e.batch_all { "bar: bitwise" } else { "bar: 99%, tensor-core batch windows" },
+        if det_ok { "PASS" } else { "FAIL" }
+    );
+    all_ok &= det_ok;
+    let rep_ok = mixed == again;
+    println!("reproducible (batch run twice): {}", if rep_ok { "PASS" } else { "FAIL" });
+    all_ok &= rep_ok;
+    let gr_ok = (0..nb).filter(|&i| !cfgs[i].sampled()).all(|i| mixed[i] == plain[i]);
+    println!(
+        "greedy rows in a mixed batch == an all-greedy batch: {}",
+        if gr_ok { "PASS" } else { "FAIL" }
+    );
+    all_ok &= gr_ok;
+    // Distribution sanity on sequence 0 alone.
+    let g = alone(&mut e, &seqs[0], RowSampling::greedy())?;
+    let k1 = alone(
+        &mut e,
+        &seqs[0],
+        RowSampling { temperature: 1.0, top_k: 1, top_p: 1.0, seed: 99, presence: 0.0 },
+    )?;
+    let hot = |seed| RowSampling { temperature: 1.5, top_k: 0, top_p: 1.0, seed, presence: 0.0 };
+    let h1 = alone(&mut e, &seqs[0], hot(1))?;
+    let h2 = alone(&mut e, &seqs[0], hot(2))?;
+    let h1b = alone(&mut e, &seqs[0], hot(1))?;
+    let k1_ok = k1 == g;
+    let hot_ok = h1 != g && h1 != h2 && h1 == h1b;
+    println!("T 1, top-k 1 == greedy: {}", if k1_ok { "PASS" } else { "FAIL" });
+    println!(
+        "T 1.5 differs from greedy ({} of {steps} tokens differ), seeds 1 and 2 differ, seed 1 twice equal: {}",
+        h1.iter().zip(&g).filter(|(x, y)| x != y).count(),
+        if hot_ok { "PASS" } else { "FAIL" }
+    );
+    all_ok &= k1_ok && hot_ok;
+    ensure!(all_ok, "sample-check failed");
+    println!("sample-check: PASS");
     Ok(())
 }

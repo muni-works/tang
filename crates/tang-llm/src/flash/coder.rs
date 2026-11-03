@@ -927,6 +927,14 @@ pub struct Coder {
     gpu: Gpu,
     /// Top-k / top-p / presence sampling in the head (`enable_sampler`); `None`: Gumbel-max.
     sampler: Option<Box<super::sampler::Sampler>>,
+    /// Per-row sampling in slot windows (`enable_row_sampling`): each slot its own settings.
+    row_sampler: Option<Box<super::sampler::RowSampler>>,
+    slot_samp: Vec<super::sampler::RowSampling>,
+    /// The next window's per-row sampler words (`stage_row_words`); empty: every row greedy.
+    row_words: Vec<u32>,
+    /// Every decode step through the batch module once built, whatever its row count: a
+    /// sequence's numerics (and so its samples) don't depend on how many others decode with it.
+    pub batch_all: bool,
     pub hp: Hparams,
     g: Gguf,
     geo: Geometry,
@@ -1231,6 +1239,10 @@ impl Coder {
             dev,
             gpu,
             sampler: None,
+            row_sampler: None,
+            slot_samp: vec![super::sampler::RowSampling::greedy(); MAX_SLOTS],
+            row_words: Vec::new(),
+            batch_all: false,
             hp,
             g,
             geo,
@@ -1465,6 +1477,7 @@ impl Coder {
     /// Release slot `i` (not 0) and its memory, on every stage.
     pub fn free_slot(&mut self, i: usize) {
         if i > 0 && i < MAX_SLOTS && self.slots[i].take().is_some() {
+            self.slot_samp[i] = super::sampler::RowSampling::greedy();
             if let Some(p) = self.peer.as_deref_mut() {
                 p.slots[i] = None;
             }
@@ -1561,7 +1574,7 @@ impl Coder {
     /// token. Greedy; the sampler isn't per slot yet.
     pub fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
         let mut pos = self.slot_tokens(slot).len();
         self.slot_tokens_mut(slot)?.extend_from_slice(ids);
         let end = pos + ids.len();
@@ -1577,6 +1590,9 @@ impl Coder {
                 .collect();
             let w0 = Instant::now();
             self.stage_rows(&rows, &[[0, t as u32, slot as u32, t as u32]])?;
+            if pos + t == end {
+                self.stage_row_words(&[(t - 1, slot, end - 1)]);
+            }
             let nchunk = self.nchunk(pos + t);
             let st = WinStats {
                 t,
@@ -1619,7 +1635,11 @@ impl Coder {
         let b = items.len();
         let t: usize = items.iter().map(|x| 1 + x.2.len()).sum();
         ensure!(b >= 1 && t <= MAX_T, "{b} sequences, {t} rows");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        ensure!(
+            items.iter().all(|x| x.2.is_empty() || !self.slot_samp[x.0].sampled()),
+            "drafts are verified greedily: a sampled slot takes no drafts"
+        );
         if items.iter().all(|x| x.2.is_empty()) {
             let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
             return Ok(self
@@ -1653,6 +1673,13 @@ impl Coder {
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
         let w0 = Instant::now();
         self.stage_rows(&staged, &segs)?;
+        let rw: Vec<(usize, usize, usize)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.2.is_empty())
+            .map(|(i, x)| (segs[i][0] as usize, x.0, pos0[i]))
+            .collect();
+        self.stage_row_words(&rw);
         let nchunk = self.nchunk(end);
         let st = WinStats {
             t,
@@ -2199,8 +2226,8 @@ impl Coder {
         let b = rows.len();
         let cap = MAX_T.max(self.batch_rows());
         ensure!((1..=cap).contains(&b), "{b} rows (at most {cap})");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
-        let wide = b > MAX_T;
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        let wide = b > MAX_T || (self.batch_all && self.batch.is_some());
         let mut staged = Vec::with_capacity(b);
         let mut segs = Vec::with_capacity(b);
         let mut end = 0;
@@ -2217,6 +2244,9 @@ impl Coder {
             segs.push([i as u32, 1, slot as u32, 1]);
         }
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
+        let rw: Vec<(usize, usize, usize)> =
+            staged.iter().enumerate().map(|(i, r)| (i, r.0, r.1)).collect();
+        self.stage_row_words(&rw);
         let w0 = Instant::now();
         let nchunk = self.nchunk(end);
         let st = WinStats {
@@ -3687,6 +3717,9 @@ impl Coder {
                 tang_moe::args![part, np, ids],
             );
         }
+        if let Some(rs) = self.row_sampler.as_ref().filter(|_| !self.skip("argmax")) {
+            rs.enqueue(v.dev, v.stream, &self.head_buf(last), &v.s.out_ids, t);
+        }
         self.kcopy_on(last, self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())), ids, t * 4);
     }
 
@@ -4127,6 +4160,13 @@ impl Coder {
         mut probe: Option<&mut Probe>,
     ) -> Result<Vec<u32>> {
         self.last_batch = self.in_batch.get();
+        if let Some(rs) = self.row_sampler.as_ref() {
+            // Every window stages its rows' words (none sampled unless a slot path set them).
+            let mut w = std::mem::take(&mut self.row_words);
+            w.resize(t * super::sampler::ROW_WORDS, 0);
+            rs.stage(&self.dev, &w)?;
+        }
+        self.row_words.clear();
         self.greedy.set(
             self.temperature == 0.0 && self.sampler.as_ref().is_none_or(|s| s.presence == 0.0),
         );
@@ -5474,6 +5514,60 @@ impl Coder {
 
     pub fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
         self.sampler.as_deref_mut()
+    }
+
+    /// Per-row sampling in slot windows (`prefill_slot`, `decode_batch`, `verify_batch` rows
+    /// without drafts): each slot samples with its own [`set_slot_sampling`](Self::set_slot_sampling)
+    /// settings; greedy rows keep the argmax bit for bit. One GPU. Window graphs are recaptured.
+    pub fn enable_row_sampling(&mut self) -> Result<()> {
+        ensure!(self.peer.is_none(), "per-row sampling needs one GPU");
+        ensure!(self.sampler.is_none(), "per-row sampling replaces the engine sampler");
+        if self.row_sampler.is_none() {
+            let rows = MAX_T.max(256);
+            self.row_sampler = Some(Box::new(super::sampler::RowSampler::new(
+                &self.gpu,
+                &self.dev,
+                self.hp.n_vocab,
+                rows,
+                MAX_SLOTS,
+            )?));
+            self.graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Slot `slot`'s sampling from now on, its output history (presence penalty) cleared.
+    pub fn set_slot_sampling(&mut self, slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        ensure!(slot < MAX_SLOTS, "slot {slot}");
+        if s.sampled() {
+            let rs = self
+                .row_sampler
+                .as_ref()
+                .ok_or_else(|| anyhow!("per-row sampling is off (enable_row_sampling)"))?;
+            rs.clear_slot(&self.dev, slot)?;
+        }
+        self.slot_samp[slot] = s;
+        Ok(())
+    }
+
+    /// The next window's sampled rows: `(row, slot, position)` for each row whose pick is a
+    /// slot's next token.
+    fn stage_row_words(&mut self, rows: &[(usize, usize, usize)]) {
+        self.row_words.clear();
+        if self.row_sampler.is_none() {
+            return;
+        }
+        let w = super::sampler::ROW_WORDS;
+        for &(r, slot, pos) in rows {
+            let s = self.slot_samp[slot];
+            if !s.sampled() {
+                continue;
+            }
+            if self.row_words.len() < (r + 1) * w {
+                self.row_words.resize((r + 1) * w, 0);
+            }
+            self.row_words[r * w..(r + 1) * w].copy_from_slice(&s.words(slot, pos));
+        }
     }
 
     /// A new generation's output starts at position `pos` (penalties count output from there).
