@@ -1,18 +1,46 @@
-//! Metal TKV / KIVI decode: bit-identity vs the CPU decoder and throughput.
+//! TKV / KIVI decode on Metal or CUDA: bit-identity vs the CPU decoder and throughput.
 //!
 //!     cargo run --release -p tang-compute --features metal --example kvdec_bench -- \
 //!         <x.f32> <heads>x<T>x<hd> <k|v> <rel> [--copies N] [--block B] [--lane W] [--reps R]
+//!     cargo run --release -p tang-compute --features cuda --example kvdec_bench -- <...>
 //!
 //! `--copies N` decodes N copies of the stream in one dispatch (≈ N layer×kind streams of a
 //! model's cache) to measure whole-cache decode time.
 use cram_codec::kvcodec::{encode, Kind, KvParams, KvStream};
 use cram_codec::kvgpu::{Batch, Placement};
 use std::time::Instant;
-use tang_compute::{ComputeDevice, MetalDevice};
+#[cfg(feature = "metal")]
+use tang_compute::MetalDevice as Device;
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+use tang_compute::CudaComputeDevice as Device;
+use tang_compute::ComputeDevice;
 
 fn flag(a: &[String], f: &str) -> Option<String> {
     a.iter().position(|x| x == f).map(|i| a[i + 1].clone())
 }
+
+/// New device: Metal when that feature is on (the Mac), else CUDA. With NEITHER
+/// feature, fall back to the CPU device so the example still configures (the
+/// CPU path has no tkv_decode and the run fails loudly there).
+#[cfg(feature = "metal")]
+fn new_device() -> Device {
+    MetalDevice::new().expect("metal")
+}
+#[cfg(feature = "metal")]
+use tang_compute::MetalDevice;
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+fn new_device() -> Device {
+    CudaComputeDevice::new().expect("no CUDA GPU")
+}
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+use tang_compute::CudaComputeDevice;
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+fn new_device() -> Device {
+    tang_compute::CpuDevice::new()
+}
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+use tang_compute::CpuDevice as Device;
+
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -71,7 +99,7 @@ fn main() {
         )
         .unwrap();
     }
-    let dev = MetalDevice::new().expect("metal");
+    let dev = new_device();
     let up = |v: &[u32]| dev.upload_u32(v);
     let (sb, lb, cb, pb) = (
         up(&b.stream),

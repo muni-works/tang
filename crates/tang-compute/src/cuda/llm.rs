@@ -8,7 +8,8 @@ use cudarc::cublas::{Gemm, GemmConfig};
 use cudarc::driver::{CudaFunction, CudaSlice, LaunchArgs, LaunchConfig, PushKernelArg};
 
 use super::{CudaBuffer, CudaComputeDevice, CudaStorage, Q4Weight};
-use crate::kernels::llm_cuda;
+use crate::device::ComputeDevice;
+use crate::kernels::{kvdec_cuda, llm_cuda};
 
 /// Push a KV cache (f32 or bf16) as a kernel argument.
 fn kv_arg<'a>(lb: &mut LaunchArgs<'a>, b: &'a CudaBuffer) {
@@ -1286,7 +1287,85 @@ impl CudaComputeDevice {
         }
         self.finish(out)
     }
+
+    /// Compressed-KV decode (see `ComputeDevice::tkv_decode`): one thread per lane,
+    /// tables from `cram_codec::kvgpu::Batch`. The out buffer is f32 or bf16 (a cache
+    /// the caller allocated with `alloc` / `alloc_bf16`); the kernel is compiled per
+    /// kind. The u32 tables ride as f32 bit patterns (see `upload_u32`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tkv_decode(
+        &self,
+        stream: &CudaBuffer,
+        lanes: &CudaBuffer,
+        chans: &CudaBuffer,
+        prior: &CudaBuffer,
+        scratch: &CudaBuffer,
+        out: &CudaBuffer,
+        rope: Option<(&CudaBuffer, &CudaBuffer)>,
+        n_lanes: usize,
+    ) {
+        assert!(matches!(out.storage(), CudaStorage::F32(_) | CudaStorage::Bf16(_)));
+        let bf16 = out.is_bf16();
+        let f = self.kv_func(kvdec_cuda::KVDEC_CUDA, "tkv_decode", bf16);
+        let (cs, sn) = rope.map_or((prior, prior), |(c, s)| (c, s));
+        let nl = n_lanes as u32;
+        unsafe {
+            let mut lb = self.stream.launch_builder(&f);
+            lb.arg(stream.f32_data())
+                .arg(lanes.f32_data())
+                .arg(chans.f32_data())
+                .arg(prior.f32_data())
+                .arg(scratch.f32_data())
+                .arg(kv_arg_out(out))
+                .arg(cs.f32_data())
+                .arg(sn.f32_data())
+                .arg(&nl);
+            lb.launch(blocks((n_lanes.div_ceil(32), 1, 1), 32)).unwrap();
+        }
+    }
+
+    /// KIVI-style integer dequant (see `ComputeDevice::kivi_dequant`), CUDA.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn kivi_dequant(
+        &self,
+        codes: &CudaBuffer,
+        sz: &CudaBuffer,
+        out: &CudaBuffer,
+        pages: Option<(&CudaBuffer, u32)>,
+        p: [u32; 6],
+    ) {
+        assert!(matches!(out.storage(), CudaStorage::F32(_) | CudaStorage::Bf16(_)));
+        let bf16 = out.is_bf16();
+        let f = self.kv_func(kvdec_cuda::KVDEC_CUDA, "kivi_dequant", bf16);
+        let prm = [p[0], p[1], p[2], p[3], p[4], p[5], pages.map_or(0, |x| x.1)];
+        let pb = self.upload_u32(&prm);
+        let t = pages.map_or(&pb, |x| &x.0);
+        unsafe {
+            let mut lb = self.stream.launch_builder(&f);
+            lb.arg(codes.f32_data())
+                .arg(sz.f32_data())
+                .arg(kv_arg_out(out))
+                .arg(pb.f32_data())
+                .arg(t.f32_data());
+            lb.launch(per_elem((p[3] * p[2] as u32) as usize * p[4] as usize))
+                .unwrap();
+        }
+    }
 }
+
+/// The cache argument for a kernel that WRITES it through `&CudaBuffer` (the trait
+/// method takes the shared ref): the same slice `kv_arg` pushes. The device pointer is
+/// what the kernel gets and it writes through it (as `kv_arg_mut` would with `&mut`).
+fn kv_arg_out<'a>(b: &'a CudaBuffer) -> &'a CudaSlice<f32> {
+    match b.storage() {
+        CudaStorage::F32(s) => s,
+        // bf16 rides as u16 slices; erase the element type for the launch (same pointer)
+        CudaStorage::Bf16(s) => unsafe { &*(s as *const CudaSlice<u16> as *const CudaSlice<f32>) },
+        CudaStorage::Q4(_) | CudaStorage::Q2(_) => panic!("a KV cache is f32 or bf16"),
+    }
+}
+
+
 
 /// Parity against `CpuDevice` (the trait's portable reference implementations). Each test
 /// skips, with a note, when there's no CUDA driver or GPU.

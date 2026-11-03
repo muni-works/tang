@@ -50,6 +50,9 @@ pub mod noise_cuda;
 pub mod llm_cuda;
 
 #[cfg(feature = "cuda")]
+pub mod kvdec_cuda;
+
+#[cfg(feature = "cuda")]
 pub mod flash_cuda;
 
 #[cfg(feature = "cuda")]
