@@ -50,9 +50,11 @@ pub const MAX_T: usize = fl::MAX_T;
 /// Sequences one engine holds at once (slot 0 is the one the single-sequence API uses).
 pub const MAX_SLOTS: usize = 16;
 /// u32s of the per-row record staged with each window: positions, slots, then segments.
-/// u32s of the per-row record per window row (positions, slots, segments).
-const ROWS_PER_T: usize = 6;
+/// Row record per window row: positions, slots, segments (4 each), tree cache offsets,
+/// tree roots.
+const ROWS_PER_T: usize = 8;
 const ROWS_U32: usize = ROWS_PER_T * MAX_T;
+const _: () = assert!(super::tree::MAX_T == MAX_T);
 
 /// Options of a [`Coder`] load.
 #[derive(Clone, Debug)]
@@ -620,7 +622,8 @@ impl Kern {
 struct Scratch {
     ctl: B,
     /// Per-row record (`ROWS_U32`): row positions, row slots, then `[start, len, slot, keep]`
-    /// per segment (a slot's consecutive rows).
+    /// per segment (a slot's consecutive rows), then per row the tree cache offset and root
+    /// position (`cx_attn_*`'s `CX_OFF`; 0 / 0 outside tree windows).
     rows: B,
     r: B,
     x: B,
@@ -847,6 +850,8 @@ pub struct Coder {
     pub use_graphs: bool,
     pub last: WinStats,
     pub last_commit_ms: f64,
+    /// The last tree window's winner: (chain, accepted drafts).
+    pub last_tree: (usize, usize),
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
@@ -1140,6 +1145,7 @@ impl Coder {
             use_graphs: true,
             last: WinStats::default(),
             last_commit_ms: 0.0,
+            last_tree: (0, 0),
             load_report,
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
@@ -1431,6 +1437,83 @@ impl Coder {
                 emb.len(),
             );
         }
+    }
+
+    /// Tree verify (`flash::tree`): `cur` and the chains of `forest` as one verify window of slot
+    /// 0, each chain a segment reading the committed state; commits the winning chain and
+    /// returns the emitted tokens (its accepted drafts' successors plus the correction), which
+    /// equal what plain greedy decoding would emit. Greedy only.
+    pub fn verify_forest(&mut self, cur: u32, forest: &super::tree::Forest) -> Result<Vec<u32>> {
+        ensure!(self.sampler.is_none(), "tree windows are greedy for now");
+        ensure!(self.peer.is_none(), "tree windows are single-GPU for now");
+        let pos0 = self.tokens.len();
+        if forest.chains.is_empty() {
+            return Ok(vec![self.step(cur)?]);
+        }
+        let (rows, segs) = forest.layout(cur, pos0);
+        let t = rows.len();
+        ensure!(t <= MAX_T, "{t} rows");
+        ensure!(pos0 + t <= self.max_ctx, "context {} > max {}", pos0 + t, self.max_ctx);
+        let staged: Vec<(usize, usize, u32)> = rows.iter().map(|r| (0, r.pos, r.tok)).collect();
+        let sg: Vec<[u32; 4]> = segs.iter().map(|&(r0, n)| [r0 as u32, n as u32, 0, 0]).collect();
+        let w0 = Instant::now();
+        self.stage_rows(&staged, &sg)?;
+        let n = self.hp.n_embd;
+        let rec = self.io.u32s(Io::rows(n, MAX_T), ROWS_U32);
+        for (i, r) in rows.iter().enumerate() {
+            rec[6 * MAX_T + i] = r.off as u32;
+            rec[7 * MAX_T + i] = pos0 as u32;
+        }
+        let nchunk = self.nchunk(pos0 + t);
+        let st = WinStats { t, ..Default::default() };
+        let targets = self.run_staged(st, w0, t, true, nchunk, sg.len(), None)?;
+        let (b, m) = forest.accept(&targets);
+        self.last_tree = (b, m);
+        let out = forest.emitted(&targets, (b, m));
+        let tc = Instant::now();
+        self.commit_tree(segs[b].0, m + 1, pos0, forest.off(b))?;
+        self.tokens.push(cur);
+        self.tokens.extend_from_slice(&forest.chains[b][..m]);
+        self.last_commit_ms = tc.elapsed().as_secs_f64() * 1e3;
+        // Refill the MTP chain from the winning chain's rows (no-op without MTP).
+        self.mtp_after_window(pos0, segs[b].0, &out)?;
+        Ok(out)
+    }
+
+    /// Keep rows `r0 .. r0 + keep` of the last tree window: run their recurrence into slot 0's
+    /// state, then move their window keys (cache `pos0 + 1 + off ..`) down to `pos0 + 1 ..`.
+    fn commit_tree(&mut self, r0: usize, keep: usize, pos0: usize, off: usize) -> Result<()> {
+        let n = self.hp.n_embd;
+        let rec = self.io.u32s(Io::rows(n, MAX_T), ROWS_U32);
+        rec[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&[r0 as u32, keep as u32, 0, keep as u32]);
+        self.kcopy_on(0, self.a(&self.s.rows), self.io_dev_on(0, Io::rows(n, MAX_T)), ROWS_U32 * 4);
+        for layer in &self.layers {
+            if let Some(g) = &layer.gdn {
+                self.gdn_step_seg(0, g, layer.w_in.rows, 1, true);
+                self.gdn_commit_seg(0, g, layer.w_in.rows, 1);
+            }
+        }
+        let m = keep - 1;
+        if off > 0 && m > 0 {
+            let cell = self.hp.n_head_kv * self.hp.head_dim * 2;
+            for layer in &self.layers {
+                let Some(at) = &layer.attn else { continue };
+                for buf in [&at.k, &at.v] {
+                    let base = self.a(buf);
+                    // Ascending pieces of at most `off` cells never read what an earlier one wrote.
+                    let mut i = 0;
+                    while i < m {
+                        let len = off.min(m - i);
+                        let dst = base + ((pos0 + 1 + i) * cell) as u64;
+                        let src = base + ((pos0 + 1 + i + off) * cell) as u64;
+                        self.kcopy_on(0, dst, src, len * cell);
+                        i += len;
+                    }
+                }
+            }
+        }
+        self.dev.sync();
+        Ok(())
     }
 
     /// Feed `ids` to slot `slot` (windows of up to `MAX_T` of its rows) and return the next

@@ -1169,6 +1169,11 @@ GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEM
 
 // Rows of a window may belong to different sequences: row t is at position ROWS[t] of slot
 // ROWS[CX_MAXT + t], whose bf16 K/V caches for this layer are at ktab[slot] / vtab[slot].
+// Tree windows (several draft chains of one sequence): a row's keys past position
+// ROWS[7 CX_MAXT + t] (its chain's root) live at cache index position + ROWS[6 CX_MAXT + t], so
+// chains at the same depth don't share cache cells. Offset 0 (every other window) is the plain
+// layout.
+#define CX_OFF(rows, t, p) ((p) > (int)(rows)[7 * CX_MAXT + (t)] ? (p) + (int)(rows)[6 * CX_MAXT + (t)] : (p))
 
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];
 // k heads (rmsnorm * kn, rope) and v into the row's slot caches at the row's position.
@@ -1199,7 +1204,7 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
     if (isq) {
         q[((size_t)t * CX_NH + h) * CX_HD + d] = x;
     } else {
-        const size_t o = ((size_t)pos * CX_NKV + g) * CX_HD + d;
+        const size_t o = ((size_t)CX_OFF(rows, t, (int)pos) * CX_NKV + g) * CX_HD + d;
         kc[o] = f2bf(x);
         vc[o] = f2bf(row[CX_QV + g * CX_HD + d]);
     }
@@ -1238,8 +1243,9 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, c
     }
     const int hi = min(pos + 1, lo + CX_CHUNK);
     for (int p = lo + warp; p < hi; p += 4) {
-        const unsigned short* kr = kc + ((size_t)p * CX_NKV + g) * CX_HD + lane * CX_DL;
-        const unsigned short* vr = vc + ((size_t)p * CX_NKV + g) * CX_HD + lane * CX_DL;
+        const size_t pc = (size_t)CX_OFF(rows, c, p);
+        const unsigned short* kr = kc + (pc * CX_NKV + g) * CX_HD + lane * CX_DL;
+        const unsigned short* vr = vc + (pc * CX_NKV + g) * CX_HD + lane * CX_DL;
         float kv[CX_DL], vv[CX_DL];
         #pragma unroll
         for (int i = 0; i < CX_DL; i++) { kv[i] = bf2f(kr[i]); vv[i] = bf2f(vr[i]); }
