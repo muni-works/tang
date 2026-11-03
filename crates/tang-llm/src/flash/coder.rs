@@ -997,6 +997,8 @@ pub struct Coder {
     pub mtp_alt: Option<(u32, f32)>,
     /// Each slot's latest MTP chain (batched decode; slot 0's is `mtp_last`).
     slot_chain: Vec<Vec<(u32, f32)>>,
+    /// How many sequence slots fit in VRAM (set at the first `alloc_slot`); 0: not yet known.
+    slot_cap: usize,
     /// Per-segment commit graphs after a batched verify window, by segment count.
     commit_seg_graphs: Vec<Option<Graph>>,
     pub last_mtp_ms: f64,
@@ -1290,6 +1292,7 @@ impl Coder {
             mtp_last: Vec::new(),
             mtp_alt: None,
             slot_chain: vec![Vec::new(); MAX_SLOTS],
+            slot_cap: 0,
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
             peer,
@@ -1411,8 +1414,42 @@ impl Coder {
         self.commit_graphs.iter_mut().for_each(|g| *g = None);
     }
 
+    /// Device bytes one sequence slot takes (its GDN states, K/V and MTP K/V).
+    pub fn slot_bytes(&self) -> usize {
+        let kv = self.max_ctx * self.hp.n_head_kv * self.hp.head_dim * 2 * 2;
+        let gdn = (self.geo.gdn_hv * 128 * 128 + 3 * self.geo.gdn_conv()) * 4;
+        let per_layer: usize = self
+            .layers
+            .iter()
+            .map(|l| usize::from(l.gdn.is_some()) * gdn + usize::from(l.attn.is_some()) * kv)
+            .sum();
+        per_layer + usize::from(self.mtp.is_some()) * kv
+    }
+
     /// A free sequence slot (1..MAX_SLOTS), its state zeroed and no tokens.
     pub fn alloc_slot(&mut self) -> Result<usize> {
+        if self.slot_cap == 0 {
+            // A slot's state is ~0.85 GB at a 32k context (K/V of every attention layer at
+            // `max_ctx`, plus the GDN states): MAX_SLOTS of them don't fit. Cap the count at
+            // what's free now, less headroom for graphs and later scratch, so a server parking
+            // finished slots evicts one instead of failing an allocation mid-step.
+            let headroom = std::env::var("TANG_SLOT_HEADROOM_GB")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(4.0);
+            let free = cudarc::driver::result::mem_get_info().map_or(usize::MAX, |m| m.0);
+            let per = self.slot_bytes().max(1);
+            let fit = (free as f64 - headroom * 1e9).max(0.0) as usize / per;
+            self.slot_cap = fit.clamp(1, MAX_SLOTS - 1);
+            eprintln!(
+                "coder: {} sequence slots fit ({:.2} GB each, {:.1} GB free)",
+                self.slot_cap,
+                per as f64 / 1e9,
+                free as f64 / 1e9
+            );
+        }
+        let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
+        ensure!(live < self.slot_cap, "all {} slots that fit in VRAM in use", self.slot_cap);
         let i = (1..MAX_SLOTS)
             .find(|&i| self.slots[i].is_none())
             .ok_or_else(|| anyhow!("all {} slots in use", MAX_SLOTS))?;
