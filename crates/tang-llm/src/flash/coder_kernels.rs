@@ -802,6 +802,140 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
     moe_down_grouped_body<2>(d, sd, ids, hq, out, T, r16, fast, plan);
 }
 
+// ---- streaming grouped experts (batch decode: 1-8 tokens an expert) ----
+//
+// cx_moe_gu_g / cx_moe_down_g with each warp owning NR rows of its group's expert (2 a step)
+// instead of 2, the steps' rows staged with cp.async CX_SST steps ahead in a per-warp ring, so a
+// block streams NR * 8 rows with loads in flight while it computes, rather than one short block
+// per 16 rows (which is block-launch-bound at ~2 pairs a group). Every dot is the grouped
+// kernels' (same staged bytes, same cx_dot / cx_dotq_half on them): bitwise equal.
+// Grid (rows / (8 NR), groups), block 256, dynamic smem 8 * CX_SST * 2 * r16 * 16 bytes.
+#ifndef CX_SST
+#define CX_SST 4
+#endif
+#ifndef CX_GCHUNK_S
+#define CX_GCHUNK_S 8
+#endif
+#ifndef CX_SNR_GU
+#define CX_SNR_GU 8
+#endif
+#ifndef CX_SNR_DOWN
+#define CX_SNR_DOWN 16
+#endif
+template <int NR, bool DOWN>
+__device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi];
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    // The group's (at most CX_GCHUNK) activations, staged once a block after the first weight
+    // loads are issued: codes [m][K], then scales [m][K / 32].
+    constexpr int KA = DOWN ? CX_FF : CX_HID;
+    constexpr int ACT16 = (CX_GCHUNK_S * (KA + KA / 8)) / 16;
+    unsigned char* act = (unsigned char*)dsm;
+    float* actd = (float*)(act + CX_GCHUNK_S * KA);
+    uint4* ring = dsm + ACT16 + warp * (CX_SST * 2 * r16);
+    const int row0 = (blockIdx.x * 8 + warp) * NR;
+    constexpr int NS = NR / 2;
+    const unsigned char* wp[CX_SST][2];
+    auto issue = [&](int st) {
+        const int slot = st % CX_SST;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int r = row0 + 2 * st + j;
+            const ExW& m = DOWN ? (shared ? sg : g) : (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u));
+            const int ro = DOWN ? r : (r < CX_FF ? r : r - CX_FF);
+            const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
+            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * 2 + j) * r16, lane);
+        }
+        cx_async_commit();
+    };
+    #pragma unroll
+    for (int st = 0; st < CX_SST - 1; st++) {
+        if (st < NS) issue(st); else cx_async_commit();
+    }
+    {
+        const int m = b - a;
+        const float* xdg = (const float*)(xq + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+        for (int i = threadIdx.x; i < m * (KA / 16); i += blockDim.x) {
+            const int q = i / (KA / 16), c = i % (KA / 16);
+            const int p = plan[CX_PLAN_LIST + a + q];
+            const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+            ((uint4*)act)[q * (KA / 16) + c] = *(const uint4*)(xq + (size_t)t * KA + c * 16);
+        }
+        for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
+            const int q = i / (KA / 32), c = i % (KA / 32);
+            const int p = plan[CX_PLAN_LIST + a + q];
+            const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
+            actd[q * (KA / 32) + c] = xdg[(size_t)t * (KA / 32) + c];
+        }
+        __syncthreads();
+    }
+    for (int st = 0; st < NS; st++) {
+        if (st + CX_SST - 1 < NS) issue(st + CX_SST - 1); else cx_async_commit();
+        cx_async_wait<CX_SST - 1>();
+        __syncwarp();
+        const int slot = st % CX_SST;
+        const unsigned char* w0 = wp[slot][0];
+        const unsigned char* w1 = wp[slot][1];
+        const int rr0 = row0 + 2 * st;
+        if (DOWN) {
+            const ExW& m = shared ? sg : g;
+            for (int q = a; q < b; q++) {
+                const int p = plan[CX_PLAN_LIST + q];
+                const unsigned char* hcodes = act + (size_t)(q - a) * CX_FF;
+                const float* hd = actd + (q - a) * (CX_FF / 32);
+                const bool aligned = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)hcodes) & 15) == 0;
+                if (fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
+                    const int h = lane >> 4;
+                    const unsigned char* wh = h ? w1 : w0;
+                    const float v = m.ty == 12 ? cx_dotq_half<12>(wh, hcodes, hd, CX_FF) : cx_dotq_half<13>(wh, hcodes, hd, CX_FF);
+                    if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr0 + h] = v;
+                    continue;
+                }
+                const float v0 = cx_dot(m.ty, w0, hcodes, hd, CX_FF, fast);
+                if (lane == 0) out[(size_t)p * CX_HID + rr0] = v0;
+                const float v1 = cx_dot(m.ty, w1, hcodes, hd, CX_FF, fast);
+                if (lane == 0) out[(size_t)p * CX_HID + rr0 + 1] = v1;
+            }
+        } else {
+            int ty[2];
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int r = rr0 + j;
+                ty[j] = (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u)).ty;
+            }
+            for (int q = a; q < b; q++) {
+                const int p = plan[CX_PLAN_LIST + q];
+                const unsigned char* xc = act + (size_t)(q - a) * CX_HID;
+                const float* xdq = actd + (q - a) * (CX_HID / 32);
+                const float v0 = cx_dot(ty[0], w0, xc, xdq, CX_HID, fast);
+                if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0] = v0;
+                const float v1 = cx_dot(ty[1], w1, xc, xdq, CX_HID, fast);
+                if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0 + 1] = v1;
+            }
+        }
+        __syncwarp();
+    }
+    cx_async_wait<0>();
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_s(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int r16,
+                                                              int fast, const unsigned* plan) {
+    moe_stream_body<CX_SNR_GU, false>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_s(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int r16,
+                                                                int fast, const unsigned* plan) {
+    moe_stream_body<CX_SNR_DOWN, true>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan);
+}
+
 // ---- grouped expert GEMM on tensor cores (wide prefill) ----
 //
 // The grouped kernels above decode an expert's weights once per (token, expert) pair; at wide

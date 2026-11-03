@@ -1591,6 +1591,34 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             e.set_moe_variant(m, fuse);
             println!("== TANG_CODER_MOE={m} fuse_silu={fuse}");
         }
+        // TANG_BATCH_QUICK=1: speed at N only (kernel sweeps).
+        if std::env::var("TANG_BATCH_QUICK").is_ok_and(|v| v == "1") {
+            let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+            let mut next: Vec<u32> = Vec::new();
+            for (i, &s) in slots.iter().enumerate() {
+                next.push(e.prefill_slot(s, &seqs[i][..64.min(seqs[i].len())])?);
+            }
+            let mut ms = 0.0;
+            for it in 0..steps + 4 {
+                if it == 4 {
+                    e.prof_reset();
+                }
+                let rows: Vec<(usize, u32)> = slots.iter().copied().zip(next.iter().copied()).collect();
+                let t0 = std::time::Instant::now();
+                next = e.decode_batch(&rows)?;
+                if it >= 4 {
+                    ms += t0.elapsed().as_secs_f64() * 1e3;
+                }
+            }
+            println!("quick batch {nb}: {:.2} ms a step", ms / steps as f64);
+            if let Some(r) = e.prof_report() {
+                println!("{r}");
+            }
+            for &s in &slots {
+                e.free_slot(s);
+            }
+            return Ok(());
+        }
         // Alone.
         let mut alone: Vec<(Vec<u32>, Vec<f32>)> = Vec::new();
         for s in &seqs {

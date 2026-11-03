@@ -139,6 +139,9 @@ struct Variants {
     /// Batch decode windows (past `MAX_T` rows) run the dense layers and experts as the
     /// tensor-core GEMMs too (`TANG_CODER_BGEMM=1`). Not bitwise; off by default.
     bgemm: bool,
+    /// Batch windows run the streaming grouped expert kernels (`cx_moe_*_s`);
+    /// `TANG_CODER_MOE_STREAM=0` for the 16-rows-a-block grouped ones. Bitwise equal.
+    stream: bool,
 }
 
 impl Default for Variants {
@@ -155,6 +158,7 @@ impl Default for Variants {
             wgemm_down: true,
             attn_fa2: false,
             bgemm: false,
+            stream: true,
         }
     }
 }
@@ -175,6 +179,7 @@ impl Variants {
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
             attn_fa2: !env_is("TANG_CODER_ATTN", "splitk"),
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
+            stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
         }
     }
 }
@@ -423,6 +428,9 @@ struct Kern {
     moe_down_db: Fun,
     moe_gu_g: Fun,
     moe_down_g: Fun,
+    /// Streaming grouped experts (batch windows): `cx_moe_gu_s` / `cx_moe_down_s`.
+    moe_gu_s: Fun,
+    moe_down_s: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -475,6 +483,8 @@ impl Kern {
             moe_down_db: f("cx_moe_down_db")?,
             moe_gu_g: f("cx_moe_gu_g")?,
             moe_down_g: f("cx_moe_down_g")?,
+            moe_gu_s: f("cx_moe_gu_s")?,
+            moe_down_s: f("cx_moe_down_s")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -570,6 +580,8 @@ impl Kern {
             moe_down_db: f(cm, "cx_moe_down_db")?,
             moe_gu_g: f(cm, "cx_moe_gu_g")?,
             moe_down_g: f(cm, "cx_moe_down_g")?,
+            moe_gu_s: f(cm, "cx_moe_gu_s")?,
+            moe_down_s: f(cm, "cx_moe_down_s")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -614,6 +626,8 @@ impl Kern {
             self.moe_down,
             self.moe_gu_g,
             self.moe_down_g,
+            self.moe_gu_s,
+            self.moe_down_s,
             self.moe_gu_db,
             self.moe_down_db,
             self.fa2,
@@ -777,6 +791,26 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
 const BATCH_GCHUNK: usize = 8;
+
+/// The streaming grouped expert kernels' shape (`CX_SST`, `CX_SNR_GU`, `CX_SNR_DOWN`): ring
+/// stages a warp, rows a warp for gate|up and for down.
+/// `TANG_CODER_SST` / `TANG_CODER_SNR_GU` / `TANG_CODER_SNR_DOWN` override them (sweeps).
+fn stream_shape() -> (usize, usize, usize) {
+    static S: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let n = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (
+            n("TANG_CODER_SST", 4),
+            n("TANG_CODER_SNR_GU", 8),
+            n("TANG_CODER_SNR_DOWN", 16),
+        )
+    })
+}
 
 /// A sequence past slot 0: its own recurrent state, conv history and K/V caches (per layer:
 /// `gdn` for GDN layers, `kv` for attention layers), and its tokens.
@@ -1765,7 +1799,10 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "#define CX_GCHUNK {BATCH_GCHUNK}\n{}{}{}",
+            "#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            stream_shape().0,
+            stream_shape().1,
+            stream_shape().2,
             ck::prelude(&self.shapes, rows),
             kernels::GEMV_SRC,
             ck::SRC
@@ -2316,6 +2353,8 @@ impl Coder {
             (k.moe_plan, "route"),
             (k.moe_gu_g, "moe_gu"),
             (k.moe_down_g, "moe_down"),
+            (k.moe_gu_s, "moe_gu"),
+            (k.moe_down_s, "moe_down"),
             (k.moe_gemm_gu, "moe_gu"),
             (k.moe_gemm_down, "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
@@ -3243,6 +3282,15 @@ impl Coder {
                             b[wi]
                         );
                     }
+                } else if self.in_batch.get() && self.var.stream {
+                    self.launch_on(
+                        stream,
+                        v.k.moe_gu_s,
+                        ((2 * ff / (8 * stream_shape().1)) as u32, groups, 1),
+                        256,
+                        (8 * stream_shape().0 * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
+                    );
                 } else {
                     self.launch_on(
                         stream,
@@ -3269,6 +3317,15 @@ impl Coder {
                         256,
                         0,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, plan],
+                    );
+                } else if self.in_batch.get() && self.var.stream {
+                    self.launch_on(
+                        stream,
+                        v.k.moe_down_s,
+                        ((nh / (8 * stream_shape().2)) as u32, groups, 1),
+                        256,
+                        (8 * stream_shape().0 * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
                     );
                 } else {
                     self.launch_on(
