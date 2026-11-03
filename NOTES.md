@@ -242,3 +242,8 @@ measurement I can rent.
 Also recorded: an H200 pod was rented and terminated during this session (pod
 `vt40bv1in0s2v7`, $5.29/hr, ~8 min, ≈$0.70) and produced nothing because SSH to the pod
 proxy timed out repeatedly; mew replaced it at zero marginal cost.
+
+### Rounding note
+The post and the page round the table values to 2–3 significant figures: 5.599 → 5.60,
+1.098 → 1.10, 0.556 → 0.56, 27.77 → 27.8, 3.6852 → 3.69. Every rounded figure in
+docs/launch/beat2.md and design/cram.html traces to an unrounded number above.
