@@ -805,7 +805,7 @@ fn stream_shape() -> (usize, usize, usize) {
                 .unwrap_or(d)
         };
         (
-            n("TANG_CODER_SST", 4),
+            n("TANG_CODER_SST", 1),
             n("TANG_CODER_SNR_GU", 8),
             n("TANG_CODER_SNR_DOWN", 16),
         )

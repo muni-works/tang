@@ -295,6 +295,68 @@ __device__ __forceinline__ float cx_dotq_half(const unsigned char* w, const unsi
     for (int o = 8; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     return acc;
 }
+// cx_dotq_fast (HALF = 0) / cx_dotq_half (HALF = 1) for m <= 8 activation rows at once
+// (xc + t * xs codes, xd + t * ds scales): each weight block decoded once, then every row's
+// sums, each row's arithmetic and reduction exactly the single-row kernel's (bitwise).
+template <int TY, int HALF>
+__device__ __forceinline__ void cx_dotq_m(const unsigned char* w, const unsigned char* xc, int xs, const float* xd, int ds,
+                                          int k, int m, float* acc) {
+    const int lane = HALF ? (threadIdx.x & 15) : (threadIdx.x & 31);
+    const int BB = TY == 12 ? 144 : 176, QS = TY == 12 ? 16 : 48;
+    const int sbl = lane >> 3, j = (lane & 7) >> 1, l0 = (lane & 1) * 16;
+    #pragma unroll
+    for (int t = 0; t < 8; t++) acc[t] = 0.f;
+    for (int sb = sbl; sb < k / 256; sb += (HALF ? 2 : 4)) {
+        const unsigned char* b = w + sb * BB;
+        const float d = h2f(rd16(b)), dmin = h2f(rd16(b + 2));
+        int s0, m0, s1, m1;
+        scale_min_k4(2 * j, b + 4, s0, m0);
+        scale_min_k4(2 * j + 1, b + 4, s1, m1);
+        const uint4 q = *(const uint4*)(b + QS + j * 32 + l0);
+        uint4 hb = make_uint4(0, 0, 0, 0);
+        if (TY == 13) hb = *(const uint4*)(b + 16 + l0);
+        const int e = sb * 256 + j * 64 + l0;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {hb.x, hb.y, hb.z, hb.w};
+        unsigned lo[4], hi[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            lo[i] = qw[i] & 0x0F0F0F0Fu;
+            hi[i] = (qw[i] >> 4) & 0x0F0F0F0Fu;
+            if (TY == 13) {
+                lo[i] |= ((hw[i] >> (2 * j)) & 0x01010101u) << 4;
+                hi[i] |= ((hw[i] >> (2 * j + 1)) & 0x01010101u) << 4;
+            }
+        }
+        const float ds0 = d * i2f(s0), ds1 = d * i2f(s1);
+        const float dm0 = -dmin * i2f(m0), dm1 = -dmin * i2f(m1);
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= m) break;
+            const unsigned char* xr = xc + (size_t)t * xs;
+            const uint4 x0 = *(const uint4*)(xr + e), x1 = *(const uint4*)(xr + e + 32);
+            const unsigned xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+            int sa = 0, sh = 0, ca = 0, ch = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                sa = __dp4a((int)lo[i], (int)xa[i], sa);
+                sh = __dp4a((int)hi[i], (int)xb[i], sh);
+                ca = __dp4a(0x01010101, (int)xa[i], ca);
+                ch = __dp4a(0x01010101, (int)xb[i], ch);
+            }
+            const float* xdr = xd + t * ds;
+            const float dx0 = xdr[e / 32], dx1 = xdr[e / 32 + 1];
+            acc[t] = fmaf(dx0, fmaf(ds0, i2f(sa), dm0 * i2f(ca)), acc[t]);
+            acc[t] = fmaf(dx1, fmaf(ds1, i2f(sh), dm1 * i2f(ch)), acc[t]);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (t >= m) break;
+        float a = acc[t];
+        for (int o = HALF ? 8 : 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        acc[t] = a;
+    }
+}
 __device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k, int fast) {
     if (fast && (((unsigned long long)w | (unsigned long long)xc) & 15) == 0) {
         if (ty == 12) return cx_dotq_fast<12>(w, xc, xd, k);
@@ -813,6 +875,9 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 #ifndef CX_SST
 #define CX_SST 4
 #endif
+#ifndef CX_MT
+#define CX_MT 1
+#endif
 #ifndef CX_GCHUNK_S
 #define CX_GCHUNK_S 8
 #endif
@@ -885,8 +950,24 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
         const unsigned char* w0 = wp[slot][0];
         const unsigned char* w1 = wp[slot][1];
         const int rr0 = row0 + 2 * st;
+        const int mt = b - a;
         if (DOWN) {
             const ExW& m = shared ? sg : g;
+            const bool al = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)act) & 15) == 0;
+            if (CX_MT && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && al && mt <= 8) {
+                const int h = lane >> 4;
+                const unsigned char* wh = h ? w1 : w0;
+                float acc[8];
+                if (m.ty == 12) cx_dotq_m<12, 1>(wh, act, CX_FF, actd, CX_FF / 32, CX_FF, mt, acc);
+                else cx_dotq_m<13, 1>(wh, act, CX_FF, actd, CX_FF / 32, CX_FF, mt, acc);
+                if ((lane & 15) == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++)
+                        if (t < mt) out[(size_t)plan[CX_PLAN_LIST + a + t] * CX_HID + rr0 + h] = acc[t];
+                }
+                __syncwarp();
+                continue;
+            }
             for (int q = a; q < b; q++) {
                 const int p = plan[CX_PLAN_LIST + q];
                 const unsigned char* hcodes = act + (size_t)(q - a) * CX_FF;
@@ -910,6 +991,28 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
             for (int j = 0; j < 2; j++) {
                 const int r = rr0 + j;
                 ty[j] = (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u)).ty;
+            }
+            const bool al = ((((unsigned long long)w0) | ((unsigned long long)w1) | (unsigned long long)act) & 15) == 0;
+            if (CX_MT && fast && al && mt <= 8 && (ty[0] == 12 || ty[0] == 13) && ty[1] == ty[0]) {
+                float a0[8], a1[8];
+                if (ty[0] == 12) {
+                    cx_dotq_m<12, 0>(w0, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a0);
+                    cx_dotq_m<12, 0>(w1, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a1);
+                } else {
+                    cx_dotq_m<13, 0>(w0, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a0);
+                    cx_dotq_m<13, 0>(w1, act, CX_HID, actd, CX_HID / 32, CX_HID, mt, a1);
+                }
+                if (lane == 0) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++) {
+                        if (t >= mt) break;
+                        const size_t p = plan[CX_PLAN_LIST + a + t];
+                        out[p * 2 * CX_FF + rr0] = a0[t];
+                        out[p * 2 * CX_FF + rr0 + 1] = a1[t];
+                    }
+                }
+                __syncwarp();
+                continue;
             }
             for (int q = a; q < b; q++) {
                 const int p = plan[CX_PLAN_LIST + q];
