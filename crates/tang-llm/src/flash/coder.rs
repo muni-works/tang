@@ -796,7 +796,17 @@ const BATCH_GCHUNK: usize = 8;
 /// stages a warp, rows a warp for gate|up and for down.
 /// `TANG_CODER_SST` / `TANG_CODER_SNR_GU` / `TANG_CODER_SNR_DOWN` override them (sweeps).
 fn stream_shape() -> (usize, usize, usize) {
-    static S: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    let s = stream_shape4();
+    (s.0, s.1, s.2)
+}
+
+/// [`stream_shape`] and the down kernel's ring depth (`TANG_CODER_SST_DOWN`).
+fn stream_sst_down() -> usize {
+    stream_shape4().3
+}
+
+fn stream_shape4() -> (usize, usize, usize, usize) {
+    static S: std::sync::OnceLock<(usize, usize, usize, usize)> = std::sync::OnceLock::new();
     *S.get_or_init(|| {
         let n = |k: &str, d: usize| {
             std::env::var(k)
@@ -808,6 +818,7 @@ fn stream_shape() -> (usize, usize, usize) {
             n("TANG_CODER_SST", 1),
             n("TANG_CODER_SNR_GU", 8),
             n("TANG_CODER_SNR_DOWN", 16),
+            n("TANG_CODER_SST_DOWN", 2),
         )
     })
 }
@@ -1799,7 +1810,8 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            "#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            stream_sst_down(),
             stream_shape().0,
             stream_shape().1,
             stream_shape().2,
@@ -3324,7 +3336,7 @@ impl Coder {
                         v.k.moe_down_s,
                         ((nh / (8 * stream_shape().2)) as u32, groups, 1),
                         256,
-                        (8 * stream_shape().0 * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        (8 * stream_sst_down() * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
                     );
                 } else {

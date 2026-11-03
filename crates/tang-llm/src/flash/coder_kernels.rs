@@ -875,6 +875,9 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 #ifndef CX_SST
 #define CX_SST 4
 #endif
+#ifndef CX_SST_DOWN
+#define CX_SST_DOWN CX_SST
+#endif
 #ifndef CX_MT
 #define CX_MT 1
 #endif
@@ -887,7 +890,7 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 #ifndef CX_SNR_DOWN
 #define CX_SNR_DOWN 16
 #endif
-template <int NR, bool DOWN>
+template <int NR, bool DOWN, int SST>
 __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                 const unsigned char* xq, float* out, int T, int r16, int fast,
                                                 const unsigned* plan) {
@@ -905,12 +908,12 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
     constexpr int ACT16 = (CX_GCHUNK_S * (KA + KA / 8)) / 16;
     unsigned char* act = (unsigned char*)dsm;
     float* actd = (float*)(act + CX_GCHUNK_S * KA);
-    uint4* ring = dsm + ACT16 + warp * (CX_SST * 2 * r16);
+    uint4* ring = dsm + ACT16 + warp * (SST * 2 * r16);
     const int row0 = (blockIdx.x * 8 + warp) * NR;
     constexpr int NS = NR / 2;
-    const unsigned char* wp[CX_SST][2];
+    const unsigned char* wp[SST][2];
     auto issue = [&](int st) {
-        const int slot = st % CX_SST;
+        const int slot = st % SST;
         #pragma unroll
         for (int j = 0; j < 2; j++) {
             const int r = row0 + 2 * st + j;
@@ -922,7 +925,7 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
         cx_async_commit();
     };
     #pragma unroll
-    for (int st = 0; st < CX_SST - 1; st++) {
+    for (int st = 0; st < SST - 1; st++) {
         if (st < NS) issue(st); else cx_async_commit();
     }
     {
@@ -943,10 +946,10 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
         __syncthreads();
     }
     for (int st = 0; st < NS; st++) {
-        if (st + CX_SST - 1 < NS) issue(st + CX_SST - 1); else cx_async_commit();
-        cx_async_wait<CX_SST - 1>();
+        if (st + SST - 1 < NS) issue(st + SST - 1); else cx_async_commit();
+        cx_async_wait<SST - 1>();
         __syncwarp();
-        const int slot = st % CX_SST;
+        const int slot = st % SST;
         const unsigned char* w0 = wp[slot][0];
         const unsigned char* w1 = wp[slot][1];
         const int rr0 = row0 + 2 * st;
@@ -1031,12 +1034,12 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_s(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                               const unsigned char* xq, float* out, int T, int r16,
                                                               int fast, const unsigned* plan) {
-    moe_stream_body<CX_SNR_GU, false>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
+    moe_stream_body<CX_SNR_GU, false, CX_SST>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down_s(ExW d, ExW sd, const unsigned* ids,
                                                                 const unsigned char* hq, float* out, int T, int r16,
                                                                 int fast, const unsigned* plan) {
-    moe_stream_body<CX_SNR_DOWN, true>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan);
+    moe_stream_body<CX_SNR_DOWN, true, CX_SST_DOWN>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan);
 }
 
 // ---- grouped expert GEMM on tensor cores (wide prefill) ----

@@ -100,7 +100,7 @@ head and argmax for every row. `MAX_SLOTS` is 128. `flash serve --batch N` with 
 plain decode by the batch width. `flash-batch-check` (`TANG_BATCH_N`, `TANG_BATCH_CTX`) passes
 **bitwise** at 64 sequences.
 
-Speed doesn't follow: 866 tok/s aggregate at 64 (812 at 8), linear in B past 8. The expert
+Speed: 866 tok/s aggregate at 64 at first; 1,251 with the streaming expert kernels (gate|up ~1.5–2 TB/s, down ~1–1.2 TB/s). Dense GEMVs, GDN and attention are now about half the step. The expert
 kernels read distinct experts at ~0.5–0.9 TB/s (target ~2.4) and the 32-row GEMVs are L2-bound.
 Numbers in `speed-log.md`. Next: a bandwidth-bound grouped expert kernel for 1–2 tokens an expert
 (stream weights once, no per-block staging stall; down is the worse half), and dense layers

@@ -204,6 +204,31 @@ re-reading activations per weight row) are the walls.
   `cx_moe_gemm_*`, the prefill kernels): slower at every B past 8 (B=64: 132.5 vs 78.3 ms
   eager) and not bitwise. They're tiled for 64 tokens an expert; decode has ~2.
 
+### Streaming grouped experts for batch windows (2026-11-03, H200, explain, ~1.2k context)
+
+`cx_moe_gu_s` / `cx_moe_down_s`: grid (row tiles of 64 / 128 rows, groups of at most 8 pairs),
+each warp walking its rows of one expert with cp.async staging, the group's activations staged
+once a block, and `cx_dotq_m` decoding each Q4_K/Q5_K weight block once for all the group's rows
+(each row's arithmetic the single-row dot's). Bitwise PASS at 64. Graphs, 16 steps:
+
+| B | ms a step | tok/s aggregate | tok/s a stream |
+|---|---|---|---|
+| 1 | 4.03 | 248 | 248 |
+| 2 | 4.74 | 422 | 211 |
+| 4 | 6.51 | 615 | 154 |
+| 8 | 9.86 | 812 | 101 |
+| 16 | 20.01 | 800 | 50 |
+| 32 | 31.04 | 1031 | 32 |
+| 64 | 51.16 | 1251 | 20 |
+
+Eager, B=64 (ms a layer, GB/s from ~367 distinct experts + shared): gate|up 0.57 → 0.29
+(~1.5 TB/s; 0.22 ms / ~2 TB/s on 64-token prompts), down 0.50 → 0.23 (~0.95 TB/s; 0.18 /
+~1.2 TB/s). Ring depth barely matters (gate|up best at 1 stage — occupancy wins; down 2).
+
+- **Plain code sums precomputed per 16 bytes** (dropping 8 of 16 dp4a a row-token, exact): slower
+  (gate|up 0.22 → 0.26 ms), the extra prologue pass costs more than it saves.
+- **Deeper rings / more rows a warp for down** (4/8 stages, 32 rows): flat or worse.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
