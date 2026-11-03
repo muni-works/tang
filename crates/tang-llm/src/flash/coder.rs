@@ -932,9 +932,6 @@ pub struct Coder {
     slot_samp: Vec<super::sampler::RowSampling>,
     /// The next window's per-row sampler words (`stage_row_words`); empty: every row greedy.
     row_words: Vec<u32>,
-    /// Every decode step through the batch module once built, whatever its row count: a
-    /// sequence's numerics (and so its samples) don't depend on how many others decode with it.
-    pub batch_all: bool,
     pub hp: Hparams,
     g: Gguf,
     geo: Geometry,
@@ -1242,7 +1239,6 @@ impl Coder {
             row_sampler: None,
             slot_samp: vec![super::sampler::RowSampling::greedy(); MAX_SLOTS],
             row_words: Vec::new(),
-            batch_all: false,
             hp,
             g,
             geo,
@@ -2227,7 +2223,7 @@ impl Coder {
         let cap = MAX_T.max(self.batch_rows());
         ensure!((1..=cap).contains(&b), "{b} rows (at most {cap})");
         ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
-        let wide = b > MAX_T || (self.batch_all && self.batch.is_some());
+        let wide = b > MAX_T;
         let mut staged = Vec::with_capacity(b);
         let mut segs = Vec::with_capacity(b);
         let mut end = 0;

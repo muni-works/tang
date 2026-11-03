@@ -2148,8 +2148,6 @@ pub fn sample_check(args: &[String]) -> Result<()> {
         e.enable_batch(nb.next_multiple_of(32))?;
     }
     e.enable_row_sampling()?;
-    // TANG_BATCH_ALL=1: one-row steps through the batch module too (`Coder::batch_all`).
-    e.batch_all = std::env::var("TANG_BATCH_ALL").is_ok_and(|v| v == "1");
     let half = ids.len() / 2;
     let seqs: Vec<Vec<u32>> = (0..nb)
         .map(|i| ids[..ids.len() - (3 * i) % half].to_vec())
@@ -2238,7 +2236,7 @@ pub fn sample_check(args: &[String]) -> Result<()> {
         );
     }
     let rate = agree as f64 / tot as f64;
-    let det_ok = if nb <= super::coder::MAX_T || e.batch_all {
+    let det_ok = if nb <= super::coder::MAX_T {
         same_seq == nsampled && rate == 1.0
     } else {
         rate >= 0.99
@@ -2246,7 +2244,7 @@ pub fn sample_check(args: &[String]) -> Result<()> {
     println!(
         "determinism (alone vs batched): {same_seq}/{nsampled} sampled sequences identical, tokens agree {:.2}% given the same history ({}) : {}",
         100.0 * rate,
-        if nb <= super::coder::MAX_T || e.batch_all { "bar: bitwise" } else { "bar: 99%, tensor-core batch windows" },
+        if nb <= super::coder::MAX_T { "bar: bitwise" } else { "bar: 99%, tensor-core batch windows" },
         if det_ok { "PASS" } else { "FAIL" }
     );
     all_ok &= det_ok;
