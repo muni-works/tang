@@ -1131,6 +1131,15 @@ typedef float gst_t;
 __device__ __forceinline__ float gst_ld(const gst_t* p) { return *p; }
 __device__ __forceinline__ void gst_st(gst_t* p, float x) { *p = x; }
 #endif
+// The value a state element has after a store and load: the recurrence rounds every token's
+// new state to it in registers, so a token's arithmetic is the same whether its window holds
+// one token (state stored between tokens) or eight (state in registers): window independence
+// and spec-decode equivalence hold bitwise in every storage mode. Identity for f32.
+__device__ __forceinline__ float gst_rt(float x) {
+    gst_t t;
+    gst_st(&t, x);
+    return gst_ld(&t);
+}
 
 // The recurrence + gated norm. Grid GDN_HV (a block per v head), block 512 = 4 row groups of 32
 // state rows × 128 columns; each thread holds its 32 state values in registers for the window.
@@ -1226,15 +1235,16 @@ __device__ __forceinline__ void gdn_step_body(
         if (!outs || t0 + t < plen) {
             // No output for this row: the state update alone (the same fmas as below).
             #pragma unroll
-            for (int r = 0; r < 32; r++) st[r] = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
+            for (int r = 0; r < 32; r++) st[r] = gst_rt(__fmaf_rn(sk[t][rg * 32 + r], d, st[r]));
             __syncthreads();
             continue;
         }
         p = 0.0f;
         #pragma unroll
         for (int r = 0; r < 32; r++) {
-            st[r] = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
-            p = __fmaf_rn(st[r], sq[t][rg * 32 + r], p);
+            const float sn = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
+            p = __fmaf_rn(sn, sq[t][rg * 32 + r], p);
+            st[r] = gst_rt(sn);
         }
         __syncthreads();
         red[rg][j] = p;
@@ -1400,10 +1410,12 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
             float o0 = 0.0f, o1 = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
-                st[i] = __fmaf_rn(sk[t][sub + 8 * i], d, st[i]);
-                st[i + 1] = __fmaf_rn(sk[t][sub + 8 * i + 8], d, st[i + 1]);
-                o0 = __fmaf_rn(st[i], sq[t][sub + 8 * i], o0);
-                o1 = __fmaf_rn(st[i + 1], sq[t][sub + 8 * i + 8], o1);
+                const float s0 = __fmaf_rn(sk[t][sub + 8 * i], d, st[i]);
+                const float s1 = __fmaf_rn(sk[t][sub + 8 * i + 8], d, st[i + 1]);
+                o0 = __fmaf_rn(s0, sq[t][sub + 8 * i], o0);
+                o1 = __fmaf_rn(s1, sq[t][sub + 8 * i + 8], o1);
+                st[i] = gst_rt(s0);
+                st[i + 1] = gst_rt(s1);
             }
             const float o = sum8(o0 + o1);
             if (sub == 0) Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = o * INV_SQRT_D;
