@@ -268,7 +268,8 @@ cargo build --release -p tang-llm --no-default-features --features cuda
 G=$(ls /workspace/m/*.gguf | head -1)
 target/release/tang-llm serve $G --batch 64 --ctx 32768 > serve-sched.log 2>&1 &
 # wait for "listening on", then, for each C:
-for C in 8 64; do python3 /workspace/load.py $C 8080 3 > lt-sched-$C.json; done
+# serve listens on 8911 by default (the "listening on" line has the port):
+for C in 8 64; do python3 /workspace/load.py $C 8911 3 > lt-sched-$C.json; done
 grep "batch prefill policy" serve-sched.log
 ```
 
