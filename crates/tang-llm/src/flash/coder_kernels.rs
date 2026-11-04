@@ -2099,7 +2099,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, E
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID);
+    // Token tiles staged in smem (K = hidden: 16 slabs); the down GEMM (K = FF, 4 slabs) is
+    // faster without.
+    __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
+    gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, false, xs);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;

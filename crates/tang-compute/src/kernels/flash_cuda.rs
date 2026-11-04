@@ -1278,13 +1278,62 @@ __device__ __forceinline__ float sum8(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 4);
     return v;
 }
+// fl_gdn_wide's per-token inputs, every token in parallel (they don't depend on the state):
+// conv + SiLU of q, k, v, l2 norm of q and k, the decay g and beta b. X row t (GW_XROW floats):
+// q [GDN_HK][128], k [GDN_HK][128], v [GDN_HV][128], g [GDN_HV], b [GDN_HV]. The same
+// arithmetic as the recurrence kernel staged itself (bitwise). Grid n, block 256.
+#define GW_XROW (2 * GDN_HK * 128 + GDN_HV * 128 + 2 * GDN_HV)
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide_prep(
+    const u64* __restrict__ Htab, const float* __restrict__ P, unsigned int stride,
+    const float* __restrict__ DT, const float* __restrict__ SA, const unsigned int* __restrict__ SEG,
+    float eps, const float* __restrict__ Wc, float* __restrict__ X) {
+    __shared__ float xs[2 * GDN_HK * 128];
+    const unsigned int r0 = SEG[0], slot = SEG[2], t = blockIdx.x;
+    const float* H0 = (const float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    float* Xr = X + (u64)t * GW_XROW;
+    const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (unsigned int ch = tid; ch < GDN_CONV; ch += 256) {
+        const float4 w = ((const float4*)Wc)[ch];
+        float e[4];
+        #pragma unroll
+        for (unsigned int q = 0; q < 4; q++) {
+            const unsigned int p = t + q;
+            e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
+        }
+        float acc = e[0] * w.x;
+        acc = __fmaf_rn(e[1], w.y, acc);
+        acc = __fmaf_rn(e[2], w.z, acc);
+        acc = __fmaf_rn(e[3], w.w, acc);
+        const float v = silu(acc);
+        if (ch < 2 * GDN_HK * 128) xs[ch] = v;
+        else Xr[ch] = v;
+    }
+    if (tid < GDN_HV) {
+        const float a = Pr[(u64)t * stride + GDN_A + tid] + DT[tid];
+        const float sp = a > 20.0f ? a : log1pf(expf(a));
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + tid] = expf(sp * SA[tid]);
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + GDN_HV + tid] = sigm(Pr[(u64)t * stride + GDN_B + tid]);
+    }
+    __syncthreads();
+    for (unsigned int h = warp; h < 2 * GDN_HK; h += 8) {
+        const float* r = xs + h * 128;
+        const float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
+        const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
+        const float rs = 1.0f / sqrtf(ss + eps);
+        float* o = Xr + h * 128;
+        o[lane] = x0 * rs; o[lane + 32] = x1 * rs; o[lane + 64] = x2 * rs; o[lane + 96] = x3 * rs;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
     const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
-    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc) {
+    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc,
+    const float* __restrict__ X) {
     __shared__ __align__(16) float sq[GW_C][128];
     __shared__ __align__(16) float sk[GW_C][128];
-    __shared__ float sv[GW_C][64];
+    __shared__ __align__(16) float sv[GW_C][64];
     __shared__ float sg[GW_C], sb[GW_C];
     const unsigned int r0 = SEG[0], n = SEG[1], slot = SEG[2];
     float* S = (float*)Stab[slot];
@@ -1300,43 +1349,21 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
     for (unsigned int t0 = 0; t0 < n; t0 += GW_C) {
         const unsigned int nn = min(n - t0, (unsigned int)GW_C);
         __syncthreads();
-        // conv + SiLU: q, k (256 channels) and this block's 64 v channels, nn tokens.
-        for (unsigned int i = tid; i < GW_C * (256 + 64); i += 512) {
-            const unsigned int t = i / (256 + 64), c = i % (256 + 64);
+        // This chunk's inputs from fl_gdn_wide_prep: q, k of head hk, this block's 64 v
+        // columns, g and b of head hv.
+        for (unsigned int i = tid; i < GW_C * 80; i += 512) {
+            const unsigned int t = i / 80, c = i % 80;
             if (t >= nn) continue;
-            const unsigned int ch = c < 128 ? hk * 128 + c
-                                  : c < 256 ? GDN_HK * 128 + hk * 128 + (c - 128)
-                                            : 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64 + (c - 256);
-            const float4 w = ((const float4*)Wc)[ch];
-            float e[4];
-            #pragma unroll
-            for (unsigned int q = 0; q < 4; q++) {
-                const unsigned int p = t0 + t + q;
-                e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
-            }
-            float acc = e[0] * w.x;
-            acc = __fmaf_rn(e[1], w.y, acc);
-            acc = __fmaf_rn(e[2], w.z, acc);
-            acc = __fmaf_rn(e[3], w.w, acc);
-            const float v = silu(acc);
-            if (c < 128) sq[t][c] = v;
-            else if (c < 256) sk[t][c - 128] = v;
-            else sv[t][c - 256] = v;
+            const float* xr = X + (u64)(t0 + t) * GW_XROW;
+            float4 v4;
+            if (c < 32) { v4 = ((const float4*)(xr + hk * 128))[c]; *(float4*)&sq[t][4 * c] = v4; }
+            else if (c < 64) { v4 = ((const float4*)(xr + GDN_HK * 128 + hk * 128))[c - 32]; *(float4*)&sk[t][4 * (c - 32)] = v4; }
+            else { v4 = ((const float4*)(xr + 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64))[c - 64]; *(float4*)&sv[t][4 * (c - 64)] = v4; }
         }
         if (tid < nn) {
-            const float a = Pr[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
-            const float sp = a > 20.0f ? a : log1pf(expf(a));
-            sg[tid] = expf(sp * SA[hv]);
-            sb[tid] = sigm(Pr[(u64)(t0 + tid) * stride + GDN_B + hv]);
-        }
-        __syncthreads();
-        // l2 norm of q and k: a warp per (token, q | k).
-        for (unsigned int u = warp; u < 2 * nn; u += 16) {
-            float* r = (u & 1) ? sk[u >> 1] : sq[u >> 1];
-            float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
-            const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
-            const float rs = 1.0f / sqrtf(ss + eps);
-            r[lane] = x0 * rs; r[lane + 32] = x1 * rs; r[lane + 64] = x2 * rs; r[lane + 96] = x3 * rs;
+            const float* xr = X + (u64)(t0 + tid) * GW_XROW + 2 * GDN_HK * 128 + GDN_HV * 128;
+            sg[tid] = xr[hv];
+            sb[tid] = xr[GDN_HV + hv];
         }
         __syncthreads();
         for (unsigned int t = 0; t < nn; t++) {

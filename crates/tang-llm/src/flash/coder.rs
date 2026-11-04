@@ -535,6 +535,8 @@ struct Kern {
     gdn_commit_seg: Fun,
     /// Wide windows' GDN: a warp per state column (`fl_gdn_wide`), then the gated norm.
     gdn_wide: Fun,
+    /// fl_gdn_wide's per-token inputs (conv, norms, gates), every token in parallel.
+    gdn_wide_prep: Fun,
     gdn_wide_norm: Fun,
     copy: Fun,
     argmax1: Fun,
@@ -598,6 +600,7 @@ impl Kern {
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
             gdn_wide: self.gdn_wide,
+            gdn_wide_prep: self.gdn_wide_prep,
             gdn_wide_norm: self.gdn_wide_norm,
             copy: self.copy,
             argmax1: self.argmax1,
@@ -705,6 +708,7 @@ impl Kern {
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(fm, "fl_gdn_conv_commit_seg")?,
             gdn_wide: f(fm, "fl_gdn_wide")?,
+            gdn_wide_prep: f(fm, "fl_gdn_wide_prep")?,
             gdn_wide_norm: f(fm, "fl_gdn_wide_norm")?,
             copy: f(em, "fe_copy")?,
             argmax1: f(em, "fe_argmax1")?,
@@ -2839,6 +2843,7 @@ impl Coder {
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
+            (k.gdn_wide_prep, "gdn_wide_prep"),
             (k.gdn_wide, "gdn_wide"),
             (k.gdn_wide_norm, "gdn_wide_norm"),
             (k.copy, "copy"),
@@ -3725,14 +3730,27 @@ impl Coder {
                 v.dev.buffer_addr(&g.conv),
             );
             let t = self.wide_rows() as u32;
+            // The prep's rows (q, k, v, g, b a token) borrow the expert gate|up buffer, free
+            // until this layer's MoE.
+            let xrow = 2 * self.geo.gdn_hk * 128 + self.geo.gdn_hv * 128 + 2 * self.geo.gdn_hv;
+            assert!((self.hp.n_expert_used + 1) * 2 * self.hp.n_ff_exp >= xrow, "gdn prep rows fit egu");
+            let x = v.dev.buffer_addr(&v.s.egu);
             unsafe {
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide_prep,
+                    (t, 1, 1),
+                    256,
+                    0,
+                    tang_moe::args![htab, p, sd, dt, sa, seg, eps, wc, x],
+                );
                 self.launch_on(
                     v.stream,
                     v.k.gdn_wide,
                     (self.geo.gdn_hv as u32, 2, 1),
                     512,
                     0,
-                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc],
+                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
                 );
                 self.launch_on(
                     v.stream,
