@@ -1517,6 +1517,89 @@ extern "C" __global__ void __launch_bounds__(256) cx_router_b(const Seg* segs, i
 // The router (F32 / BF16 segments) for a wide window: a plain f32 tiled GEMM, 64 rows × 64
 // tokens a block, k in steps of 32 through shared memory, 4 × 4 outputs a thread. x is the f32
 // activations [T][k]. out[t][row]. Grid (rows / 64 rounded up, T / 64 rounded up), block 256.
+// cx_sgemm_wide, re-tiled: 64 rows x 128 tokens a block, 4 x 8 outputs a thread, k slabs of 16
+// loaded as float4 (the next slab in registers while this one computes), each row's segment
+// found once a block. Every output is the same fmaf chain over k ascending as cx_sgemm_wide
+// (bitwise equal). Grid (rows / 64, T / 128), block 256.
+extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide2(const Seg* segs, int nseg, int rows_total,
+                                                                 const float* x, int k, float* out, int ostride,
+                                                                 int T) {
+    __shared__ const unsigned char* wrow[64];
+    __shared__ int wty[64], wout[64];
+    __shared__ __align__(16) float ws[16][64 + 4];
+    __shared__ __align__(16) float xs[16][128 + 4];
+    const int r0 = blockIdx.x * 64, t0 = blockIdx.y * 128, tid = threadIdx.x;
+    if (tid < 64) {
+        const int rr = r0 + tid;
+        const unsigned char* w = nullptr;
+        int ty = 0, o = 0;
+        if (rr < rows_total) {
+            int q = rr, si = 0;
+            while (si < nseg - 1 && q >= segs[si].rows) { q -= segs[si].rows; si++; }
+            const Seg sg = segs[si];
+            w = (const unsigned char*)sg.w + (size_t)q * sg.row_bytes;
+            ty = sg.type;
+            o = sg.out_off + q;
+        }
+        wrow[tid] = w; wty[tid] = ty; wout[tid] = o;
+    }
+    __syncthreads();
+    const int lr = tid >> 2, lc = (tid & 3) * 4;  // loader: row / token lr (+64), k lc..lc+3
+    const unsigned char* wl = wrow[lr];
+    const bool wbf = wty[lr] != 0;
+    const int ta = t0 + lr, tb = t0 + lr + 64;
+    const float* xa = ta < T ? x + (size_t)ta * k : nullptr;
+    const float* xb = tb < T ? x + (size_t)tb * k : nullptr;
+    auto ldw = [&](int k0) -> float4 {
+        if (!wl) return make_float4(0.f, 0.f, 0.f, 0.f);
+        if (!wbf) return *(const float4*)((const float*)wl + k0 + lc);
+        const uint2 u = *(const uint2*)((const unsigned short*)wl + k0 + lc);
+        return make_float4(bf2f((unsigned short)(u.x & 0xffff)), bf2f((unsigned short)(u.x >> 16)),
+                           bf2f((unsigned short)(u.y & 0xffff)), bf2f((unsigned short)(u.y >> 16)));
+    };
+    float4 pw = ldw(0);
+    float4 pa = xa ? *(const float4*)(xa + lc) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 pb = xb ? *(const float4*)(xb + lc) : make_float4(0.f, 0.f, 0.f, 0.f);
+    const int tx = tid & 15, ty = tid >> 4;
+    float acc[4][8] = {};
+    for (int k0 = 0; k0 < k; k0 += 16) {
+        __syncthreads();
+        ws[lc][lr] = pw.x; ws[lc + 1][lr] = pw.y; ws[lc + 2][lr] = pw.z; ws[lc + 3][lr] = pw.w;
+        xs[lc][lr] = pa.x; xs[lc + 1][lr] = pa.y; xs[lc + 2][lr] = pa.z; xs[lc + 3][lr] = pa.w;
+        xs[lc][lr + 64] = pb.x; xs[lc + 1][lr + 64] = pb.y; xs[lc + 2][lr + 64] = pb.z; xs[lc + 3][lr + 64] = pb.w;
+        __syncthreads();
+        if (k0 + 16 < k) {
+            pw = ldw(k0 + 16);
+            if (xa) pa = *(const float4*)(xa + k0 + 16 + lc);
+            if (xb) pb = *(const float4*)(xb + k0 + 16 + lc);
+        }
+        #pragma unroll
+        for (int c = 0; c < 16; c++) {
+            // Rows 4 ty.., tokens 4 tx.. and 64 + 4 tx..: one 16-byte read of w, two of x a column
+            // (conflict-free).
+            const float4 av = *(const float4*)&ws[c][4 * ty];
+            const float4 b0 = *(const float4*)&xs[c][4 * tx], b1 = *(const float4*)&xs[c][64 + 4 * tx];
+            const float a[4] = {av.x, av.y, av.z, av.w};
+            const float b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int r = 4 * ty + i;
+        if (!wrow[r]) continue;
+        const int o = wout[r];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int tt = t0 + (j < 4 ? 4 * tx + j : 64 + 4 * tx + j - 4);
+            if (tt < T) out[(size_t)tt * ostride + o] = acc[i][j];
+        }
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide(const Seg* segs, int nseg, int rows_total,
                                                                 const float* x, int k, float* out, int ostride,
                                                                 int T) {
