@@ -276,6 +276,66 @@ grep "batch prefill policy" serve-sched.log
 Compare `agg_tps`, `ttft_p50/p95`, `stream_tps_p50` against `artifacts/gates-1104/lt-8.json` and
 `lt-64cold.json`; rerun C = 64 with `TANG_SERVE_PREFILL_FILL_SHARE=0.6` to place the dial.
 
+## Load-test bug sweep (2026-11-04, coder-serve2)
+
+Found in `serve --batch 128 --ctx 131072` (`artifacts/gates-1104/serve-b128.log` in coder-serve).
+
+- **(a) `--batch` clamped twice (128 → 27 → 26).** `flash serve` counts slots before and after
+  building the batch and wide windows; the second pass clamped the already clamped value and
+  warned again. The first count is now provisional and silent (it sizes the batch windows); the
+  count that sticks is `--batch` against the count after the windows, capped by the provisional
+  one, with one warning: `--batch 128 clamped to 26: 27 sequence slots fit … after the batch and
+  wide windows`. The drop to 26 itself is real: the windows took 2.8 GB (96.6 → 93.8 GB free),
+  most of a 3.30 GB slot at 131k. (`fit_slots` adds back what live slots hold, and none exist
+  at startup, so it wasn't counting its own allocation.) Test:
+  `batch::tests::startup_clamps_once_from_the_request`.
+- **(b) The phantom `req 128: prompt 0 … state saves 7.0–7.5 s` after every completion.** The
+  worker calls `Backend::after` for batched requests too, and `FlashServe::after` printed the
+  one-stream path's stale `line`, whose `snap_ms` every batched prefix-state save kept adding
+  to: 7 s was the running total over all requests, not work per completion. The slot-0 running
+  snapshot after it never ran (slot 0 holds no tokens under `--batch`; the log has no
+  `saved the running state` line). Not a throughput bug. `after` now returns for batched
+  requests (it logs only an error), and the `batch req:` line carries the request's own
+  `state saves N ms` (part of its prefill time). No unit test (FlashServe needs a model).
+- **(c) Over-context requests.** One rule, `batch::token_limit`: a prompt with no room for a
+  generated token (`prompt + 1 >= --ctx`) is refused at admission, before a slot is taken, with
+  `context_length_exceeded: the prompt is N tokens; the context window is C`; otherwise
+  `max_tokens` is cut so the sequence ends inside the window and the request finishes with
+  `finish_reason: "length"` there. Tests (`server::context_limits`, a fake batching engine): the
+  refused request never joins the batch, a stream reaching the window stops with `length` while
+  the stream beside it finishes, and the admission error answers HTTP 400 to a non-streaming
+  client. A streaming client has its 200 headers already, so it gets the same message as an SSE
+  `error` event (the tokenizer runs on the worker for the flash engine, so the check can't run
+  before the response starts). Real probe (`--ctx 4096` keeps prompts small):
+
+  ```
+  tang-llm serve $G --batch 8 --ctx 4096 --port 8921 &
+  python3 - <<'PY'
+  import json, urllib.request as u, concurrent.futures as cf
+  def chat(text, mt, stream=False):
+      b = json.dumps({"messages": [{"role": "user", "content": text}], "max_tokens": mt,
+                      "temperature": 0, "stream": stream}).encode()
+      r = u.Request("http://127.0.0.1:8921/v1/chat/completions", b, {"content-type": "application/json"})
+      try:
+          with u.urlopen(r) as f: return f.status, json.load(f)
+      except u.HTTPError as e: return e.code, json.load(e)
+  print(chat("word " * 6000, 16))             # 400, context_length_exceeded
+  with cf.ThreadPoolExecutor(4) as ex:         # near the window + max_tokens past it, beside 3 normal
+      fs = [ex.submit(chat, "word " * 3900, 1000)] + [ex.submit(chat, "count to 50", 200) for _ in range(3)]
+      for f in fs: s, j = f.result(); print(s, j["choices"][0]["finish_reason"], j["usage"])
+  PY
+  curl -s localhost:8921/health
+  ```
+  Expect the first 400, the near-window request `200 length` with `prompt + completion < 4096`,
+  the other three finishing normally, `/health` ok. Result in "Spec decode under batching" below.
+- **(d) `TANG_SERVE_DETERMINISTIC=1`.** Batched greedy ≠ solo greedy past 8 rows (7/64
+  identical in the drain test) is the batch module's tolerance path (K-split GEMVs, grouped
+  experts, MMA) and stays. The switch doesn't build the batch module and runs every decode
+  window at ≤ `MAX_T` (8) rows on the narrow, bitwise module (`batch::window_width`), more
+  windows a step, so a stream's greedy output is independent of what it's batched with.
+  Throughput cost: a step of N streams becomes ⌈N/8⌉ narrow windows instead of one batch
+  window; measured below.
+
 ## Known issues (2026-11-04)
 
 - **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
