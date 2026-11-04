@@ -276,6 +276,108 @@ grep "batch prefill policy" serve-sched.log
 Compare `agg_tps`, `ttft_p50/p95`, `stream_tps_p50` against `artifacts/gates-1104/lt-8.json` and
 `lt-64cold.json`; rerun C = 64 with `TANG_SERVE_PREFILL_FILL_SHARE=0.6` to place the dial.
 
+## bf16 GDN state (2026-11-04, H200 ru6a6zybgtu80q)
+
+`TANG_CODER_GDN_STATE=f32|bf16|f16|bf16sr` (default **f32**). A 16-bit mode stores each layer's
+recurrent state as 2-byte elements: half the per-slot GDN memory (75 → 38 MB at 36 layers) and
+half the state traffic. The recurrence still runs in f32 registers. The rounding (`gst_rt`)
+happens **after every token's update**, in registers, not only when the window stores the
+state. Rounding only at the store made a token's state depend on its window's width:
+`flash-tcheck` t1 vs t8 differed in every logit and `flash-spec-test` FAILed (every mode
+DIFFERS). With per-token rounding a T=8 window computes what eight T=1 windows compute, so
+tcheck and spec stay bitwise. The kernels are `fl_gdn_conv_step(_seg)` and `fl_gdn_wide`
+(prefill). The slot tables hold addresses only, so they don't change. `slot_bytes`, slot
+allocation, the VRAM cap and save/restore follow the mode. A state saved under one mode is
+rejected under the other. `TANG_CODER_GDN_RBITS=n` is a diagnostic: f32 storage with n
+significand bits rounded off per token.
+
+**Gate tool:** `flash-state-kl` (wide prefill, then 2,000 greedy steps). With `--dump`, an f32 run writes
+its tokens and logits. A second process under the other mode runs teacher-forced on those
+tokens and prints mean/max KL(f32 ‖ mode) and top-1 agreement per 512-token bucket. Prompts:
+the AA explain/refactor/write (~1.24k tokens) and an 8,000-token review of `flash/cli.rs`.
+
+| prompt | positions | bf16 mean KL | bf16 top-1 | f16 mean KL | f16 top-1 | floor (RBITS=2) KL | floor top-1 |
+|---|---|---|---|---|---|---|---|
+| explain | 0–512 | 5.15e-3 | 97.66% | 3.57e-3 | 98.44% | 3.28e-3 | 98.24% |
+| | 512–1024 | 4.53e-3 | 98.05% | 3.05e-3 | 98.05% | 3.03e-3 | 98.83% |
+| | 1024–1536 | 5.25e-3 | 97.27% | 4.34e-3 | 96.68% | 4.35e-3 | 96.68% |
+| | 1536–2000 | 4.63e-3 | 97.84% | 3.40e-3 | 97.41% | 2.81e-3 | 97.84% |
+| | **all** | **4.90e-3** | **97.70%** | **3.59e-3** | **97.65%** | **3.38e-3** | **97.90%** |
+| refactor | 0–512 | 1.27e-3 | 99.80% | 1.33e-3 | 99.61% | | |
+| | 512–1024 | 1.93e-3 | 98.24% | 1.85e-3 | 98.44% | | |
+| | 1024–1536 | 1.33e-3 | 99.22% | 1.06e-3 | 99.80% | | |
+| | 1536–2000 | 1.89e-3 | 99.57% | 1.43e-3 | 99.35% | | |
+| | **all** | **1.60e-3** | **99.20%** | **1.42e-3** | **99.30%** | | |
+| write | 0–512 | 3.34e-3 | 98.44% | 2.66e-3 | 98.05% | | |
+| | 512–1024 | 1.55e-3 | 99.41% | 1.62e-3 | 99.41% | | |
+| | 1024–1536 | 2.47e-3 | 99.22% | 2.22e-3 | 99.22% | | |
+| | 1536–2000 | 5.83e-4 | 99.78% | 7.91e-4 | 99.78% | | |
+| | **all** | **2.02e-3** | **99.20%** | **1.85e-3** | **99.10%** | | |
+| 8k review | 0–512 | 4.10e-3 | 97.66% | 2.28e-3 | 98.05% | 2.30e-3 | 98.24% |
+| | 512–1024 | 3.66e-3 | 98.44% | 2.20e-3 | 98.83% | 2.17e-3 | 99.41% |
+| | 1024–1536 | 3.47e-3 | 97.66% | 1.85e-3 | 98.83% | 1.75e-3 | 98.63% |
+| | 1536–2000 | 4.83e-3 | 97.63% | 2.93e-3 | 98.06% | 3.08e-3 | 98.92% |
+| | **all** | **3.99e-3** | **97.85%** | **2.30e-3** | **98.45%** | **2.31e-3** | **98.80%** |
+
+**The task's bars (mean KL ≤ 1e-3, agreement ≥ 99.5%) can't be met by any state that isn't
+bitwise f32. This engine has a perturbation floor.** f32 against its own reference is exactly 0 (deterministic).
+Rounding off just the **2 lowest** of 23 significand bits (≈5e-7 relative) already gives
+2.3–3.4e-3 and 97.9–98.8% agreement, the same as f16 or bf16. Earlier sweeps on explain, with rounding at the
+window store only, show the same: RBITS 2 / 6 / 13 gave 2.75 / 3.20 / 3.04e-3, f16 2.88e-3, bf16 3.50e-3. Any
+change to the state, however small, flips near-tied decisions downstream (top-10 of 512
+experts, greedy near-ties), and the divergence saturates at that level. It doesn't scale with
+the size of the error. The f32 batch path already accepted at B=64 shows the same kind of
+divergence: `flash-batch-check` N=64 tolerance is 99.10% token agreement on f32.
+
+**Measured against that floor:**
+- **f16 matches the floor:** 8k 2.30e-3 vs 2.31e-3; explain 3.59 vs 3.38e-3.
+- **bf16 is 1.45–1.7× above it:** explain 4.90e-3, 8k 3.99e-3, with 0.3–1 point lower agreement.
+- **Drift:** neither mode's KL trends upward across the 512-token buckets, on any prompt (8k: 4.1 / 3.7 /
+  3.5 / 4.8e-3 for bf16; the last bucket's rise is within the floor's own spread, 2.3 → 3.1e-3).
+- **Stochastic rounding** (`bf16sr`, rounding at the window store) didn't help: explain 3.58e-3, 8k 2.23e-3, vs
+  RNE's 3.50 / 2.18e-3.
+
+**Gates under bf16 / f16:**
+
+| gate | f32 | bf16 | f16 |
+|---|---|---|---|
+| flash-tcheck t1 vs t8 / t8-verify | 0 / 0 differ | 0 / 0 | 0 / 0 |
+| flash-spec-test (all modes SAME, T 0 and 0.8) | PASS | PASS | PASS |
+| flash-batch-check N=8 | PASS bitwise | PASS bitwise | PASS bitwise |
+| flash-batch-check N=64 (tolerance) | 99.10% agree, mean \|dlogit\| 0.124 | 99.14%, 0.132 | — |
+| needle (passphrase at 10% of 8k tokens) | found | found | found |
+
+(batch-check compares a mode's batch output with the same mode alone: the batch kernels stay
+row-independent under 16-bit state. Its tolerance numbers at N=64 are the same as f32's.)
+
+**Speed** (explain prompt, same binary, H200). Quick = `TANG_BATCH_QUICK` graph replay at a
+64-token prompt. GDN = `gdn_conv_step` ms per step from an eager `TANG_CODER_PROF` run.
+
+| | f32 | bf16 | Δ |
+|---|---|---|---|
+| B=8 quick ms/step | 9.06 | 8.94 | −0.12 |
+| B=32 quick ms/step | 19.15 | 18.78 | −0.37 |
+| B=64 quick ms/step | 30.24 | 29.63 (f16 29.43) | −0.6 |
+| B=8 GDN ms/step | 0.72 | 0.67 | −0.05 |
+| B=32 GDN ms/step | 2.19 | 1.89 | −0.30 |
+| B=64 GDN ms/step | 4.29 | 3.68 | −0.61 |
+| B=64 batch-check ms/step (ctx ~1.2k) | 38.85 | 38.04 | −0.8 |
+| T=1 window (eager bench, median) | 7.47 ms | 7.53 ms | +0.06 |
+| T=3 MTP window (median) | 5.79 ms | 5.84 ms | +0.05 |
+
+The win is about 30% of the predicted 2.1 / 1 ms. That prediction assumed the f32 step sits at the
+state-bandwidth floor. It doesn't: B=64 moves 36 × 64 × 4 MB ≈ 9.4 GB a step, ≈2 ms at
+4.8 TB/s, against 4.29 ms measured. The rest is the per-token barriers and reductions, which
+16-bit storage doesn't change. At T=1 the conversion is slightly slower (11.0 vs 10.6 µs a
+layer). A vectorized state load/store (2 × bf16 per lane) and fewer barriers per token are
+the next lever if GDN matters again.
+
+**Decision: default stays f32.** bf16 fails the stated bars and is measurably above the
+floor. f16 is at the floor, passes every bitwise gate and gives the same speed (B=64 29.43
+ms). It's the mode to flip if the bars are restated relative to the floor, for example
+"mean KL ≤ 1.2× an RBITS=2 run, no upward trend". The win is small: 0.6 ms (2%) at B=64, none
+single-stream.
+
 ## Known issues (2026-11-04)
 
 - **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
