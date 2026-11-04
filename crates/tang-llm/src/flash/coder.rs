@@ -749,11 +749,18 @@ impl Kern {
             self.fa2,
         ] {
             unsafe {
+                // Static shared memory counts against the opt-in cap (matters on sm_86).
+                let mut st = 0i32;
+                cudarc::driver::sys::cuFuncGetAttribute(
+                    &mut st,
+                    cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                    f,
+                );
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
                         f,
                         cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem_max,
+                        smem_max - st.max(0),
                     ),
                     "cuFuncSetAttribute",
                 )
@@ -1120,7 +1127,12 @@ impl Coder {
     pub fn load(path: &Path, opts: CoderOpts) -> Result<Self> {
         let t0 = Instant::now();
         let g = Gguf::open(path)?;
-        let hp = Hparams::from_gguf(&g)?;
+        let mut hp = Hparams::from_gguf(&g)?;
+        // Debug: `TANG_CODER_MAX_LAYERS=N` loads only the first N layers (profiling on a small
+        // GPU; outputs are garbage, the kernels are real).
+        if let Some(n) = std::env::var("TANG_CODER_MAX_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            hp.n_layer = hp.n_layer.min(n.max(1));
+        }
         ensure!(hp.arch == Arch::Qwen3Next, "not a qwen3next GGUF");
         ensure!(
             hp.ssm_d_state == 128 && hp.ssm_d_conv == 4,
