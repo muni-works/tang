@@ -364,3 +364,17 @@ narrow references (auto-wide off by default in `load_coder`).
 flash-aa explain (1235 tokens): prefill **1.49 → 0.35 s** (830 → 3,530 tok/s); decode unchanged.
 Crossover (flash-wide-check): 32 tok 785 vs 472, 64: 856 vs 671, 128: 851 vs 1,141, 256: 849 vs
 1,770, 512: 842 vs 2,589 tok/s (narrow vs wide).
+
+### Wide expert GEMM: Q4_K / Q5_K superblock operands loaded once (2026-11-04, H200)
+
+`gemm_tile_sbk`: for the experts (gate/up Q4_K, down Q5_K in UD-Q4_K_XL) a lane loads a
+superblock's d, dmin, scales and qs words once per 256 columns (`sbk_load`, as the batch MMA
+kernels), next superblock's loads in flight, instead of 4–5 scattered loads per 8 weights.
+Two 3k wide prefills: moe_gu 568 → 411 ms, moe_down 227 → 198 ms. wide-check 3000: 3,741 →
+**4,276 tok/s**; 8000: 3,980 → 4,414. Serve C=64 x3: 421 → **447 tok/s** aggregate, TTFT p50
+16.5 → 15.2 s, p95 69 → 61 s, wall 292 → 275 s. Gates: wide-check 3000/8000 KL 9e-7 / 3e-6,
+spec-test PASS, tcheck t1/t8 bitwise, batch-check N=8 bitwise.
+
+Tried and reverted: software-pipelining the generic k32 tile (decode the next 32 columns before
+this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely registers.
+`__launch_bounds__(256, 3)` on the expert GEMMs: slightly slower.

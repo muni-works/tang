@@ -1676,6 +1676,91 @@ __device__ __forceinline__ void gemm_tile32(const unsigned char* wa, const unsig
     }
 }
 
+// gemm_tile32 for Q4_K / Q5_K rows: a superblock's operands (d, dmin, scales, this lane's qs
+// words) loaded once per 256 columns with the next superblock's loads in flight (sbk_load, as
+// the batch MMA kernels), instead of 4-5 scattered loads per 8 weights. Same staging and math.
+template <int TY>
+__device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const unsigned char* wb, bool live,
+                                              const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
+                                              float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
+                                              int (*ssx)[GT_KS / 32 + 1]) {
+    constexpr int BB = TY == 12 ? 144 : 176;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const unsigned char* xr[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + g];
+    SbK ra, rb, pa, pb;
+    if (live) { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
+    for (int ks = 0; ks < K; ks += GT_KS) {
+        const int kn = min(GT_KS, K - ks), nb = kn / 32;
+        __syncthreads();
+        for (int i = threadIdx.x; i < 64 * nb; i += blockDim.x) {
+            const int t = i / nb, b = i - t * nb;
+            const float* xd = xd_s[t];
+            sxd[t][b] = xd ? xd[ks / 32 + b] : 0.f;
+            int sm = 0;
+            const unsigned char* r = xrow_s[t];
+            if (r) {
+                const uint4* q = (const uint4*)(r + ks + b * 32);
+                const uint4 u0 = q[0], u1 = q[1];
+                sm = __dp4a((int)u0.x, 0x01010101, sm); sm = __dp4a((int)u0.y, 0x01010101, sm);
+                sm = __dp4a((int)u0.z, 0x01010101, sm); sm = __dp4a((int)u0.w, 0x01010101, sm);
+                sm = __dp4a((int)u1.x, 0x01010101, sm); sm = __dp4a((int)u1.y, 0x01010101, sm);
+                sm = __dp4a((int)u1.z, 0x01010101, sm); sm = __dp4a((int)u1.w, 0x01010101, sm);
+            }
+            ssx[t][b] = sm;
+        }
+        __syncthreads();
+        if (!live) continue;
+        for (int k0 = ks; k0 < ks + kn; k0 += 256) {
+            const int sb = k0 / 256;
+            if ((sb + 1) * 256 < K) {
+                sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
+                sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
+            }
+            #pragma unroll
+            for (int st = 0; st < 8; st++) {
+                const int j = st >> 1, hi = st & 1;
+                unsigned a[4];
+                #pragma unroll
+                for (int w = 0; w < 2; w++) {
+                    unsigned qa = hi ? (ra.q[j][w] >> 4) & 0x0F0F0F0Fu : ra.q[j][w] & 0x0F0F0F0Fu;
+                    unsigned qb = hi ? (rb.q[j][w] >> 4) & 0x0F0F0F0Fu : rb.q[j][w] & 0x0F0F0F0Fu;
+                    if (TY == 13) {
+                        qa |= ((ra.h[w] >> st) & 0x01010101u) << 4;
+                        qb |= ((rb.h[w] >> st) & 0x01010101u) << 4;
+                    }
+                    a[w * 2] = qa;
+                    a[w * 2 + 1] = qb;
+                }
+                int s0, m0, s1, m1;
+                scale_min_w(st, ra.sc, s0, m0);
+                scale_min_w(st, rb.sc, s1, m1);
+                const float da = ra.d * i2f(s0), ma = ra.dm * i2f(m0);
+                const float db = rb.d * i2f(s1), mb = rb.dm * i2f(m1);
+                const int e = k0 + st * 32, bi = (e - ks) >> 5;
+                #pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    if (c >= nch) break;
+                    const unsigned char* x = xr[c];
+                    const unsigned b0 = x ? *(const unsigned*)(x + e + 4 * tig) : 0u;
+                    const unsigned b1 = x ? *(const unsigned*)(x + e + 16 + 4 * tig) : 0u;
+                    int d[4];
+                    mma_s8_16832(d, a, b0, b1);
+                    #pragma unroll
+                    for (int jj = 0; jj < 2; jj++) {
+                        const int t = c * 8 + 2 * tig + jj;
+                        const float dx = sxd[t][bi], sx = i2f(ssx[t][bi]);
+                        acc[c][jj] = fmaf(dx, fmaf(da, i2f(d[jj]), -ma * sx), acc[c][jj]);
+                        acc[c][2 + jj] = fmaf(dx, fmaf(db, i2f(d[2 + jj]), -mb * sx), acc[c][2 + jj]);
+                    }
+                }
+            }
+            if ((sb + 1) * 256 < K) { ra = pa; rb = pb; }
+        }
+    }
+}
+
 // `xrow_s` / `xd_s`: the tile's 64 token rows (codes, per-32 scales; null past the tile) in
 // shared memory. Every thread of the block calls it.
 // `k16`: the old per-16 tile for every type (no syncs), for blocks whose warps differ in type.
@@ -1708,8 +1793,8 @@ __device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, c
     __shared__ float sxd[64][GT_KS / 32 + 1];
     __shared__ int ssx[64][GT_KS / 32 + 1];
     switch (ty) {
-        case 12: gemm_tile32<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
-        case 13: gemm_tile32<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 12: gemm_tile_sbk<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 13: gemm_tile_sbk<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 8: gemm_tile32<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 108: gemm_tile32<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 2: gemm_tile32<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
