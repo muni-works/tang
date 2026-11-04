@@ -1326,7 +1326,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide_prep(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
     const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc,
@@ -1342,16 +1342,20 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
     float* Yr = Y + (u64)r0 * GDN_V;
     const unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x;
     const unsigned int warp = tid >> 5, lane = tid & 31, sub = lane & 7;
-    const unsigned int jl = warp * 4 + (lane >> 3), j = blockIdx.y * 64 + jl;
-    float st[16];
+    const unsigned int jl = (warp * 4 + (lane >> 3)) * 2, j = blockIdx.y * 64 + jl;
+    float st0[16], st1[16];
     #pragma unroll
-    for (int i = 0; i < 16; i++) st[i] = S[((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j];
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j;
+        st0[i] = S[o];
+        st1[i] = S[o + 1];
+    }
     for (unsigned int t0 = 0; t0 < n; t0 += GW_C) {
         const unsigned int nn = min(n - t0, (unsigned int)GW_C);
         __syncthreads();
         // This chunk's inputs from fl_gdn_wide_prep: q, k of head hk, this block's 64 v
         // columns, g and b of head hv.
-        for (unsigned int i = tid; i < GW_C * 80; i += 512) {
+        for (unsigned int i = tid; i < GW_C * 80; i += 256) {
             const unsigned int t = i / 80, c = i % 80;
             if (t >= nn) continue;
             const float* xr = X + (u64)(t0 + t) * GW_XROW;
@@ -1368,44 +1372,54 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
         __syncthreads();
         for (unsigned int t = 0; t < nn; t++) {
             const float g = sg[t];
-            // Lane sub's 16 rows are 32 q + 4 sub + r: four float4 reads of k (and of q), each
-            // one conflict-free wavefront for the warp (was 16 scalar reads).
             float kk[16];
             #pragma unroll
             for (int q4 = 0; q4 < 4; q4++) {
                 const float4 v4 = *(const float4*)&sk[t][32 * q4 + 4 * sub];
                 kk[4 * q4] = v4.x; kk[4 * q4 + 1] = v4.y; kk[4 * q4 + 2] = v4.z; kk[4 * q4 + 3] = v4.w;
             }
-            float p0 = 0.0f, p1 = 0.0f;
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
-                st[i] *= g;
-                st[i + 1] *= g;
-                p0 = __fmaf_rn(st[i], kk[i], p0);
-                p1 = __fmaf_rn(st[i + 1], kk[i + 1], p1);
+                st0[i] *= g; st0[i + 1] *= g; st1[i] *= g; st1[i + 1] *= g;
+                p0 = __fmaf_rn(st0[i], kk[i], p0);
+                p1 = __fmaf_rn(st0[i + 1], kk[i + 1], p1);
+                p2 = __fmaf_rn(st1[i], kk[i], p2);
+                p3 = __fmaf_rn(st1[i + 1], kk[i + 1], p3);
             }
-            const float p = sum8(p0 + p1);
-            const float d = (sv[t][jl] - p) * sb[t];
+            const float pa = sum8(p0 + p1), pb = sum8(p2 + p3);
+            const float2 vv = *(const float2*)&sv[t][jl];
+            const float bt = sb[t];
+            const float d0 = (vv.x - pa) * bt, d1 = (vv.y - pb) * bt;
             float qq[16];
             #pragma unroll
             for (int q4 = 0; q4 < 4; q4++) {
                 const float4 v4 = *(const float4*)&sq[t][32 * q4 + 4 * sub];
                 qq[4 * q4] = v4.x; qq[4 * q4 + 1] = v4.y; qq[4 * q4 + 2] = v4.z; qq[4 * q4 + 3] = v4.w;
             }
-            float o0 = 0.0f, o1 = 0.0f;
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
-                st[i] = __fmaf_rn(kk[i], d, st[i]);
-                st[i + 1] = __fmaf_rn(kk[i + 1], d, st[i + 1]);
-                o0 = __fmaf_rn(st[i], qq[i], o0);
-                o1 = __fmaf_rn(st[i + 1], qq[i + 1], o1);
+                st0[i] = __fmaf_rn(kk[i], d0, st0[i]);
+                st0[i + 1] = __fmaf_rn(kk[i + 1], d0, st0[i + 1]);
+                st1[i] = __fmaf_rn(kk[i], d1, st1[i]);
+                st1[i + 1] = __fmaf_rn(kk[i + 1], d1, st1[i + 1]);
+                o0 = __fmaf_rn(st0[i], qq[i], o0);
+                o1 = __fmaf_rn(st0[i + 1], qq[i + 1], o1);
+                o2 = __fmaf_rn(st1[i], qq[i], o2);
+                o3 = __fmaf_rn(st1[i + 1], qq[i + 1], o3);
             }
-            const float o = sum8(o0 + o1);
-            if (sub == 0) Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = o * INV_SQRT_D;
+            const float oa = sum8(o0 + o1), ob = sum8(o2 + o3);
+            if (sub == 0)
+                *(float2*)&Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = make_float2(oa * INV_SQRT_D, ob * INV_SQRT_D);
         }
     }
     #pragma unroll
-    for (int i = 0; i < 16; i++) S[((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j] = st[i];
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j;
+        S[o] = st0[i];
+        S[o + 1] = st1[i];
+    }
 }
 
 // fl_gdn_wide's gated norm, in place on Y: y = o · rms(o)⁻¹ · w · gate(z). Grid (len, GDN_HV),

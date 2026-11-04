@@ -3748,7 +3748,7 @@ impl Coder {
                     v.stream,
                     v.k.gdn_wide,
                     (self.geo.gdn_hv as u32, 2, 1),
-                    512,
+                    256,
                     0,
                     tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
                 );
