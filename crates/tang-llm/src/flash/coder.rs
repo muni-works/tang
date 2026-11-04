@@ -3120,10 +3120,11 @@ impl Coder {
                     t as i32,
                 );
                 unsafe {
-                    // TANG_CODER_SGEMM2: 0 the old tile, 2 the 64-token tile, else the 128-token one.
+                    // TANG_CODER_SGEMM2: 0 the old tile, 1 the 128-token tile, else the 64-token
+                    // one (H200 router, two 3k prefills: 87 / 41 / 34 ms).
                     let s2v = std::env::var("TANG_CODER_SGEMM2").unwrap_or_default();
                     let s2 = s2v != "0" && w.k.is_multiple_of(16);
-                    let small = s2 && s2v == "2";
+                    let small = s2 && s2v != "1";
                     let (f, tb, nt) = if !s2 {
                         (wd.k.sgemm_wide, 64, 256)
                     } else if small {

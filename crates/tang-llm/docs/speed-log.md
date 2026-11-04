@@ -585,3 +585,42 @@ Gates:
 
 `TANG_CODER_DENSE32=1` (Q8X at 32 rows a warp) is slower on the H200 too: gdn_in 144 → 191 ms,
 3000 tokens 6,675 → 6,392 tok/s, KL 5.5e-4. It stays off by default.
+
+### Wide prefill: router SGEMM re-tiled, wide GDN bitwise to afa748e7 again (2026-11-04, H200)
+
+Follow-up on the same branch. Runs used `flash-wide-check --ids-file refactor.ids -n 32` with
+`TANG_CODER_WIDE=2048` on pod o7lpawaxjvnm9b, shared with the serving agent under
+`/workspace/gpu.lock`. Logs are in `artifacts/h200/r3`.
+
+- **Router:** `cx_sgemm_wide2` replaces `cx_sgemm_wide`. It uses 64-row tiles, float4 k slabs
+  prefetched in registers, conflict-free float4 smem reads, and finds each row's segment once a
+  block. Every output is the same `fmaf` chain over k ascending, so the result is bitwise equal
+  and top-10 expert selection is unchanged (no tf32 or bf16 needed). Router time, two 3k
+  prefills:
+
+| tile | router ms |
+|---|---|
+| old `cx_sgemm_wide` | 87.3 |
+| 64 x 128 (`TANG_CODER_SGEMM2=1`) | 40.7 |
+| 64 x 64, block 128 (default) | 34.2 |
+
+  The 25 ms target isn't met. The rest would take tf32 or bf16 tensor cores, which would change
+  routing.
+- **GDN KL:** q and k are now staged permuted, so each lane's float4 reads give afa748e7's rows
+  (`sub + 8 i`) in order. The wide GDN is bitwise equal to afa748e7 again. KL vs narrow is back
+  to 8.61e-5 at 3000 and 4.43e-6 at 8000, and gdn_wide is not slower: 132 → 120 ms.
+
+| | afa748e7 | branch |
+|---|---|---|
+| wide prefill, 1000 tokens | 3,967 tok/s | 6,424 tok/s |
+| wide prefill, 3000 tokens | 4,263 tok/s | 7,143 tok/s (7,223 with the 64-token router tile) |
+| wide prefill, 8000 tokens | 4,391 tok/s | 7,534 tok/s |
+| serve C=64 ×3, aggregate | 443 tok/s | **583 tok/s** |
+| serve C=64: TTFT p50 / p95 | 15.5 / 63.3 s | 2.9 / 37.2 s |
+| serve C=64: wall | 277 s | 210 s |
+
+The load test ran with the 128-token router tile, before the 64-token tile became the default.
+
+Gates: tcheck t1 / t8 / t8-verify bitwise; batch-check N=8 bitwise, checksum unchanged
+(2066e91aa9110ab5); wide-check 3000 and 8000 PASS. spec-test was not re-run here; it passed
+earlier on this branch.
