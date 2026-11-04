@@ -275,3 +275,24 @@ grep "batch prefill policy" serve-sched.log
 
 Compare `agg_tps`, `ttft_p50/p95`, `stream_tps_p50` against `artifacts/gates-1104/lt-8.json` and
 `lt-64cold.json`; rerun C = 64 with `TANG_SERVE_PREFILL_FILL_SHARE=0.6` to place the dial.
+
+## Known issues (2026-11-04)
+
+- **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
+  greedy tokens still equal). Bisected with the wide-window switches on 4133d39a (H200,
+  refactor ids, 2048-row windows, teacher-forced max KL over 8 steps):
+
+  | `TANG_CODER_ATTN` | `TANG_CODER_WGEMM` | KL |
+  |---|---|---|
+  | fa2 (default) | on (default) | 1.15e-2 |
+  | fa2 | 0 | **1.52e-2** |
+  | splitk | on | 2.04e-3 |
+  | splitk | 0 | 0 (bitwise) |
+  | fa2 | gu only | 4.73e-3 |
+  | fa2 | down only | 9.70e-3 |
+
+  The FA2 attention (`cx_attn_fa2` + merge) is the stage that diverges at short context; the
+  tensor-core GEMMs add ~2e-3 on their own. At 3000 / 8000 tokens both are under 1e-5. Not fixed.
+- **`flash-tcheck` panics at `cli.rs:1913`** (index out of bounds on an empty per-layer
+  capture) after printing `t1 vs t8: logits differ in 0`, on 4133d39a too. The bitwise logits
+  line is the gate; the per-layer table needs a capture the Coder engine doesn't fill.
