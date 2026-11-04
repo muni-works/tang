@@ -1442,27 +1442,38 @@ impl Coder {
         per_layer + usize::from(self.mtp.is_some()) * kv
     }
 
+    /// Sequence slots that fit in VRAM now: recounted from free memory (plus what the live
+    /// slots already hold), and kept as the cap [`alloc_slot`](Self::alloc_slot) enforces.
+    /// `flash serve` calls it at startup, before and after building its windows, to clamp
+    /// `--batch`.
+    pub fn fit_slots(&mut self) -> usize {
+        // A slot's state is ~0.85 GB at a 32k context (K/V of every attention layer at
+        // `max_ctx`, plus the GDN states): MAX_SLOTS of them don't fit. Cap the count at
+        // what's free, less headroom for graphs and later scratch, so a server parking
+        // finished slots evicts one instead of failing an allocation mid-step.
+        let headroom = std::env::var("TANG_SLOT_HEADROOM_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(4.0);
+        let per = self.slot_bytes().max(1);
+        let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
+        let free = cudarc::driver::result::mem_get_info()
+            .map_or(usize::MAX, |m| m.0.saturating_add(live * per));
+        self.slot_cap =
+            crate::batch::slots_that_fit(free, (headroom * 1e9) as usize, per, MAX_SLOTS);
+        eprintln!(
+            "coder: {} sequence slots fit ({:.2} GB each, {:.1} GB free, {headroom} GB headroom)",
+            self.slot_cap,
+            per as f64 / 1e9,
+            free as f64 / 1e9
+        );
+        self.slot_cap
+    }
+
     /// A free sequence slot (1..MAX_SLOTS), its state zeroed and no tokens.
     pub fn alloc_slot(&mut self) -> Result<usize> {
         if self.slot_cap == 0 {
-            // A slot's state is ~0.85 GB at a 32k context (K/V of every attention layer at
-            // `max_ctx`, plus the GDN states): MAX_SLOTS of them don't fit. Cap the count at
-            // what's free now, less headroom for graphs and later scratch, so a server parking
-            // finished slots evicts one instead of failing an allocation mid-step.
-            let headroom = std::env::var("TANG_SLOT_HEADROOM_GB")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(4.0);
-            let free = cudarc::driver::result::mem_get_info().map_or(usize::MAX, |m| m.0);
-            let per = self.slot_bytes().max(1);
-            let fit = (free as f64 - headroom * 1e9).max(0.0) as usize / per;
-            self.slot_cap = fit.clamp(1, MAX_SLOTS - 1);
-            eprintln!(
-                "coder: {} sequence slots fit ({:.2} GB each, {:.1} GB free)",
-                self.slot_cap,
-                per as f64 / 1e9,
-                free as f64 / 1e9
-            );
+            self.fit_slots();
         }
         let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
         ensure!(live < self.slot_cap, "all {} slots that fit in VRAM in use", self.slot_cap);

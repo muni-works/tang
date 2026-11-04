@@ -124,8 +124,8 @@ scheduler work.
 
 ## Serving fixes 2026-11-04
 
-GPU checks below are still to run (written without a GPU; CPU tests green). `$M` is the
-Qwen3-Coder-Next model directory; build with `cargo build --release -p tang-llm
+GPU checks below are still to run (written without a GPU; CPU tests green). `$G` is the
+Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
 --no-default-features --features cuda`.
 
 1. **A failed step ends only its streams.** `engine.step` used to retire every stream with the
@@ -136,6 +136,20 @@ Qwen3-Coder-Next model directory; build with `cargo build --release -p tang-llm
    that reads as one, or a panic out of the compute layer, which `catch_unwind` now catches)
    ends every stream, sets `NodeState::unhealthy`, and `/health` answers 503 `unhealthy: …`;
    new requests fail with "restart the server" instead of joining. Tests: `server::step_failures`.
-   GPU check: `tang-llm flash serve $M --batch 64 --ctx 32768`, then 64 concurrent requests where
-   one has a prompt near `--ctx` and `max_tokens` past it (the slot overflows mid-decode): only
-   that request errors, the other 63 finish, `curl -s localhost:PORT/health` stays `ok`.
+   GPU check: `tang-llm serve $G --batch 64 --ctx 32768`, then 64 concurrent requests where one
+   has a prompt near `--ctx` and `max_tokens` past it (if the slot overflows mid-decode, only that
+   request errors; the other 63 finish), and `curl -s localhost:8911/health` stays `ok`. A forced
+   fault (`TANG_FORCE_STEP_FAULT` is not wired; kill -SEGV is not the same) can't be staged
+   cheaply: check the log line `tang-llm: the engine is unhealthy:` on the next real one.
+
+2. **`--batch` clamped to the slots that fit.** `Coder::fit_slots` counts slots from free VRAM,
+   `slot_bytes()` at `--ctx` and `TANG_SLOT_HEADROOM_GB` (default 4), and is the cap
+   `alloc_slot` enforces. `flash serve` calls it at startup and again after building the batch
+   and wide windows (they take memory), and sets `batch = min(batch, cap - 1)`
+   (`batch::clamp_batch`; one slot spare so admitting can always evict a parked one), logging
+   `--batch N clamped to M: C sequence slots fit in free VRAM at --ctx X`. `batch_can_admit`
+   bounds busy slots by that `batch`, so admission stays under the cap. Test:
+   `batch::tests::batch_stays_under_the_slots_that_fit`. GPU check: `tang-llm serve $G --batch 128
+   --ctx 131072` on an H200 logs the clamp (slots ≈ (free − 4 GB) / slot size) and then 128
+   concurrent requests run without an allocation failure; `--batch 64 --ctx 32768` is unchanged
+   (no warning, 64 at once).

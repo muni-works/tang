@@ -43,6 +43,21 @@ pub fn yields(priority: Priority, prefilling: bool, blocked_interactive: bool) -
     priority == Priority::Background && prefilling && blocked_interactive
 }
 
+/// Sequence slots that fit in `free` device bytes less `headroom`, `per` bytes each, at least
+/// 1 and below `max_slots` (slot 0 is the engine's own).
+pub fn slots_that_fit(free: usize, headroom: usize, per: usize, max_slots: usize) -> usize {
+    (free.saturating_sub(headroom) / per.max(1)).clamp(1, max_slots.max(2) - 1)
+}
+
+/// `--batch` within the engine's slots (`max_slots`, slot 0 excluded) and below the VRAM cap
+/// (`cap` slots fit; one stays spare so admitting can always evict a parked slot), at least 1.
+pub fn clamp_batch(batch: usize, max_slots: usize, cap: usize) -> usize {
+    batch
+        .min(max_slots.saturating_sub(1))
+        .min(cap.saturating_sub(1))
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +122,24 @@ mod tests {
         assert!(!yields(Priority::Background, false, true));
         assert!(!yields(Priority::Background, true, false));
         assert!(!yields(Priority::Interactive, true, true));
+    }
+
+    #[test]
+    fn batch_stays_under_the_slots_that_fit() {
+        const GB: usize = 1_000_000_000;
+        // 0.85 GB a slot, 60 GB free, 4 GB headroom: 65 fit.
+        let cap = super::slots_that_fit(60 * GB, 4 * GB, 850_000_000, 128);
+        assert_eq!(cap, 65);
+        assert_eq!(super::clamp_batch(64, 128, cap), 64);
+        assert_eq!(super::clamp_batch(96, 128, cap), 64);
+        // Less free memory than headroom: one slot, and batching is off.
+        let cap = super::slots_that_fit(3 * GB, 4 * GB, 850_000_000, 128);
+        assert_eq!(cap, 1);
+        assert_eq!(super::clamp_batch(64, 128, cap), 1);
+        // Lots of memory: the engine's slot count bounds it.
+        let cap = super::slots_that_fit(usize::MAX, 0, 1, 128);
+        assert_eq!(cap, 127);
+        assert_eq!(super::clamp_batch(200, 128, cap), 126);
+        assert_eq!(super::clamp_batch(8, 128, cap), 8);
     }
 }

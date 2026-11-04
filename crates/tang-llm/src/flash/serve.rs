@@ -159,6 +159,10 @@ pub trait ServeEngine {
     fn alloc_slot(&mut self) -> Result<usize> {
         bail!("this engine has no sequence slots")
     }
+    /// Sequence slots that fit in VRAM at the configured context (see `Coder::fit_slots`).
+    fn fit_slots(&mut self) -> usize {
+        self.max_slots().saturating_sub(1).max(1)
+    }
     fn free_slot(&mut self, _slot: usize) {}
     fn prefill_slot(&mut self, _slot: usize, _ids: &[u32]) -> Result<u32> {
         bail!("this engine has no sequence slots")
@@ -367,6 +371,9 @@ impl ServeEngine for super::coder::Coder {
     }
     fn alloc_slot(&mut self) -> Result<usize> {
         super::coder::Coder::alloc_slot(self)
+    }
+    fn fit_slots(&mut self) -> usize {
+        super::coder::Coder::fit_slots(self)
     }
     fn free_slot(&mut self, slot: usize) {
         super::coder::Coder::free_slot(self, slot)
@@ -644,6 +651,21 @@ fn hash(ids: &[u32]) -> u64 {
 }
 
 impl FlashServe {
+    /// `want` streams at once, clamped to the slots that fit in VRAM at `--ctx` (one spare,
+    /// see [`crate::batch::clamp_batch`]); warns when it cuts.
+    fn clamp_batch(&mut self, want: usize) -> usize {
+        let cap = self.e.fit_slots();
+        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap);
+        if n < want {
+            eprintln!(
+                "tang-llm: warning: --batch {want} clamped to {n}: {cap} sequence slots fit in \
+                 free VRAM at --ctx {} (TANG_SLOT_HEADROOM_GB sets the headroom)",
+                self.ctx
+            );
+        }
+        n
+    }
+
     fn request_sampling(&self, req: &Request) -> (f32, usize, f32, f32) {
         request_sampling(self.sampling, self.temp, req)
     }
@@ -828,7 +850,7 @@ impl FlashServe {
                 me.e.max_slots() > 1,
                 "--batch needs an engine with sequence slots (qwen3next)"
             );
-            me.batch = s.batch.min(me.e.max_slots() - 1);
+            me.batch = me.clamp_batch(s.batch);
             me.e.enable_row_sampling()?;
             eprintln!(
                 "tang-llm: continuous batching: up to {} requests at once (per-row sampling{})",
@@ -866,6 +888,8 @@ impl FlashServe {
                     Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
                 }
             }
+            // The windows took memory: count again before any slot exists.
+            me.batch = me.clamp_batch(me.batch);
         }
         for f in &warm {
             let t = Instant::now();
