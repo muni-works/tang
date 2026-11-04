@@ -22,7 +22,7 @@
 use super::{FlashServe, Memo};
 use crate::chat::{Chunk, Detok, Parser, Piece};
 use crate::engine::{Finish, Outcome, Request, Usage};
-use crate::server::{DynLane, Inflight};
+use crate::server::{DynLane, Inflight, StepFailure};
 use anyhow::{bail, ensure, Result};
 use serde_json::Value;
 use std::time::Instant;
@@ -139,6 +139,9 @@ pub(super) struct Stream {
     prefill_only: bool,
     /// Sampled (temperature > 0): no drafts.
     sampled: bool,
+    /// A step failed this stream: its slot's state is suspect, so retiring frees the slot
+    /// instead of parking it for reuse.
+    broken: bool,
 }
 
 impl FlashServe {
@@ -318,6 +321,7 @@ impl FlashServe {
             decode_from: None,
             prefill_only: req.prefill_only,
             sampled: samp.sampled(),
+            broken: false,
         }))
     }
 
@@ -383,7 +387,29 @@ impl FlashServe {
         Ok(())
     }
 
+    /// One step for every lane; a failure names the lanes it hurt ([`StepFailure`]), whose
+    /// streams are marked broken so retiring them drops their slots.
     pub(super) fn batch_step(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
+        let result = self.batch_step_lanes(lanes);
+        if let Some(f) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<StepFailure>())
+        {
+            for &i in &f.lanes {
+                if let Some(s) = lanes
+                    .get_mut(i)
+                    .and_then(|l| l.stream.downcast_mut::<Stream>())
+                {
+                    s.broken = true;
+                    s.finish.get_or_insert(Finish::Cancelled);
+                }
+            }
+        }
+        result
+    }
+
+    fn batch_step_lanes(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
         let t_step = Instant::now();
         let prefill_tokens0: usize = lanes
             .iter()
@@ -441,10 +467,11 @@ impl FlashServe {
             let t = Instant::now();
             let chunk = &s.ids[s.done_prompt..s.done_prompt + n];
             let next = if wide > 0 && n > 2 * MAX_T {
-                self.e.prefill_slot_wide(s.slot, chunk)?
+                self.e.prefill_slot_wide(s.slot, chunk)
             } else {
-                self.e.prefill_slot(s.slot, chunk)?
-            };
+                self.e.prefill_slot(s.slot, chunk)
+            }
+            .map_err(|e| StepFailure::lanes(vec![i], e))?;
             let dt = t.elapsed().as_secs_f64();
             s.prefill_s += dt;
             if decoding {
@@ -455,7 +482,8 @@ impl FlashServe {
                 s.marks.remove(0);
                 let t = Instant::now();
                 let slot = s.slot;
-                self.snapshot_at(slot, pinned)?;
+                self.snapshot_at(slot, pinned)
+                    .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
                 s.prefill_s += t.elapsed().as_secs_f64();
             }
@@ -466,7 +494,8 @@ impl FlashServe {
                     s.finish = Some(Finish::Stop);
                 } else {
                     s.decode_from = Some(Instant::now());
-                    self.batch_take(s, next, l.on)?;
+                    self.batch_take(s, next, l.on)
+                        .map_err(|e| StepFailure::lanes(vec![i], e))?;
                     if s.finish.is_none() {
                         s.pending = Some(next);
                         s.drafts = self.e.slot_drafts(s.slot);
@@ -518,16 +547,17 @@ impl FlashServe {
                 })
                 .collect();
             let t = Instant::now();
+            // A window's failure is its rows' (a slot past its context, say), unless it's a
+            // device fault (`StepFailure::lanes` marks those fatal).
             let kept = if mtp {
-                self.e.verify_batch(&items)?
+                self.e.verify_batch(&items)
             } else {
                 let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
                 self.e
-                    .decode_batch(&rows)?
-                    .into_iter()
-                    .map(|k| vec![k])
-                    .collect()
-            };
+                    .decode_batch(&rows)
+                    .map(|k| k.into_iter().map(|k| vec![k]).collect())
+            }
+            .map_err(|e| StepFailure::lanes(group.to_vec(), e))?;
             self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
             for ((&i, toks), item) in group.iter().zip(&kept).zip(&items) {
                 let l = &mut lanes[i];
@@ -537,7 +567,8 @@ impl FlashServe {
                 s.drafted += item.2.len();
                 s.accepted += toks.len() - 1;
                 for &tok in toks {
-                    self.batch_take(s, tok, l.on)?;
+                    self.batch_take(s, tok, l.on)
+                        .map_err(|e| StepFailure::lanes(vec![i], e))?;
                     if s.finish.is_some() {
                         break;
                     }
@@ -601,7 +632,12 @@ impl FlashServe {
         }
         // Park the slot. The pending token (if any) was sampled but never fed: the slot's
         // tokens are the prompt plus the output before it.
-        if let Some(sl) = self.slots.iter_mut().find(|x| x.id == s.slot) {
+        if s.broken {
+            if let Some(k) = self.slots.iter().position(|x| x.id == s.slot) {
+                self.slots.remove(k);
+                self.e.free_slot(s.slot);
+            }
+        } else if let Some(sl) = self.slots.iter_mut().find(|x| x.id == s.slot) {
             sl.busy = false;
             sl.key = s.key.clone();
         }

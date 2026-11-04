@@ -121,3 +121,21 @@ with a tolerance gate).
 
 **Effort:** about 1.5–2 weeks. M1 is mostly plumbing. M2 is the one hard kernel. M3 is
 scheduler work.
+
+## Serving fixes 2026-11-04
+
+GPU checks below are still to run (written without a GPU; CPU tests green). `$M` is the
+Qwen3-Coder-Next model directory; build with `cargo build --release -p tang-llm
+--no-default-features --features cuda`.
+
+1. **A failed step ends only its streams.** `engine.step` used to retire every stream with the
+   error. Now `batch_step` wraps failures in `server::StepFailure { lanes, fatal }`: a prefill,
+   prefix snapshot or token-take error names its one lane, a decode/verify window's error names
+   the window's lanes. The worker retires those (their slots are freed, not parked: `broken`) and
+   the rest keep decoding. A device fault (`CUDA_ERROR…` in the message, an unattributed error
+   that reads as one, or a panic out of the compute layer, which `catch_unwind` now catches)
+   ends every stream, sets `NodeState::unhealthy`, and `/health` answers 503 `unhealthy: …`;
+   new requests fail with "restart the server" instead of joining. Tests: `server::step_failures`.
+   GPU check: `tang-llm flash serve $M --batch 64 --ctx 32768`, then 64 concurrent requests where
+   one has a prompt near `--ctx` and `max_tokens` past it (the slot overflows mid-decode): only
+   that request errors, the other 63 finish, `curl -s localhost:PORT/health` stays `ok`.
