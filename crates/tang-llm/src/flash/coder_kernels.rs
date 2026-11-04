@@ -8,12 +8,21 @@
 
 /// The `#define` prelude for a model's shapes, for windows of up to `maxt` rows (`MAX_T`, or the
 /// wide prefill width, which also sets the int8 activation layout `XQ8_T`).
+/// TCX expert kernels' K split (warps a 16-row tile): gate|up, down
+/// (`TANG_TCX_SGU` / `TANG_TCX_SDN`, divisors of 8 and of the superblock count).
+pub fn tcx_split() -> (usize, usize) {
+    let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    (n("TANG_TCX_SGU", 2), n("TANG_TCX_SDN", 1))
+}
+
 pub fn prelude(c: &Shapes, maxt: usize) -> String {
+    let (sgu, sdn) = tcx_split();
     format!(
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
-         #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n",
+         #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n\
+         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -1376,17 +1385,16 @@ __device__ __forceinline__ void tcx_load(const unsigned char* t, int lane, TcxT&
     o.s1 = __ldg((const uint4*)(sc + 64 + (g + 8) * 16));
 }
 __device__ __forceinline__ unsigned u4w(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+// xg: token g's permuted codes (+ 8 tig); da / db: tokens 2 tig, 2 tig + 1's per-256 scales.
 template <bool Q5, int K>
-__device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const unsigned char* act, const float* actd,
-                                         float acc[4], int sb0, int sb1) {
+__device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const unsigned char* xg, const float* da,
+                                         const float* db, float acc[4], int sb0, int sb1, const TcxT& first) {
     constexpr int NSB = K / 256;
     constexpr int TB = Q5 ? 2880 : 2368;
     const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
     const int na = 2 * tig, nb = 2 * tig + 1;
     acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
-    const unsigned char* xg = act + (size_t)(g < m ? g : 0) * K + tig * 8;
-    TcxT cur, nxt;
-    tcx_load<Q5>(tile + sb0 * TB, lane, cur);
+    TcxT cur = first, nxt;
     for (int sb = sb0; sb < sb1; sb++) {
         if (sb + 1 < sb1) tcx_load<Q5>(tile + (sb + 1) * TB, lane, nxt);
         int i1[4] = {0, 0, 0, 0}, i2[4] = {0, 0, 0, 0};
@@ -1405,7 +1413,7 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
                 }
                 a[c] = v;
             }
-            const uint2 bb = *(const uint2*)(xg + sb * 256 + s * 32);
+            const uint2 bb = __ldg((const uint2*)(xg + sb * 256 + s * 32));
             int d[4];
             mma_s8_16832(d, a, bb.x, bb.y);
             const unsigned sw0 = u4w(cur.s0, s >> 2), sw1 = u4w(cur.s1, s >> 2);
@@ -1424,12 +1432,12 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
         const float d0 = h2f((unsigned short)(cur.dw0 & 0xFFFFu)), m0 = h2f((unsigned short)(cur.dw0 >> 16));
         const float d1 = h2f((unsigned short)(cur.dw1 & 0xFFFFu)), m1 = h2f((unsigned short)(cur.dw1 >> 16));
         if (na < m) {
-            const float dx = actd[na * NSB + sb];
+            const float dx = __ldg(da + sb);
             acc[0] = fmaf(dx, fmaf(d0, i2f(i1[0]), -m0 * i2f(i2[0])), acc[0]);
             acc[2] = fmaf(dx, fmaf(d1, i2f(i1[2]), -m1 * i2f(i2[2])), acc[2]);
         }
         if (nb < m) {
-            const float dx = actd[nb * NSB + sb];
+            const float dx = __ldg(db + sb);
             acc[1] = fmaf(dx, fmaf(d0, i2f(i1[1]), -m0 * i2f(i2[1])), acc[1]);
             acc[3] = fmaf(dx, fmaf(d1, i2f(i1[3]), -m1 * i2f(i2[3])), acc[3]);
         }
@@ -1476,26 +1484,22 @@ __device__ __forceinline__ void moe_tcx_body(ExW g, ExW u, ExW sg, ExW su, const
         }
         return;
     }
-    unsigned char* act = (unsigned char*)dsm;
-    float* actd = (float*)(act + 8 * KA);
-    const float* xdg = (const float*)(xk + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
-    // Codes permuted a 32: [tig][b0 (cols 4 tig..), b1 (16 + 4 tig..)], so B is one 8-byte load.
-    for (int i = threadIdx.x; i < m * (KA / 4); i += blockDim.x) {
-        const int q = i / (KA / 4), w = i % (KA / 4);
-        const int blk = w >> 3, wi = w & 7, tg = wi >> 1, h = wi & 1;
-        ((unsigned*)act)[i] = *(const unsigned*)(xk + (size_t)tok(pair_s[q]) * KA + blk * 32 + h * 16 + tg * 4);
-    }
-    for (int i = threadIdx.x; i < m * (KA / 256); i += blockDim.x) {
-        const int q = i / (KA / 256), c = i % (KA / 256);
-        actd[i] = xdg[(size_t)tok(pair_s[q]) * (KA / 256) + c];
-    }
-    __syncthreads();
-    const int gq = lane >> 2, tig = lane & 3;
+    // The first superblock's weights are in flight before the activations are staged.
     const unsigned char* tile = wbase + (size_t)(ro / 16) * mw.row_bytes;
-    float acc[4];
     const int sb0 = ks * NSB / S, sb1 = (ks + 1) * NSB / S;
-    if (mw.ty == 112) tcx_rows<false, KA>(tile, m, act, actd, acc, sb0, sb1);
-    else tcx_rows<true, KA>(tile, m, act, actd, acc, sb0, sb1);
+    TcxT first;
+    if (mw.ty == 112) tcx_load<false>(tile + sb0 * 2368, lane, first);
+    else tcx_load<true>(tile + sb0 * 2880, lane, first);
+    // Activations straight from global (cx_q8k wrote them in B-fragment order; L1 / L2 hits).
+    const float* xdg = (const float*)(xk + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+    const int gq = lane >> 2, tig = lane & 3;
+    const int tg_ = tok(pair_s[gq < m ? gq : 0]);
+    const unsigned char* xg = xk + (size_t)tg_ * KA + tig * 8;
+    const float* da = xdg + (size_t)tok(pair_s[2 * tig < m ? 2 * tig : 0]) * (KA / 256);
+    const float* db = xdg + (size_t)tok(pair_s[2 * tig + 1 < m ? 2 * tig + 1 : 0]) * (KA / 256);
+    float acc[4];
+    if (mw.ty == 112) tcx_rows<false, KA>(tile, m, xg, da, db, acc, sb0, sb1, first);
+    else tcx_rows<true, KA>(tile, m, xg, da, db, acc, sb0, sb1, first);
     if (S > 1) {
         red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
         __syncthreads();
@@ -1536,7 +1540,9 @@ __device__ __forceinline__ void q8k_store(float v, unsigned char* xk, int nrows_
     for (int i = 1; i < 8; i++) amax = fmaxf(amax, sh[i]);
     const float d = amax / 127.0f;
     const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
-    xk[(size_t)row * K + c * 256 + threadIdx.x] = (unsigned char)(signed char)q;
+    // Permuted a 32 as the MMA's B fragment wants it: [tig][cols 4 tig.., 16 + 4 tig..].
+    const int o = threadIdx.x & 31, pos = (threadIdx.x & ~31) + ((o & 15) >> 2) * 8 + (o >> 4) * 4 + (o & 3);
+    xk[(size_t)row * K + c * 256 + pos] = (unsigned char)(signed char)q;
     if (threadIdx.x == 0) ((float*)(xk + (size_t)nrows_max * K))[row * (K / 256) + c] = d;
 }
 extern "C" __global__ void __launch_bounds__(256) cx_q8k(const float* x, unsigned char* xk) {

@@ -67,9 +67,27 @@ pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<
     ensure!(rows % 16 == 0 && k % 256 == 0, "tcx: {rows} x {k} isn't 16 x 256 tiled");
     ensure!(src.len() == ne * rows * nsb * bb, "tcx: {} bytes, want {}", src.len(), ne * rows * nsb * bb);
     let tb = tile_bytes(q5);
-    let mut out = vec![0u8; ne * (rows / 16) * nsb * tb];
+    let per = (rows / 16) * nsb * tb;
+    let mut out = vec![0u8; ne * per];
+    // Experts in parallel (one chunk of experts a thread).
+    let nt = std::thread::available_parallelism().map_or(8, |n| n.get()).min(ne.max(1));
+    let chunk = ne.div_ceil(nt);
+    std::thread::scope(|sc| {
+        for (ci, oc) in out.chunks_mut(chunk * per).enumerate() {
+            sc.spawn(move || repack_into(q5, src, ci * chunk, oc, rows, k));
+        }
+    });
+    Ok(out)
+}
+
+fn repack_into(q5: bool, src: &[u8], e0: usize, out: &mut [u8], rows: usize, k: usize) {
+    let bb = if q5 { 176 } else { 144 };
+    let nsb = k / 256;
+    let tb = tile_bytes(q5);
+    let per = (rows / 16) * nsb * tb;
     let mut dec = vec![(0u16, 0u16, [0u8; 8], [0u8; 8], [0u8; 256]); 16];
-    for e in 0..ne {
+    for el in 0..out.len() / per {
+        let e = e0 + el;
         for rt in 0..rows / 16 {
             for sb in 0..nsb {
                 for (r, dr) in dec.iter_mut().enumerate() {
@@ -77,7 +95,7 @@ pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<
                     let o = (row * nsb + sb) * bb;
                     *dr = decode_sb(q5, &src[o..o + bb]);
                 }
-                let t = &mut out[((e * (rows / 16) + rt) * nsb + sb) * tb..][..tb];
+                let t = &mut out[((el * (rows / 16) + rt) * nsb + sb) * tb..][..tb];
                 for lane in 0..32 {
                     let (g, tig) = (lane / 4, lane % 4);
                     for c in 0..4 {
@@ -108,7 +126,6 @@ pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<
             }
         }
     }
-    Ok(out)
 }
 
 /// Dequantize a repacked matrix set back to f32 (`[ne][rows][k]`), reading the tile layout as

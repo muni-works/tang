@@ -3960,9 +3960,9 @@ impl Coder {
                 self.launch_on(
                     stream,
                     v.k.moe_gu_t,
-                    ((2 * ff * 4 / 128) as u32, groups, 1),
+                    ((2 * ff * ck::tcx_split().0 / 128) as u32, groups, 1),
                     256,
-                    (8 * (nh + nh / 64)) as u32,
+                    0,
                     tang_moe::args![tg, tu, tsg, tsu, ids, xk, mxq, egu, ti, fastk, plan],
                 );
                 self.launch_on(stream, v.k.silu_q8k, ((ff / 256) as u32, np, 1), 256, 0, tang_moe::args![egu, hk, pb]);
@@ -3972,9 +3972,9 @@ impl Coder {
                 self.launch_on(
                     stream,
                     v.k.moe_down_t,
-                    ((nh * 2 / 128) as u32, groups, 1),
+                    ((nh * ck::tcx_split().1 / 128) as u32, groups, 1),
                     256,
-                    (8 * (ff + ff / 64)) as u32,
+                    0,
                     tang_moe::args![td, tsd, ids, hk, hq, parts, ti, fastk, plan],
                 );
             }
@@ -4824,7 +4824,7 @@ impl Coder {
         );
         let key = (t, verify, nchunk, nseg, self.greedy.get());
         let split = self.peer.is_some();
-        if probe.is_none() && self.use_graphs {
+        if probe.is_none() && self.use_graphs && self.prof.is_none() {
             if !split && !self.graphs.contains_key(&key) {
                 // First use: run eagerly (loads every kernel), then capture.
                 self.enqueue_window(t, verify, nchunk, nseg, None)?;
