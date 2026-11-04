@@ -487,3 +487,11 @@ this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely regist
   231 ms, wide 4,276 → 4,285 tok/s (noise level); not kept. Weight-load latency isn't what holds
   the dense GEMMs at ~45 TOPS; next suspects are the token-operand loads (8 bytes a lane a chunk
   from global, 8 rows) and 2 blocks an SM. Needs a profiler (ncu doesn't run on these pods).
+
+### FA2 wide attention on fp16 tensor cores (2026-11-04)
+
+`cx_attn_fa2` runs Q, P and its K/V tiles (converted in shared memory once a tile) as fp16
+instead of bf16: attention outputs 8x closer to split-K (rel L2 0.9-3.2e-3 → 1.1-4.2e-4).
+flash-wide-check warm tok/s, bf16 → fp16, H200: 1000 4,005 → 3,997, 3000 4,284 → 4,265, 8000
+4,436 → 4,390 (−1%); H100: 1000 3,989 → 4,046, 3000 4,318 → 4,313, 8000 4,463 → 4,417.
+Short-context KL unchanged (see qwen3next-batching.md Known issues: a 1e-7 jitter fails it too).
