@@ -154,6 +154,10 @@ struct Variants {
     /// Narrow windows of 2..8 rows run the streaming grouped expert kernels
     /// (`TANG_CODER_NSTREAM=1`). Bitwise.
     nstream: bool,
+    /// Batch and narrow streaming windows run the persistent weight-major expert kernels
+    /// (`cx_moe_*_p`): `TANG_CODER_MOE_PERSIST=gu|down|all|0`. Bitwise with `cx_moe_*_s`.
+    persist_gu: bool,
+    persist_down: bool,
 }
 
 impl Default for Variants {
@@ -175,6 +179,8 @@ impl Default for Variants {
             mma_down: true,
             dmma: true,
             nstream: false,
+            persist_gu: false,
+            persist_down: false,
         }
     }
 }
@@ -207,6 +213,14 @@ impl Variants {
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
             dmma: !env_is("TANG_CODER_DMMA", "0"),
             nstream: env_is("TANG_CODER_NSTREAM", "1"),
+            persist_gu: {
+                let m = std::env::var("TANG_CODER_MOE_PERSIST").unwrap_or_else(|_| "0".into());
+                m == "all" || m == "gu"
+            },
+            persist_down: {
+                let m = std::env::var("TANG_CODER_MOE_PERSIST").unwrap_or_else(|_| "0".into());
+                m == "all" || m == "down"
+            },
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -477,6 +491,9 @@ struct Kern {
     /// Streaming grouped experts (batch windows): `cx_moe_gu_s` / `cx_moe_down_s`.
     moe_gu_s: Fun,
     moe_down_s: Fun,
+    /// Persistent weight-major streaming experts: `cx_moe_gu_p` / `cx_moe_down_p`.
+    moe_gu_p: Fun,
+    moe_down_p: Fun,
     /// Int8 tensor-core grouped experts (batch windows, not bitwise): `cx_moe_gu_m` / `_down_m`.
     moe_gu_m: Fun,
     moe_down_m: Fun,
@@ -543,6 +560,8 @@ impl Kern {
             moe_down_g: f("cx_moe_down_g")?,
             moe_gu_s: f("cx_moe_gu_s")?,
             moe_down_s: f("cx_moe_down_s")?,
+            moe_gu_p: f("cx_moe_gu_p")?,
+            moe_down_p: f("cx_moe_down_p")?,
             moe_gu_m: f("cx_moe_gu_m")?,
             moe_down_m: f("cx_moe_down_m")?,
             mma_q8x: f("cx_mma_q8x")?,
@@ -648,6 +667,8 @@ impl Kern {
             moe_down_g: f(cm, "cx_moe_down_g")?,
             moe_gu_s: f(cm, "cx_moe_gu_s")?,
             moe_down_s: f(cm, "cx_moe_down_s")?,
+            moe_gu_p: f(cm, "cx_moe_gu_p")?,
+            moe_down_p: f(cm, "cx_moe_down_p")?,
             moe_gu_m: f(cm, "cx_moe_gu_m")?,
             moe_down_m: f(cm, "cx_moe_down_m")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
@@ -702,6 +723,8 @@ impl Kern {
             self.moe_down_g,
             self.moe_gu_s,
             self.moe_down_s,
+            self.moe_gu_p,
+            self.moe_down_p,
             self.moe_gu_m,
             self.moe_down_m,
             self.moe_gu_db,
@@ -794,7 +817,7 @@ impl Scratch {
             ids: z(rows * hp.n_expert_used),
             w: z(rows * hp.n_expert_used),
             egu: z(np * 2 * hp.n_ff_exp),
-            plan: z(2 * (2 + 2 * np)),
+            plan: z(2 * (4 + 2 * np)),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
             moe_y: z(rows * n),
@@ -885,6 +908,26 @@ fn stream_shape() -> (usize, usize, usize) {
 /// [`stream_shape`] and the down kernel's ring depth (`TANG_CODER_SST_DOWN`).
 fn stream_sst_down() -> usize {
     stream_shape4().3
+}
+
+/// The persistent expert kernels' ring stages (`TANG_CODER_PSST`, default 3), slices an
+/// expert's gate|up and down rows are cut into (`TANG_CODER_PSPLIT` / `_PSPLIT_DOWN`), and
+/// blocks per SM (`TANG_CODER_PCTA`, default 2). Batch module only; narrow ones use defaults.
+fn persist_shape() -> (usize, usize, usize, usize) {
+    static S: std::sync::OnceLock<(usize, usize, usize, usize)> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        (n("TANG_CODER_PSST", 3), n("TANG_CODER_PSPLIT", 1), n("TANG_CODER_PSPLIT_DOWN", 1), n("TANG_CODER_PCTA", 2))
+    })
+}
+
+/// Rows a warp stages per ring step in the streaming gate|up kernel (`TANG_CODER_SRP`, 2 or 4).
+fn stream_srp() -> usize {
+    std::env::var("TANG_CODER_SRP").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+fn persist_grid() -> u32 {
+    (sm_count() * persist_shape().3) as u32
 }
 
 fn stream_shape4() -> (usize, usize, usize, usize) {
@@ -2156,13 +2199,17 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "{}#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            "{}#define CX_SRP {}\n#define CX_PSST {}\n#define CX_PSPLIT {}\n#define CX_PSPLIT_DOWN {}\n#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
             std::env::var("TANG_CODER_BATCH_DEFS")
                 .unwrap_or_default()
                 .split(',')
                 .filter(|d| !d.is_empty())
                 .map(|d| format!("#define {}\n", d.replace('=', " ")))
                 .collect::<String>(),
+            stream_srp(),
+            persist_shape().0,
+            persist_shape().1,
+            persist_shape().2,
             stream_sst_down(),
             stream_shape().0,
             stream_shape().1,
@@ -3805,9 +3852,11 @@ impl Coder {
         } else {
             (1, 8, 16, 2)
         };
+        let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
+        let srp = if self.in_batch.get() { stream_srp() } else { 2 };
         if self.var.grouped || many || nstream {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
-            let pw = 2 + 2 * self.tw() * (hp.n_expert_used + 1);
+            let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
             // Batch modules split an expert's pairs into groups of `BATCH_GCHUNK`.
@@ -3874,6 +3923,16 @@ impl Coder {
                             b[wi]
                         );
                     }
+                } else if ((self.in_batch.get() && self.var.stream) || nstream) && self.var.persist_gu {
+                    let ctr = plan + ((pw - 2) * 4) as u64;
+                    self.launch_on(
+                        stream,
+                        v.k.moe_gu_p,
+                        (persist_grid(), 1, 1),
+                        256,
+                        (8 * psst * srp * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan, ctr],
+                    );
                 } else if self.in_batch.get() && self.var.mma_gu {
                     self.launch_on(
                         stream,
@@ -3889,7 +3948,7 @@ impl Coder {
                         v.k.moe_gu_s,
                         ((2 * ff / (8 * snr_gu)) as u32, groups, 1),
                         256,
-                        (8 * sst * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        (8 * sst * srp * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
                 } else {
@@ -3918,6 +3977,16 @@ impl Coder {
                         256,
                         0,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, plan],
+                    );
+                } else if ((self.in_batch.get() && self.var.stream) || nstream) && self.var.persist_down {
+                    let ctr = plan + ((pw - 2) * 4) as u64;
+                    self.launch_on(
+                        stream,
+                        v.k.moe_down_p,
+                        (persist_grid(), 1, 1),
+                        256,
+                        (8 * psst * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan, ctr],
                     );
                 } else if self.in_batch.get() && self.var.mma_down {
                     self.launch_on(

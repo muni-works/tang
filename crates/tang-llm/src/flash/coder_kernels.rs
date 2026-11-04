@@ -919,15 +919,18 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 #ifndef CX_SNR_GU
 #define CX_SNR_GU 8
 #endif
+// Rows a warp stages (and computes, two at a time) per ring step, gate|up only (down: 2).
+#ifndef CX_SRP
+#define CX_SRP 2
+#endif
 #ifndef CX_SNR_DOWN
 #define CX_SNR_DOWN 16
 #endif
 template <int NR, bool DOWN, int SST>
 __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                 const unsigned char* xq, float* out, int T, int r16, int fast,
-                                                const unsigned* plan) {
+                                                const unsigned* plan, int gi, int bx) {
     extern __shared__ uint4 dsm[];
-    const int gi = blockIdx.y;
     if (gi >= (int)plan[0]) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int a = plan[1 + gi], b = plan[2 + gi];
@@ -940,19 +943,20 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
     constexpr int ACT16 = (CX_GCHUNK_S * (KA + KA / 8)) / 16;
     unsigned char* act = (unsigned char*)dsm;
     float* actd = (float*)(act + CX_GCHUNK_S * KA);
-    uint4* ring = dsm + ACT16 + warp * (SST * 2 * r16);
-    const int row0 = (blockIdx.x * 8 + warp) * NR;
-    constexpr int NS = NR / 2;
-    const unsigned char* wp[SST][2];
+    constexpr int RP = DOWN ? 2 : CX_SRP;
+    uint4* ring = dsm + ACT16 + warp * (SST * RP * r16);
+    const int row0 = (bx * 8 + warp) * NR;
+    constexpr int NS = NR / RP;
+    const unsigned char* wp[SST][RP];
     auto issue = [&](int st) {
         const int slot = st % SST;
         #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            const int r = row0 + 2 * st + j;
+        for (int j = 0; j < RP; j++) {
+            const int r = row0 + RP * st + j;
             const ExW& m = DOWN ? (shared ? sg : g) : (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u));
             const int ro = DOWN ? r : (r < CX_FF ? r : r - CX_FF);
             const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
-            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * 2 + j) * r16, lane);
+            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * RP + j) * r16, lane);
         }
         cx_async_commit();
     };
@@ -982,9 +986,11 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
         cx_async_wait<SST - 1>();
         __syncwarp();
         const int slot = st % SST;
-        const unsigned char* w0 = wp[slot][0];
-        const unsigned char* w1 = wp[slot][1];
-        const int rr0 = row0 + 2 * st;
+        #pragma unroll
+        for (int jj = 0; jj < RP / 2; jj++) {
+        const unsigned char* w0 = wp[slot][2 * jj];
+        const unsigned char* w1 = wp[slot][2 * jj + 1];
+        const int rr0 = row0 + RP * st + 2 * jj;
         const int mt = b - a;
         if (DOWN) {
             const ExW& m = shared ? sg : g;
@@ -1059,6 +1065,7 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
                 if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0 + 1] = v1;
             }
         }
+        }
         __syncwarp();
     }
     cx_async_wait<0>();
@@ -1066,12 +1073,65 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_s(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                               const unsigned char* xq, float* out, int T, int r16,
                                                               int fast, const unsigned* plan) {
-    moe_stream_body<CX_SNR_GU, false, CX_SST>(g, u, sg, su, ids, xq, out, T, r16, fast, plan);
+    moe_stream_body<CX_SNR_GU, false, CX_SST>(g, u, sg, su, ids, xq, out, T, r16, fast, plan, blockIdx.y, blockIdx.x);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down_s(ExW d, ExW sd, const unsigned* ids,
                                                                 const unsigned char* hq, float* out, int T, int r16,
                                                                 int fast, const unsigned* plan) {
-    moe_stream_body<CX_SNR_DOWN, true, CX_SST_DOWN>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan);
+    moe_stream_body<CX_SNR_DOWN, true, CX_SST_DOWN>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan, blockIdx.y, blockIdx.x);
+}
+
+// Persistent, weight-major streaming experts: a grid of about SMs x k blocks, each pulling the
+// next work item (a group and a 1/CX_PSPLIT slice of its expert's rows) off an atomic counter and
+// streaming that slice through the warps' cp.async rings (CX_PSST stages), so a block moves one
+// expert's rows contiguously instead of 8-16 blocks each touching a sliver of it. Every dot is
+// moe_stream_body's (bitwise). ctr[0] is the work counter, ctr[1] counts finished blocks; the
+// last block out zeroes both, so a captured graph replays with them at zero.
+// Dynamic smem 8 * CX_PSST * 2 * r16 * 16 + the activations, as cx_moe_*_s.
+#ifndef CX_PSST
+#define CX_PSST 3
+#endif
+#ifndef CX_PSPLIT
+#define CX_PSPLIT 1
+#endif
+#ifndef CX_PSPLIT_DOWN
+#define CX_PSPLIT_DOWN 1
+#endif
+template <bool DOWN, int SPLIT>
+__device__ __forceinline__ void moe_persist_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                 const unsigned char* xq, float* out, int T, int r16, int fast,
+                                                 const unsigned* plan, unsigned* ctr) {
+    constexpr int ROWS = DOWN ? CX_HID : 2 * CX_FF;
+    constexpr int NR = ROWS / (8 * SPLIT);
+    static_assert(NR % 2 == 0 && NR * 8 * SPLIT == ROWS, "persistent split");
+    __shared__ int item;
+    const int nitems = (int)plan[0] * SPLIT;
+    for (;;) {
+        __syncthreads();
+        if (threadIdx.x == 0) item = (int)atomicAdd(ctr, 1u);
+        __syncthreads();
+        const int it = item;
+        if (it >= nitems) break;
+        moe_stream_body<NR, DOWN, CX_PSST>(g, u, sg, su, ids, xq, out, T, r16, fast, plan, it / SPLIT, it % SPLIT);
+    }
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(ctr + 1, 1u) == gridDim.x - 1) {
+            ctr[0] = 0u;
+            ctr[1] = 0u;
+            __threadfence();
+        }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_p(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int r16,
+                                                              int fast, const unsigned* plan, unsigned* ctr) {
+    moe_persist_body<false, CX_PSPLIT>(g, u, sg, su, ids, xq, out, T, r16, fast, plan, ctr);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_p(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int r16,
+                                                                int fast, const unsigned* plan, unsigned* ctr) {
+    moe_persist_body<true, CX_PSPLIT_DOWN>(d, d, sd, sd, ids, hq, out, T, r16, fast, plan, ctr);
 }
 
 // ---- grouped experts on int8 tensor cores for batch windows (<= 8 tokens a group) ----

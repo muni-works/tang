@@ -277,6 +277,66 @@ GDN conv+step 4.35, GDN in 4.06, router 1.64, GDN out 1.35, route+plan 0.79, hea
 - Gate|up stays ~0.22 ms a layer on all three kernels (per-pair-dot streaming, MMA, MMA with
   two tiles): ~2 TB/s for ~400 distinct experts × 1.18 MB. Down is ~1.9 TB/s on MMA.
 
+### Persistent weight-major experts (2026-11-04, H200 h8zep5lcaascxj, explain)
+
+`cx_moe_gu_p` / `cx_moe_down_p` (`TANG_CODER_MOE_PERSIST=gu|down|all`): a grid of SMs × k
+blocks, each pulling the next (group, row slice) off an atomic counter (two slots at the end
+of the plan region; the last block out zeroes them, so graphs replay) and streaming the slice
+through `moe_stream_body` (same dots, bitwise). Shape: `TANG_CODER_PSST` ring stages,
+`TANG_CODER_PCTA` blocks an SM, `TANG_CODER_PSPLIT` slices an expert. `TANG_BATCH_QUICK=1`,
+B=64, 64-token prompts, graph replay (the quick path prints no profile):
+
+| kernel | shape | B=64 ms a step | gate|up ms a layer (Δ from 0.22) |
+|---|---|---|---|
+| `cx_moe_gu_s` (default) | SST 1, 8 rows a warp | 30.32 | ~0.22 (~2 TB/s) |
+| `cx_moe_gu_p` | PSST 3, 2 a SM, whole expert | 61.07 | ~0.86 (~0.5 TB/s) |
+| `cx_moe_gu_p` | PSST 2, 3 a SM, whole expert | 63.54 | ~0.91 |
+| `cx_moe_gu_p` | PSST 2, 3 a SM, 1/4 expert | 35.97 | ~0.34 |
+| `cx_moe_gu_p` | PSST 1, 6 a SM, 1/4 expert | 34.92 | ~0.32 |
+| `cx_moe_gu_p` | PSST 1, 6 a SM, 1/8 expert | 33.73 | ~0.29 (~1.6 TB/s) |
+| `cx_moe_gu_p` | PSST 1, 6 a SM, 1/16 expert | 30.61 | ~0.23 |
+| `cx_moe_gu_p` | PSST 2, 4 a SM, 1/16 expert | 31.29 | ~0.24 |
+
+Whole experts per block are 4× slower: 16 warps an SM (vs ~48 for the streaming grid) and
+~1.4 waves of 375 items over 264 blocks, each item a serial 64-step walk per warp.
+Time falls monotonically as slices shrink and converges on `cx_moe_gu_s` at 1/16 (8 rows a
+warp, the streaming grid's own shape) without passing it. Tolerance at 1/8 (B=64, full check):
+99.37% agreement, mean |Δlogit| 0.122, the streaming kernel's numbers (same dots). So the
+~2 TB/s ceiling is not the grid fragmenting an expert's rows over 8-16 blocks: giving one
+block the whole expert's contiguous 1.2 MB is strictly worse, because a block's 8 warps walk
+their rows serially (load latency + dp4a per 2-row step) and only many resident warps hide
+that. The limit is per-warp latency × resident warps, not the memory-side layout. Off by
+default; kept behind the switch.
+
+### ILP sweep on `cx_moe_gu_s` (2026-11-04, H200 h8zep5lcaascxj, explain)
+
+More independent loads in flight a warp: ring depth D (`TANG_CODER_SST`) and rows staged a
+step (`TANG_CODER_SRP`, new: 2 or 4, dots still two rows at a time with `cx_dotq_m`, bitwise).
+B=64 quick, ms a step (gate|up ms a layer ≈ 0.22 + Δ/48). Resident warps an SM estimated from
+dynamic smem (8 warps a block; Q5_K rows, 18 KB activations):
+
+| SRP | D | rows a warp | ms a step | ≈ gate\|up ms a layer | warps an SM |
+|---|---|---|---|---|---|
+| 2 | 1 | 8 | **30.32** | 0.22 | ~40 |
+| 2 | 2 | 8 | 31.19 | 0.24 | ~24 |
+| 2 | 4 | 8 | 33.73 | 0.29 | ~16 |
+| 2 | 1 | 16 | 32.49 | 0.27 | ~40 |
+| 2 | 2 | 16 | 33.03 | 0.28 | ~24 |
+| 2 | 4 | 16 | 35.38 | 0.33 | ~16 |
+| 2 | 8 | 16 | launch fails (smem) | | |
+| 4 | 1 | 8 | 31.65 | 0.25 | ~24 |
+| 4 | 2 | 8 | 33.75 | 0.29 | ~16 |
+| 4 | 2 | 16 | 35.48 | 0.33 | ~16 |
+
+Every extra outstanding step costs resident warps one-for-one (the ring lives in smem), and
+the trade is never positive: bytes in flight an SM stay about constant while the per-step
+fixed cost grows. Stopping rule met (best variant 0% faster than 0.22 ms a layer): this layout
+is at its floor of ~2 TB/s, set by the instruction work per byte (dp4a decode and scale math on
+Q4_K/Q5_K super-blocks for ~1.75 tokens), not by load latency or grid shape. The remaining
+lever is fewer instructions a byte (a different quant layout or tensor-core decode), a
+decision for Cam. The T=8 narrow run was skipped: the best variant is the default shape, and
+narrow streaming (`TANG_CODER_NSTREAM=1`) is already recorded as slower.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
