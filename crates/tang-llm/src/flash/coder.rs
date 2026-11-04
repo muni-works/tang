@@ -374,8 +374,9 @@ struct Dense {
     /// segments as a second matrix.
     mma: Option<(B, i32, usize)>,
     rest: Option<Box<Dense>>,
-    /// Only F32 / BF16 segments (the router and the shared expert's gate): batch windows run
-    /// `cx_router_b`.
+    /// Only F32 / BF16 segments (the router and the shared expert's gate): batch windows can run
+    /// `cx_router_b` (`TANG_CODER_ROUTERB=1`; slower than the K-split GEMV so far: 1.89 vs
+    /// 1.64 ms a step at B=64).
     float1: bool,
 }
 
@@ -2645,6 +2646,7 @@ impl Coder {
             && self.in_batch.get()
             && self.var.dmma
             && w.float1
+            && env_is("TANG_CODER_ROUTERB", "1")
             && w.k.is_multiple_of(128)
             && t <= 64
             && (w.k / 128) * w.rows * t <= DMMA_PART

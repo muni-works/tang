@@ -259,6 +259,24 @@ Eager B=64 at 94c1b95b, ms a step: gate|up (streaming) 10.7, down (MMA) 5.8 (~1.
   (4.6 ms). One sequence gives ~1 token an expert, so grouping saves no bytes, and the
   streaming kernels stage activations per block with fewer warps than per-pair `_d4`.
 
+### Batch windows: plan prefix, router, expert MMA retries (2026-11-04, H200, new pod)
+
+| commit | change | B=16 | B=32 | B=64 ms | B=64 tok/s |
+|---|---|---|---|---|---|
+| 5bbaee5c | parallel prefix in `cx_moe_plan_w` (route+plan 1.6 → 0.8 ms) | 17.41 | 24.74 | 38.78 | 1650 |
+
+Tolerance PASS (99.50%, mean |Δlogit| 0.122). Eager B=64, ms a step: gate|up 10.6, down 5.6,
+GDN conv+step 4.35, GDN in 4.06, router 1.64, GDN out 1.35, route+plan 0.79, head 0.76.
+
+- **Expert MMA with precomputed code sums + a superblock's scales unpacked once** (68896d53):
+  slower, down 5.8 → 7.5 ms, gate|up unchanged. Reverted.
+- **Two 16-row tiles a warp in the expert MMA** (B fragment and scales shared): gate|up 10.9 →
+  12.5 ms. Dropped.
+- **Router with the activations in shared memory** (`cx_router_b`, `TANG_CODER_ROUTERB=1`):
+  1.64 → 1.89 ms. Off.
+- Gate|up stays ~0.22 ms a layer on all three kernels (per-pair-dot streaming, MMA, MMA with
+  two tiles): ~2 TB/s for ~400 distinct experts × 1.18 MB. Down is ~1.9 TB/s on MMA.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
