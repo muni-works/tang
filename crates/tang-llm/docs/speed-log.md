@@ -308,6 +308,35 @@ their rows serially (load latency + dp4a per 2-row step) and only many resident 
 that. The limit is per-warp latency × resident warps, not the memory-side layout. Off by
 default; kept behind the switch.
 
+### ILP sweep on `cx_moe_gu_s` (2026-11-04, H200 h8zep5lcaascxj, explain)
+
+More independent loads in flight a warp: ring depth D (`TANG_CODER_SST`) and rows staged a
+step (`TANG_CODER_SRP`, new: 2 or 4, dots still two rows at a time with `cx_dotq_m`, bitwise).
+B=64 quick, ms a step (gate|up ms a layer ≈ 0.22 + Δ/48). Resident warps an SM estimated from
+dynamic smem (8 warps a block; Q5_K rows, 18 KB activations):
+
+| SRP | D | rows a warp | ms a step | ≈ gate\|up ms a layer | warps an SM |
+|---|---|---|---|---|---|
+| 2 | 1 | 8 | **30.32** | 0.22 | ~40 |
+| 2 | 2 | 8 | 31.19 | 0.24 | ~24 |
+| 2 | 4 | 8 | 33.73 | 0.29 | ~16 |
+| 2 | 1 | 16 | 32.49 | 0.27 | ~40 |
+| 2 | 2 | 16 | 33.03 | 0.28 | ~24 |
+| 2 | 4 | 16 | 35.38 | 0.33 | ~16 |
+| 2 | 8 | 16 | launch fails (smem) | | |
+| 4 | 1 | 8 | 31.65 | 0.25 | ~24 |
+| 4 | 2 | 8 | 33.75 | 0.29 | ~16 |
+| 4 | 2 | 16 | 35.48 | 0.33 | ~16 |
+
+Every extra outstanding step costs resident warps one-for-one (the ring lives in smem), and
+the trade is never positive: bytes in flight an SM stay about constant while the per-step
+fixed cost grows. Stopping rule met (best variant 0% faster than 0.22 ms a layer): this layout
+is at its floor of ~2 TB/s, set by the instruction work per byte (dp4a decode and scale math on
+Q4_K/Q5_K super-blocks for ~1.75 tokens), not by load latency or grid shape. The remaining
+lever is fewer instructions a byte (a different quant layout or tensor-core decode), a
+decision for Cam. The T=8 narrow run was skipped: the best variant is the default shape, and
+narrow streaming (`TANG_CODER_NSTREAM=1`) is already recorded as slower.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is

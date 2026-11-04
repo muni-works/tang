@@ -898,6 +898,11 @@ fn persist_shape() -> (usize, usize, usize, usize) {
     })
 }
 
+/// Rows a warp stages per ring step in the streaming gate|up kernel (`TANG_CODER_SRP`, 2 or 4).
+fn stream_srp() -> usize {
+    std::env::var("TANG_CODER_SRP").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
 fn persist_grid() -> u32 {
     (sm_count() * persist_shape().3) as u32
 }
@@ -1907,13 +1912,14 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "{}#define CX_PSST {}\n#define CX_PSPLIT {}\n#define CX_PSPLIT_DOWN {}\n#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            "{}#define CX_SRP {}\n#define CX_PSST {}\n#define CX_PSPLIT {}\n#define CX_PSPLIT_DOWN {}\n#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
             std::env::var("TANG_CODER_BATCH_DEFS")
                 .unwrap_or_default()
                 .split(',')
                 .filter(|d| !d.is_empty())
                 .map(|d| format!("#define {}\n", d.replace('=', " ")))
                 .collect::<String>(),
+            stream_srp(),
             persist_shape().0,
             persist_shape().1,
             persist_shape().2,
@@ -3480,6 +3486,7 @@ impl Coder {
             (1, 8, 16, 2)
         };
         let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
+        let srp = if self.in_batch.get() { stream_srp() } else { 2 };
         if self.var.grouped || many || nstream {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
             let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
@@ -3556,7 +3563,7 @@ impl Coder {
                         v.k.moe_gu_p,
                         (persist_grid(), 1, 1),
                         256,
-                        (8 * psst * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        (8 * psst * srp * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan, ctr],
                     );
                 } else if self.in_batch.get() && self.var.mma_gu {
@@ -3574,7 +3581,7 @@ impl Coder {
                         v.k.moe_gu_s,
                         ((2 * ff / (8 * snr_gu)) as u32, groups, 1),
                         256,
-                        (8 * sst * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        (8 * sst * srp * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
                 } else {

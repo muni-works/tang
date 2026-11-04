@@ -919,6 +919,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 #ifndef CX_SNR_GU
 #define CX_SNR_GU 8
 #endif
+// Rows a warp stages (and computes, two at a time) per ring step, gate|up only (down: 2).
+#ifndef CX_SRP
+#define CX_SRP 2
+#endif
 #ifndef CX_SNR_DOWN
 #define CX_SNR_DOWN 16
 #endif
@@ -939,19 +943,20 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
     constexpr int ACT16 = (CX_GCHUNK_S * (KA + KA / 8)) / 16;
     unsigned char* act = (unsigned char*)dsm;
     float* actd = (float*)(act + CX_GCHUNK_S * KA);
-    uint4* ring = dsm + ACT16 + warp * (SST * 2 * r16);
+    constexpr int RP = DOWN ? 2 : CX_SRP;
+    uint4* ring = dsm + ACT16 + warp * (SST * RP * r16);
     const int row0 = (bx * 8 + warp) * NR;
-    constexpr int NS = NR / 2;
-    const unsigned char* wp[SST][2];
+    constexpr int NS = NR / RP;
+    const unsigned char* wp[SST][RP];
     auto issue = [&](int st) {
         const int slot = st % SST;
         #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            const int r = row0 + 2 * st + j;
+        for (int j = 0; j < RP; j++) {
+            const int r = row0 + RP * st + j;
             const ExW& m = DOWN ? (shared ? sg : g) : (shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u));
             const int ro = DOWN ? r : (r < CX_FF ? r : r - CX_FF);
             const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
-            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * 2 + j) * r16, lane);
+            wp[slot][j] = cx_stage_async(src, m.row_bytes, ring + (slot * RP + j) * r16, lane);
         }
         cx_async_commit();
     };
@@ -981,9 +986,11 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
         cx_async_wait<SST - 1>();
         __syncwarp();
         const int slot = st % SST;
-        const unsigned char* w0 = wp[slot][0];
-        const unsigned char* w1 = wp[slot][1];
-        const int rr0 = row0 + 2 * st;
+        #pragma unroll
+        for (int jj = 0; jj < RP / 2; jj++) {
+        const unsigned char* w0 = wp[slot][2 * jj];
+        const unsigned char* w1 = wp[slot][2 * jj + 1];
+        const int rr0 = row0 + RP * st + 2 * jj;
         const int mt = b - a;
         if (DOWN) {
             const ExW& m = shared ? sg : g;
@@ -1057,6 +1064,7 @@ __device__ __forceinline__ void moe_stream_body(ExW g, ExW u, ExW sg, ExW su, co
                 const float v1 = cx_dot(ty[1], w1, xc, xdq, CX_HID, fast);
                 if (lane == 0) out[(size_t)p * 2 * CX_FF + rr0 + 1] = v1;
             }
+        }
         }
         __syncwarp();
     }
