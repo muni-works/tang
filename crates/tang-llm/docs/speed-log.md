@@ -378,3 +378,7 @@ spec-test PASS, tcheck t1/t8 bitwise, batch-check N=8 bitwise.
 Tried and reverted: software-pipelining the generic k32 tile (decode the next 32 columns before
 this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely registers.
 `__launch_bounds__(256, 3)` on the expert GEMMs: slightly slower.
+- Q8X dense tile with a lane's 128 columns of codes + scales loaded as one batch: gdn_in 242 →
+  231 ms, wide 4,276 → 4,285 tok/s (noise level); not kept. Weight-load latency isn't what holds
+  the dense GEMMs at ~45 TOPS; next suspects are the token-operand loads (8 bytes a lane a chunk
+  from global, 8 rows) and 2 blocks an SM. Needs a profiler (ncu doesn't run on these pods).
