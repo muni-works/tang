@@ -1570,6 +1570,140 @@ pub fn wide_check(args: &[String]) -> Result<()> {
 /// Tokens and logits must be bitwise equal. Then decode speed at 1, 2, 4, … up to N sequences
 /// (tok/s aggregate and per stream). `TANG_BATCH_CTX=8192`: the speed runs first prefill
 /// every sequence to about that many tokens (the prompt repeated, wide prefill windows).
+/// `tang-llm flash-spec-batch-check <gguf> --mtp M ...`: speculative decoding in batch windows.
+/// `TANG_BATCH_N` sequences (default 32) decode `-n` greedy tokens each, first with budget 0
+/// (one row a sequence, the plain batched path), then for each budget in `TANG_SPEC_BUDGETS`
+/// (default `8,16,32`, and `auto` for the tuner) with D-Cut-ranked MTP drafts verified in
+/// `verify_batch`, windows up to `TANG_SPEC_ROWS` rows (default `2N` rounded to 32, ≤ 256).
+/// Reports, per budget, token agreement with budget 0 (up to each sequence's first
+/// divergence; spec decode is lossless given the same verify kernels, so equal tokens within
+/// the window width class), accepted drafts and tokens per second.
+pub fn spec_batch_check(args: &[String]) -> Result<()> {
+    use crate::batch::spec::{Mode, Tuner};
+    let mut a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    ensure!(ids.len() > 32, "need a longer prompt");
+    let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let nb = env_n("TANG_BATCH_N").unwrap_or(32).clamp(1, 128);
+    let steps = a.n.max(8);
+    if a.opts.max_ctx < ids.len() + 2 * steps + 64 {
+        a.opts.max_ctx = (ids.len() + 2 * steps + 64).next_multiple_of(1024);
+    }
+    let mut e = load_coder(&a)?;
+    ensure!(e.has_mtp(), "spec-batch-check needs --mtp");
+    ensure!(e.temperature == 0.0, "spec-batch-check is greedy");
+    let rows = env_n("TANG_SPEC_ROWS")
+        .unwrap_or(2 * nb)
+        .next_multiple_of(32)
+        .clamp(32, 256);
+    e.enable_batch(rows)?;
+    let half = ids.len() / 2;
+    let seqs: Vec<Vec<u32>> = (0..nb)
+        .map(|i| ids[..ids.len() - (7 * i) % half].to_vec())
+        .collect();
+    let budgets: Vec<String> = std::env::var("TANG_SPEC_BUDGETS")
+        .unwrap_or_else(|_| "8,16,32,auto".into())
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    // One run: `None` = budget 0 through decode_batch; else the mode.
+    let mut run = |e: &mut super::coder::Coder, mode: Option<Mode>| -> Result<(Vec<Vec<u32>>, f64, usize, usize, usize)> {
+        let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+        let mut cur = Vec::new();
+        for (i, &s) in slots.iter().enumerate() {
+            cur.push(e.prefill_slot(s, &seqs[i])?);
+        }
+        let mut got: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        let mut tuner = mode.map(Tuner::new);
+        let (mut windows, mut drafted, mut accepted) = (0, 0, 0);
+        let t0 = std::time::Instant::now();
+        while got.iter().any(|g| g.len() < steps) {
+            let live: Vec<usize> = (0..nb).filter(|&i| got[i].len() < steps).collect();
+            let conf: Vec<Vec<f32>> = live
+                .iter()
+                .map(|&i| {
+                    let room = steps - got[i].len() - 1;
+                    e.slot_drafts(slots[i]).iter().take(room).map(|x| x.1).collect()
+                })
+                .collect();
+            let room = rows.saturating_sub(live.len());
+            let choice = tuner.as_mut().map(|t| t.choose(&conf, room));
+            let give = choice.as_ref().map_or(vec![0; live.len()], |c| c.drafts.clone());
+            e.slot_mtp = choice.as_ref().is_none_or(|c| c.mtp);
+            let items: Vec<(usize, u32, Vec<u32>)> = live
+                .iter()
+                .zip(&give)
+                .map(|(&i, &g)| {
+                    let d = e.slot_drafts(slots[i])[..g].iter().map(|x| x.0).collect();
+                    (slots[i], cur[i], d)
+                })
+                .collect();
+            let tw = std::time::Instant::now();
+            let kept = e.verify_batch(&items)?;
+            let ms = tw.elapsed().as_secs_f64() * 1e3;
+            windows += 1;
+            let extra: usize = give.iter().sum();
+            let acc: usize = kept.iter().map(|k| k.len() - 1).sum();
+            if let (Some(t), Some(c)) = (tuner.as_mut(), choice.as_ref()) {
+                t.observe(live.len(), extra, c.mtp, ms, c.raw, acc);
+            }
+            drafted += extra;
+            accepted += acc;
+            for (&i, k) in live.iter().zip(&kept) {
+                got[i].extend_from_slice(k);
+                got[i].truncate(steps);
+                cur[i] = *k.last().unwrap();
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        for &s in &slots {
+            e.free_slot(s);
+        }
+        Ok((got, dt, windows, drafted, accepted))
+    };
+    let (base, dt0, w0, _, _) = run(&mut e, None)?;
+    let tok = (nb * steps) as f64;
+    println!(
+        "spec-batch-check: {nb} sequences x {steps} tokens, windows up to {rows} rows; budget 0: {w0} windows, {:.1} tok/s",
+        tok / dt0
+    );
+    let mut all_eq = true;
+    for b in &budgets {
+        let mode = if b == "auto" {
+            Mode::Auto
+        } else {
+            Mode::Fixed(b.parse()?)
+        };
+        let (got, dt, w, d, acc) = run(&mut e, Some(mode))?;
+        let (mut same, mut tot, mut ident) = (0, 0, 0);
+        for i in 0..nb {
+            let first = (0..steps).find(|&k| got[i][k] != base[i][k]).unwrap_or(steps);
+            same += first;
+            tot += steps;
+            ident += usize::from(first == steps);
+        }
+        all_eq &= ident == nb;
+        println!(
+            "budget {b}: {w} windows, drafts {acc}/{d} accepted ({:.0} %), {:.1} tokens a window, {:.1} tok/s ({:.2}x budget 0); vs budget 0: {ident}/{nb} sequences identical, {:.2}% tokens before the first divergence",
+            100.0 * acc as f64 / d.max(1) as f64,
+            tok / w.max(1) as f64,
+            tok / dt,
+            dt0 / dt,
+            100.0 * same as f64 / tot as f64
+        );
+    }
+    println!(
+        "spec-batch-check: {}",
+        if all_eq {
+            "all budgets token-identical to budget 0"
+        } else {
+            "some sequences diverge (batch-module windows are tolerance-gated: compare within a width class)"
+        }
+    );
+    Ok(())
+}
+
 pub fn batch_check(args: &[String]) -> Result<()> {
     let mut a = parse(args)?;
     let ids = prompt_ids(&a)?;

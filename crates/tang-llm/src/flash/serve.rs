@@ -226,10 +226,12 @@ pub trait ServeEngine {
     fn verify_batch(&mut self, _items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         bail!("this engine has no sequence slots")
     }
-    /// A slot's latest MTP chain, for its next verify.
-    fn slot_drafts(&self, _slot: usize) -> Vec<u32> {
+    /// A slot's latest MTP chain (tokens and the head's probabilities), for its next verify.
+    fn slot_drafts(&self, _slot: usize) -> Vec<(u32, f32)> {
         Vec::new()
     }
+    /// Run the MTP head after slot windows (`Coder::slot_mtp`).
+    fn set_slot_mtp(&mut self, _on: bool) {}
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
@@ -420,11 +422,11 @@ impl ServeEngine for super::coder::Coder {
     fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         super::coder::Coder::verify_batch(self, items)
     }
-    fn slot_drafts(&self, slot: usize) -> Vec<u32> {
-        super::coder::Coder::slot_drafts(self, slot)
-            .iter()
-            .map(|x| x.0)
-            .collect()
+    fn slot_drafts(&self, slot: usize) -> Vec<(u32, f32)> {
+        super::coder::Coder::slot_drafts(self, slot).to_vec()
+    }
+    fn set_slot_mtp(&mut self, on: bool) {
+        self.slot_mtp = on;
     }
     fn use_mtp(&self) -> bool {
         self.use_mtp
@@ -581,6 +583,11 @@ pub struct FlashServe {
     /// `TANG_SERVE_DETERMINISTIC=1`: every window on the narrow (bitwise) path, at most
     /// `MAX_T` rows, so a stream's greedy output doesn't depend on what it's batched with.
     deterministic: bool,
+    /// Speculative decoding under batching: the draft budget's table (`crate::batch::spec`).
+    spec: crate::batch::spec::Tuner,
+    /// Spec-decode counters since the last summary line (steps, extra rows, drafted,
+    /// accepted, tokens, ms) and when it was printed.
+    spec_log: ([f64; 6], Instant),
     slots: Vec<batch::SlotInfo>,
     /// The batch prefill scheduler's account and knobs (see `batch_step`).
     sched: crate::batch::prefill::Sched,
@@ -794,6 +801,8 @@ impl FlashServe {
             warm_dir: None,
             batch: 1,
             deterministic: std::env::var("TANG_SERVE_DETERMINISTIC").is_ok_and(|v| v == "1"),
+            spec: crate::batch::spec::Tuner::new(crate::batch::spec::Mode::from_env()),
+            spec_log: ([0.0; 6], Instant::now()),
             slots: Vec::new(),
             sched: Default::default(),
             prefill_policy: None,
@@ -877,9 +886,27 @@ impl FlashServe {
                      (bitwise; greedy output independent of the batch)"
                 );
             }
-            // Past MAX_T streams (no drafts): one batch window for every decoding stream.
-            if me.batch > MAX_T && !me.e.use_mtp() && !me.deterministic {
-                let rows = me.batch.next_multiple_of(32);
+            if !me.e.use_mtp() {
+                me.spec.mode = crate::batch::spec::Mode::Off;
+            }
+            if me.e.use_mtp() {
+                eprintln!(
+                    "tang-llm: speculative decoding under batching: {:?} (TANG_SERVE_SPEC)",
+                    me.spec.mode
+                );
+            }
+            // Past MAX_T streams, or MTP drafts on top of the streams: batch windows, up to
+            // TANG_SERVE_BATCH_ROWS rows (default --batch rounded up to 32; the drafts get
+            // the rows the streams leave).
+            let spec_rows = me.spec.mode != crate::batch::spec::Mode::Off;
+            if (me.batch > MAX_T || spec_rows) && !me.deterministic {
+                let rows = std::env::var("TANG_SERVE_BATCH_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(me.batch)
+                    .max(me.batch)
+                    .next_multiple_of(32)
+                    .clamp(32, 256);
                 let t = Instant::now();
                 match me.e.enable_batch_rows(rows) {
                     Ok(()) => eprintln!(

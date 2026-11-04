@@ -11,6 +11,8 @@ use crate::queue::{Priority, Ticket};
 
 #[path = "batch_prefill.rs"]
 pub mod prefill;
+#[path = "batch_spec.rs"]
+pub mod spec;
 
 /// What the rules need to know about the engine's slots right now.
 #[derive(Debug, Clone, Copy)]
