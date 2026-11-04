@@ -917,6 +917,8 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
 const BATCH_GCHUNK: usize = 8;
+/// Wide modules group an expert's pairs by one GEMM tile (64 tokens).
+const WIDE_GCHUNK: usize = 64;
 
 /// The batch module's dense-MMA split-K partials (f32 values: splits x rows x tokens).
 const DMMA_PART: usize = 1 << 22;
@@ -2338,8 +2340,10 @@ impl Coder {
         if let Some(p) = self.peer.as_deref_mut() {
             p.wide = None;
         }
+        // Groups of at most 64 pairs (one GEMM tile): the expert GEMM's grid is (rows,
+        // groups, 1) instead of a z tile per 64 rows of the window, nearly all empty.
         let src = format!(
-            "{}{}{}",
+            "#define CX_GCHUNK {WIDE_GCHUNK}\n{}{}{}",
             ck::prelude(&self.shapes, rows),
             kernels::GEMV_SRC,
             ck::SRC
@@ -3910,6 +3914,8 @@ impl Coder {
             // Batch modules split an expert's pairs into groups of `BATCH_GCHUNK`.
             let groups = if self.in_batch.get() {
                 n.min(hp.n_expert + 1 + n / BATCH_GCHUNK)
+            } else if self.in_wide.get() {
+                n.min(hp.n_expert + 1 + n / WIDE_GCHUNK)
             } else {
                 n.min(hp.n_expert + 1)
             } as u32;
@@ -3925,7 +3931,8 @@ impl Coder {
                 // Wide windows: the tensor-core GEMM, 128 rows × 64 of a group's tokens a block.
                 let gemm = (self.in_wide.get() || (self.in_batch.get() && self.var.bgemm))
                     && self.var.wgemm;
-                let tiles = t.div_ceil(64) as u32;
+                // Batch and wide modules' groups are at most 64 pairs: one tile.
+                let tiles = if self.in_batch.get() || self.in_wide.get() { 1 } else { t.div_ceil(64) as u32 };
                 if gemm && self.var.wgemm_gu {
                     self.launch_on(
                         stream,
