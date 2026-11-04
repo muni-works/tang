@@ -548,6 +548,40 @@ fragment feeds two MMAs.
 Tried and reverted: GDN at one column a lane with 32 columns a block (128 blocks): 3.9 ms.
 Four columns a lane: 1.86 ms. Token staging with the runtime-half bug: slower.
 
-**Not yet verified on the H200.** The `coder-next-prefill-verify` pod didn't exist when this was
-written. Still to run there: the gates (wide-check 3000/8000, tcheck, spec-test, batch-check
-N=8) and the prefill / C=64 measurements.
+H200 results, pod o7lpawaxjvnm9b. afa748e7 and this branch were run back to back with the same
+settings: `flash-wide-check --ids-file refactor.ids -n 32`, `TANG_CODER_WIDE=2048`. Logs are in
+`artifacts/h200/`.
+
+| | afa748e7 | this branch |
+|---|---|---|
+| wide prefill, 1000 tokens | 3,967 tok/s | **5,829 tok/s** |
+| wide prefill, 3000 tokens | 4,263 tok/s | **6,679 tok/s** |
+| wide prefill, 8000 tokens | 4,391 tok/s | **7,172 tok/s** |
+| 3000: moe_gu / moe_down | 410 / 197 ms | 201 / 114 ms |
+| 3000: gdn_in / gdn_out | 240 / 92 ms | 144 / 53 ms |
+| 3000: GDN recurrence | 181 ms | 132 + 11 ms prep |
+| 3000: attn_in / attn_out | 57 / 30 ms | 26 / 18 ms |
+| 3000: router (unchanged) | 87 ms | 87 ms |
+| serve C=64 ×3, aggregate | 443 tok/s | **543 tok/s** |
+| serve C=64: TTFT p50 / p95 | 15.5 / 63.3 s | 7.2 / 42.0 s |
+| serve C=64: wall | 277 s | 226 s |
+
+Gates:
+- **tcheck:** t1 / t8 / t8-verify bitwise on both.
+- **spec-test:** PASS on both.
+- **batch-check:** N=8 PASS bitwise and N=64 PASS within tolerance. The logits checksums are
+  identical to afa748e7, so the batch path is unchanged.
+- **wide-check KL vs narrow, -n 32:**
+
+| | afa748e7 | this branch |
+|---|---|---|
+| 3000 | 8.6e-5 | 1.1e-4 |
+| 8000 | 4.4e-6 | 1.1e-5 |
+| 1000 | 3.1e-2 | 8.7e-2 |
+
+  At 3000 and 8000 the greedy output is equal on both builds. Both builds miss the 1e-5 bar at
+  3000 with these settings. 1000 fails on both (the known FA2 short-context issue). The GEMMs
+  are bitwise, so the KL change comes from the GDN summation order.
+
+`TANG_CODER_DENSE32=1` (Q8X at 32 rows a warp) is slower on the H200 too: gdn_in 144 → 191 ms,
+3000 tokens 6,675 → 6,392 tok/s, KL 5.5e-4. It stays off by default.
