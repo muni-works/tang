@@ -215,12 +215,10 @@ impl FlashServe {
         let t0 = Instant::now();
         let (ids, text, _spliced) = self.prompt(req)?;
         self.record_warm(req);
-        ensure!(
-            ids.len() + 1 < self.ctx,
-            "prompt is {} tokens; the context window is {}",
-            ids.len(),
-            self.ctx
-        );
+        // Refused here, before a slot is taken (a 400 for the client); a prompt that fits
+        // generates up to the window's end and stops there with `length`.
+        let limit = crate::batch::token_limit(ids.len(), self.ctx, req.max_tokens)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let (temperature, top_k, top_p, presence) = self.request_sampling(req);
         let samp = crate::flash::sampler::RowSampling {
             temperature,
@@ -239,11 +237,6 @@ impl FlashServe {
         }
         let mut marks = self.marks(&ids, &text);
         marks.retain(|&(p, _)| p > reused);
-        let limit = req
-            .max_tokens
-            .unwrap_or(usize::MAX)
-            .min(self.ctx - ids.len() - 1)
-            .max(1);
         let gen_at = text
             .rfind("<|im_start|>assistant\n")
             .map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());

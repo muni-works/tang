@@ -61,6 +61,22 @@ pub fn clamp_batch(batch: usize, max_slots: usize, cap: usize) -> usize {
         .max(1)
 }
 
+/// Admission against the context window: a prompt of `prompt` tokens needs room for itself
+/// and one generated token, else it's refused (the message says so, for a 400); otherwise
+/// the most tokens it may generate: `max_tokens`, cut so the sequence ends inside `ctx`
+/// (finish reason `length` there), at least one.
+pub fn token_limit(prompt: usize, ctx: usize, max_tokens: Option<usize>) -> Result<usize, String> {
+    if prompt + 1 >= ctx {
+        return Err(format!(
+            "context_length_exceeded: the prompt is {prompt} tokens; the context window is {ctx}"
+        ));
+    }
+    Ok(max_tokens
+        .unwrap_or(usize::MAX)
+        .min(ctx - prompt - 1)
+        .max(1))
+}
+
 /// A decode step of `rows` sequences runs in the batch module (`Coder::enable_batch`, built
 /// for `batch_rows`, a multiple of 32) only past the narrow module's `narrow` rows; 1..=narrow
 /// rows always take the narrow module, batch module or not. The batch module's dense paths
@@ -176,6 +192,19 @@ mod tests {
         let fin = super::clamp_batch(16, 128, after).min(super::clamp_batch(16, 128, before));
         assert_eq!(fin, 16);
         assert_eq!(super::clamp_batch(128, 128, 40).min(provisional), provisional);
+    }
+
+    #[test]
+    fn prompts_past_the_context_are_refused_and_outputs_stop_inside_it() {
+        assert!(super::token_limit(4096, 4096, None).is_err());
+        assert!(super::token_limit(5000, 4096, Some(1)).is_err());
+        assert!(super::token_limit(4095, 4096, None).is_err());
+        assert_eq!(super::token_limit(4094, 4096, None), Ok(1));
+        assert_eq!(super::token_limit(4000, 4096, Some(1000)), Ok(95));
+        assert_eq!(super::token_limit(100, 4096, Some(256)), Ok(256));
+        assert_eq!(super::token_limit(100, 4096, Some(0)), Ok(1));
+        let e = super::token_limit(5000, 4096, None).unwrap_err();
+        assert!(e.contains("5000") && e.contains("4096"), "{e}");
     }
 
     #[test]
