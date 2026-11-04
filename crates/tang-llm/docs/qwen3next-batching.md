@@ -100,7 +100,19 @@ head and argmax for every row. `MAX_SLOTS` is 128. `flash serve --batch N` with 
 plain decode by the batch width. `flash-batch-check` (`TANG_BATCH_N`, `TANG_BATCH_CTX`) passes
 **bitwise** at 64 sequences.
 
-Speed: 866 tok/s aggregate at 64 at first; 1,251 with the streaming expert kernels (gate|up ~1.5–2 TB/s, down ~1–1.2 TB/s). Dense GEMVs, GDN and attention are now about half the step. The expert
+Speed: 866 tok/s aggregate at 64 at first; 1,251 with the streaming expert kernels (gate|up ~1.5–2 TB/s, down ~1–1.2 TB/s). Dense GEMVs, GDN and attention are now about half the step.
+
+Tensor cores (tolerance-gated, see `speed-log.md`): int8 MMA down experts and Q8X dense layers
+take B=64 to 40.0 ms (1,600 tok/s), B=32 to 25.8 ms. Left: gate|up experts (~10.7 ms), router
+and plan (~3.2 ms), GDN conv+step (4.3 ms).
+
+**Proposal: bf16 GDN state for batch windows.** The recurrent state is f32, 32 heads × 128 ×
+128 per layer and sequence (2 MB); a decode step reads and writes all of it, ~270 MB a layer at
+B=64, which is the 4.3 ms GDN conv+step (36 layers, ≈ bandwidth). Keeping it in bf16 (f32
+accumulate inside the step, round on store) halves the traffic: ~2.1 ms saved at B=64, ~1 ms at
+B=32, and half the per-slot state memory (75 → 38 MB). It's a numerics change on every step of
+every sequence (the error compounds through the recurrence, unlike a reordered sum), so it needs
+its own gate: long-context greedy agreement and KL against the f32 state, not just batch-check. The expert
 kernels read distinct experts at ~0.5–0.9 TB/s (target ~2.4) and the 32-row GEMVs are L2-bound.
 Numbers in `speed-log.md`. Next: a bandwidth-bound grouped expert kernel for 1–2 tokens an expert
 (stream weights once, no per-block staging stall; down is the worse half), and dense layers
