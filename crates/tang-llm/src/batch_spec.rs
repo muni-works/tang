@@ -262,6 +262,14 @@ impl Tuner {
             let probe = self.depth.is_empty() || self.steps % PROBE == 0;
             return none(mtp || probe);
         }
+        // Plain steps are only measured while plain decoding runs: while drafting wins, run
+        // one plain step now and then (often until its cell has samples), so a wrong guess of
+        // its cost (the prior, or a fit from drafting steps only) can't keep drafting going.
+        let plain_n = self.cells.get(&Self::key(live, 0, false)).map_or(0, |c| c.n);
+        let every = if plain_n < 2 { PROBE / 8 } else { PROBE };
+        if b > 0 && self.steps % every == every / 2 {
+            return none(false);
+        }
         let probe = self.steps % PROBE == 0;
         // Acceptance is only measured while drafting: now and then, verify one draft a stream
         // anyway, so a low `alpha` (an earlier, unlucky load) can recover.
@@ -392,6 +400,34 @@ mod tests {
         }
         assert_eq!(extra, 0);
         assert!(t.alpha < 0.5, "{}", t.alpha);
+    }
+
+    /// Plain steps are cheaper than the prior says (and drafting steps carry an expensive MTP
+    /// pass): the tuner has to measure plain decoding to find it wins, then stay there.
+    #[test]
+    fn auto_measures_plain_steps_and_keeps_them_when_cheaper() {
+        let mut t = Tuner::new(Mode::Auto);
+        let live = 8;
+        let conf = vec![vec![0.95f32, 0.95]; live];
+        let cost = |extra: usize, mtp: bool| {
+            if mtp {
+                12.0 + 0.6 * (live + extra) as f64
+            } else {
+                4.0 + 0.3 * live as f64
+            }
+        };
+        let mut plain = 0;
+        for step in 0..400 {
+            let c = if t.mtp_live { conf.clone() } else { vec![vec![]; live] };
+            let ch = t.choose(&c, 24);
+            let extra: usize = ch.drafts.iter().sum();
+            let (_, raw) = dcut(&c, extra);
+            t.observe(live, extra, ch.mtp, cost(extra, ch.mtp), raw, raw.round() as usize);
+            if step >= 300 && !ch.mtp {
+                plain += 1;
+            }
+        }
+        assert!(plain > 90, "plain steps in the last 100: {plain}");
     }
 
     #[test]
