@@ -2165,8 +2165,9 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
     __shared__ float sxd[64][GT_KS / 32 + 1];
     __shared__ int ssx[64][GT_KS / 32 + 1];
-    if (mty == 13) gemm_tile_sbk<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx);
-    else if (mty == 12) gemm_tile_sbk<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx);
+    __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
+    if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx, xs);
+    else if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx, xs);
     else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
