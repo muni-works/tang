@@ -524,6 +524,8 @@ struct Kern {
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
     gemm_dense: Fun,
+    /// cx_gemm_dense with 32 rows a warp for Q8X (block 128; `TANG_CODER_DENSE32=1`, off by default: slower on the 3090).
+    gemm_dense32: Fun,
     moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
@@ -590,6 +592,7 @@ impl Kern {
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
+            gemm_dense32: f("cx_gemm_dense32")?,
             moe_add_norm: f("cx_moe_add_norm")?,
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
@@ -698,6 +701,7 @@ impl Kern {
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
+            gemm_dense32: f(cm, "cx_gemm_dense32")?,
             moe_add_norm: f(cm, "cx_moe_add_norm")?,
             prep: f(cm, "cx_attn_prep")?,
             part: f(cm, "cx_attn_part")?,
@@ -2982,10 +2986,11 @@ impl Coder {
                     t as i32,
                 );
                 unsafe {
+                    let d32 = env_is("TANG_CODER_DENSE32", "1");
                     gpu::launch(
-                        wd.k.gemm_dense,
+                        if d32 { wd.k.gemm_dense32 } else { wd.k.gemm_dense },
                         (w.rows.div_ceil(128) as u32, t.div_ceil(64) as u32, 1),
-                        (256, 1, 1),
+                        (if d32 { 128 } else { 256 }, 1, 1),
                         0,
                         v.stream,
                         tang_moe::args![sp, ns, xq, ki, out, os, ti],

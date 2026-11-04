@@ -2189,6 +2189,129 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     }
 }
 
+// Q8X, 32 rows a warp (two m16 tiles: rows g, g + 8 and g + 16, g + 24 of the warp's 32), so
+// each staged B fragment and scale read feeds two MMAs (the 16-row tile is bound by those smem
+// reads). Same MMAs and accumulation order per output as gemm_tile32s (bitwise). Block 128.
+__device__ __forceinline__ void gemm_q8x_32r(const unsigned char* w0r, int rb, const unsigned char* const* xrow_s,
+                                             const float* const* xd_s, int nch, float acc[2][8][4], int K, SdsT* sds,
+                                             unsigned char* xs) {
+    constexpr int STR = 160;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const unsigned char* wr[4] = {w0r, w0r + (size_t)8 * rb, w0r + (size_t)16 * rb, w0r + (size_t)24 * rb};
+    const int nq = K / XS_COLS;
+    xs_issue<STR>(xs, xrow_s, 0);
+    for (int q = 0; q < nq; q++) {
+        const int kb = q * XS_COLS;
+        const int ks = kb - kb % GT_KS;
+        if (kb == ks) {
+            __syncthreads();
+            gt_stage_sds(false, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sds);
+        }
+        unsigned char* cur = xs + (q & 1) * 64 * STR;
+        if (q + 1 < nq) { xs_issue<STR>(xs + ((q + 1) & 1) * 64 * STR, xrow_s, kb + XS_COLS); cp_wait1(); }
+        else cp_wait0();
+        __syncthreads();
+        #pragma unroll 2
+        for (int kk = 0; kk < XS_COLS; kk += 32) {
+            const int k0 = kb + kk, e0 = k0 + 8 * tig;
+            int w[4][2];
+            float dw[4];
+            #pragma unroll
+            for (int r = 0; r < 4; r++) decode8_q8x(wr[r], K, e0, w[r][0], w[r][1], dw[r]);
+            const unsigned a0[4] = {(unsigned)w[0][0], (unsigned)w[1][0], (unsigned)w[0][1], (unsigned)w[1][1]};
+            const unsigned a1[4] = {(unsigned)w[2][0], (unsigned)w[3][0], (unsigned)w[2][1], (unsigned)w[3][1]};
+            const int bi = (k0 - ks) >> 5;
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                if (c >= nch) break;
+                const uint2 xv = *(const uint2*)(cur + (c * 8 + g) * STR + kk + 8 * tig);
+                int d0[4], d1[4];
+                mma_s8_16832(d0, a0, xv.x, xv.y);
+                mma_s8_16832(d1, a1, xv.x, xv.y);
+                const float4 q4 = *(const float4*)&sds[bi][c * 8 + 2 * tig];
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const float dx = j ? q4.z : q4.x;
+                    acc[0][c][j] = fmaf(dx * dw[0], i2f(d0[j]), acc[0][c][j]);
+                    acc[0][c][2 + j] = fmaf(dx * dw[1], i2f(d0[2 + j]), acc[0][c][2 + j]);
+                    acc[1][c][j] = fmaf(dx * dw[2], i2f(d1[j]), acc[1][c][j]);
+                    acc[1][c][2 + j] = fmaf(dx * dw[3], i2f(d1[2 + j]), acc[1][c][2 + j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+// cx_gemm_dense with 4 warps of 32 rows (128 rows a block, same grid). A block whose warps are
+// not all Q8X in one segment each runs the k16 tile per 16 rows (no syncs).
+extern "C" __global__ void __launch_bounds__(128) cx_gemm_dense32(const Seg* segs, int nseg, const unsigned char* xq,
+                                                                  int k, float* out, int ostride, int T) {
+    __shared__ const float* xd_s[64];
+    __shared__ const unsigned char* xrow_s[64];
+    __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
+    __shared__ __align__(16) float scr[GT_SCR];
+    const int t0 = blockIdx.y * 64, cnt = min(64, T - t0), nch = (cnt + 7) / 8;
+    const float* xdb = (const float*)(xq + (size_t)XQ8_T * k);
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+        xd_s[i] = i < cnt ? xdb + (size_t)(t0 + i) * (k / 32) : nullptr;
+        xrow_s[i] = i < cnt ? xq + (size_t)(t0 + i) * k : nullptr;
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
+    int row = (blockIdx.x * 4 + warp) * 32, s = 0;
+    while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+    const bool live = s < nseg;
+    const bool fast = __syncthreads_and(live && segs[s].type == 108 && row + 32 <= segs[s].rows && k % XS_COLS == 0);
+    if (fast) {
+        const Seg sg = segs[s];
+        float acc[2][8][4];
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+            #pragma unroll
+            for (int c = 0; c < 8; c++) acc[h][c][0] = acc[h][c][1] = acc[h][c][2] = acc[h][c][3] = 0.f;
+        gemm_q8x_32r((const unsigned char*)sg.w + (size_t)(row + gq) * sg.row_bytes, sg.row_bytes, xrow_s, xd_s, nch,
+                     acc, k, (SdsT*)scr, xs);
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                if (c >= nch) break;
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int i = c * 8 + 2 * tig + j;
+                    if (i >= cnt) continue;
+                    float* o = out + (size_t)(t0 + i) * ostride + sg.out_off + row + 16 * h + gq;
+                    o[0] = acc[h][c][j];
+                    o[8] = acc[h][c][2 + j];
+                }
+            }
+        return;
+    }
+    for (int h = 0; h < 2; h++) {
+        int r = (blockIdx.x * 4 + warp) * 32 + 16 * h, s2 = 0;
+        while (s2 < nseg && r >= segs[s2].rows) { r -= segs[s2].rows; s2++; }
+        if (s2 >= nseg) return;
+        const Seg sg = segs[s2];
+        const unsigned char* wa = (const unsigned char*)sg.w + (size_t)(r + gq) * sg.row_bytes;
+        float acc[8][4];
+        #pragma unroll
+        for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+        gemm_tile_any(sg.type, wa, wa + (size_t)8 * sg.row_bytes, true, xrow_s, xd_s, nch, acc, k, scr, true);
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            if (c >= nch) break;
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int i = c * 8 + 2 * tig + j;
+                if (i >= cnt) continue;
+                float* o = out + (size_t)(t0 + i) * ostride + sg.out_off + r + gq;
+                o[0] = acc[c][j];
+                o[8] = acc[c][2 + j];
+            }
+        }
+    }
+}
+
 // A dense matrix (stacked segments, as fe_gemv8 takes them) over the window's rows:
 // out[t][out_off + row] for t < T, from xq's int8 codes ([XQ8_T][k], then [XQ8_T][k / 32]
 // scales). Each warp's 16 rows lie in one segment (rows % 16 == 0, checked on the host).
