@@ -324,7 +324,30 @@ fn load_coder(a: &Args) -> Result<Coder> {
     e.temperature = a.temp;
     e.seed = a.seed;
     eprintln!("{}", e.load_report);
+    auto_wide(&mut e, 0);
     Ok(e)
+}
+
+/// Wide prefill windows for single-stream prompts (`TANG_CODER_AUTO_WIDE` rows, else
+/// `default`; 0: off), so `Coder::prefill` takes them past `TANG_CODER_WIDE_MIN` tokens. Not
+/// with an MTP head (wide windows don't feed it). Off by default for the check tools, whose
+/// references are the narrow prefill.
+fn auto_wide(e: &mut Coder, default: usize) {
+    let rows: usize = std::env::var("TANG_CODER_AUTO_WIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default);
+    if rows == 0 || e.use_mtp {
+        return;
+    }
+    let t = std::time::Instant::now();
+    match e.enable_wide(rows) {
+        Ok(()) => eprintln!(
+            "coder: wide prefill windows of {rows} rows built in {:.1} s",
+            t.elapsed().as_secs_f64()
+        ),
+        Err(err) => eprintln!("coder: no wide prefill ({err})"),
+    }
 }
 
 /// Byte-level BPE piece → text (GPT-2 byte map), for printing.
@@ -1272,6 +1295,7 @@ pub fn aa(args: &[String]) -> Result<()> {
     ensure!(!files.is_empty(), "--ids-files A,B,..");
     a.opts.max_ctx = a.opts.max_ctx.max(4096);
     let mut e = load_coder(&a)?;
+    auto_wide(&mut e, 2048);
     let mut row = |e: &mut Coder, name: &str, ids: &[u32], draft: &str| -> Result<f64> {
         let (out, _, prefill_s, secs, sp) = decode_spec(e, ids, a.n, a.chunk, draft)?;
         let tps = sp.tokens as f64 / secs;

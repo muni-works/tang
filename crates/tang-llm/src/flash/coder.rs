@@ -177,6 +177,15 @@ impl Default for Variants {
     }
 }
 
+/// Prompts of at least this many tokens take wide prefill in [`Coder::prefill`]
+/// (`TANG_CODER_WIDE_MIN`, default 128: on an H200 wide passes narrow between 64 and 128).
+fn wide_min() -> usize {
+    std::env::var("TANG_CODER_WIDE_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
 impl Variants {
     fn from_env() -> Self {
         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i64>().ok());
@@ -4794,6 +4803,19 @@ impl Coder {
         mut logits_cb: Option<LogitsCb<'_>>,
     ) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
+        // Single-stream prompts past `wide_min()` tokens take the wide windows (when built, no
+        // MTP head to feed, no per-window logits wanted): ~4x narrow prefill on an H200.
+        if logits_cb.is_none()
+            && self.mtp.is_none()
+            && self.wide.is_some()
+            && ids.len() >= wide_min()
+        {
+            let next = self.prefill_wide(0, ids)?;
+            if let Some(p) = &self.prof {
+                p.borrow_mut().total.clear();
+            }
+            return Ok(next);
+        }
         let mut pos = self.tokens.len();
         self.tokens.extend_from_slice(ids);
         let mut next = 0;

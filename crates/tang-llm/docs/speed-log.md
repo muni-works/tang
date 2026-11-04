@@ -351,3 +351,16 @@ Serve, `/workspace/load.py 64 <port> 3` after `serve --batch 64 --ctx 32768`, sa
 406 → 292 s, 192/192 ok. Gates: `flash-wide-check` 3000/8000 PASS (KL 9e-7 / 3e-6); 1000 fails
 the 1e-3 bar on both (base 1.15e-2, this 7.9e-3: pre-existing, FA2 at short context);
 `flash-tcheck` t1 vs t8 bitwise; `flash-spec-test` PASS.
+
+### Single-stream prefill takes the wide windows (2026-11-04, H200)
+
+`Coder::prefill` (flash-aa, single-request serve) used only the narrow path (~850 tok/s) even
+when wide windows existed. It now takes `prefill_wide` on slot 0 for prompts of at least
+`TANG_CODER_WIDE_MIN` (128) tokens when wide windows are built, no MTP head is loaded and no
+per-window logits are wanted. `flash-aa` builds 2048-row windows (`TANG_CODER_AUTO_WIDE`, 0 off;
++~50 s load); `serve` without `--batch` builds them too (`TANG_SERVE_WIDE`). Check tools keep
+narrow references (auto-wide off by default in `load_coder`).
+
+flash-aa explain (1235 tokens): prefill **1.49 → 0.35 s** (830 → 3,530 tok/s); decode unchanged.
+Crossover (flash-wide-check): 32 tok 785 vs 472, 64: 856 vs 671, 128: 851 vs 1,141, 256: 849 vs
+1,770, 512: 842 vs 2,589 tok/s (narrow vs wide).

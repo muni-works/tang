@@ -892,6 +892,22 @@ impl FlashServe {
             }
             // The windows took memory: count again before any slot exists.
             me.batch = me.clamp_batch(me.batch);
+        } else if !me.e.use_mtp() {
+            // One stream: wide prefill windows for long prompts too (TANG_SERVE_WIDE rows).
+            let rows: usize = std::env::var("TANG_SERVE_WIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            if rows > 0 {
+                let t = Instant::now();
+                match me.e.enable_wide_rows(rows) {
+                    Ok(()) => eprintln!(
+                        "tang-llm: wide prefill windows of {rows} rows built in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
+                }
+            }
         }
         for f in &warm {
             let t = Instant::now();
