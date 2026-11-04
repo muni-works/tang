@@ -1069,6 +1069,12 @@ pub struct Coder {
     /// window is enqueued, `last_batch` when the latest window was one (for `logits`).
     batch: Option<Wide>,
     in_batch: std::cell::Cell<bool>,
+    /// Batch-module verify windows: each GDN layer's own projection rows (by the address of
+    /// the layer's narrow `proj`), since the module's one shared `proj` holds only the last
+    /// layer's by the time the commit replays every layer's kept rows. Allocated on the first
+    /// such window; `seg_proj` while one (and its commit) is enqueued.
+    batch_gproj: Vec<(u64, B)>,
+    seg_proj: std::cell::Cell<bool>,
     last_batch: bool,
     /// The Coder kernels' shapes (for building the wide module).
     shapes: Shapes,
@@ -1377,6 +1383,8 @@ impl Coder {
             wide_pos0: std::cell::Cell::new(0),
             batch: None,
             in_batch: std::cell::Cell::new(false),
+            batch_gproj: Vec::new(),
+            seg_proj: std::cell::Cell::new(false),
             last_batch: false,
             shapes: sh.clone(),
             seed: 0,
@@ -2088,6 +2096,35 @@ impl Coder {
     ) -> Result<Vec<Vec<u32>>> {
         let b = items.len();
         let wide = self.in_batch.get();
+        if wide && self.batch_gproj.is_empty() {
+            let rows = self.batch_rows();
+            let mut v = Vec::new();
+            for l in &self.layers {
+                if let Some(g) = &l.gdn {
+                    v.push((self.dev.buffer_addr(&g.proj), self.dev.alloc_f32(rows * l.w_in.rows)));
+                }
+            }
+            self.batch_gproj = v;
+        }
+        self.seg_proj.set(wide);
+        let r = self.verify_window(items, staged, segs, pos0, end, t, w0);
+        self.seg_proj.set(false);
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_window(
+        &mut self,
+        items: &[(usize, u32, Vec<u32>)],
+        staged: &[(usize, usize, u32)],
+        segs: &[[u32; 4]],
+        pos0: &[usize],
+        end: usize,
+        t: usize,
+        w0: Instant,
+    ) -> Result<Vec<Vec<u32>>> {
+        let b = items.len();
+        let wide = self.in_batch.get();
         self.stage_rows(staged, segs)?;
         let rw: Vec<(usize, usize, usize)> = items
             .iter()
@@ -2293,6 +2330,7 @@ impl Coder {
             return Ok(());
         }
         self.batch = None;
+        self.batch_gproj.clear();
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
             "{}#define CX_SRP {}\n#define CX_PSST {}\n#define CX_PSPLIT {}\n#define CX_PSPLIT_DOWN {}\n#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
@@ -3456,7 +3494,15 @@ impl Coder {
     fn proj_on(&self, w: usize, b: &B) -> u64 {
         let v = self.stage_view(w);
         match v.wide {
-            Some(wd) => v.dev.buffer_addr(&wd.proj),
+            Some(wd) => {
+                if w == 0 && self.seg_proj.get() && self.in_batch.get() {
+                    let a = v.dev.buffer_addr(b);
+                    if let Some((_, pb)) = self.batch_gproj.iter().find(|x| x.0 == a) {
+                        return v.dev.buffer_addr(pb);
+                    }
+                }
+                v.dev.buffer_addr(&wd.proj)
+            }
             None => v.dev.buffer_addr(b),
         }
     }
