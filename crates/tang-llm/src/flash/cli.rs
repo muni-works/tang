@@ -2654,3 +2654,97 @@ pub fn sample_check(args: &[String]) -> Result<()> {
     println!("sample-check: PASS");
     Ok(())
 }
+
+/// `flash-state-kl` (qwen3next): the GDN state dtype's long-context quality gate. With
+/// `--dump FILE`: prefill the prompt (wide windows of 256 rows), decode `-n` greedy tokens and
+/// write the tokens and every step's logits (`n` u32, then `n` × vocab f32). With `--ref FILE`
+/// (another process, e.g. `TANG_CODER_GDN_STATE=bf16`): the same prompt, teacher-forced on the
+/// reference's tokens; prints per-512-token buckets of mean KL(ref ‖ this) and top-1 agreement
+/// (this run's argmax = the reference's token), then the totals.
+pub fn state_kl(args: &[String]) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut a = parse(args)?;
+    let ids = prompt_ids(&a)?;
+    let steps = a.n;
+    if a.opts.max_ctx < ids.len() + steps + 8 {
+        a.opts.max_ctx = (ids.len() + steps + 8).next_multiple_of(1024);
+    }
+    let mut e = load_coder(&a)?;
+    ensure!(e.temperature == 0.0, "state-kl is greedy");
+    e.enable_wide(256)?;
+    let v = e.hp.n_vocab;
+    let s = e.alloc_slot()?;
+    let mut next = e.prefill_wide(s, &ids)?;
+    let forced: Option<(Vec<u32>, std::io::BufReader<std::fs::File>)> = match &a.reference {
+        Some(p) => {
+            let mut f = std::io::BufReader::new(std::fs::File::open(p)?);
+            let mut b = vec![0u8; 4 * steps];
+            f.read_exact(&mut b)?;
+            Some((b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(), f))
+        }
+        None => None,
+    };
+    let lsm = |l: &[f32]| -> Vec<f64> {
+        let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let z = l.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln() + m;
+        l.iter().map(|&x| x as f64 - z).collect()
+    };
+    let (mut toks, mut lgs) = (Vec::new(), Vec::<f32>::new());
+    let mut forced = forced;
+    let mut kls = Vec::new();
+    let mut agree = Vec::new();
+    let mut rl = vec![0u8; 4 * v];
+    for i in 0..steps {
+        let got = e.decode_batch(&[(s, next)])?[0];
+        let lg = e.logits(1);
+        match forced.as_mut() {
+            None => {
+                toks.push(got);
+                lgs.extend_from_slice(&lg);
+                next = got;
+            }
+            Some((ft, f)) => {
+                f.read_exact(&mut rl)?;
+                let r: Vec<f32> = rl.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                let (p, q) = (lsm(&r), lsm(&lg));
+                kls.push(p.iter().zip(&q).map(|(x, y)| x.exp() * (x - y)).sum::<f64>());
+                agree.push(got == ft[i]);
+                next = ft[i];
+            }
+        }
+    }
+    if let Some(p) = &a.dump {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
+        for t in &toks {
+            f.write_all(&t.to_le_bytes())?;
+        }
+        for x in &lgs {
+            f.write_all(&x.to_le_bytes())?;
+        }
+        println!("state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}", ids.len(), p.display());
+        return Ok(());
+    }
+    println!("state-kl: prompt {} tokens, {steps} teacher-forced steps", ids.len());
+    println!("{:>11} {:>10} {:>10} {:>9}", "positions", "mean KL", "max KL", "top-1");
+    for b in (0..steps).step_by(512) {
+        let e2 = (b + 512).min(steps);
+        let k = &kls[b..e2];
+        let ag = agree[b..e2].iter().filter(|&&x| x).count();
+        println!(
+            "{:>5}-{:<5} {:>10.2e} {:>10.2e} {:>8.2}%",
+            b,
+            e2,
+            k.iter().sum::<f64>() / k.len() as f64,
+            k.iter().cloned().fold(0.0, f64::max),
+            100.0 * ag as f64 / k.len() as f64
+        );
+    }
+    let ag = agree.iter().filter(|&&x| x).count();
+    println!(
+        "state-kl total: mean KL {:.3e}, max KL {:.3e}, top-1 agreement {:.2}% ({ag}/{steps})",
+        kls.iter().sum::<f64>() / steps as f64,
+        kls.iter().cloned().fold(0.0, f64::max),
+        100.0 * ag as f64 / steps as f64
+    );
+    Ok(())
+}

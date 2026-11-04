@@ -1084,15 +1084,47 @@ extern "C" __global__ void fl_gdn_conv_commit(float* __restrict__ H0, const floa
     for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];
 }
 
-// GDN recurrent state storage (GDN_S16: bf16, round-to-nearest-even on store; else f32).
+// GDN recurrent state storage (GDN_S16: bf16, round-to-nearest-even on store, GDN_SR
+// stochastic; GDN_H16: f16, nearest-even; else f32).
 // The recurrence always runs in f32 registers: only the window-boundary load/store change.
-#ifdef GDN_S16
+#if defined(GDN_H16)
+// f16 (11-bit significand: 8x bf16's precision, range ample for the decayed state).
+typedef unsigned short gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) {
+    float x;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(x) : "h"(*p));
+    return x;
+}
+__device__ __forceinline__ void gst_st(gst_t* p, float x) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
+    *p = h;
+}
+#elif defined(GDN_S16)
 typedef unsigned short gst_t;
 __device__ __forceinline__ float gst_ld(const gst_t* p) { return __uint_as_float(((unsigned int)*p) << 16); }
 __device__ __forceinline__ void gst_st(gst_t* p, float x) {
     unsigned int u = __float_as_uint(x);
+#ifdef GDN_SR
+    // Stochastic rounding: add 16 hashed bits of the value and truncate (deterministic, and
+    // independent of the slot, so batch and lone runs still agree).
+    unsigned int h = u * 0x85ebca6bu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12;
+    u += h & 0xffffu;
+#else
     u += 0x7fffu + ((u >> 16) & 1u);
+#endif
     *p = (unsigned short)(u >> 16);
+}
+#elif defined(GDN_RBITS)
+// Diagnostic: f32 storage with the low GDN_RBITS significand bits rounded off (nearest-even).
+typedef float gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) { return *p; }
+__device__ __forceinline__ void gst_st(gst_t* p, float x) {
+    unsigned int u = __float_as_uint(x);
+    const unsigned int h = 1u << (GDN_RBITS - 1);
+    u += (h - 1) + ((u >> GDN_RBITS) & 1u);
+    *p = __uint_as_float(u & ~((1u << GDN_RBITS) - 1));
 }
 #else
 typedef float gst_t;

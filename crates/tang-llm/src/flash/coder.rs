@@ -72,17 +72,41 @@ const GDN_COMMIT: u32 = 1;
 const GDN_REPLAY: u32 = 3;
 const ROWS_U32: usize = ROWS_PER_T * MAX_T;
 
-/// GDN recurrent state storage (`TANG_CODER_GDN_STATE=f32|bf16`, read once at first use):
-/// bf16 halves each slot's state and the step's state traffic; the recurrence itself runs in
-/// f32 registers either way (only the window-boundary load and the round-to-nearest-even
-/// store change). Kernels, buffers, `slot_bytes` and saved states all follow it.
-fn gdn_s16() -> bool {
-    static S16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S16.get_or_init(|| match std::env::var("TANG_CODER_GDN_STATE").as_deref() {
-        Ok("bf16") => true,
-        Ok("f32") | Err(_) => false,
-        Ok(v) => panic!("TANG_CODER_GDN_STATE={v}: f32 or bf16"),
+/// GDN recurrent state storage (`TANG_CODER_GDN_STATE=f32|bf16|bf16sr|f16`, read once at
+/// first use): a 16-bit state halves each slot's state and the step's state traffic; the
+/// recurrence itself runs in f32 registers either way (only the window-boundary load and the
+/// store's rounding change: nearest-even, or stochastic for `bf16sr`). Kernels, buffers,
+/// `slot_bytes` and saved states all follow it.
+fn gdn_state_mode() -> &'static str {
+    static M: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    M.get_or_init(|| match std::env::var("TANG_CODER_GDN_STATE").as_deref() {
+        Ok("bf16") => "bf16",
+        Ok("bf16sr") => "bf16sr",
+        Ok("f16") => "f16",
+        Ok("f32") | Err(_) => "f32",
+        Ok(v) => panic!("TANG_CODER_GDN_STATE={v}: f32, bf16, bf16sr or f16"),
     })
+}
+
+/// The flash module's defines for the state mode.
+fn gdn_state_defines() -> &'static str {
+    match gdn_state_mode() {
+        "bf16" => "#define GDN_S16 1\n",
+        "bf16sr" => "#define GDN_S16 1\n#define GDN_SR 1\n",
+        "f16" => "#define GDN_H16 1\n",
+        // Diagnostic (f32 storage): TANG_CODER_GDN_RBITS=n rounds off n significand bits.
+        _ => {
+            static R: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            R.get_or_init(|| match std::env::var("TANG_CODER_GDN_RBITS") {
+                Ok(n) => format!("#define GDN_RBITS {}\n", n.parse::<u32>().expect("RBITS")),
+                Err(_) => String::new(),
+            })
+        }
+    }
+}
+
+fn gdn_s16() -> bool {
+    gdn_state_mode() != "f32"
 }
 
 /// Bytes per GDN state element.
@@ -643,7 +667,7 @@ impl Kern {
         let fm = gpu
             .module(&format!(
                 "#define GDN_SLOTS 1\n{}{}",
-                if gdn_s16() { "#define GDN_S16 1\n" } else { "" },
+                gdn_state_defines(),
                 geo.cuda_source()
             ))
             .map_err(|e| anyhow!("flash kernels: {e}"))?;
