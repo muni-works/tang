@@ -754,17 +754,49 @@ extern "C" __global__ void __launch_bounds__(1024) cx_moe_plan_w(const unsigned*
         atomicAdd(&cnt[p >= T * CX_TOPK ? CX_NE : (int)ids[p]], 1);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int at = 0, g = 0;
-        for (int k = 0; k <= CX_NE; k++) {
-            start[k] = at;
-            gid[k] = g;
-            for (int o = 0; o < cnt[k]; o += CX_GCHUNK) { plan[1 + g] = (unsigned)(at + o); g++; }
-            at += cnt[k];
+    // Prefix over the keys (pairs and group counts), a warp-scan per 32 keys then over the
+    // warps' totals; one thread per key writes its groups' starts.
+    {
+        __shared__ int wsum[32], wgrp[32];
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        int base_a = 0, base_g = 0;
+        for (int k0 = 0; k0 <= CX_NE; k0 += blockDim.x) {
+            const int kk = k0 + threadIdx.x;
+            const int c = kk <= CX_NE ? cnt[kk] : 0;
+            const int gc = (c + CX_GCHUNK - 1) / CX_GCHUNK;
+            int ia = c, ig = gc;
+            for (int o = 1; o < 32; o <<= 1) {
+                const int va = __shfl_up_sync(0xffffffffu, ia, o), vg = __shfl_up_sync(0xffffffffu, ig, o);
+                if (lane >= o) { ia += va; ig += vg; }
+            }
+            if (lane == 31) { wsum[wid] = ia; wgrp[wid] = ig; }
+            __syncthreads();
+            if (wid == 0) {
+                const int nw = blockDim.x >> 5;
+                int sa = lane < nw ? wsum[lane] : 0, sgp = lane < nw ? wgrp[lane] : 0;
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int va = __shfl_up_sync(0xffffffffu, sa, o), vg = __shfl_up_sync(0xffffffffu, sgp, o);
+                    if (lane >= o) { sa += va; sgp += vg; }
+                }
+                if (lane < nw) { wsum[lane] = sa; wgrp[lane] = sgp; }
+            }
+            __syncthreads();
+            const int pa = base_a + (wid ? wsum[wid - 1] : 0) + ia - c;
+            const int pg = base_g + (wid ? wgrp[wid - 1] : 0) + ig - gc;
+            if (kk <= CX_NE) {
+                start[kk] = pa;
+                for (int o = 0, q = pg; o < c; o += CX_GCHUNK, q++) plan[1 + q] = (unsigned)(pa + o);
+            }
+            const int tot_a = wsum[(blockDim.x >> 5) - 1], tot_g = wgrp[(blockDim.x >> 5) - 1];
+            __syncthreads();
+            base_a += tot_a;
+            base_g += tot_g;
         }
-        ng = g;
-        plan[0] = (unsigned)g;
-        plan[1 + g] = (unsigned)n;
+        if (threadIdx.x == 0) {
+            ng = base_g;
+            plan[0] = (unsigned)base_g;
+            plan[1 + base_g] = (unsigned)n;
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -873,10 +905,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_g(ExW d, ExW sd, c
 // kernels' (same staged bytes, same cx_dot / cx_dotq_half on them): bitwise equal.
 // Grid (rows / (8 NR), groups), block 256, dynamic smem 8 * CX_SST * 2 * r16 * 16 bytes.
 #ifndef CX_SST
-#define CX_SST 4
+#define CX_SST 1
 #endif
 #ifndef CX_SST_DOWN
-#define CX_SST_DOWN CX_SST
+#define CX_SST_DOWN 2
 #endif
 #ifndef CX_MT
 #define CX_MT 1
@@ -1084,6 +1116,12 @@ __device__ __forceinline__ void sbk_load(const unsigned char* b, int tig, SbK& o
         o.h[0] = o.h[1] = 0;
     }
 }
+#ifndef CX_MMA_PF
+#define CX_MMA_PF 1
+#endif
+#ifndef CX_MMA_MINB
+#define CX_MMA_MINB 1
+#endif
 // scale_min_k4 on the 12 scale bytes held as three words (sub-block j a compile-time constant).
 __device__ __forceinline__ void scale_min_w(int j, const unsigned* sc, int& s, int& m) {
     auto by = [&](int i) { return (int)((sc[i >> 2] >> ((i & 3) * 8)) & 0xFFu); };
@@ -1106,7 +1144,7 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
     // Token g's B operand base (rows past m read token 0's codes: their columns are dropped).
     const unsigned char* xg = act + (size_t)(g < m ? g : 0) * K;
     for (int sb = 0; sb < NSB; sb++) {
-        if (sb + 1 < NSB) {
+        if (CX_MMA_PF && sb + 1 < NSB) {
             sbk_load<TY>(wa + (sb + 1) * BB, tig, na_);
             sbk_load<TY>(wb + (sb + 1) * BB, tig, nb_);
         }
@@ -1130,6 +1168,19 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             const unsigned b1 = *(const unsigned*)(xg + e + 16 + tig * 4);
             int d[4];
             mma_s8_16832(d, a, b0, b1);
+            // Columns 2 tig, 2 tig + 1's code sums over the block: precomputed (asum), or token
+            // g's from the quad's B fragments, then shuffled to the columns.
+            int sqa, sqb;
+            if (asum) {
+                sqa = na < m ? asum[na * (K / 32) + e / 32] : 0;
+                sqb = nb < m ? asum[nb * (K / 32) + e / 32] : 0;
+            } else {
+                int sq = __dp4a((int)b0, 0x01010101, __dp4a((int)b1, 0x01010101, 0));
+                sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+                sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+                sqa = __shfl_sync(0xffffffffu, sq, (2 * tig) * 4);
+                sqb = __shfl_sync(0xffffffffu, sq, (2 * tig + 1) * 4);
+            }
             int s0, m0, s1, m1;
             scale_min_w(s, ra.sc, s0, m0);
             scale_min_w(s, rb2.sc, s1, m1);
@@ -1137,17 +1188,20 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             const float db = rb2.d * i2f(s1), mb = rb2.dm * i2f(m1);
             const int blk = e / 32;
             if (na < m) {
-                const float dx = actd[na * (K / 32) + blk], sx = i2f(asum[na * (K / 32) + blk]);
+                const float dx = actd[na * (K / 32) + blk], sx = i2f(sqa);
                 acc[0] = fmaf(dx, fmaf(da, i2f(d[0]), -ma * sx), acc[0]);
                 acc[2] = fmaf(dx, fmaf(db, i2f(d[2]), -mb * sx), acc[2]);
             }
             if (nb < m) {
-                const float dx = actd[nb * (K / 32) + blk], sx = i2f(asum[nb * (K / 32) + blk]);
+                const float dx = actd[nb * (K / 32) + blk], sx = i2f(sqb);
                 acc[1] = fmaf(dx, fmaf(da, i2f(d[1]), -ma * sx), acc[1]);
                 acc[3] = fmaf(dx, fmaf(db, i2f(d[3]), -mb * sx), acc[3]);
             }
         }
-        if (sb + 1 < NSB) { ra = na_; rb2 = nb_; }
+        if (sb + 1 < NSB) {
+            if (CX_MMA_PF) { ra = na_; rb2 = nb_; }
+            else { sbk_load<TY>(wa + (sb + 1) * BB, tig, ra); sbk_load<TY>(wb + (sb + 1) * BB, tig, rb2); }
+        }
     }
 }
 template <bool DOWN>
@@ -1183,16 +1237,6 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         actd[i] = xdg[(size_t)t * (KA / 32) + c];
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
-        const uint4 v0 = ((const uint4*)act)[2 * i], v1 = ((const uint4*)act)[2 * i + 1];
-        int sx = 0;
-        sx = __dp4a((int)v0.x, 0x01010101, sx); sx = __dp4a((int)v0.y, 0x01010101, sx);
-        sx = __dp4a((int)v0.z, 0x01010101, sx); sx = __dp4a((int)v0.w, 0x01010101, sx);
-        sx = __dp4a((int)v1.x, 0x01010101, sx); sx = __dp4a((int)v1.y, 0x01010101, sx);
-        sx = __dp4a((int)v1.z, 0x01010101, sx); sx = __dp4a((int)v1.w, 0x01010101, sx);
-        asum[i] = sx;
-    }
-    __syncthreads();
     const int r0 = (blockIdx.x * 8 + warp) * 16;
     const int gq = lane >> 2, tig = lane & 3;
     const ExW& mw = DOWN ? (shared ? sg : g) : (shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u));
@@ -1203,8 +1247,8 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         const unsigned char* wa = wbase + (size_t)(ro + gq) * mw.row_bytes;
         const unsigned char* wb = wa + (size_t)8 * mw.row_bytes;
         float acc[4];
-        if (mw.ty == 12) moe_mma_rows<12, DOWN>(wa, wb, 0, m, act, actd, asum, acc);
-        else moe_mma_rows<13, DOWN>(wa, wb, 0, m, act, actd, asum, acc);
+        if (mw.ty == 12) moe_mma_rows<12, DOWN>(wa, wb, 0, m, act, actd, nullptr, acc);
+        else moe_mma_rows<13, DOWN>(wa, wb, 0, m, act, actd, nullptr, acc);
         if (2 * tig < m) {
             out[(size_t)pair_s[2 * tig] * ostride + r0 + gq] = acc[0];
             out[(size_t)pair_s[2 * tig] * ostride + r0 + gq + 8] = acc[2];
@@ -1224,12 +1268,12 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         }
     }
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_m(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+extern "C" __global__ void __launch_bounds__(256, CX_MMA_MINB) cx_moe_gu_m(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                               const unsigned char* xq, float* out, int T, int r16,
                                                               int fast, const unsigned* plan) {
     moe_mma_body<false>(g, u, sg, su, ids, xq, out, T, fast, plan);
 }
-extern "C" __global__ void __launch_bounds__(256) cx_moe_down_m(ExW d, ExW sd, const unsigned* ids,
+extern "C" __global__ void __launch_bounds__(256, CX_MMA_MINB) cx_moe_down_m(ExW d, ExW sd, const unsigned* ids,
                                                                 const unsigned char* hq, float* out, int T, int r16,
                                                                 int fast, const unsigned* plan) {
     moe_mma_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
@@ -1246,7 +1290,7 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_m(ExW d, ExW sd, c
 #define MQ_KC 256
 extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, int nseg, const unsigned char* xq, int k,
                                                              float* out, int ostride, int T, int splits, float* part,
-                                                             int rows_total) {
+                                                             int rows_total, const float* xf) {
     __shared__ uint4 xs[64 * MQ_KC / 16];
     __shared__ float xds[64 * (MQ_KC / 32)];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -1260,13 +1304,61 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
     const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
     const float* xdb = (const float*)(xq + (size_t)XQ8_T * k);
     const int ks = k / splits, kb = blockIdx.y * ks;
+    if (ok && sg.type != 108) {
+        // F32 / BF16 segments (small ones: GDN beta / alpha): a plain dot a row and token at a
+        // time over this split's columns, from the f32 activations.
+        for (int r = 0; r < 16; r++) {
+            const unsigned char* w = (const unsigned char*)sg.w + (size_t)(row + r) * sg.row_bytes;
+            for (int t = 0; t < T; t++) {
+                const float* xr = xf + (size_t)t * k;
+                float a = 0.f;
+                for (int e = kb + lane; e < kb + ks; e += 32) {
+                    const float wv = sg.type == 0 ? ((const float*)w)[e] : bf2f(((const unsigned short*)w)[e]);
+                    a = fmaf(wv, xr[e], a);
+                }
+                for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+                if (lane == 0) {
+                    if (splits == 1) out[(size_t)t * ostride + sg.out_off + row + r] = a;
+                    else part[((size_t)blockIdx.y * T + t) * rows_total + growrow + r] = a;
+                }
+            }
+        }
+    }
+    if (ok && (sg.type == 12 || sg.type == 13)) {
+        // Q4_K / Q5_K segments (GDN's ssm_ba): the expert MMA tile, 8 tokens at a time, whole k;
+        // token group i in split i % splits (the other splits add zeros).
+        const unsigned char* wa = (const unsigned char*)sg.w + (size_t)(row + g) * sg.row_bytes;
+        const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
+        for (int t0 = 0; t0 < T; t0 += 8) {
+            const int m = min(8, T - t0);
+            float a4[4] = {0.f, 0.f, 0.f, 0.f};
+            if ((t0 / 8) % splits == (int)blockIdx.y && k == CX_HID) {
+                if (sg.type == 12) moe_mma_rows<12, false>(wa, wb, 0, m, xq + (size_t)t0 * k, xdb + (size_t)t0 * (k / 32), nullptr, a4);
+                else moe_mma_rows<13, false>(wa, wb, 0, m, xq + (size_t)t0 * k, xdb + (size_t)t0 * (k / 32), nullptr, a4);
+            }
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const int t = t0 + 2 * tig + j;
+                if (t >= T) continue;
+                if (splits == 1) {
+                    out[(size_t)t * ostride + sg.out_off + row + g] = a4[j];
+                    out[(size_t)t * ostride + sg.out_off + row + g + 8] = a4[2 + j];
+                } else {
+                    float* pp = part + ((size_t)blockIdx.y * T + t) * rows_total + growrow + g;
+                    pp[0] = a4[j];
+                    pp[8] = a4[2 + j];
+                }
+            }
+        }
+    }
+    const bool mm = ok && sg.type == 108;
     float acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
     for (int k0 = kb; k0 < kb + ks; k0 += MQ_KC) {
         unsigned af[8][4];
         float dwa[8], dwb[8];
-        if (ok) {
+        if (mm) {
             #pragma unroll
             for (int st = 0; st < 8; st++) {
                 const int e = k0 + st * 32;
@@ -1288,7 +1380,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
             xds[i] = xdb[(size_t)t * (k / 32) + k0 / 32 + c];
         }
         __syncthreads();
-        if (!ok) continue;
+        if (!mm) continue;
         const unsigned char* xsb = (const unsigned char*)xs;
         #pragma unroll
         for (int st = 0; st < 8; st++) {
@@ -1310,7 +1402,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
             }
         }
     }
-    if (!ok) return;
+    if (!mm) return;
     #pragma unroll
     for (int nt = 0; nt < 8; nt++) {
         if (nt >= NT) break;
@@ -1326,6 +1418,91 @@ extern "C" __global__ void __launch_bounds__(128) cx_mma_q8x(const Seg* segs, in
                 pp[0] = acc[nt][j];
                 pp[8] = acc[nt][2 + j];
             }
+        }
+    }
+}
+// The router (F32 / BF16, one segment) for a batch window: a block owns 16 rows and a 128-wide
+// slice of k for all T <= 64 tokens, the tokens' slice in shared memory (padded rows), each lane
+// two tokens (t, t + 32) of each of its warp's 2 rows. Partials [split][t][rows] for
+// cx_mma_q8x_red. Grid (rows / 16 rounded up, k / 128), block 256.
+extern "C" __global__ void __launch_bounds__(256) cx_router_b(const Seg* segs, int nseg, const float* x, int k, int T,
+                                                              float* part, int rows_total) {
+    __shared__ float xs[64][129];
+    const int k0 = blockIdx.y * 128;
+    for (int i = threadIdx.x; i < T * 128; i += blockDim.x) {
+        const int t = i >> 7, c = i & 127;
+        xs[t][c] = x[(size_t)t * k + k0 + c];
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const int r = blockIdx.x * 16 + warp * 2 + j;
+        if (r >= rows_total) continue;
+        int rr = r, si = 0;
+        while (si < nseg - 1 && rr >= segs[si].rows) { rr -= segs[si].rows; si++; }
+        const Seg sg = segs[si];
+        const unsigned char* w = (const unsigned char*)sg.w + (size_t)rr * sg.row_bytes;
+        float a0 = 0.f, a1 = 0.f;
+        const bool t1 = lane + 32 < T, t0 = lane < T;
+        for (int c = 0; c < 128; c++) {
+            const float wv = sg.type == 0 ? ((const float*)w)[k0 + c] : bf2f(((const unsigned short*)w)[k0 + c]);
+            if (t0) a0 = fmaf(wv, xs[lane][c], a0);
+            if (t1) a1 = fmaf(wv, xs[lane + 32][c], a1);
+        }
+        if (t0) part[((size_t)blockIdx.y * T + lane) * rows_total + r] = a0;
+        if (t1) part[((size_t)blockIdx.y * T + lane + 32) * rows_total + r] = a1;
+    }
+}
+// The router (F32 / BF16 segments) for a wide window: a plain f32 tiled GEMM, 64 rows × 64
+// tokens a block, k in steps of 32 through shared memory, 4 × 4 outputs a thread. x is the f32
+// activations [T][k]. out[t][row]. Grid (rows / 64 rounded up, T / 64 rounded up), block 256.
+extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide(const Seg* segs, int nseg, int rows_total,
+                                                                const float* x, int k, float* out, int ostride,
+                                                                int T) {
+    __shared__ float ws[32][65], xs[32][65];
+    const int r0 = blockIdx.x * 64, t0 = blockIdx.y * 64;
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        for (int i = threadIdx.x; i < 64 * 32; i += 256) {
+            const int r = i >> 5, c = i & 31;
+            const int rr = r0 + r, tt = t0 + r;
+            float wv = 0.f;
+            if (rr < rows_total) {
+                int q = rr, si = 0;
+                while (si < nseg - 1 && q >= segs[si].rows) { q -= segs[si].rows; si++; }
+                const Seg sg = segs[si];
+                const unsigned char* w = (const unsigned char*)sg.w + (size_t)q * sg.row_bytes;
+                wv = sg.type == 0 ? ((const float*)w)[k0 + c] : bf2f(((const unsigned short*)w)[k0 + c]);
+            }
+            ws[c][r] = wv;
+            xs[c][r] = tt < T ? x[(size_t)tt * k + k0 + c] : 0.f;
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int c = 0; c < 32; c++) {
+            float a[4], b[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { a[i] = ws[c][ty + 16 * i]; b[i] = xs[c][tx + 16 * i]; }
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int jj = 0; jj < 4; jj++) acc[i][jj] = fmaf(a[i], b[jj], acc[i][jj]);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int rr = r0 + ty + 16 * i;
+        if (rr >= rows_total) continue;
+        int q = rr, si = 0;
+        while (si < nseg - 1 && q >= segs[si].rows) { q -= segs[si].rows; si++; }
+        const int o = segs[si].out_off + q;
+        #pragma unroll
+        for (int jj = 0; jj < 4; jj++) {
+            const int tt = t0 + tx + 16 * jj;
+            if (tt < T) out[(size_t)tt * ostride + o] = acc[i][jj];
         }
     }
 }
@@ -1412,21 +1589,219 @@ __device__ __forceinline__ void gemm_tile(const unsigned char* wa, const unsigne
     }
 }
 
-__device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, const unsigned char* wb,
-                                              const unsigned char* const* xrow, const float* const* xd, int nch,
-                                              float acc[8][4], int K) {
+// The k32 tile for weight types whose scale (and min) is constant over each 32 columns (all
+// but Q3_K / Q6_K, 16-column scales): one mma.sync m16n8k32 per 32 columns and chunk, and the
+// row's and token's scales applied once per 32 columns instead of per 16. The tokens' f32
+// scales and (for Q4_K / Q5_K mins) per-32 code sums are staged in shared memory a K slab at a
+// time, so the inner loop has no shuffles and no scattered scale loads. Every thread of the
+// block must call it (it syncs); `live` = false warps only help stage.
+#define GT_KS 1024
+template <int TY>
+__device__ __forceinline__ void gt_dec(const unsigned char* row, int K, int e0, int& w0, int& w1, float& dw, float& mw) {
+    if (TY == 108) { decode8_q8x(row, K, e0, w0, w1, dw); mw = 0.f; }
+    else decode8i<TY>(row, e0, w0, w1, dw, mw);
+}
+template <int TY>
+__device__ __forceinline__ void gemm_tile32(const unsigned char* wa, const unsigned char* wb, bool live,
+                                            const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
+                                            float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
+                                            int (*ssx)[GT_KS / 32 + 1]) {
+    constexpr bool MIN = TY == 12 || TY == 13;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const unsigned char* xr[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + g];
+    for (int ks = 0; ks < K; ks += GT_KS) {
+        const int kn = min(GT_KS, K - ks), nb = kn / 32;
+        __syncthreads();
+        for (int i = threadIdx.x; i < 64 * nb; i += blockDim.x) {
+            const int t = i / nb, b = i - t * nb;
+            const float* xd = xd_s[t];
+            sxd[t][b] = xd ? xd[ks / 32 + b] : 0.f;
+            if (MIN) {
+                int sm = 0;
+                const unsigned char* r = xrow_s[t];
+                if (r) {
+                    const uint4* q = (const uint4*)(r + ks + b * 32);
+                    const uint4 u0 = q[0], u1 = q[1];
+                    sm = __dp4a((int)u0.x, 0x01010101, sm); sm = __dp4a((int)u0.y, 0x01010101, sm);
+                    sm = __dp4a((int)u0.z, 0x01010101, sm); sm = __dp4a((int)u0.w, 0x01010101, sm);
+                    sm = __dp4a((int)u1.x, 0x01010101, sm); sm = __dp4a((int)u1.y, 0x01010101, sm);
+                    sm = __dp4a((int)u1.z, 0x01010101, sm); sm = __dp4a((int)u1.w, 0x01010101, sm);
+                }
+                ssx[t][b] = sm;
+            }
+        }
+        __syncthreads();
+        if (!live) continue;
+        #pragma unroll 4
+        for (int k0 = ks; k0 < ks + kn; k0 += 32) {
+            unsigned a[4];
+            int w0, w1;
+            float dwa, mwa, dwb, mwb;
+            // The 32 columns permuted (the same for weights and tokens, so the dot is the
+            // same sum): lane tig's 8 consecutive columns k0 + 8 tig.. are the MMA's k = 4 tig..
+            // and 16 + 4 tig.., so each decode of 8 weights is used whole.
+            const int e0 = k0 + 8 * tig;
+            gt_dec<TY>(wa, K, e0, w0, w1, dwa, mwa);
+            a[0] = (unsigned)w0;
+            a[2] = (unsigned)w1;
+            gt_dec<TY>(wb, K, e0, w0, w1, dwb, mwb);
+            a[1] = (unsigned)w0;
+            a[3] = (unsigned)w1;
+            const int bi = (k0 - ks) >> 5;
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                if (c >= nch) break;
+                const unsigned char* x = xr[c];
+                const uint2 xv = x ? *(const uint2*)(x + k0 + 8 * tig) : make_uint2(0u, 0u);
+                const unsigned b0 = xv.x, b1 = xv.y;
+                int d[4];
+                mma_s8_16832(d, a, b0, b1);
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int t = c * 8 + 2 * tig + j;
+                    const float dx = sxd[t][bi];
+                    if (MIN) {
+                        const float sx = i2f(ssx[t][bi]);
+                        acc[c][j] = fmaf(dx, fmaf(dwa, i2f(d[j]), -mwa * sx), acc[c][j]);
+                        acc[c][2 + j] = fmaf(dx, fmaf(dwb, i2f(d[2 + j]), -mwb * sx), acc[c][2 + j]);
+                    } else {
+                        acc[c][j] = fmaf(dx * dwa, i2f(d[j]), acc[c][j]);
+                        acc[c][2 + j] = fmaf(dx * dwb, i2f(d[2 + j]), acc[c][2 + j]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// gemm_tile32 for Q4_K / Q5_K rows: a superblock's operands (d, dmin, scales, this lane's qs
+// words) loaded once per 256 columns with the next superblock's loads in flight (sbk_load, as
+// the batch MMA kernels), instead of 4-5 scattered loads per 8 weights. Same staging and math.
+template <int TY>
+__device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const unsigned char* wb, bool live,
+                                              const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
+                                              float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
+                                              int (*ssx)[GT_KS / 32 + 1]) {
+    constexpr int BB = TY == 12 ? 144 : 176;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const unsigned char* xr[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + g];
+    SbK ra, rb, pa, pb;
+    if (live) { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
+    for (int ks = 0; ks < K; ks += GT_KS) {
+        const int kn = min(GT_KS, K - ks), nb = kn / 32;
+        __syncthreads();
+        for (int i = threadIdx.x; i < 64 * nb; i += blockDim.x) {
+            const int t = i / nb, b = i - t * nb;
+            const float* xd = xd_s[t];
+            sxd[t][b] = xd ? xd[ks / 32 + b] : 0.f;
+            int sm = 0;
+            const unsigned char* r = xrow_s[t];
+            if (r) {
+                const uint4* q = (const uint4*)(r + ks + b * 32);
+                const uint4 u0 = q[0], u1 = q[1];
+                sm = __dp4a((int)u0.x, 0x01010101, sm); sm = __dp4a((int)u0.y, 0x01010101, sm);
+                sm = __dp4a((int)u0.z, 0x01010101, sm); sm = __dp4a((int)u0.w, 0x01010101, sm);
+                sm = __dp4a((int)u1.x, 0x01010101, sm); sm = __dp4a((int)u1.y, 0x01010101, sm);
+                sm = __dp4a((int)u1.z, 0x01010101, sm); sm = __dp4a((int)u1.w, 0x01010101, sm);
+            }
+            ssx[t][b] = sm;
+        }
+        __syncthreads();
+        if (!live) continue;
+        for (int k0 = ks; k0 < ks + kn; k0 += 256) {
+            const int sb = k0 / 256;
+            if ((sb + 1) * 256 < K) {
+                sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
+                sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
+            }
+            #pragma unroll
+            for (int st = 0; st < 8; st++) {
+                const int j = st >> 1, hi = st & 1;
+                unsigned a[4];
+                #pragma unroll
+                for (int w = 0; w < 2; w++) {
+                    unsigned qa = hi ? (ra.q[j][w] >> 4) & 0x0F0F0F0Fu : ra.q[j][w] & 0x0F0F0F0Fu;
+                    unsigned qb = hi ? (rb.q[j][w] >> 4) & 0x0F0F0F0Fu : rb.q[j][w] & 0x0F0F0F0Fu;
+                    if (TY == 13) {
+                        qa |= ((ra.h[w] >> st) & 0x01010101u) << 4;
+                        qb |= ((rb.h[w] >> st) & 0x01010101u) << 4;
+                    }
+                    a[w * 2] = qa;
+                    a[w * 2 + 1] = qb;
+                }
+                int s0, m0, s1, m1;
+                scale_min_w(st, ra.sc, s0, m0);
+                scale_min_w(st, rb.sc, s1, m1);
+                const float da = ra.d * i2f(s0), ma = ra.dm * i2f(m0);
+                const float db = rb.d * i2f(s1), mb = rb.dm * i2f(m1);
+                const int e = k0 + st * 32, bi = (e - ks) >> 5;
+                #pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    if (c >= nch) break;
+                    const unsigned char* x = xr[c];
+                    const unsigned b0 = x ? *(const unsigned*)(x + e + 4 * tig) : 0u;
+                    const unsigned b1 = x ? *(const unsigned*)(x + e + 16 + 4 * tig) : 0u;
+                    int d[4];
+                    mma_s8_16832(d, a, b0, b1);
+                    #pragma unroll
+                    for (int jj = 0; jj < 2; jj++) {
+                        const int t = c * 8 + 2 * tig + jj;
+                        const float dx = sxd[t][bi], sx = i2f(ssx[t][bi]);
+                        acc[c][jj] = fmaf(dx, fmaf(da, i2f(d[jj]), -ma * sx), acc[c][jj]);
+                        acc[c][2 + jj] = fmaf(dx, fmaf(db, i2f(d[2 + jj]), -mb * sx), acc[c][2 + jj]);
+                    }
+                }
+            }
+            if ((sb + 1) * 256 < K) { ra = pa; rb = pb; }
+        }
+    }
+}
+
+// `xrow_s` / `xd_s`: the tile's 64 token rows (codes, per-32 scales; null past the tile) in
+// shared memory. Every thread of the block calls it.
+// `k16`: the old per-16 tile for every type (no syncs), for blocks whose warps differ in type.
+__device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, const unsigned char* wb, bool live,
+                                              const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
+                                              float acc[8][4], int K, bool k16 = false) {
+    if (k16 || ty == 11 || ty == 14) {
+        if (!live) return;
+        const int g = (threadIdx.x & 31) >> 2;
+        const unsigned char* xr[8];
+        #pragma unroll
+        for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + g];
+        switch (ty) {
+            case 12: gemm_tile<12>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 13: gemm_tile<13>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 14: gemm_tile<14>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 8: gemm_tile<8>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 108: gemm_tile<108>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 11: gemm_tile<11>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 2: gemm_tile<2>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 20: gemm_tile<20>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 6: gemm_tile<6>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 23: gemm_tile<23>(wa, wb, xr, xd_s, nch, acc, K); break;
+            case 42: gemm_tile<42>(wa, wb, xr, xd_s, nch, acc, K); break;
+            default: break;
+        }
+        return;
+    }
+    // One staging area for every instance (statics in the templates would each take their own).
+    __shared__ float sxd[64][GT_KS / 32 + 1];
+    __shared__ int ssx[64][GT_KS / 32 + 1];
     switch (ty) {
-        case 12: gemm_tile<12>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 13: gemm_tile<13>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 14: gemm_tile<14>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 8: gemm_tile<8>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 108: gemm_tile<108>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 11: gemm_tile<11>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 2: gemm_tile<2>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 20: gemm_tile<20>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 6: gemm_tile<6>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 23: gemm_tile<23>(wa, wb, xrow, xd, nch, acc, K); break;
-        case 42: gemm_tile<42>(wa, wb, xrow, xd, nch, acc, K); break;
+        case 12: gemm_tile_sbk<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 13: gemm_tile_sbk<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 8: gemm_tile32<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 108: gemm_tile32<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 2: gemm_tile32<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 20: gemm_tile32<20>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 6: gemm_tile32<6>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 23: gemm_tile32<23>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 42: gemm_tile32<42>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         default: break;
     }
 }
@@ -1462,13 +1837,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, E
     const int ro = r0 < CX_FF ? r0 : r0 - CX_FF;
     const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(ro + gq) * m.row_bytes;
     const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
-    const unsigned char* xr[8];
-    #pragma unroll
-    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + gq];
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    gemm_tile_any(m.ty, wa, wb, xr, xd_s, nch, acc, CX_HID);
+    gemm_tile_any(m.ty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
@@ -1512,13 +1884,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     const ExW& m = shared ? sd : d;
     const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(r0 + gq) * m.row_bytes;
     const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
-    const unsigned char* xr[8];
-    #pragma unroll
-    for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + gq];
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    gemm_tile_any(m.ty, wa, wb, xr, xd_s, nch, acc, CX_FF);
+    gemm_tile_any(m.ty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
@@ -1539,28 +1908,32 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
 extern "C" __global__ void __launch_bounds__(256) cx_gemm_dense(const Seg* segs, int nseg, const unsigned char* xq,
                                                                 int k, float* out, int ostride, int T) {
     __shared__ const float* xd_s[64];
+    __shared__ const unsigned char* xrow_s[64];
     const int t0 = blockIdx.y * 64, cnt = min(64, T - t0), nch = (cnt + 7) / 8;
     const float* xdb = (const float*)(xq + (size_t)XQ8_T * k);
-    for (int i = threadIdx.x; i < 64; i += blockDim.x)
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
         xd_s[i] = i < cnt ? xdb + (size_t)(t0 + i) * (k / 32) : nullptr;
+        xrow_s[i] = i < cnt ? xq + (size_t)(t0 + i) * k : nullptr;
+    }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
     int row = (blockIdx.x * 8 + warp) * 16, s = 0;
     while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
-    if (s >= nseg) return;
-    const Seg sg = segs[s];
-    const unsigned char* wa = (const unsigned char*)sg.w + (size_t)(row + gq) * sg.row_bytes;
+    // Past the last row: stage with the block (the k32 tile syncs), compute nothing. A block
+    // whose live warps sit in segments of different types takes the k16 tile (no syncs).
+    const bool live = s < nseg;
+    int r0 = blockIdx.x * 128, s0 = 0;
+    while (s0 < nseg - 1 && r0 >= segs[s0].rows) { r0 -= segs[s0].rows; s0++; }
+    const int ty0 = segs[s0].type;
+    const Seg sg = segs[live ? s : s0];
+    const bool k16 = !__syncthreads_and(sg.type == ty0);
+    const unsigned char* wa = (const unsigned char*)sg.w + (size_t)((live ? row : 0) + gq) * sg.row_bytes;
     const unsigned char* wb = wa + (size_t)8 * sg.row_bytes;
-    const unsigned char* xr[8];
-    #pragma unroll
-    for (int c = 0; c < 8; c++) {
-        const int i = c * 8 + gq;
-        xr[c] = i < cnt ? xq + (size_t)(t0 + i) * k : nullptr;
-    }
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    gemm_tile_any(sg.type, wa, wb, xr, xd_s, nch, acc, k);
+    gemm_tile_any(sg.type, wa, wb, live, xrow_s, xd_s, nch, acc, k, k16);
+    if (!live) return;
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;

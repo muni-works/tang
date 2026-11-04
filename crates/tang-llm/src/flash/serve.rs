@@ -76,6 +76,33 @@ pub struct Settings {
     pub profile: Option<PathBuf>,
 }
 
+/// A request's (temperature, top-k, top-p, presence penalty): what it names, the mode's
+/// defaults for the rest.
+fn request_sampling(mode: SamplingMode, temp0: f32, req: &Request) -> (f32, usize, f32, f32) {
+    let thinking = req.think != Some(false);
+    let card = match (mode, thinking) {
+        (SamplingMode::Greedy, _) => (temp0, 0usize, 1.0f32, 0.0f32),
+        (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
+        (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
+    };
+    let temp = if req.temperature_set {
+        req.sampling.temperature.max(0.0)
+    } else {
+        card.0
+    };
+    let top_k = if req.top_k_set {
+        req.sampling.top_k
+    } else {
+        card.1
+    };
+    let top_p = if req.top_p_set {
+        req.sampling.top_p
+    } else {
+        card.2
+    };
+    (temp, top_k, top_p, req.presence_penalty.unwrap_or(card.3))
+}
+
 /// What the server needs from an engine: the Flash-Next [`Engine`] or the qwen3next
 /// [`Coder`](super::coder::Coder).
 pub trait ServeEngine {
@@ -132,12 +159,30 @@ pub trait ServeEngine {
     fn alloc_slot(&mut self) -> Result<usize> {
         bail!("this engine has no sequence slots")
     }
+    /// Sequence slots that fit in VRAM at the configured context (see `Coder::fit_slots`).
+    fn fit_slots(&mut self) -> usize {
+        self.max_slots().saturating_sub(1).max(1)
+    }
     fn free_slot(&mut self, _slot: usize) {}
     fn prefill_slot(&mut self, _slot: usize, _ids: &[u32]) -> Result<u32> {
         bail!("this engine has no sequence slots")
     }
     fn decode_batch(&mut self, _rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         bail!("this engine has no sequence slots")
+    }
+    /// Per-row sampling in slot windows: turn it on (startup, `--batch`).
+    fn enable_row_sampling(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Slot `slot`'s sampling for its next request. Engines without per-row sampling refuse a
+    /// sampled one rather than run it greedy.
+    fn set_slot_sampling(&mut self, _slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        ensure!(
+            !s.sampled(),
+            "this engine's batched windows are greedy: temperature {} isn't supported with --batch",
+            s.temperature
+        );
+        Ok(())
     }
     /// Wide prefill windows for sequence slots: build them (`rows` tokens a window).
     fn enable_wide_rows(&mut self, _rows: usize) -> Result<()> {
@@ -327,6 +372,9 @@ impl ServeEngine for super::coder::Coder {
     fn alloc_slot(&mut self) -> Result<usize> {
         super::coder::Coder::alloc_slot(self)
     }
+    fn fit_slots(&mut self) -> usize {
+        super::coder::Coder::fit_slots(self)
+    }
     fn free_slot(&mut self, slot: usize) {
         super::coder::Coder::free_slot(self, slot)
     }
@@ -335,6 +383,12 @@ impl ServeEngine for super::coder::Coder {
     }
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         super::coder::Coder::decode_batch(self, rows)
+    }
+    fn enable_row_sampling(&mut self) -> Result<()> {
+        super::coder::Coder::enable_row_sampling(self)
+    }
+    fn set_slot_sampling(&mut self, slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        super::coder::Coder::set_slot_sampling(self, slot, s)
     }
     fn enable_batch_rows(&mut self, rows: usize) -> Result<()> {
         super::coder::Coder::enable_batch(self, rows)
@@ -525,8 +579,9 @@ pub struct FlashServe {
     /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
     batch: usize,
     slots: Vec<batch::SlotInfo>,
-    /// Prefill seconds not yet matched by decode time (see `batch_step`).
-    prefill_debt: f64,
+    /// The batch prefill scheduler's account and knobs (see `batch_step`).
+    sched: crate::batch::prefill::Sched,
+    prefill_policy: Option<crate::batch::prefill::Policy>,
     tok: FlashTokenizer,
     /// Keeps request text out of the special tokens (see [`Shield`]).
     shield: Shield,
@@ -597,6 +652,25 @@ fn hash(ids: &[u32]) -> u64 {
 }
 
 impl FlashServe {
+    /// `want` streams at once, clamped to the slots that fit in VRAM at `--ctx` (one spare,
+    /// see [`crate::batch::clamp_batch`]); warns when it cuts.
+    fn clamp_batch(&mut self, want: usize) -> usize {
+        let cap = self.e.fit_slots();
+        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap);
+        if n < want {
+            eprintln!(
+                "tang-llm: warning: --batch {want} clamped to {n}: {cap} sequence slots fit in \
+                 free VRAM at --ctx {} (TANG_SLOT_HEADROOM_GB sets the headroom)",
+                self.ctx
+            );
+        }
+        n
+    }
+
+    fn request_sampling(&self, req: &Request) -> (f32, usize, f32, f32) {
+        request_sampling(self.sampling, self.temp, req)
+    }
+
     pub fn load(s: &Settings) -> Result<Self> {
         let t = Instant::now();
         let saved = s.disk.as_ref().map(|d| d.join(ROUTING));
@@ -715,7 +789,8 @@ impl FlashServe {
             warm_dir: None,
             batch: 1,
             slots: Vec::new(),
-            prefill_debt: 0.0,
+            sched: Default::default(),
+            prefill_policy: None,
             e,
             im_start: id("<|im_start|>")?,
             shield: Shield::new(&tok.tok),
@@ -777,9 +852,10 @@ impl FlashServe {
                 me.e.max_slots() > 1,
                 "--batch needs an engine with sequence slots (qwen3next)"
             );
-            me.batch = s.batch.min(me.e.max_slots() - 1);
+            me.batch = me.clamp_batch(s.batch);
+            me.e.enable_row_sampling()?;
             eprintln!(
-                "tang-llm: continuous batching: up to {} requests at once (greedy{})",
+                "tang-llm: continuous batching: up to {} requests at once (per-row sampling{})",
                 me.batch,
                 if me.e.use_mtp() {
                     ", MTP drafts"
@@ -800,6 +876,24 @@ impl FlashServe {
                 }
             }
             // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 2048; 0: off).
+            let rows: usize = std::env::var("TANG_SERVE_WIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048);
+            if rows > 0 {
+                let t = Instant::now();
+                match me.e.enable_wide_rows(rows) {
+                    Ok(()) => eprintln!(
+                        "tang-llm: wide prefill windows of {rows} rows built in {:.1} s",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
+                }
+            }
+            // The windows took memory: count again before any slot exists.
+            me.batch = me.clamp_batch(me.batch);
+        } else if !me.e.use_mtp() {
+            // One stream: wide prefill windows for long prompts too (TANG_SERVE_WIDE rows).
             let rows: usize = std::env::var("TANG_SERVE_WIDE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1371,28 +1465,7 @@ impl FlashServe {
             .unwrap_or(usize::MAX)
             .min(self.ctx - ids.len() - 1)
             .max(1);
-        let thinking = req.think != Some(false);
-        let card = match (self.sampling, thinking) {
-            (SamplingMode::Greedy, _) => (self.temp, 0usize, 1.0f32, 0.0f32),
-            (SamplingMode::ModelCard, true) => (1.0, 20, 0.95, 0.0),
-            (SamplingMode::ModelCard, false) => (0.7, 20, 0.8, 1.5),
-        };
-        let temp = if req.temperature_set {
-            req.sampling.temperature.max(0.0)
-        } else {
-            card.0
-        };
-        let top_k = if req.top_k_set {
-            req.sampling.top_k
-        } else {
-            card.1
-        };
-        let top_p = if req.top_p_set {
-            req.sampling.top_p
-        } else {
-            card.2
-        };
-        let presence = req.presence_penalty.unwrap_or(card.3);
+        let (temp, top_k, top_p, presence) = self.request_sampling(req);
         self.e.set_sampling(temp, req.sampling.seed as u32);
         if let Some(sp) = self.e.sampler_mut() {
             // top-k 0 (off) keeps the 64 best: the sampler's bound.

@@ -229,6 +229,54 @@ Eager, B=64 (ms a layer, GB/s from ~367 distinct experts + shared): gate|up 0.57
   (gate|up 0.22 → 0.26 ms), the extra prologue pass costs more than it saves.
 - **Deeper rings / more rows a warp for down** (4/8 stages, 32 rows): flat or worse.
 
+### Tensor-core batch windows, tolerance-gated (2026-11-03, H200, explain, ~1.2k context)
+
+Past 8 rows, batch windows may drop bitwise equality: `flash-batch-check` then gates on
+**greedy agreement given the same history ≥ 99%** (each sequence's steps up to and including
+its first divergence from the sequence alone) and **mean |Δlogit| ≤ 0.2** over those steps
+(`TANG_BATCH_TOL`); max |Δlogit| is reported. Narrow windows (T ≤ 8) stay bitwise.
+
+Measured noise floor at B=64 (16 steps): agreement 99.50% (986/991), mean |Δlogit| 0.122,
+max 11.9. The int8 MMA down kernel matches the per-pair dot to ~1e-6 relative
+(`TANG_CODER_MMA_CHECK=1`), so the spread isn't the kernel: a reordered fp32 sum flips the int8
+rounding of some activation downstream, and the flips compound over 48 layers. A 0.05 max bar
+is unreachable for any change of summation order in this pipeline.
+
+| commit | change | B=16 | B=32 | B=64 ms | B=64 tok/s |
+|---|---|---|---|---|---|
+| 34c91db3 | streaming experts (bitwise) | 20.01 | 31.04 | 51.16 | 1251 |
+| 90a132d9 | + MMA down experts (`cx_moe_down_m`) | 19.32 | 29.75 | 48.64 | 1316 |
+| 90a132d9 | + Q8X dense MMA (`cx_mma_q8x`) | 18.60 | 27.24 | 43.02 | 1488 |
+| 94c1b95b | + mixed matrices (GDN in on MMA) | 18.48 | 25.79 | 40.01 | 1600 |
+
+Eager B=64 at 94c1b95b, ms a step: gate|up (streaming) 10.7, down (MMA) 5.8 (~1.8 TB/s), GDN in
+4.1, GDN conv+step 4.3 (≈ the f32 state's bandwidth at 64 sequences), router 1.6, route+plan
+1.6, GDN out 1.35, attention in/out + head ~2.
+
+- **Gate|up on MMA** (`TANG_CODER_MOE_MMA=all`): no faster than streaming (10.2–11 vs 10.7 ms).
+- **Narrow streaming experts** (`TANG_CODER_NSTREAM=1`, T = 2..8, bitwise, spec-test PASS):
+  slower. T=8 oracle window 10.0 → 13.5 ms, forced-wrong windows 7.2 → 9.3 ms; T=1 unchanged
+  (4.6 ms). One sequence gives ~1 token an expert, so grouping saves no bytes, and the
+  streaming kernels stage activations per block with fewer warps than per-pair `_d4`.
+
+### Batch windows: plan prefix, router, expert MMA retries (2026-11-04, H200, new pod)
+
+| commit | change | B=16 | B=32 | B=64 ms | B=64 tok/s |
+|---|---|---|---|---|---|
+| 5bbaee5c | parallel prefix in `cx_moe_plan_w` (route+plan 1.6 → 0.8 ms) | 17.41 | 24.74 | 38.78 | 1650 |
+
+Tolerance PASS (99.50%, mean |Δlogit| 0.122). Eager B=64, ms a step: gate|up 10.6, down 5.6,
+GDN conv+step 4.35, GDN in 4.06, router 1.64, GDN out 1.35, route+plan 0.79, head 0.76.
+
+- **Expert MMA with precomputed code sums + a superblock's scales unpacked once** (68896d53):
+  slower, down 5.8 → 7.5 ms, gate|up unchanged. Reverted.
+- **Two 16-row tiles a warp in the expert MMA** (B fragment and scales shared): gate|up 10.9 →
+  12.5 ms. Dropped.
+- **Router with the activations in shared memory** (`cx_router_b`, `TANG_CODER_ROUTERB=1`):
+  1.64 → 1.89 ms. Off.
+- Gate|up stays ~0.22 ms a layer on all three kernels (per-pair-dot streaming, MMA, MMA with
+  two tiles): ~2 TB/s for ~400 distinct experts × 1.18 MB. Down is ~1.9 TB/s on MMA.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
@@ -314,3 +362,68 @@ loads in flight while it decodes the previous tile. Split the shared expert and 
 by rows so no block carries 8× the members. nsys works on the RunPod image
 (`/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys`) but gives no stall reasons, and
 ncu still can't inject. Occupancy and stall data were not measured here.
+
+### Wide prefill: k32 expert/dense GEMM tile, warp-per-column GDN, f32 router GEMM (2026-11-04, H200)
+
+`flash-wide-check --ctx 3000` (refactor ids, `TANG_CODER_WIDE=2048`, the serve width), GPU time
+of the two wide prefills by stage (`TANG_CODER_PROF=1`; the narrow prefill is now excluded):
+
+| stage | before ms | after ms |
+|---|---|---|
+| moe_gu (`cx_moe_gemm_gu`) | 1107 | 568 |
+| GDN recurrence | 441 (`fl_gdn_conv_step_seg`, 32 blocks) | 190 (`fl_gdn_wide` + norm) |
+| moe_down | 427 | 227 |
+| gdn_in (`cx_gemm_dense` + GEMV fallback) | 408 | 243 |
+| router (F32: 256 eight-row GEMVs a layer) | 393 | 89 (`cx_sgemm_wide`) |
+| gdn_out / attn_in / attn_out | 137 / 92 / 46 | 91 / 59 / 30 |
+| wide prefill, 3000 tokens | 1.63 s, **1,844 tok/s** | 0.80 s, **3,741 tok/s** |
+
+1000 / 8000 tokens: 3,428 / 3,980 tok/s. Narrow prefill (`prefill_slot`, what `flash-aa` and
+`--batch`-less paths use) is unchanged at ~810 tok/s.
+
+- `gemm_tile32` (every k32-scaled type: Q4_K/Q5_K/Q8_0/Q8X/Q4_0/Q5_0/IQ4): one m16n8k32 MMA a
+  32 columns, scales and mins once a 32 instead of per 16, the tokens' scales and per-32 code
+  sums staged in shared memory (no shuffles in the loop), and the 32 columns permuted so each
+  8-weight decode is used whole (half the decodes). Q3_K/Q6_K keep the k16 tile.
+- `fl_gdn_wide`: 8 lanes per state column (columns are independent given k, q, g, b), 3-step
+  shuffle reductions, no block barrier a token; gated norm in `fl_gdn_wide_norm`.
+  `TANG_CODER_GDNW=0` for the old kernel.
+- Router: F32 GEMM (`TANG_CODER_SGEMM=0` off); other non-GEMM matrices take the batched K-split
+  GEMV (32 rows a launch) instead of 8-row GEMVs.
+
+Serve, `/workspace/load.py 64 <port> 3` after `serve --batch 64 --ctx 32768`, same H200, HEAD
+4133d39a vs this: aggregate **302 → 421 tok/s**, TTFT p50 25.6 → 16.5 s, p95 108 → 69 s, wall
+406 → 292 s, 192/192 ok. Gates: `flash-wide-check` 3000/8000 PASS (KL 9e-7 / 3e-6); 1000 fails
+the 1e-3 bar on both (base 1.15e-2, this 7.9e-3: pre-existing, FA2 at short context);
+`flash-tcheck` t1 vs t8 bitwise; `flash-spec-test` PASS.
+
+### Single-stream prefill takes the wide windows (2026-11-04, H200)
+
+`Coder::prefill` (flash-aa, single-request serve) used only the narrow path (~850 tok/s) even
+when wide windows existed. It now takes `prefill_wide` on slot 0 for prompts of at least
+`TANG_CODER_WIDE_MIN` (128) tokens when wide windows are built, no MTP head is loaded and no
+per-window logits are wanted. `flash-aa` builds 2048-row windows (`TANG_CODER_AUTO_WIDE`, 0 off;
++~50 s load); `serve` without `--batch` builds them too (`TANG_SERVE_WIDE`). Check tools keep
+narrow references (auto-wide off by default in `load_coder`).
+
+flash-aa explain (1235 tokens): prefill **1.49 → 0.35 s** (830 → 3,530 tok/s); decode unchanged.
+Crossover (flash-wide-check): 32 tok 785 vs 472, 64: 856 vs 671, 128: 851 vs 1,141, 256: 849 vs
+1,770, 512: 842 vs 2,589 tok/s (narrow vs wide).
+
+### Wide expert GEMM: Q4_K / Q5_K superblock operands loaded once (2026-11-04, H200)
+
+`gemm_tile_sbk`: for the experts (gate/up Q4_K, down Q5_K in UD-Q4_K_XL) a lane loads a
+superblock's d, dmin, scales and qs words once per 256 columns (`sbk_load`, as the batch MMA
+kernels), next superblock's loads in flight, instead of 4–5 scattered loads per 8 weights.
+Two 3k wide prefills: moe_gu 568 → 411 ms, moe_down 227 → 198 ms. wide-check 3000: 3,741 →
+**4,276 tok/s**; 8000: 3,980 → 4,414. Serve C=64 x3: 421 → **447 tok/s** aggregate, TTFT p50
+16.5 → 15.2 s, p95 69 → 61 s, wall 292 → 275 s. Gates: wide-check 3000/8000 KL 9e-7 / 3e-6,
+spec-test PASS, tcheck t1/t8 bitwise, batch-check N=8 bitwise.
+
+Tried and reverted: software-pipelining the generic k32 tile (decode the next 32 columns before
+this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely registers.
+`__launch_bounds__(256, 3)` on the expert GEMMs: slightly slower.
+- Q8X dense tile with a lane's 128 columns of codes + scales loaded as one batch: gdn_in 242 →
+  231 ms, wide 4,276 → 4,285 tok/s (noise level); not kept. Weight-load latency isn't what holds
+  the dense GEMMs at ~45 TOPS; next suspects are the token-operand loads (8 bytes a lane a chunk
+  from global, 8 rows) and 2 blocks an SM. Needs a profiler (ncu doesn't run on these pods).

@@ -151,6 +151,9 @@ struct Variants {
     /// Batch windows run Q8X dense matrices on int8 tensor cores (`cx_mma_q8x`; not bitwise),
     /// `TANG_CODER_DMMA=0` for the K-split GEMVs.
     dmma: bool,
+    /// Narrow windows of 2..8 rows run the streaming grouped expert kernels
+    /// (`TANG_CODER_NSTREAM=1`). Bitwise.
+    nstream: bool,
 }
 
 impl Default for Variants {
@@ -171,8 +174,18 @@ impl Default for Variants {
             mma_gu: true,
             mma_down: true,
             dmma: true,
+            nstream: false,
         }
     }
+}
+
+/// Prompts of at least this many tokens take wide prefill in [`Coder::prefill`]
+/// (`TANG_CODER_WIDE_MIN`, default 128: on an H200 wide passes narrow between 64 and 128).
+fn wide_min() -> usize {
+    std::env::var("TANG_CODER_WIDE_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
 }
 
 impl Variants {
@@ -193,6 +206,7 @@ impl Variants {
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
             dmma: !env_is("TANG_CODER_DMMA", "0"),
+            nstream: env_is("TANG_CODER_NSTREAM", "1"),
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -367,6 +381,14 @@ struct Dense {
     /// Every segment Q8X (type 108), 16-row aligned, k a multiple of 256: batch windows can
     /// run it on int8 tensor cores (`cx_mma_q8x`).
     q8x_ok: bool,
+    /// With `q8x_ok`: the Q8X segments' own table (segments, count, rows) and the other
+    /// segments as a second matrix.
+    mma: Option<(B, i32, usize)>,
+    rest: Option<Box<Dense>>,
+    /// Only F32 / BF16 segments (the router and the shared expert's gate): batch windows can run
+    /// `cx_router_b` (`TANG_CODER_ROUTERB=1`; slower than the K-split GEMV so far: 1.89 vs
+    /// 1.64 ms a step at B=64).
+    float1: bool,
 }
 
 /// A routed-expert tensor (`[n_expert][rows][k]`, GGUF type) in VRAM, as the kernels take it.
@@ -461,6 +483,9 @@ struct Kern {
     /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
     mma_q8x: Fun,
     mma_q8x_red: Fun,
+    router_b: Fun,
+    /// The F32 / BF16 router as an f32 GEMM (wide windows).
+    sgemm_wide: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -474,6 +499,9 @@ struct Kern {
     gdn_commit: Fun,
     gdn_step_seg: Fun,
     gdn_commit_seg: Fun,
+    /// Wide windows' GDN: a warp per state column (`fl_gdn_wide`), then the gated norm.
+    gdn_wide: Fun,
+    gdn_wide_norm: Fun,
     copy: Fun,
     argmax1: Fun,
     argmax2: Fun,
@@ -519,6 +547,8 @@ impl Kern {
             moe_down_m: f("cx_moe_down_m")?,
             mma_q8x: f("cx_mma_q8x")?,
             mma_q8x_red: f("cx_mma_q8x_red")?,
+            router_b: f("cx_router_b")?,
+            sgemm_wide: f("cx_sgemm_wide")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -531,6 +561,8 @@ impl Kern {
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
+            gdn_wide: self.gdn_wide,
+            gdn_wide_norm: self.gdn_wide_norm,
             copy: self.copy,
             argmax1: self.argmax1,
             argmax2: self.argmax2,
@@ -620,6 +652,8 @@ impl Kern {
             moe_down_m: f(cm, "cx_moe_down_m")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
             mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
+            router_b: f(cm, "cx_router_b")?,
+            sgemm_wide: f(cm, "cx_sgemm_wide")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -632,6 +666,8 @@ impl Kern {
             gdn_commit: f(fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(fm, "fl_gdn_conv_commit_seg")?,
+            gdn_wide: f(fm, "fl_gdn_wide")?,
+            gdn_wide_norm: f(fm, "fl_gdn_wide_norm")?,
             copy: f(em, "fe_copy")?,
             argmax1: f(em, "fe_argmax1")?,
             argmax2: f(em, "fe_argmax2")?,
@@ -930,6 +966,11 @@ pub struct Coder {
     gpu: Gpu,
     /// Top-k / top-p / presence sampling in the head (`enable_sampler`); `None`: Gumbel-max.
     sampler: Option<Box<super::sampler::Sampler>>,
+    /// Per-row sampling in slot windows (`enable_row_sampling`): each slot its own settings.
+    row_sampler: Option<Box<super::sampler::RowSampler>>,
+    slot_samp: Vec<super::sampler::RowSampling>,
+    /// The next window's per-row sampler words (`stage_row_words`); empty: every row greedy.
+    row_words: Vec<u32>,
     pub hp: Hparams,
     g: Gguf,
     geo: Geometry,
@@ -997,6 +1038,8 @@ pub struct Coder {
     pub mtp_alt: Option<(u32, f32)>,
     /// Each slot's latest MTP chain (batched decode; slot 0's is `mtp_last`).
     slot_chain: Vec<Vec<(u32, f32)>>,
+    /// How many sequence slots fit in VRAM (set at the first `alloc_slot`); 0: not yet known.
+    slot_cap: usize,
     /// Per-segment commit graphs after a batched verify window, by segment count.
     commit_seg_graphs: Vec<Option<Graph>>,
     pub last_mtp_ms: f64,
@@ -1240,6 +1283,9 @@ impl Coder {
             dev,
             gpu,
             sampler: None,
+            row_sampler: None,
+            slot_samp: vec![super::sampler::RowSampling::greedy(); MAX_SLOTS],
+            row_words: Vec::new(),
             hp,
             g,
             geo,
@@ -1292,6 +1338,7 @@ impl Coder {
             mtp_last: Vec::new(),
             mtp_alt: None,
             slot_chain: vec![Vec::new(); MAX_SLOTS],
+            slot_cap: 0,
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
             train_dump: None,
@@ -1305,7 +1352,8 @@ impl Coder {
     // ---- sequence slots (several sequences in one window)
 
     /// Rewrite every layer's slot tables from the live slots (slot 0: the layer's own buffers;
-    /// a free slot: 0).
+    /// a free slot: 0), and sync. Once, at load; slots coming and going update their own
+    /// entries ([`write_slot_entry`](Self::write_slot_entry)).
     fn write_slot_tables(&mut self) {
         for w in 0..self.n_stages() {
             self.write_slot_tables_on(w);
@@ -1336,6 +1384,113 @@ impl Coder {
             }
         }
         self.dev.sync();
+    }
+
+    /// Slot `i`'s entry in every table (stage layers and MTP) after it was allocated or freed:
+    /// two f32 words per table at `2 * i`, the same values a full
+    /// [`write_slot_tables`](Self::write_slot_tables) would write there (0 for a free slot),
+    /// the other entries untouched. No sync on GPU 0: the uploads are on the engine's stream,
+    /// which every kernel reading the tables runs on (or forks from by event, the side
+    /// stream), so they're ordered before the next window. The peer stage's kernels run on
+    /// its own `Ctx` stream, not its device's upload stream, so that one is synced.
+    fn write_slot_entry(&mut self, i: usize) {
+        let words = |v: u64| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)];
+        for w in 0..self.n_stages() {
+            let nl = self.stage_view(w).layers.len();
+            let mut entries = Vec::with_capacity(nl);
+            for l in 0..nl {
+                let layer = &self.stage_view(w).layers[l];
+                if layer.gdn.is_none() && layer.attn.is_none() {
+                    continue;
+                }
+                let pair = if w == 0 {
+                    self.slots[i].as_ref().and_then(|sl| {
+                        if layer.gdn.is_some() {
+                            sl.gdn[l].as_ref()
+                        } else {
+                            sl.kv[l].as_ref()
+                        }
+                    })
+                } else {
+                    let p = self.peer.as_ref().expect("no peer");
+                    p.slots[i].as_ref().and_then(|(gdn, kv)| {
+                        if layer.gdn.is_some() {
+                            gdn[l].as_ref()
+                        } else {
+                            kv[l].as_ref()
+                        }
+                    })
+                };
+                let (a, b) = pair.map_or((0, 0), |(a, b)| (self.a_on(w, a), self.a_on(w, b)));
+                entries.push((l, words(a), words(b)));
+            }
+            let (dev, layers) = if w == 0 {
+                (&self.dev, &mut self.layers)
+            } else {
+                let p = self.peer.as_deref_mut().expect("no peer");
+                (&p.dev, &mut p.layers)
+            };
+            for (l, wa, wb) in entries {
+                let layer = &mut layers[l];
+                let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
+                    (Some(g), _) => (&mut g.stab, &mut g.htab),
+                    (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
+                    _ => continue,
+                };
+                dev.upload_into_f32_at(da, 2 * i, &wa);
+                dev.upload_into_f32_at(db, 2 * i, &wb);
+            }
+            if w > 0 {
+                dev.sync();
+            }
+        }
+        if self.mtp.is_some() {
+            let (a, b) = self.slots[i]
+                .as_ref()
+                .and_then(|s| s.mtp_kv.as_ref())
+                .map_or((0, 0), |(a, b)| (self.a(a), self.a(b)));
+            if let Some(at) = self.mtp.as_mut().and_then(|m| m.layer.attn.as_mut()) {
+                self.dev.upload_into_f32_at(&mut at.ktab, 2 * i, &words(a));
+                self.dev.upload_into_f32_at(&mut at.vtab, 2 * i, &words(b));
+            }
+        }
+        // TANG_SLOT_TABLE_CHECK=1: the tables must equal a full rewrite's, bit for bit.
+        if std::env::var("TANG_SLOT_TABLE_CHECK").is_ok_and(|v| v == "1") {
+            let before = self.slot_table_words();
+            self.write_slot_tables();
+            assert!(
+                before == self.slot_table_words(),
+                "slot {i}: the per-entry tables differ from a full rewrite"
+            );
+        }
+    }
+
+    /// Every slot table's words (stage layers, then MTP), read back (for the check above).
+    fn slot_table_words(&self) -> Vec<u32> {
+        self.dev.sync();
+        let mut out = Vec::new();
+        for w in 0..self.n_stages() {
+            let dev = if w == 0 {
+                &self.dev
+            } else {
+                &self.peer.as_ref().expect("no peer").dev
+            };
+            dev.sync();
+            for layer in self.stage_view(w).layers {
+                let (a, b) = match (&layer.gdn, &layer.attn) {
+                    (Some(g), _) => (&g.stab, &g.htab),
+                    (_, Some(at)) => (&at.ktab, &at.vtab),
+                    _ => continue,
+                };
+                out.extend(dev.download(a).iter().map(|x| x.to_bits()));
+                out.extend(dev.download(b).iter().map(|x| x.to_bits()));
+            }
+        }
+        if let Some(at) = self.mtp.as_ref().and_then(|m| m.layer.attn.as_ref()) {
+            out.extend(self.dev.download(&at.ktab).iter().map(|x| x.to_bits()));
+            out.extend(self.dev.download(&at.vtab).iter().map(|x| x.to_bits()));
+        }
+        out
     }
 
     /// [`write_slot_tables`](Self::write_slot_tables) for stage `w`'s layers only.
@@ -1414,8 +1569,53 @@ impl Coder {
         self.commit_graphs.iter_mut().for_each(|g| *g = None);
     }
 
+    /// Device bytes one sequence slot takes (its GDN states, K/V and MTP K/V).
+    pub fn slot_bytes(&self) -> usize {
+        let kv = self.max_ctx * self.hp.n_head_kv * self.hp.head_dim * 2 * 2;
+        let gdn = (self.geo.gdn_hv * 128 * 128 + 3 * self.geo.gdn_conv()) * 4;
+        let per_layer: usize = self
+            .layers
+            .iter()
+            .map(|l| usize::from(l.gdn.is_some()) * gdn + usize::from(l.attn.is_some()) * kv)
+            .sum();
+        per_layer + usize::from(self.mtp.is_some()) * kv
+    }
+
+    /// Sequence slots that fit in VRAM now: recounted from free memory (plus what the live
+    /// slots already hold), and kept as the cap [`alloc_slot`](Self::alloc_slot) enforces.
+    /// `flash serve` calls it at startup, before and after building its windows, to clamp
+    /// `--batch`.
+    pub fn fit_slots(&mut self) -> usize {
+        // A slot's state is ~0.85 GB at a 32k context (K/V of every attention layer at
+        // `max_ctx`, plus the GDN states): MAX_SLOTS of them don't fit. Cap the count at
+        // what's free, less headroom for graphs and later scratch, so a server parking
+        // finished slots evicts one instead of failing an allocation mid-step.
+        let headroom = std::env::var("TANG_SLOT_HEADROOM_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(4.0);
+        let per = self.slot_bytes().max(1);
+        let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
+        let free = cudarc::driver::result::mem_get_info()
+            .map_or(usize::MAX, |m| m.0.saturating_add(live * per));
+        self.slot_cap =
+            crate::batch::slots_that_fit(free, (headroom * 1e9) as usize, per, MAX_SLOTS);
+        eprintln!(
+            "coder: {} sequence slots fit ({:.2} GB each, {:.1} GB free, {headroom} GB headroom)",
+            self.slot_cap,
+            per as f64 / 1e9,
+            free as f64 / 1e9
+        );
+        self.slot_cap
+    }
+
     /// A free sequence slot (1..MAX_SLOTS), its state zeroed and no tokens.
     pub fn alloc_slot(&mut self) -> Result<usize> {
+        if self.slot_cap == 0 {
+            self.fit_slots();
+        }
+        let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
+        ensure!(live < self.slot_cap, "all {} slots that fit in VRAM in use", self.slot_cap);
         let i = (1..MAX_SLOTS)
             .find(|&i| self.slots[i].is_none())
             .ok_or_else(|| anyhow!("all {} slots in use", MAX_SLOTS))?;
@@ -1469,17 +1669,18 @@ impl Coder {
             p.slots[i] = Some((gdn, kvv));
         }
         self.slot_chain[i].clear();
-        self.write_slot_tables();
+        self.write_slot_entry(i);
         Ok(i)
     }
 
     /// Release slot `i` (not 0) and its memory, on every stage.
     pub fn free_slot(&mut self, i: usize) {
         if i > 0 && i < MAX_SLOTS && self.slots[i].take().is_some() {
+            self.slot_samp[i] = super::sampler::RowSampling::greedy();
             if let Some(p) = self.peer.as_deref_mut() {
                 p.slots[i] = None;
             }
-            self.write_slot_tables();
+            self.write_slot_entry(i);
         }
     }
 
@@ -1649,7 +1850,7 @@ impl Coder {
     /// token. Greedy; the sampler isn't per slot yet.
     pub fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
         let mut pos = self.slot_tokens(slot).len();
         self.slot_tokens_mut(slot)?.extend_from_slice(ids);
         let end = pos + ids.len();
@@ -1665,6 +1866,9 @@ impl Coder {
                 .collect();
             let w0 = Instant::now();
             self.stage_rows(&rows, &[[0, t as u32, slot as u32, t as u32]])?;
+            if pos + t == end {
+                self.stage_row_words(&[(t - 1, slot, end - 1)]);
+            }
             let nchunk = self.nchunk(pos + t);
             let st = WinStats {
                 t,
@@ -1707,7 +1911,11 @@ impl Coder {
         let b = items.len();
         let t: usize = items.iter().map(|x| 1 + x.2.len()).sum();
         ensure!(b >= 1 && t <= MAX_T, "{b} sequences, {t} rows");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        ensure!(
+            items.iter().all(|x| x.2.is_empty() || !self.slot_samp[x.0].sampled()),
+            "drafts are verified greedily: a sampled slot takes no drafts"
+        );
         if items.iter().all(|x| x.2.is_empty()) {
             let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
             return Ok(self
@@ -1741,6 +1949,13 @@ impl Coder {
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
         let w0 = Instant::now();
         self.stage_rows(&staged, &segs)?;
+        let rw: Vec<(usize, usize, usize)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.2.is_empty())
+            .map(|(i, x)| (segs[i][0] as usize, x.0, pos0[i]))
+            .collect();
+        self.stage_row_words(&rw);
         let nchunk = self.nchunk(end);
         let st = WinStats {
             t,
@@ -1941,7 +2156,13 @@ impl Coder {
         self.batch = None;
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
-            "#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            "{}#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
+            std::env::var("TANG_CODER_BATCH_DEFS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(|d| format!("#define {}\n", d.replace('=', " ")))
+                .collect::<String>(),
             stream_sst_down(),
             stream_shape().0,
             stream_shape().1,
@@ -2287,8 +2508,10 @@ impl Coder {
         let b = rows.len();
         let cap = MAX_T.max(self.batch_rows());
         ensure!((1..=cap).contains(&b), "{b} rows (at most {cap})");
-        ensure!(self.sampler.is_none(), "batched windows are greedy for now");
-        let wide = b > MAX_T;
+        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        // 1..=MAX_T rows: the narrow module, always (`crate::batch::batch_module` says why);
+        // concurrency dropping to 1 under `serve --batch 64` lands here.
+        let wide = crate::batch::batch_module(b, MAX_T, self.batch_rows());
         let mut staged = Vec::with_capacity(b);
         let mut segs = Vec::with_capacity(b);
         let mut end = 0;
@@ -2305,6 +2528,9 @@ impl Coder {
             segs.push([i as u32, 1, slot as u32, 1]);
         }
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
+        let rw: Vec<(usize, usize, usize)> =
+            staged.iter().enumerate().map(|(i, r)| (i, r.0, r.1)).collect();
+        self.stage_row_words(&rw);
         let w0 = Instant::now();
         let nchunk = self.nchunk(end);
         let st = WinStats {
@@ -2514,6 +2740,8 @@ impl Coder {
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
+            (k.gdn_wide, "gdn_wide"),
+            (k.gdn_wide_norm, "gdn_wide_norm"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
             (k.argmax2, "argmax"),
@@ -2708,6 +2936,50 @@ impl Coder {
         // Wide windows: the same GEMV over MAX_T rows at a time, each chunk's int8 made here
         // (fe_q8's rule, the one norm_q8 applies), so every row's sum is the one a narrow window
         // gives it.
+        if t > MAX_T
+            && self.in_batch.get()
+            && self.var.dmma
+            && w.float1
+            && env_is("TANG_CODER_ROUTERB", "1")
+            && w.k.is_multiple_of(128)
+            && t <= 64
+            && (w.k / 128) * w.rows * t <= DMMA_PART
+        {
+            if let Some(wd) = v.wide {
+                let ns = w.nseg;
+                let (sp, ki, ti, part, rt, si, os) = (
+                    v.dev.buffer_addr(&w.segs),
+                    w.k as i32,
+                    t as i32,
+                    v.dev.buffer_addr(&wd.part),
+                    w.rows as i32,
+                    (w.k / 128) as i32,
+                    ostride as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        wd.k.router_b,
+                        (w.rows.div_ceil(16) as u32, (w.k / 128) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, x, ki, ti, part, rt],
+                    )
+                    .expect("cx_router_b");
+                    gpu::launch(
+                        wd.k.mma_q8x_red,
+                        (w.rows.div_ceil(128) as u32, t as u32, 1),
+                        (128, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, part, si, rt, ti, out, os],
+                    )
+                    .expect("cx_mma_q8x_red");
+                }
+                self.mark(name);
+                return;
+            }
+        }
         if t > MAX_T && self.in_batch.get() && self.var.dmma && w.q8x_ok && t <= 64 {
             if let Some(wd) = v.wide {
                 self.gemm_q8x(wi, wd, w, x, xq, out, t, ostride);
@@ -2715,7 +2987,44 @@ impl Coder {
                 return;
             }
         }
-        if t > MAX_T && self.in_batch.get() && w.k.is_multiple_of(self.var.kq * 256) && !gemv_v1() {
+        // Wide windows: an F32 / BF16 matrix (the router + shared gate) as an f32 GEMM.
+        if t > MAX_T
+            && self.in_wide.get()
+            && w.float1
+            && w.k.is_multiple_of(32)
+            && !env_is("TANG_CODER_SGEMM", "0")
+        {
+            if let Some(wd) = v.wide {
+                let (sp, ns, rt, ki, os, ti) = (
+                    v.dev.buffer_addr(&w.segs),
+                    w.nseg,
+                    w.rows as i32,
+                    w.k as i32,
+                    ostride as i32,
+                    t as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        wd.k.sgemm_wide,
+                        (w.rows.div_ceil(64) as u32, t.div_ceil(64) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, rt, x, ki, out, os, ti],
+                    )
+                    .expect("cx_sgemm_wide");
+                }
+                self.mark(name);
+                return;
+            }
+        }
+        // Batch windows, and wide windows' matrices the GEMM doesn't take (the F32 router, GDN's
+        // mixed-type input): the batched K-split GEMV, 32 rows a launch instead of MAX_T.
+        if t > MAX_T
+            && (self.in_batch.get() || self.in_wide.get())
+            && w.k.is_multiple_of(self.var.kq * 256)
+            && !gemv_v1()
+        {
             if let Some(wd) = v.wide {
                 self.gemv_batch(wi, wd, w, x, xq, out, t, ostride);
                 self.mark(name);
@@ -2833,43 +3142,49 @@ impl Coder {
                 q
             }
         };
-        let tiles = w.rows / 16;
+        let (mseg, mn, mrows) = w.mma.as_ref().expect("q8x segments");
+        let tiles = mrows / 16;
         let mut splits = 1usize;
         while tiles * splits < 2048
             && (k / 256).is_multiple_of(splits * 2)
-            && splits * 2 * w.rows * t <= DMMA_PART
+            && splits * 2 * mrows * t <= DMMA_PART
         {
             splits *= 2;
         }
         let (sp, ns, os, ti, si, rt) = (
-            v.dev.buffer_addr(&w.segs),
-            w.nseg,
+            v.dev.buffer_addr(mseg),
+            *mn,
             ostride as i32,
             t as i32,
             splits as i32,
-            w.rows as i32,
+            *mrows as i32,
         );
         let part = v.dev.buffer_addr(&wd.part);
         unsafe {
             gpu::launch(
                 wd.k.mma_q8x,
-                (w.rows.div_ceil(64) as u32, splits as u32, 1),
+                (mrows.div_ceil(64) as u32, splits as u32, 1),
                 (128, 1, 1),
                 0,
                 v.stream,
-                tang_moe::args![sp, ns, xq, ki, out, os, ti, si, part, rt],
+                tang_moe::args![sp, ns, xq, ki, out, os, ti, si, part, rt, x],
             )
             .expect("cx_mma_q8x");
             if splits > 1 {
                 gpu::launch(
                     wd.k.mma_q8x_red,
-                    (w.rows.div_ceil(128) as u32, t as u32, 1),
+                    (mrows.div_ceil(128) as u32, t as u32, 1),
                     (128, 1, 1),
                     0,
                     v.stream,
                     tang_moe::args![sp, ns, part, si, rt, ti, out, os],
                 )
                 .expect("cx_mma_q8x_red");
+            }
+        }
+        if let Some(r) = &w.rest {
+            if r.k.is_multiple_of(self.var.kq * 256) {
+                self.gemv_batch(wi, wd, r, x, Some(xq), out, t, ostride);
             }
         }
     }
@@ -3295,6 +3610,42 @@ impl Coder {
     /// rows run against its slot's state and history.
     fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
         let v = self.stage_view(w);
+        // Wide windows (one segment, always committed): a warp per state column.
+        if self.in_wide.get() && commit && nseg == 1 && !env_is("TANG_CODER_GDNW", "0") {
+            let (stab, htab, p, sd, dt, sa, nw, y, seg, eps, wc) = (
+                v.dev.buffer_addr(&g.stab),
+                v.dev.buffer_addr(&g.htab),
+                self.proj_on(w, &g.proj),
+                stride as u32,
+                v.dev.buffer_addr(&g.dt),
+                v.dev.buffer_addr(&g.a),
+                v.dev.buffer_addr(&g.norm),
+                v.dev.buffer_addr(&v.s.y),
+                v.dev.buffer_addr(&v.s.rows) + (2 * self.tw() * 4) as u64,
+                self.eps,
+                v.dev.buffer_addr(&g.conv),
+            );
+            let t = self.wide_rows() as u32;
+            unsafe {
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide,
+                    (self.geo.gdn_hv as u32, 2, 1),
+                    512,
+                    0,
+                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc],
+                );
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide_norm,
+                    (t, self.geo.gdn_hv as u32, 1),
+                    128,
+                    0,
+                    tang_moe::args![p, sd, nw, y, seg, eps],
+                );
+            }
+            return;
+        }
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
             v.dev.buffer_addr(&g.stab),
             v.dev.buffer_addr(&g.htab),
@@ -3444,7 +3795,17 @@ impl Coder {
         );
         let np = n as u32;
         let many = self.in_wide.get() || self.in_batch.get();
-        if self.var.grouped || many {
+        // Narrow windows of 2..8 rows on the streaming grouped kernels (`TANG_CODER_NSTREAM=1`):
+        // every group is at most 8 pairs there, as the kernels need. Bitwise.
+        let nstream = !many && self.var.nstream && t >= 2;
+        // The streaming kernels' shape: the batch module's (sweepable), else the source defaults.
+        let (sst, snr_gu, snr_down, sst_down) = if self.in_batch.get() {
+            let s = stream_shape();
+            (s.0, s.1, s.2, stream_sst_down())
+        } else {
+            (1, 8, 16, 2)
+        };
+        if self.var.grouped || many || nstream {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
             let pw = 2 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
@@ -3522,13 +3883,13 @@ impl Coder {
                         (BATCH_GCHUNK * (nh + nh / 8 + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
-                } else if self.in_batch.get() && self.var.stream {
+                } else if (self.in_batch.get() && self.var.stream) || nstream {
                     self.launch_on(
                         stream,
                         v.k.moe_gu_s,
-                        ((2 * ff / (8 * stream_shape().1)) as u32, groups, 1),
+                        ((2 * ff / (8 * snr_gu)) as u32, groups, 1),
                         256,
-                        (8 * stream_shape().0 * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
+                        (8 * sst * 2 * 16 * r16g as usize + BATCH_GCHUNK * (nh + nh / 8)) as u32,
                         tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, plan],
                     );
                 } else {
@@ -3602,13 +3963,13 @@ impl Coder {
                         }
                         eprintln!("MMA check down: {bad} of {} differ >1%, worst rel {worst:.3e}", n * nh);
                     }
-                } else if self.in_batch.get() && self.var.stream {
+                } else if (self.in_batch.get() && self.var.stream) || nstream {
                     self.launch_on(
                         stream,
                         v.k.moe_down_s,
-                        ((nh / (8 * stream_shape().2)) as u32, groups, 1),
+                        ((nh / (8 * snr_down)) as u32, groups, 1),
                         256,
-                        (8 * stream_sst_down() * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        (8 * sst_down * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
                     );
                 } else {
@@ -3774,6 +4135,9 @@ impl Coder {
                 0,
                 tang_moe::args![part, np, ids],
             );
+        }
+        if let Some(rs) = self.row_sampler.as_ref().filter(|_| !self.skip("argmax")) {
+            rs.enqueue(v.dev, v.stream, &self.head_buf(last), &v.s.out_ids, t);
         }
         self.kcopy_on(last, self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())), ids, t * 4);
     }
@@ -4244,7 +4608,22 @@ impl Coder {
         nseg: usize,
         mut probe: Option<&mut Probe>,
     ) -> Result<Vec<u32>> {
+        // The batch module's kernels assume more than MAX_T rows (see decode_batch): refuse a
+        // short window there instead of faulting the device.
+        ensure!(
+            !self.in_batch.get() || t > MAX_T,
+            "a {t}-row window in the batch module (it takes {}..={} rows)",
+            MAX_T + 1,
+            self.batch_rows()
+        );
         self.last_batch = self.in_batch.get();
+        if let Some(rs) = self.row_sampler.as_ref() {
+            // Every window stages its rows' words (none sampled unless a slot path set them).
+            let mut w = std::mem::take(&mut self.row_words);
+            w.resize(t * super::sampler::ROW_WORDS, 0);
+            rs.stage(&self.dev, &w)?;
+        }
+        self.row_words.clear();
         self.greedy.set(
             self.temperature == 0.0 && self.sampler.as_ref().is_none_or(|s| s.presence == 0.0),
         );
@@ -4542,6 +4921,19 @@ impl Coder {
         mut logits_cb: Option<LogitsCb<'_>>,
     ) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
+        // Single-stream prompts past `wide_min()` tokens take the wide windows (when built, no
+        // MTP head to feed, no per-window logits wanted): ~4x narrow prefill on an H200.
+        if logits_cb.is_none()
+            && self.mtp.is_none()
+            && self.wide.is_some()
+            && ids.len() >= wide_min()
+        {
+            let next = self.prefill_wide(0, ids)?;
+            if let Some(p) = &self.prof {
+                p.borrow_mut().total.clear();
+            }
+            return Ok(next);
+        }
         let mut pos = self.tokens.len();
         self.tokens.extend_from_slice(ids);
         let mut next = 0;
@@ -4752,6 +5144,7 @@ impl Coder {
                 Some(("kq", n)) => v.kq = n.parse()?,
                 Some(("fastk", n)) => v.fastk = n.parse()?,
                 Some(("shpar", n)) => v.shared_par = n == "1",
+                Some(("nstream", n)) => v.nstream = n == "1",
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
         }
@@ -5164,13 +5557,41 @@ fn upload_dense(
         && words
             .chunks(6)
             .all(|w| GEMM_TYPES.contains(&w[2]) && (w[3] as usize).is_multiple_of(16));
+    // Batch windows: the Q8X segments on tensor cores (their own segment table), any others
+    // (GDN's Q4_K ssm_ba, a BF16 layer) through the K-split GEMV as a second matrix.
+    let (w108, wrest): (Vec<&[u32]>, Vec<&[u32]>) = words.chunks(6).partition(|w| w[2] == 108);
     let q8x_ok = k.is_multiple_of(256)
-        && words
-            .chunks(6)
-            .all(|w| w[2] == 108 && (w[3] as usize).is_multiple_of(16));
+        && !w108.is_empty()
+        && w108.iter().all(|w| (w[3] as usize).is_multiple_of(16));
+    let mma = q8x_ok.then(|| {
+        let ws: Vec<u32> = w108.iter().flat_map(|w| w.iter().copied()).collect();
+        let rows: usize = w108.iter().map(|w| w[3] as usize).sum();
+        (dev.upload_u32(&ws), w108.len() as i32, rows)
+    });
+    let rest = (q8x_ok && !wrest.is_empty()).then(|| {
+        let ws: Vec<u32> = wrest.iter().flat_map(|w| w.iter().copied()).collect();
+        Box::new(Dense {
+            _w: Vec::new(),
+            segs: dev.upload_u32(&ws),
+            nseg: wrest.len() as i32,
+            rows: wrest.iter().map(|w| w[3] as usize).sum(),
+            k,
+            row16: ((rb + 15).div_ceil(16) + 1) as i32,
+            bytes: 0,
+            gemm_ok: false,
+            q8x_ok: false,
+            mma: None,
+            rest: None,
+            float1: false,
+        })
+    });
+    let float1 = words.chunks(6).all(|w| w[2] == 0 || w[2] == 30);
     Ok(Dense {
         gemm_ok,
         q8x_ok,
+        mma,
+        rest,
+        float1,
         segs: dev.upload_u32(&words),
         nseg: parts.len() as i32,
         rows: off,
@@ -5592,6 +6013,60 @@ impl Coder {
 
     pub fn sampler_mut(&mut self) -> Option<&mut super::sampler::Sampler> {
         self.sampler.as_deref_mut()
+    }
+
+    /// Per-row sampling in slot windows (`prefill_slot`, `decode_batch`, `verify_batch` rows
+    /// without drafts): each slot samples with its own [`set_slot_sampling`](Self::set_slot_sampling)
+    /// settings; greedy rows keep the argmax bit for bit. One GPU. Window graphs are recaptured.
+    pub fn enable_row_sampling(&mut self) -> Result<()> {
+        ensure!(self.peer.is_none(), "per-row sampling needs one GPU");
+        ensure!(self.sampler.is_none(), "per-row sampling replaces the engine sampler");
+        if self.row_sampler.is_none() {
+            let rows = MAX_T.max(256);
+            self.row_sampler = Some(Box::new(super::sampler::RowSampler::new(
+                &self.gpu,
+                &self.dev,
+                self.hp.n_vocab,
+                rows,
+                MAX_SLOTS,
+            )?));
+            self.graphs.clear();
+        }
+        Ok(())
+    }
+
+    /// Slot `slot`'s sampling from now on, its output history (presence penalty) cleared.
+    pub fn set_slot_sampling(&mut self, slot: usize, s: super::sampler::RowSampling) -> Result<()> {
+        ensure!(slot < MAX_SLOTS, "slot {slot}");
+        if s.sampled() {
+            let rs = self
+                .row_sampler
+                .as_ref()
+                .ok_or_else(|| anyhow!("per-row sampling is off (enable_row_sampling)"))?;
+            rs.clear_slot(&self.dev, slot)?;
+        }
+        self.slot_samp[slot] = s;
+        Ok(())
+    }
+
+    /// The next window's sampled rows: `(row, slot, position)` for each row whose pick is a
+    /// slot's next token.
+    fn stage_row_words(&mut self, rows: &[(usize, usize, usize)]) {
+        self.row_words.clear();
+        if self.row_sampler.is_none() {
+            return;
+        }
+        let w = super::sampler::ROW_WORDS;
+        for &(r, slot, pos) in rows {
+            let s = self.slot_samp[slot];
+            if !s.sampled() {
+                continue;
+            }
+            if self.row_words.len() < (r + 1) * w {
+                self.row_words.resize((r + 1) * w, 0);
+            }
+            self.row_words[r * w..(r + 1) * w].copy_from_slice(&s.words(slot, pos));
+        }
     }
 
     /// A new generation's output starts at position `pos` (penalties count output from there).

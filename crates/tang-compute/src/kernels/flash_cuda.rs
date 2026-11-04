@@ -1238,6 +1238,126 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step_seg(
                         (const float*)Htab[slot], Wc);
 }
 
+// Wide prefill (the Coder engine's wide windows, one segment): the recurrence with 8 lanes per
+// value column. A state column S[:, j] evolves on its own given the token's k, q, g, b and
+// v_j, so 8 lanes hold column j (16 state rows a lane) and its dot products are 3-step shuffle
+// reductions: no block barrier per token, a short dependency chain. Block = 64 columns of head
+// blockIdx.x; the block stages a chunk of tokens' conv + SiLU (+ l2 norm for q, k), g and b in
+// shared memory. Writes the raw output o (before the gated norm) to Y; fl_gdn_wide_norm
+// finishes it. Commits the state for all `len` rows (prefill). Not the narrow kernel's
+// summation order (gated by flash-wide-check's KL bar). Grid (GDN_HV, 2), block 512.
+#define GW_C 32
+__device__ __forceinline__ float sum8(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    return v;
+}
+extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
+    const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc) {
+    __shared__ float sq[GW_C][128], sk[GW_C][128], sv[GW_C][64];
+    __shared__ float sg[GW_C], sb[GW_C];
+    const unsigned int r0 = SEG[0], n = SEG[1], slot = SEG[2];
+    float* S = (float*)Stab[slot];
+    const float* H0 = (const float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    float* Yr = Y + (u64)r0 * GDN_V;
+    const unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x;
+    const unsigned int warp = tid >> 5, lane = tid & 31, sub = lane & 7;
+    const unsigned int jl = warp * 4 + (lane >> 3), j = blockIdx.y * 64 + jl;
+    float st[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) st[i] = S[((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j];
+    for (unsigned int t0 = 0; t0 < n; t0 += GW_C) {
+        const unsigned int nn = min(n - t0, (unsigned int)GW_C);
+        __syncthreads();
+        // conv + SiLU: q, k (256 channels) and this block's 64 v channels, nn tokens.
+        for (unsigned int i = tid; i < GW_C * (256 + 64); i += 512) {
+            const unsigned int t = i / (256 + 64), c = i % (256 + 64);
+            if (t >= nn) continue;
+            const unsigned int ch = c < 128 ? hk * 128 + c
+                                  : c < 256 ? GDN_HK * 128 + hk * 128 + (c - 128)
+                                            : 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64 + (c - 256);
+            const float4 w = ((const float4*)Wc)[ch];
+            float e[4];
+            #pragma unroll
+            for (unsigned int q = 0; q < 4; q++) {
+                const unsigned int p = t0 + t + q;
+                e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
+            }
+            float acc = e[0] * w.x;
+            acc = __fmaf_rn(e[1], w.y, acc);
+            acc = __fmaf_rn(e[2], w.z, acc);
+            acc = __fmaf_rn(e[3], w.w, acc);
+            const float v = silu(acc);
+            if (c < 128) sq[t][c] = v;
+            else if (c < 256) sk[t][c - 128] = v;
+            else sv[t][c - 256] = v;
+        }
+        if (tid < nn) {
+            const float a = Pr[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
+            const float sp = a > 20.0f ? a : log1pf(expf(a));
+            sg[tid] = expf(sp * SA[hv]);
+            sb[tid] = sigm(Pr[(u64)(t0 + tid) * stride + GDN_B + hv]);
+        }
+        __syncthreads();
+        // l2 norm of q and k: a warp per (token, q | k).
+        for (unsigned int u = warp; u < 2 * nn; u += 16) {
+            float* r = (u & 1) ? sk[u >> 1] : sq[u >> 1];
+            float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
+            const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
+            const float rs = 1.0f / sqrtf(ss + eps);
+            r[lane] = x0 * rs; r[lane + 32] = x1 * rs; r[lane + 64] = x2 * rs; r[lane + 96] = x3 * rs;
+        }
+        __syncthreads();
+        for (unsigned int t = 0; t < nn; t++) {
+            const float g = sg[t];
+            float p0 = 0.0f, p1 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 2) {
+                st[i] *= g;
+                st[i + 1] *= g;
+                p0 = __fmaf_rn(st[i], sk[t][sub + 8 * i], p0);
+                p1 = __fmaf_rn(st[i + 1], sk[t][sub + 8 * i + 8], p1);
+            }
+            const float p = sum8(p0 + p1);
+            const float d = (sv[t][jl] - p) * sb[t];
+            float o0 = 0.0f, o1 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 2) {
+                st[i] = __fmaf_rn(sk[t][sub + 8 * i], d, st[i]);
+                st[i + 1] = __fmaf_rn(sk[t][sub + 8 * i + 8], d, st[i + 1]);
+                o0 = __fmaf_rn(st[i], sq[t][sub + 8 * i], o0);
+                o1 = __fmaf_rn(st[i + 1], sq[t][sub + 8 * i + 8], o1);
+            }
+            const float o = sum8(o0 + o1);
+            if (sub == 0) Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = o * INV_SQRT_D;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; i++) S[((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j] = st[i];
+}
+
+// fl_gdn_wide's gated norm, in place on Y: y = o · rms(o)⁻¹ · w · gate(z). Grid (len, GDN_HV),
+// block 128.
+extern "C" __global__ void fl_gdn_wide_norm(const float* __restrict__ P, unsigned int stride,
+                                            const float* __restrict__ NW, float* __restrict__ Y,
+                                            const unsigned int* __restrict__ SEG, float eps) {
+    __shared__ float red[4];
+    const unsigned int r0 = SEG[0], t = blockIdx.x, hv = blockIdx.y, j = threadIdx.x;
+    if (t >= SEG[1]) return;
+    float* y = Y + (u64)(r0 + t) * GDN_V + hv * 128;
+    const float o = y[j];
+    const float ss = warp_sum(o * o);
+    if ((j & 31) == 0) red[j >> 5] = ss;
+    __syncthreads();
+    const float tot = ((red[0] + red[1]) + red[2]) + red[3];
+    const float rs = 1.0f / sqrtf(tot / 128.0f + eps);
+    y[j] = o * rs * NW[j] * GDN_GATE(P[(u64)(r0 + t) * stride + GDN_Z + hv * 128 + j]);
+}
+
 // fl_gdn_conv_commit per segment (as above). Grid (ceil(GDN_CONV / 256), nseg), block 256.
 extern "C" __global__ void fl_gdn_conv_commit_seg(const u64* __restrict__ Htab, const float* __restrict__ P,
                                                   unsigned int stride, const unsigned int* __restrict__ SEG) {

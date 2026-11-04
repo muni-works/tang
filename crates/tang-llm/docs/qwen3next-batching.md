@@ -100,7 +100,19 @@ head and argmax for every row. `MAX_SLOTS` is 128. `flash serve --batch N` with 
 plain decode by the batch width. `flash-batch-check` (`TANG_BATCH_N`, `TANG_BATCH_CTX`) passes
 **bitwise** at 64 sequences.
 
-Speed: 866 tok/s aggregate at 64 at first; 1,251 with the streaming expert kernels (gate|up ~1.5–2 TB/s, down ~1–1.2 TB/s). Dense GEMVs, GDN and attention are now about half the step. The expert
+Speed: 866 tok/s aggregate at 64 at first; 1,251 with the streaming expert kernels (gate|up ~1.5–2 TB/s, down ~1–1.2 TB/s). Dense GEMVs, GDN and attention are now about half the step.
+
+Tensor cores (tolerance-gated, see `speed-log.md`): int8 MMA down experts and Q8X dense layers
+take B=64 to 40.0 ms (1,600 tok/s), B=32 to 25.8 ms. Left: gate|up experts (~10.7 ms), router
+and plan (~3.2 ms), GDN conv+step (4.3 ms).
+
+**Proposal: bf16 GDN state for batch windows.** The recurrent state is f32, 32 heads × 128 ×
+128 per layer and sequence (2 MB); a decode step reads and writes all of it, ~270 MB a layer at
+B=64, which is the 4.3 ms GDN conv+step (36 layers, ≈ bandwidth). Keeping it in bf16 (f32
+accumulate inside the step, round on store) halves the traffic: ~2.1 ms saved at B=64, ~1 ms at
+B=32, and half the per-slot state memory (75 → 38 MB). It's a numerics change on every step of
+every sequence (the error compounds through the recurrence, unlike a reordered sum), so it needs
+its own gate: long-context greedy agreement and KL against the f32 state, not just batch-check. The expert
 kernels read distinct experts at ~0.5–0.9 TB/s (target ~2.4) and the 32-row GEMVs are L2-bound.
 Numbers in `speed-log.md`. Next: a bandwidth-bound grouped expert kernel for 1–2 tokens an expert
 (stream weights once, no per-block staging stall; down is the worse half), and dense layers
@@ -109,3 +121,178 @@ with a tolerance gate).
 
 **Effort:** about 1.5–2 weeks. M1 is mostly plumbing. M2 is the one hard kernel. M3 is
 scheduler work.
+
+## Serving fixes 2026-11-04
+
+GPU checks below are still to run (written without a GPU; CPU tests green). `$G` is the
+Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
+--no-default-features --features cuda`.
+
+1. **A failed step ends only its streams.** `engine.step` used to retire every stream with the
+   error. Now `batch_step` wraps failures in `server::StepFailure { lanes, fatal }`: a prefill,
+   prefix snapshot or token-take error names its one lane, a decode/verify window's error names
+   the window's lanes. The worker retires those (their slots are freed, not parked: `broken`) and
+   the rest keep decoding. A device fault (`CUDA_ERROR…` in the message, an unattributed error
+   that reads as one, or a panic out of the compute layer, which `catch_unwind` now catches)
+   ends every stream, sets `NodeState::unhealthy`, and `/health` answers 503 `unhealthy: …`;
+   new requests fail with "restart the server" instead of joining. Tests: `server::step_failures`.
+   GPU check: `tang-llm serve $G --batch 64 --ctx 32768`, then 64 concurrent requests where one
+   has a prompt near `--ctx` and `max_tokens` past it (if the slot overflows mid-decode, only that
+   request errors; the other 63 finish), and `curl -s localhost:8911/health` stays `ok`. There's
+   no switch to force a device fault; on the next real one, look for the log line
+   `tang-llm: the engine is unhealthy:` and `/health` answering 503.
+
+2. **`--batch` clamped to the slots that fit.** `Coder::fit_slots` counts slots from free VRAM,
+   `slot_bytes()` at `--ctx` and `TANG_SLOT_HEADROOM_GB` (default 4), and is the cap
+   `alloc_slot` enforces. `flash serve` calls it at startup and again after building the batch
+   and wide windows (they take memory), and sets `batch = min(batch, cap - 1)`
+   (`batch::clamp_batch`; one slot spare so admitting can always evict a parked one), logging
+   `--batch N clamped to M: C sequence slots fit in free VRAM at --ctx X`. `batch_can_admit`
+   bounds busy slots by that `batch`, so admission stays under the cap. Test:
+   `batch::tests::batch_stays_under_the_slots_that_fit`. GPU check: `tang-llm serve $G --batch 128
+   --ctx 131072` on an H200 logs the clamp (slots ≈ (free − 4 GB) / slot size) and then 128
+   concurrent requests run without an allocation failure; `--batch 64 --ctx 32768` is unchanged
+   (no warning, 64 at once).
+
+3. **A fresh slot writes its own table entries.** `alloc_slot`/`free_slot` used to rebuild every
+   layer's `[u64; MAX_SLOTS]` stab/htab/ktab/vtab table (and MTP's) on the host, upload all of
+   them and sync. Now `write_slot_entry(i)` writes slot `i`'s two f32 words per table at `2 * i`
+   (`CudaComputeDevice::upload_into_f32_at`, ~2 small copies a layer), the same values the full
+   rewrite would (0 for a freed slot); the full `write_slot_tables` + sync runs once at load.
+   No sync on GPU 0: the uploads are on the engine's stream, which every reader runs on or forks
+   from by event (`ev_fork` for the side stream), and graphs read the tables by address at
+   launch. What relied on the sync: only the layer-split peer, whose kernels run on its `Ctx`
+   stream while its uploads go through its `CudaComputeDevice` stream. The old code synced only
+   GPU 0, so that was a latent race; the peer stage is now synced after its entries are written.
+   `TANG_SLOT_TABLE_CHECK=1` reads every table back after each per-entry write, does a full
+   rewrite, and asserts the words are identical. GPU checks: `TANG_SLOT_TABLE_CHECK=1
+   TANG_BATCH_N=64 tang-llm flash-batch-check $G` (no assert; then without the env:
+   `TANG_BATCH_N=64 tang-llm flash-batch-check $G` gives the same PASS line, tolerance numbers
+   unchanged from 2026-11-03), and `flash-batch-check` at `TANG_BATCH_N=8` stays bitwise.
+
+4. **One-row steps never take the batch module.** The fault (`CUDA_ERROR_ILLEGAL_ADDRESS` at
+   the sync after a 1-row window) came from the `batch_all` experiment (88609b41 dropped it),
+   which sent every step through the batch module. The module's dense paths (K-split
+   `cx_gemvkb`, Q8X MMA, router) are all gated on `t > MAX_T`, so a short window there falls
+   through to the narrow kernels (`gemvk[t-1]`) on the batch module's scratch and int8 staging,
+   whose scales sit at `rows * k`, not `MAX_T * k`. That mixed-module path is the likely cause
+   (not reproduced here, no GPU). `cx_moe_plan_w` is safe at `n = 11` (always launched with a
+   1024-thread block) and `gemv_batch` pads the last launch to 8/16/32 rows inside the scratch.
+   The fix is the routing rule, now explicit and guarded: `batch::batch_module(rows, MAX_T,
+   batch_rows)`: only 9..=batch_rows rows use the batch module, 1..=8 always use the narrow one
+   (`decode_batch`), and `run_staged` refuses a ≤ 8-row window in the batch module with an error
+   (which #1 retires as that window's failure) instead of faulting the device. Under
+   `serve --batch 64`, concurrency dropping to 1–8 decodes narrow. Test:
+   `batch::tests::short_steps_never_take_the_batch_module`. GPU checks: `TANG_BATCH_N=64
+   tang-llm flash-batch-check $G` (same PASS and tolerance numbers as 2026-11-03); `TANG_BATCH_N=8`
+   bitwise; and `tang-llm serve $G --batch 64`, 64 concurrent requests with staggered
+   `max_tokens` (16, 32, …, 1024) so the batch drains through 64 → 9 → 8 → 1 rows, with no fault
+   and each finishing request's text equal to the same request run alone (greedy).
+
+## Scheduler for B = 64 (2026-11-04)
+
+### What the load test spent its GPU time on
+
+From `artifacts/gates-1104/serve-c9f064b5.log` (the per-request `batch req:` lines: prefill ms,
+TTFT, decode tokens / seconds / windows) and `lt-*.json`, H200, `serve --batch 64`, prompts
+200–6000 tokens (avg ~2,600 served), 256–1024 out:
+
+| | C = 8 (24 req, 98 s) | C = 64 cold (192 req, 649 s) |
+|---|---|---|
+| prompt tokens prefilled | 29.5 k | 501 k |
+| prefill GPU time (sum of chunks) | 24 s, **25 %** of wall | 372 s, **57 %** of wall |
+| prefill speed inside a chunk | 1,220 tok/s (0.81 ms/token) | 1,350 tok/s (0.72–0.91 ms/token) |
+| output tokens | 15.2 k → 155 tok/s | 123 k → 189 tok/s |
+| streams decoding, on average | 4.8 | **2.2** |
+| decode-window wall per stream token | 31 ms | 12 ms |
+| mean TTFT | 15 s | 109 s (p95 505 s, max 631 s) |
+
+So at C = 64 the GPU was busy (57 % prefill, the rest decode windows of ~2 rows) and decode
+rows were nearly empty: admissions came out of prefill at ~0.25 a second, each decoded its
+~640 tokens in ~8 s, so ~2 rows were ever decoding. The 64-row windows (44 ms for 64 tokens,
+`r-sample64.log`) never ran full.
+
+**The ceiling is prefill speed, not the policy.** Wide prefill runs at ~1,350 prompt tok/s.
+A request of ~3,100 prompt tokens and ~640 out costs 2.3 s of prefill and, at best (64-row
+windows), 0.44 s of decode, so no schedule beats ~640 / 2.74 ≈ **233 output tok/s** on this mix
+(280 if decode were free). The 1,000 tok/s aggregate target needs prefill ≥ ~6–7k tok/s
+(the wide windows' grouped-expert / GEMM path), and TTFT p95 ≤ 30 s for a cold burst of 64
+such prompts needs the same: prefilling all 64 takes 64 × 2.3 s = 147 s at 100 % of the GPU.
+
+### The policy (`crate::batch::prefill`, used by `flash/serve_batch.rs`)
+
+- **Order: shortest-first with aging and a deadline.** Key = remaining prompt tokens −
+  `TANG_SERVE_AGE_TOKENS` (400) × seconds waited; past `TANG_SERVE_PREFILL_DEADLINE_S` (20 s) a
+  prompt goes ahead of every younger one, oldest first. A cached agent turn still jumps a cold
+  prompt; a 6000-token prompt can't sit 500 s behind short ones.
+- **Prefill share depends on decode fill.** While prompts wait and fewer than
+  `TANG_SERVE_DECODE_FILL` (0.8) × batch rows decode, prefill gets `TANG_SERVE_PREFILL_FILL_SHARE`
+  (0.85) of GPU time; once rows are full, `TANG_SERVE_PREFILL_SHARE` (0.5, the old split). A
+  decode window of `dt` pays off `dt × share / (1 − share)` seconds of prefill.
+- **Chunk size scales with free GPU time.** Decode credit banks (up to one max chunk); a chunk
+  is as many tokens as the credit buys at the measured prefill rate (EMA), between
+  `TANG_SERVE_PREFILL_SLICE` (512 with wide windows, 64 without) and
+  `TANG_SERVE_PREFILL_MAX_CHUNK` (2048 / 256). With nothing decoding: `TANG_SERVE_PREFILL_BUDGET`
+  (2048 / 256). The server logs the policy in effect at its first step.
+- The old behaviour is `TANG_SERVE_PREFILL_SLICE=256 TANG_SERVE_PREFILL_MAX_CHUNK=256
+  TANG_SERVE_PREFILL_FILL_SHARE=0.5 TANG_SERVE_AGE_TOKENS=0 TANG_SERVE_PREFILL_DEADLINE_S=0`.
+
+### Expected effect (simulated)
+
+`batch::prefill::tests` runs the load closed-loop on a simulated engine with the logged costs
+(prefill 1/1350 s a token + 4 ms a chunk, a decode window 10 ms + 0.53 ms a row). The simulation
+reproduces the old run's shape (151 tok/s, p95 680 s at C = 64). Old → new:
+
+| | agg tok/s | TTFT p50 | TTFT p95 | per-stream tok/s | rows/window |
+|---|---|---|---|---|---|
+| C = 64, old | 151 | 39 s | 680 s | 40 | 3.6 |
+| C = 64, new | **246** | 46 s | **122 s** | 5 | 36 |
+| C = 8, old | 155 | 4.8 s | 41 s | 41 | 3.5 |
+| C = 8, new | **191** | **2.0 s** | **12 s** | 28 | 5.9 |
+
+The trade is per-stream speed: with prefill at 85 % of the GPU while rows are short, a running
+stream gets fewer windows a second (C = 64: 5 tok/s a stream while 60+ prompts queue; it rises
+as rows fill and the share drops to 0.5). `TANG_SERVE_PREFILL_FILL_SHARE` is the dial
+(`cargo test -p tang-llm --lib batch::prefill::tests::sweep -- --ignored --nocapture` prints the
+sweep: 0.6 gives C = 64 182 tok/s / p95 245 s / 30 tok/s a stream). Neither target (≥ 1,000 tok/s,
+p95 ≤ 30 s at C = 64) is reachable at 1,350 prefill tok/s; the next lever is wide prefill speed.
+
+### Verify
+
+On the pod (`/workspace/tang-serve`, model `/workspace/m/`, under `flock /workspace/gpu.lock`;
+the client is the untracked `artifacts/lt/load.py`, copied over first with
+`scp -P 16399 artifacts/lt/load.py root@152.236.142.239:/workspace/load.py`):
+
+```
+cargo build --release -p tang-llm --no-default-features --features cuda
+G=$(ls /workspace/m/*.gguf | head -1)
+target/release/tang-llm serve $G --batch 64 --ctx 32768 > serve-sched.log 2>&1 &
+# wait for "listening on", then, for each C:
+# serve listens on 8911 by default (the "listening on" line has the port):
+for C in 8 64; do python3 /workspace/load.py $C 8911 3 > lt-sched-$C.json; done
+grep "batch prefill policy" serve-sched.log
+```
+
+Compare `agg_tps`, `ttft_p50/p95`, `stream_tps_p50` against `artifacts/gates-1104/lt-8.json` and
+`lt-64cold.json`; rerun C = 64 with `TANG_SERVE_PREFILL_FILL_SHARE=0.6` to place the dial.
+
+## Known issues (2026-11-04)
+
+- **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
+  greedy tokens still equal). Bisected with the wide-window switches on 4133d39a (H200,
+  refactor ids, 2048-row windows, teacher-forced max KL over 8 steps):
+
+  | `TANG_CODER_ATTN` | `TANG_CODER_WGEMM` | KL |
+  |---|---|---|
+  | fa2 (default) | on (default) | 1.15e-2 |
+  | fa2 | 0 | **1.52e-2** |
+  | splitk | on | 2.04e-3 |
+  | splitk | 0 | 0 (bitwise) |
+  | fa2 | gu only | 4.73e-3 |
+  | fa2 | down only | 9.70e-3 |
+
+  The FA2 attention (`cx_attn_fa2` + merge) is the stage that diverges at short context; the
+  tensor-core GEMMs add ~2e-3 on their own. At 3000 / 8000 tokens both are under 1e-5. Not fixed.
+- **`flash-tcheck` panics at `cli.rs:1913`** (index out of bounds on an empty per-layer
+  capture) after printing `t1 vs t8: logits differ in 0`, on 4133d39a too. The bitwise logits
+  line is the gate; the per-layer table needs a capture the Coder engine doesn't fill.
