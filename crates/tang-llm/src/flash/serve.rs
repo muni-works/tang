@@ -1900,6 +1900,16 @@ impl Backend for FlashServe {
     }
 
     fn after(&mut self, _req: &Request, result: &Result<(Finish, Usage)>) {
+        // A batched request logged its own line when it retired (`batch req:`); `line` and
+        // the slot-0 snapshot below belong to the one-stream path (`line.snap_ms` only ever
+        // summed the batch's prefix-state saves, which is what the phantom `req N: prompt 0
+        // ... state saves 7000 ms` after every batched completion showed).
+        if self.batch > 1 {
+            if let Err(e) = result {
+                eprintln!("tang-llm: req {}: error: {e:#}", self.requests);
+            }
+            return;
+        }
         let l = &self.line;
         match result {
             Ok(_) => eprintln!(

@@ -89,6 +89,8 @@ pub(super) struct Stream {
     t0: Instant,
     first: Option<f64>,
     prefill_s: f64,
+    /// Of `prefill_s`, saving prefix states at its marks.
+    snap_s: f64,
     decode_from: Option<Instant>,
     prefill_only: bool,
     /// Sampled (temperature > 0): no drafts.
@@ -272,6 +274,7 @@ impl FlashServe {
             t0,
             first: None,
             prefill_s: 0.0,
+            snap_s: 0.0,
             decode_from: None,
             prefill_only: req.prefill_only,
             sampled: samp.sampled(),
@@ -440,6 +443,7 @@ impl FlashServe {
                     .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
                 s.prefill_s += t.elapsed().as_secs_f64();
+                s.snap_s += t.elapsed().as_secs_f64();
             }
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -614,12 +618,13 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms, state saves {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
             s.slot,
             s.ids.len(),
             s.reused,
             prefilled,
             s.prefill_s * 1e3,
+            s.snap_s * 1e3,
             s.first.unwrap_or(0.0),
             s.out.len(),
             decode_s,
