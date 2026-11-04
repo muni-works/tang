@@ -1926,38 +1926,13 @@ __device__ __forceinline__ void gemm_tile32s(const unsigned char* wa, const unsi
         __syncthreads();
     }
 }
-template <int TY>
-__device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const unsigned char* wb, bool live,
-                                               const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
-                                               float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
-                                               int (*ssx)[GT_KS / 32 + 1], unsigned char* xs) {
-    constexpr int BB = TY == 12 ? 144 : 176;
-    constexpr int STR = 144;
+template <int TY, int HALF, int STR>
+__device__ __forceinline__ void sbks_half(const SbK& ra, const SbK& rb, const unsigned char* cur, int kb, int ks, int nch,
+                                          float acc[8][4], float (*sxd)[GT_KS / 32 + 1], int (*ssx)[GT_KS / 32 + 1]) {
     const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
-    SbK ra, rb, pa, pb;
-    if (live) { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
-    const int nq = K / XS_COLS;
-    xs_issue<STR>(xs, xrow_s, 0);
-    for (int q = 0; q < nq; q++) {
-        const int kb = q * XS_COLS;
-        const int ks = kb - kb % GT_KS;
-        if (kb == ks) {
-            __syncthreads();
-            gt_stage_scales(true, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sxd, ssx);
-        }
-        unsigned char* cur = xs + (q & 1) * 64 * STR;
-        if (q + 1 < nq) { xs_issue<STR>(xs + ((q + 1) & 1) * 64 * STR, xrow_s, kb + XS_COLS); cp_wait1(); }
-        else cp_wait0();
-        __syncthreads();
-        if (live) {
-            const int sb = kb / 256, half = (kb / XS_COLS) & 1;
-            if (!half && (sb + 1) * 256 < K) {
-                sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
-                sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
-            }
             #pragma unroll
             for (int s4 = 0; s4 < 4; s4++) {
-                const int st = half * 4 + s4;
+                const int st = HALF * 4 + s4;
                 const int j = st >> 1, hi = st & 1;
                 unsigned a[4];
                 #pragma unroll
@@ -1994,6 +1969,38 @@ __device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const un
                     }
                 }
             }
+}
+template <int TY>
+__device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const unsigned char* wb, bool live,
+                                               const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
+                                               float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
+                                               int (*ssx)[GT_KS / 32 + 1], unsigned char* xs) {
+    constexpr int BB = TY == 12 ? 144 : 176;
+    constexpr int STR = 144;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    SbK ra, rb, pa, pb;
+    if (live) { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
+    const int nq = K / XS_COLS;
+    xs_issue<STR>(xs, xrow_s, 0);
+    for (int q = 0; q < nq; q++) {
+        const int kb = q * XS_COLS;
+        const int ks = kb - kb % GT_KS;
+        if (kb == ks) {
+            __syncthreads();
+            gt_stage_scales(true, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sxd, ssx);
+        }
+        unsigned char* cur = xs + (q & 1) * 64 * STR;
+        if (q + 1 < nq) { xs_issue<STR>(xs + ((q + 1) & 1) * 64 * STR, xrow_s, kb + XS_COLS); cp_wait1(); }
+        else cp_wait0();
+        __syncthreads();
+        if (live) {
+            const int sb = kb / 256, half = (kb / XS_COLS) & 1;
+            if (!half && (sb + 1) * 256 < K) {
+                sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
+                sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
+            }
+            if (half) sbks_half<TY, 1, STR>(ra, rb, cur, kb, ks, nch, acc, sxd, ssx);
+            else sbks_half<TY, 0, STR>(ra, rb, cur, kb, ks, nch, acc, sxd, ssx);
             if (half && (sb + 1) * 256 < K) { ra = pa; rb = pb; }
         }
         __syncthreads();
@@ -2102,7 +2109,13 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, E
     // Token tiles staged in smem (K = hidden: 16 slabs); the down GEMM (K = FF, 4 slabs) is
     // faster without.
     __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
-    gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, false, xs);
+    // The common types called directly (through gemm_tile_any's switch the compiler outlines
+    // the tile into a CALL, with acc and the operand registers through local memory).
+    __shared__ float sxd[64][GT_KS / 32 + 1];
+    __shared__ int ssx[64][GT_KS / 32 + 1];
+    if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, sxd, ssx, xs);
+    else if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, sxd, ssx, xs);
+    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, false, xs);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
@@ -2150,7 +2163,11 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF);
+    __shared__ float sxd[64][GT_KS / 32 + 1];
+    __shared__ int ssx[64][GT_KS / 32 + 1];
+    if (mty == 13) gemm_tile_sbk<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx);
+    else if (mty == 12) gemm_tile_sbk<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx);
+    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
