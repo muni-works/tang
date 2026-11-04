@@ -1346,7 +1346,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
     float st0[16], st1[16];
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        const u64 o = ((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j;
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
         st0[i] = S[o];
         st1[i] = S[o + 1];
     }
@@ -1360,8 +1360,19 @@ extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
             if (t >= nn) continue;
             const float* xr = X + (u64)(t0 + t) * GW_XROW;
             float4 v4;
-            if (c < 32) { v4 = ((const float4*)(xr + hk * 128))[c]; *(float4*)&sq[t][4 * c] = v4; }
-            else if (c < 64) { v4 = ((const float4*)(xr + GDN_HK * 128 + hk * 128))[c - 32]; *(float4*)&sk[t][4 * (c - 32)] = v4; }
+            // q, k permuted: row R = sub + 8 i (i = 4 q4 + r) at 32 q4 + 4 sub + r, so a lane's
+            // float4 reads give rows sub + 8 i in i order (afa748e7's rows and sums, bitwise).
+            if (c < 64) {
+                float* dst = c < 32 ? sq[t] : sk[t];
+                const int c4 = c & 31;
+                v4 = ((const float4*)(xr + (c < 32 ? 0 : GDN_HK * 128) + hk * 128))[c4];
+                const float e4[4] = {v4.x, v4.y, v4.z, v4.w};
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    const int R = 4 * c4 + u, i8 = R >> 3;
+                    dst[32 * (i8 >> 2) + 4 * (R & 7) + (i8 & 3)] = e4[u];
+                }
+            }
             else { v4 = ((const float4*)(xr + 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64))[c - 64]; *(float4*)&sv[t][4 * (c - 64)] = v4; }
         }
         if (tid < nn) {
@@ -1416,7 +1427,7 @@ extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
     }
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        const u64 o = ((u64)(32 * (i >> 2) + 4 * sub + (i & 3)) * GDN_HV + hv) * 128 + j;
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
         S[o] = st0[i];
         S[o + 1] = st1[i];
     }
