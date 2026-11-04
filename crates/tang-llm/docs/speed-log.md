@@ -337,6 +337,30 @@ lever is fewer instructions a byte (a different quant layout or tensor-core deco
 decision for Cam. The T=8 narrow run was skipped: the best variant is the default shape, and
 narrow streaming (`TANG_CODER_NSTREAM=1`) is already recorded as slower.
 
+### TCX: experts repacked into tensor-core tiles (2026-11-04, H200 srznguhpkj2lqo, explain)
+
+`TANG_CODER_TCX=1` (`flash::tcx`, `cx_moe_gu_t` / `cx_moe_down_t`): at load each Q4_K / Q5_K
+expert matrix is also stored as 16-row × 256-column tiles whose 4-bit codes are the
+m16n8k32 A fragments as they are (one shift and mask a register; Q5's fifth bits a separate
+plane), with d / dmin f16 and the 6-bit sub-block scales and mins unpacked to bytes
+(repack → dequant is bit-exact vs GGUF, unit-tested). A 32-column step is two MMAs: the
+codes, and the mins replicated (gives m_j · Σx); the 6-bit scale is one IMAD a value, and the
+activations are int8 with one scale a token a 256 (Q8_K-style, `cx_q8k` / `cx_silu_q8k`), so
+float math happens once a superblock. 4 (gate|up) / 2 (down) warps split a tile's K. Runs in
+every grouped window, narrow and batch. Repack: +156 s load (weights 116 → 272 s); both copies
+held for now (49.6 → 97.3 GB).
+
+| B | default ms | TCX ms | Δ |
+|---|---|---|---|
+| 1 | 4.07 | 4.40 | +8% |
+| 8 | 9.97 | 11.30 | +13% |
+| 16 | 17.50 | 14.55 | −17% |
+| 32 | 24.81 | 21.30 | −14% |
+| 64 | 38.94 | 35.67 | −8% |
+
+Tolerance at B=64 (alone vs batch, both TCX): 99.17% agreement, mean |Δlogit| 0.144 (default
+99.50% / 0.122). flash-aa explain no drafts: 245.5 → 226.8 tok/s.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is

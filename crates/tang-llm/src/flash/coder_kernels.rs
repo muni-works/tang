@@ -1339,6 +1339,217 @@ extern "C" __global__ void __launch_bounds__(256, CX_MMA_MINB) cx_moe_down_m(ExW
     moe_mma_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
 }
 
+// ---- TCX experts: repacked 16 x 256 tiles (tcx.rs) on int8 tensor cores ----
+//
+// A warp owns one 16-row tile column of its group's expert; the group's <= 8 tokens are N. A
+// step of 32 columns is two m16n8k32 s8 MMAs: the codes (A straight from the tile, a shift and
+// mask a register) and the sub-block mins replicated over the step (A' = m_j, so the MMA gives
+// m_j * sum(x) accumulated over the superblock). The 6-bit scales multiply the code MMA's int32
+// (one IMAD a value); activations are int8 with one scale a token a 256 columns (Q8_K-style), so
+// the only float math is once a superblock: acc += dx (d I1 - dmin I2). Groups of other
+// weight types (a Q8_0 shared expert) take the per-token cx_dot on the per-32 codes `xq`.
+// Grid (rows / 128, groups), block 256; dynamic smem 8 K + 8 (K / 256) 4.
+__device__ __forceinline__ void mma_s8_16832c(int* d, const unsigned* a, unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+#ifndef CX_TCX_SGU
+#define CX_TCX_SGU 4
+#endif
+#ifndef CX_TCX_SDN
+#define CX_TCX_SDN 2
+#endif
+struct TcxT { uint4 c[4]; uint4 h; unsigned dw0, dw1; uint4 s0, s1; };
+template <bool Q5>
+__device__ __forceinline__ void tcx_load(const unsigned char* t, int lane, TcxT& o) {
+    const int g = lane >> 2;
+    #pragma unroll
+    for (int q = 0; q < 4; q++) o.c[q] = __ldg((const uint4*)(t + (q * 32 + lane) * 16));
+    const unsigned char* sc = t + 2048;
+    if (Q5) { o.h = __ldg((const uint4*)(t + 2048 + lane * 16)); sc += 512; }
+    o.dw0 = __ldg((const unsigned*)(sc + g * 4));
+    o.dw1 = __ldg((const unsigned*)(sc + (g + 8) * 4));
+    o.s0 = __ldg((const uint4*)(sc + 64 + g * 16));
+    o.s1 = __ldg((const uint4*)(sc + 64 + (g + 8) * 16));
+}
+__device__ __forceinline__ unsigned u4w(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+template <bool Q5, int K>
+__device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const unsigned char* act, const float* actd,
+                                         float acc[4], int sb0, int sb1) {
+    constexpr int NSB = K / 256;
+    constexpr int TB = Q5 ? 2880 : 2368;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const int na = 2 * tig, nb = 2 * tig + 1;
+    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+    const unsigned char* xg = act + (size_t)(g < m ? g : 0) * K + tig * 8;
+    TcxT cur, nxt;
+    tcx_load<Q5>(tile + sb0 * TB, lane, cur);
+    for (int sb = sb0; sb < sb1; sb++) {
+        if (sb + 1 < sb1) tcx_load<Q5>(tile + (sb + 1) * TB, lane, nxt);
+        int i1[4] = {0, 0, 0, 0}, i2[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int qp = s >> 1;
+            unsigned a[4];
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const unsigned w = u4w(cur.c[qp], c);
+                unsigned v = (s & 1) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
+                if (Q5) {
+                    const int r = 4 * s + c;
+                    const unsigned h = u4w(cur.h, r >> 3);
+                    v |= (r & 7) <= 4 ? (h << (4 - (r & 7))) & 0x10101010u : (h >> ((r & 7) - 4)) & 0x10101010u;
+                }
+                a[c] = v;
+            }
+            const uint2 bb = *(const uint2*)(xg + sb * 256 + s * 32);
+            int d[4];
+            mma_s8_16832(d, a, bb.x, bb.y);
+            const unsigned sw0 = u4w(cur.s0, s >> 2), sw1 = u4w(cur.s1, s >> 2);
+            const unsigned mw0 = u4w(cur.s0, 2 + (s >> 2)), mw1 = u4w(cur.s1, 2 + (s >> 2));
+            const unsigned sel = (unsigned)(s & 3) * 0x1111u;
+            const unsigned am[4] = {__byte_perm(mw0, 0, sel), __byte_perm(mw1, 0, sel), __byte_perm(mw0, 0, sel),
+                                    __byte_perm(mw1, 0, sel)};
+            mma_s8_16832c(i2, am, bb.x, bb.y);
+            const int s0 = (int)__byte_perm(sw0, 0, 0x4440u | (s & 3));
+            const int s1 = (int)__byte_perm(sw1, 0, 0x4440u | (s & 3));
+            i1[0] += s0 * d[0];
+            i1[1] += s0 * d[1];
+            i1[2] += s1 * d[2];
+            i1[3] += s1 * d[3];
+        }
+        const float d0 = h2f((unsigned short)(cur.dw0 & 0xFFFFu)), m0 = h2f((unsigned short)(cur.dw0 >> 16));
+        const float d1 = h2f((unsigned short)(cur.dw1 & 0xFFFFu)), m1 = h2f((unsigned short)(cur.dw1 >> 16));
+        if (na < m) {
+            const float dx = actd[na * NSB + sb];
+            acc[0] = fmaf(dx, fmaf(d0, i2f(i1[0]), -m0 * i2f(i2[0])), acc[0]);
+            acc[2] = fmaf(dx, fmaf(d1, i2f(i1[2]), -m1 * i2f(i2[2])), acc[2]);
+        }
+        if (nb < m) {
+            const float dx = actd[nb * NSB + sb];
+            acc[1] = fmaf(dx, fmaf(d0, i2f(i1[1]), -m0 * i2f(i2[1])), acc[1]);
+            acc[3] = fmaf(dx, fmaf(d1, i2f(i1[3]), -m1 * i2f(i2[3])), acc[3]);
+        }
+        if (sb + 1 < sb1) cur = nxt;
+    }
+}
+template <bool DOWN>
+__device__ __forceinline__ void moe_tcx_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                             const unsigned char* xk, const unsigned char* xq, float* out, int T,
+                                             int fast, const unsigned* plan) {
+    extern __shared__ uint4 dsm[];
+    constexpr int KA = DOWN ? CX_FF : CX_HID;
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi], m = b - a;
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    // S warps a row tile, each a 1/S of the superblocks; summed in slice order.
+    constexpr int S = DOWN ? CX_TCX_SDN : CX_TCX_SGU;
+    constexpr int NSB = KA / 256;
+    const int ks = warp % S;
+    const int r0 = (blockIdx.x * (8 / S) + warp / S) * 16;
+    const ExW& mw = DOWN ? (shared ? sg : g) : (shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u));
+    const int ro = DOWN ? r0 : (r0 < CX_FF ? r0 : r0 - CX_FF);
+    const size_t ostride = DOWN ? CX_HID : 2 * CX_FF;
+    __shared__ int pair_s[8];
+    __shared__ float4 red_s[8][32];
+    if (threadIdx.x < 8) pair_s[threadIdx.x] = threadIdx.x < m ? (int)plan[CX_PLAN_LIST + a + threadIdx.x] : 0;
+    __syncthreads();
+    auto tok = [&](int p) { return DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK); };
+    const unsigned char* wbase = (const unsigned char*)mw.base + (size_t)e * mw.estride;
+    if (mw.ty != 112 && mw.ty != 113) {
+        // Not repacked (whole block shares the type): the per-token dot on the per-32 codes.
+        const float* xdg = (const float*)(xq + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+        for (int r = ks; r < 16; r += S) {
+            const unsigned char* w = wbase + (size_t)(ro + r) * mw.row_bytes;
+            for (int q = 0; q < m; q++) {
+                const int t = tok(pair_s[q]);
+                const float v = cx_dot(mw.ty, w, xq + (size_t)t * KA, xdg + (size_t)t * (KA / 32), KA, fast);
+                if (lane == 0) out[(size_t)pair_s[q] * ostride + r0 + r] = v;
+            }
+        }
+        return;
+    }
+    unsigned char* act = (unsigned char*)dsm;
+    float* actd = (float*)(act + 8 * KA);
+    const float* xdg = (const float*)(xk + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+    // Codes permuted a 32: [tig][b0 (cols 4 tig..), b1 (16 + 4 tig..)], so B is one 8-byte load.
+    for (int i = threadIdx.x; i < m * (KA / 4); i += blockDim.x) {
+        const int q = i / (KA / 4), w = i % (KA / 4);
+        const int blk = w >> 3, wi = w & 7, tg = wi >> 1, h = wi & 1;
+        ((unsigned*)act)[i] = *(const unsigned*)(xk + (size_t)tok(pair_s[q]) * KA + blk * 32 + h * 16 + tg * 4);
+    }
+    for (int i = threadIdx.x; i < m * (KA / 256); i += blockDim.x) {
+        const int q = i / (KA / 256), c = i % (KA / 256);
+        actd[i] = xdg[(size_t)tok(pair_s[q]) * (KA / 256) + c];
+    }
+    __syncthreads();
+    const int gq = lane >> 2, tig = lane & 3;
+    const unsigned char* tile = wbase + (size_t)(ro / 16) * mw.row_bytes;
+    float acc[4];
+    const int sb0 = ks * NSB / S, sb1 = (ks + 1) * NSB / S;
+    if (mw.ty == 112) tcx_rows<false, KA>(tile, m, act, actd, acc, sb0, sb1);
+    else tcx_rows<true, KA>(tile, m, act, actd, acc, sb0, sb1);
+    if (S > 1) {
+        red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        __syncthreads();
+        if (ks != 0) return;
+        for (int j = 1; j < S; j++) {
+            const float4 v = red_s[warp + j][lane];
+            acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+        }
+    }
+    if (2 * tig < m) {
+        out[(size_t)pair_s[2 * tig] * ostride + r0 + gq] = acc[0];
+        out[(size_t)pair_s[2 * tig] * ostride + r0 + gq + 8] = acc[2];
+    }
+    if (2 * tig + 1 < m) {
+        out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq] = acc[1];
+        out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq + 8] = acc[3];
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_t(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                             const unsigned char* xk, const unsigned char* xq,
+                                                             float* out, int T, int fast, const unsigned* plan) {
+    moe_tcx_body<false>(g, u, sg, su, ids, xk, xq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_t(ExW d, ExW sd, const unsigned* ids,
+                                                               const unsigned char* hk, const unsigned char* hq,
+                                                               float* out, int T, int fast, const unsigned* plan) {
+    moe_tcx_body<true>(d, d, sd, sd, ids, hk, hq, out, T, fast, plan);
+}
+// Per-256 int8 activations (Q8_K-style, for the TCX experts): codes [rows][K] then f32 scales
+// [rows][K / 256], d = amax / 127. Grid (K / 256, rows), block 256.
+__device__ __forceinline__ void q8k_store(float v, unsigned char* xk, int nrows_max, int K, int row, int c) {
+    __shared__ float sh[8];
+    float a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = a;
+    __syncthreads();
+    float amax = sh[0];
+    for (int i = 1; i < 8; i++) amax = fmaxf(amax, sh[i]);
+    const float d = amax / 127.0f;
+    const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
+    xk[(size_t)row * K + c * 256 + threadIdx.x] = (unsigned char)(signed char)q;
+    if (threadIdx.x == 0) ((float*)(xk + (size_t)nrows_max * K))[row * (K / 256) + c] = d;
+}
+extern "C" __global__ void __launch_bounds__(256) cx_q8k(const float* x, unsigned char* xk) {
+    const int c = blockIdx.x, t = blockIdx.y;
+    q8k_store(x[(size_t)t * CX_HID + c * 256 + threadIdx.x], xk, XQ8_T, CX_HID, t, c);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_silu_q8k(const float* gu, unsigned char* hk, int pbase) {
+    const int c = blockIdx.x, p = pbase + blockIdx.y;
+    const float gv = gu[(size_t)p * 2 * CX_FF + c * 256 + threadIdx.x];
+    const float uv = gu[(size_t)p * 2 * CX_FF + CX_FF + c * 256 + threadIdx.x];
+    q8k_store(silu_f2(gv) * uv, hk, CX_NP, CX_FF, p, c);
+}
+
 // ---- dense Q8X (Q8_0 repacked) on int8 tensor cores for batch windows ----
 //
 // A warp owns 16 rows of one segment (M) and all T <= 64 tokens (up to 8 n-tiles of 8); K steps

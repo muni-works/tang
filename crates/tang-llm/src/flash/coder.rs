@@ -175,6 +175,9 @@ struct Variants {
     /// (`cx_moe_*_p`): `TANG_CODER_MOE_PERSIST=gu|down|all|0`. Bitwise with `cx_moe_*_s`.
     persist_gu: bool,
     persist_down: bool,
+    /// Experts repacked at load into tensor-core tiles (`flash::tcx`) and run on
+    /// `cx_moe_*_t` in every grouped window, narrow and batch (`TANG_CODER_TCX=1`). Not bitwise.
+    tcx: bool,
 }
 
 impl Default for Variants {
@@ -198,6 +201,7 @@ impl Default for Variants {
             nstream: false,
             persist_gu: false,
             persist_down: false,
+            tcx: false,
         }
     }
 }
@@ -238,6 +242,7 @@ impl Variants {
                 let m = std::env::var("TANG_CODER_MOE_PERSIST").unwrap_or_else(|_| "0".into());
                 m == "all" || m == "down"
             },
+            tcx: tcx_on(),
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -248,6 +253,10 @@ impl Variants {
             },
         }
     }
+}
+
+fn tcx_on() -> bool {
+    env_is("TANG_CODER_TCX", "1")
 }
 
 fn gemv_v1() -> bool {
@@ -435,6 +444,9 @@ struct ExW {
 struct Experts {
     _w: B,
     w: ExW,
+    /// The TCX tiles (`TANG_CODER_TCX=1`, Q4_K / Q5_K only); else `w`.
+    _t: Option<B>,
+    t: ExW,
 }
 
 struct GdnL {
@@ -514,6 +526,10 @@ struct Kern {
     /// Int8 tensor-core grouped experts (batch windows, not bitwise): `cx_moe_gu_m` / `_down_m`.
     moe_gu_m: Fun,
     moe_down_m: Fun,
+    moe_gu_t: Fun,
+    moe_down_t: Fun,
+    q8k: Fun,
+    silu_q8k: Fun,
     /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
     mma_q8x: Fun,
     mma_q8x_red: Fun,
@@ -581,6 +597,10 @@ impl Kern {
             moe_down_p: f("cx_moe_down_p")?,
             moe_gu_m: f("cx_moe_gu_m")?,
             moe_down_m: f("cx_moe_down_m")?,
+            moe_gu_t: f("cx_moe_gu_t")?,
+            moe_down_t: f("cx_moe_down_t")?,
+            q8k: f("cx_q8k")?,
+            silu_q8k: f("cx_silu_q8k")?,
             mma_q8x: f("cx_mma_q8x")?,
             mma_q8x_red: f("cx_mma_q8x_red")?,
             router_b: f("cx_router_b")?,
@@ -688,6 +708,10 @@ impl Kern {
             moe_down_p: f(cm, "cx_moe_down_p")?,
             moe_gu_m: f(cm, "cx_moe_gu_m")?,
             moe_down_m: f(cm, "cx_moe_down_m")?,
+            moe_gu_t: f(cm, "cx_moe_gu_t")?,
+            moe_down_t: f(cm, "cx_moe_down_t")?,
+            q8k: f(cm, "cx_q8k")?,
+            silu_q8k: f(cm, "cx_silu_q8k")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
             mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
             router_b: f(cm, "cx_router_b")?,
@@ -744,6 +768,8 @@ impl Kern {
             self.moe_down_p,
             self.moe_gu_m,
             self.moe_down_m,
+            self.moe_gu_t,
+            self.moe_down_t,
             self.moe_gu_db,
             self.moe_down_db,
             self.fa2,
@@ -785,6 +811,9 @@ struct Scratch {
     w: B,
     egu: B,
     hq: B,
+    /// TCX per-256 int8 activations: the MoE input's (`cx_q8k`) and h's (`cx_silu_q8k`).
+    xk: B,
+    hk: B,
     /// Grouped-expert plans (`cx_moe_plan`): one for the main stream, one for the side stream.
     plan: B,
     parts: B,
@@ -837,6 +866,8 @@ impl Scratch {
             plan: z(2 * (4 + 2 * np)),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
+            xk: z((rows * n + rows * n / 256 * 4).div_ceil(4)),
+            hk: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 256 * 4).div_ceil(4)),
             moe_y: z(rows * n),
             head: z(head_rows * hp.n_vocab),
             out_ids: z(head_rows),
@@ -2772,8 +2803,11 @@ impl Coder {
             return;
         }
         gpu::launch(f, grid, (block, 1, 1), smem, stream, args).expect("launch");
-        if self.prof.is_some() && std::ptr::eq(stream, &*self.stream) {
-            self.mark(self.kname(f));
+        if let Some(p) = &self.prof {
+            // Any stream (the batch / wide sets have their own); eager, so serial.
+            let ev = gpu::Event::new(true).expect("event");
+            ev.record(stream).expect("record");
+            p.borrow_mut().marks.push((self.kname(f), ev));
         }
     }
 
@@ -2812,6 +2846,10 @@ impl Coder {
             (k.moe_down_s, "moe_down"),
             (k.moe_gu_m, "moe_gu"),
             (k.moe_down_m, "moe_down"),
+            (k.moe_gu_t, "moe_gu"),
+            (k.moe_down_t, "moe_down"),
+            (k.q8k, "moe_q8k"),
+            (k.silu_q8k, "silu_q"),
             (k.moe_gemm_gu, "moe_gu"),
             (k.moe_gemm_down, "moe_down"),
             (k.moe_add_norm, "moe_add_norm"),
@@ -3890,6 +3928,58 @@ impl Coder {
         };
         let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
         let srp = if self.in_batch.get() { stream_srp() } else { 2 };
+        if self.var.tcx && layer.gate.t.ty >= 112 && !self.in_wide.get() {
+            let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
+            let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
+            let ni = n as i32;
+            let groups = if self.in_batch.get() {
+                n.min(hp.n_expert + 1 + n / BATCH_GCHUNK)
+            } else {
+                n.min(hp.n_expert + 1)
+            } as u32;
+            let (tg, tu, td) = (layer.gate.t, layer.up.t, layer.down.t);
+            let (tsg, tsu, tsd) = (layer.sh_gate.t, layer.sh_up.t, layer.sh_down.t);
+            let (x, xk, hk) = (
+                v.dev.buffer_addr(&s.x),
+                v.dev.buffer_addr(&s.xk),
+                v.dev.buffer_addr(&s.hk),
+            );
+            unsafe {
+                self.launch_on(
+                    stream,
+                    v.k.moe_plan,
+                    (1, 1, 1),
+                    if many { 1024 } else { 128 },
+                    0,
+                    tang_moe::args![ids, ti, pb, ni, plan],
+                );
+                // The routed call (pbase 0) quantizes x; the side stream's shared call reuses it.
+                if pbase == 0 {
+                    self.launch_on(stream, v.k.q8k, ((nh / 256) as u32, ti as u32, 1), 256, 0, tang_moe::args![x, xk]);
+                }
+                self.launch_on(
+                    stream,
+                    v.k.moe_gu_t,
+                    ((2 * ff * 4 / 128) as u32, groups, 1),
+                    256,
+                    (8 * (nh + nh / 64)) as u32,
+                    tang_moe::args![tg, tu, tsg, tsu, ids, xk, mxq, egu, ti, fastk, plan],
+                );
+                self.launch_on(stream, v.k.silu_q8k, ((ff / 256) as u32, np, 1), 256, 0, tang_moe::args![egu, hk, pb]);
+                if td.ty < 112 || tsd.ty < 112 {
+                    self.launch_on(stream, v.k.silu_q, ((ff / 32) as u32, np, 1), 32, 0, tang_moe::args![egu, hq, pb]);
+                }
+                self.launch_on(
+                    stream,
+                    v.k.moe_down_t,
+                    ((nh * 2 / 128) as u32, groups, 1),
+                    256,
+                    (8 * (ff + ff / 64)) as u32,
+                    tang_moe::args![td, tsd, ids, hk, hq, parts, ti, fastk, plan],
+                );
+            }
+            return;
+        }
         if self.var.grouped || many || nstream {
             // One plan region per stream (the side stream's call is the one past the routed pairs).
             let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
@@ -5250,6 +5340,7 @@ impl Coder {
                 Some(("fastk", n)) => v.fastk = n.parse()?,
                 Some(("shpar", n)) => v.shared_par = n == "1",
                 Some(("nstream", n)) => v.nstream = n == "1",
+                Some(("tcx", n)) => v.tcx = n == "1",
                 _ => anyhow::bail!("unknown variant {kv}"),
             }
         }
@@ -5745,15 +5836,29 @@ fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<E
     if t.ty != GgmlType::from_id(ty) {
         eprintln!("coder: {} requantized to Q8_0", t.name);
     }
-    Ok(Experts {
-        w: ExW {
-            base,
-            estride: (rows * rb) as u64,
-            ty: ty as i32,
-            row_bytes: rb as i32,
-        },
-        _w: w,
-    })
+    let w0 = ExW {
+        base,
+        estride: (rows * rb) as u64,
+        ty: ty as i32,
+        row_bytes: rb as i32,
+    };
+    let q5 = t.ty == GgmlType::Q5K;
+    let (tb, tw) = if tcx_on() && (q5 || t.ty == GgmlType::Q4K) && rows % 16 == 0 && k % 256 == 0 {
+        let mut tiles = super::tcx::repack(q5, &bytes[..ne * rows * rb], ne, rows, k)?;
+        tiles.extend_from_slice(&[0u8; 16]);
+        let tb = dev.upload_bytes(&tiles);
+        let tile = super::tcx::tile_bytes(q5);
+        let tw = ExW {
+            base: dev.buffer_addr(&tb),
+            estride: ((rows / 16) * (k / 256) * tile) as u64,
+            ty: if q5 { super::tcx::TY_Q5 } else { super::tcx::TY_Q4 },
+            row_bytes: ((k / 256) * tile) as i32,
+        };
+        (Some(tb), tw)
+    } else {
+        (None, w0)
+    };
+    Ok(Experts { w: w0, _w: w, _t: tb, t: tw })
 }
 
 /// Is the GGUF at `path` a `qwen3next` model (this engine) rather than Flash-Next?
