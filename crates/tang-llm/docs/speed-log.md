@@ -487,3 +487,67 @@ this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely regist
   231 ms, wide 4,276 → 4,285 tok/s (noise level); not kept. Weight-load latency isn't what holds
   the dense GEMMs at ~45 TOPS; next suspects are the token-operand loads (8 bytes a lane a chunk
   from global, 8 rows) and 2 blocks an SM. Needs a profiler (ncu doesn't run on these pods).
+
+### Wide prefill under ncu: what held the GEMMs and GDN (2026-11-04, RTX 3090 on mew)
+
+First profiler data for the wide path. ncu can't inject on the RunPod images. On mew it runs as
+root (`RmProfilingAdminOnly=1`) against a build with cudarc `cuda-12060`, because ncu
+2025.1.1's injection library lacks `cuTensorMapEncodeIm2colWide`. Other jobs held 20 GB of the
+3090, so `TANG_CODER_MAX_LAYERS=1` (new debug knob) loads one layer of
+Qwen3-Coder-Next UD-Q4_K_XL. `flash-wide-check --ctx 2048`, `TANG_CODER_WIDE=2048`. Reports
+are in `artifacts/` (`prof_base` = afa748e7, `psd` = after).
+
+| kernel (afa748e7) | time | occ. | regs | issue | tensor | L1 / L2 hit | top stalls (cycles/issue) | smem conflicts |
+|---|---|---|---|---|---|---|---|---|
+| cx_gemm_dense gdn_in (97×32) | 5.43 ms | 34% | 128 (2 blk/SM) | 18% | 8.5% | 76 / 54% | long_sb 18.0, wait 1.6 | 0 |
+| cx_gemm_dense gdn_out (16×32) | 1.75 ms | 33% | 128 | 21% | 10.4% | 76 / 90% | long_sb 14.1, wait 1.6 | 0 |
+| cx_moe_gemm_gu (8×513×32) | 6.63 ms | 32% | 128 | 25% | 6.8% | 84 / 82% | long_sb 9.9, lg_throttle 1.5 | 0 |
+| cx_moe_gemm_down (16×513×32) | 3.00 ms | 32% | 128 | 29% | 7.7% | 78 / 59% | long_sb 8.1, wait 1.6 | 642k st |
+| fl_gdn_wide (32×2, 512 thr) | 3.03 ms | 33% (66% theor.) | 64 | 45% | – | 82 / 77% | mio 2.0, short_sb 1.8, long_sb 1.2 | 0 |
+
+Root causes, from the SASS-level samples:
+- GEMMs: IMMA waiting on its B operand. Every warp loads its own copy of the tokens straight
+  from global (generic `LD`, 8 B a lane a chunk) and uses it at once.
+- Expert GEMMs: the grid's z gave 32 tiles an expert, about 96% of the 131k blocks empty. Each
+  of them copied the four `ExW` param structs to local memory (`const ExW& m = ...`) before it
+  exited.
+- My first staged Q4_K tile indexed `SbK.q[j]` with a runtime superblock half, which sent the
+  operands through local memory (37M LDL). Fixed by templating the half.
+- fl_gdn_wide: the per-chunk conv + SiLU + l2 norm staging (global-latency FFMAs, index math)
+  ran serially in only 64 blocks. The recurrence's smem reads were 4× redundant, with four
+  columns a warp reading the same k / q.
+
+Fixes (all GEMM outputs bitwise equal to afa748e7; the GDN summation order changed, so the KL
+vs narrow went from 2.3e-6 to 2e-13 at 3000):
+- Token tiles staged in shared memory: 128-column slabs, cp.async double buffer, row strides
+  160 / 144 B (conflict-free). Tokens' scale and code sum interleaved into one 16-byte read.
+  Dense, gate|up and down GEMMs.
+- Wide modules group an expert's pairs by 64 (`CX_GCHUNK`), so the grid is (rows, groups, 1).
+  Batch modules also launch z = 1 (their groups are ≤ 8). ExW read field by field.
+- Q4_K/Q5_K expert tiles called directly. Through `gemm_tile_any`'s switch the compiler emits a
+  CALL.
+- `fl_gdn_wide_prep`: conv, SiLU, norms, g and b for every token in parallel, written into the
+  free `egu` buffer. The recurrence streams them, holds two state columns a lane, and reads k / q
+  as float4.
+
+| kernel (ncu, 3090, 1 layer, 2048 rows) | before | after |
+|---|---|---|
+| moe_gu | 6.63 ms | 2.74 ms (tensor 16%, issue 46%) |
+| moe_down | 3.00 | 1.48 |
+| gdn_in (dense) | 5.43 | 2.99 |
+| gdn_out (dense) | 1.75 | 0.83 |
+| gdn recurrence | 3.03 | 1.43 + 0.26 prep |
+
+Per-stage GPU time with `TANG_CODER_PROF`, two 3000-token wide prefills on one layer
+(per-layer stages only): 57.6 → 31.9 ms (1.8×).
+
+What's left: the dense Q8X tile is now MIO-bound. Each MMA needs about 3 smem wavefronts
+(B 2, scales 1), close to the MMA's own rate. The next step is 32 rows a warp so each B
+fragment feeds two MMAs.
+
+Tried and reverted: GDN at one column a lane with 32 columns a block (128 blocks): 3.9 ms.
+Four columns a lane: 1.86 ms. Token staging with the runtime-half bug: slower.
+
+**Not yet verified on the H200.** The `coder-next-prefill-verify` pod didn't exist when this was
+written. Still to run there: the gates (wide-check 3000/8000, tcheck, spec-test, batch-check
+N=8) and the prefill / C=64 measurements.
