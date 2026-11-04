@@ -327,14 +327,24 @@ Found in `serve --batch 128 --ctx 131072` (`artifacts/gates-1104/serve-b128.log`
   curl -s localhost:8921/health
   ```
   Expect the first 400, the near-window request `200 length` with `prompt + completion < 4096`,
-  the other three finishing normally, `/health` ok. Result in "Spec decode under batching" below.
+  the other three finishing normally, `/health` ok. **Result** (H200, `artifacts/spec/probe2.txt`;
+  the near-window prompt also asks to count to 3000 so it can't stop on its own): 400
+  `context_length_exceeded: the prompt is 6009 tokens; the context window is 4096`; near-window
+  `200 length`, 3929 + 166 = 4095 tokens; the three others `stop` at 170; `/health` ok.
 - **(d) `TANG_SERVE_DETERMINISTIC=1`.** Batched greedy ≠ solo greedy past 8 rows (7/64
   identical in the drain test) is the batch module's tolerance path (K-split GEMVs, grouped
   experts, MMA) and stays. The switch doesn't build the batch module and runs every decode
   window at ≤ `MAX_T` (8) rows on the narrow, bitwise module (`batch::window_width`), more
   windows a step, so a stream's greedy output is independent of what it's batched with.
-  Throughput cost: a step of N streams becomes ⌈N/8⌉ narrow windows instead of one batch
-  window; measured below.
+  Throughput cost (decode-heavy load below, `--batch 64`, no drafts): C = 8 617 vs 614 tok/s
+  (no change: ≤ 8 streams were narrow anyway), C = 32 630 vs 851 (−26 %), C = 64 620 vs 987
+  (−37 %); per-stream p50 at C = 64 10.7 vs 18.1 tok/s.
+- **GPU checks of (a)/(b)**: `serve --batch 128 --ctx 131072` now logs one line, `--batch 128
+  clamped to 26: 27 sequence slots fit … after the batch and wide windows`
+  (`artifacts/spec/serve-clamp.log`); no `req N: prompt 0` lines in any batched serve log (the
+  only `req` line left is the refused request's error).
+- **Also found: `--mtp` was ignored on the qwen3next serve path** (`CoderOpts` built with
+  `..Default::default()`), so `serve --mtp` ran suffix drafts with no MTP head. Fixed.
 
 ## Spec decode under batching (2026-11-04, coder-serve2)
 
@@ -370,7 +380,7 @@ past 8 every stream waited for ⌈N/8⌉ narrow windows.
   maximises `(streams + α·Σ top scores) / ms` among `⌈ρ·streams·k⌉`, ρ ∈ {¼, ½, ¾, 1}, against
   **plain** decoding (no MTP pass at all = today's path). While plain wins it runs the head one
   step in 64 (and verifies one draft a stream then) to keep `α` and the scores fresh.
-- `TANG_SERVE_SPEC=off|auto|<rows>` (default auto with `--mtp`), `TANG_SERVE_BATCH_ROWS` (batch
+- `TANG_SERVE_SPEC=off|auto|<rows>` (default **off**, see the serve numbers below), `TANG_SERVE_BATCH_ROWS` (batch
   module rows, default `--batch` rounded up to 32), `TANG_SERVE_SPEC_LOG=1` (a line per window;
   a `tang-llm: spec:` summary prints every 30 s regardless).
 
@@ -390,6 +400,25 @@ MTP on; logs in `artifacts/spec/`):
 Within a width class spec decode is lossless: every budget gives budget 0's tokens exactly
 (N = 2 narrow, N = 16 and 32 in the batch module). Across classes (8-row narrow vs batch module,
 ≤ 64 vs > 64 rows) tokens drift at the tolerance path's usual rate.
+
+**Serve** (`serve --mtp mtp.gguf --batch 64 --ctx 32768`, decode-heavy closed loop: prompts
+200–800 tokens, 512–1024 out, 10 % sampled at T 0.8, R = 2 a worker; `load_dec.py`,
+`artifacts/spec/lt-*.json`). Aggregate tok/s (per-stream p50):
+
+| C | off (plain batch windows) | auto | fixed 32 rows | deterministic (off) |
+|---|---|---|---|---|
+| 8 | **614** (89) | 593 (84) | 540 (88) | 617 (89) |
+| 16 | **677** (48) | 652 (46) | 655 (56) | – |
+| 32 | **851** (30) | 800 (29) | 785 (30) | 630 (22) |
+| 64 | **987** (18) | 892 (16) | – | 620 (11) |
+
+Drafts were accepted at 83–95 % in serve too, but no setting beat plain windows: at serve load
+the drafting steps cost more than in the engine check (prefill chunks interleave, 10 % of
+streams are sampled and draft nothing, the extra MTP passes after every window and over every
+wide-prefilled prompt), and auto, once it measures plain steps, settles on plain and pays only
+its probes and the MTP head's prefill fill (3–10 %). The first auto run (before the tuner
+measured plain steps) drafted throughout and was 10 % under plain. Hence `TANG_SERVE_SPEC`
+defaults to **off**; `auto` is there for loads with fewer, longer greedy streams.
 
 **Where the gain goes.** Acceptance is high (88–99 % at k = 2) but the MTP passes are 8 rows
 each, with a sync: at 32 streams a step runs ~8 of them, ~20 % of the step (budget 0 with MTP
