@@ -180,3 +180,55 @@ are only comparable to each other: borrowed 71.2/46.4/28.4%, 2.46; pilot 1 76.3/
 2.68; pilot 3 step 400 79.2/57.3/39.0%, 2.75; step 700 79.7/58.8/41.1%, 2.80. The export
 round trip holds: held-out validation from the step-400 GGUF equals the in-memory one within
 requantization (CE .2608 vs .2613 at depth 1).
+
+## Full run: 0 → 3200 (pilot 3 recipe, continued)
+
+Same recipe as pilot 3 (`--beta .6 --vat --soft 1 --windows 8`, warmup 30, seed 42), one
+cosine schedule over three resumed segments: 0→1000 at lr 5e-5 (`--total 1000`), then
+1000→2000 and 2000→3200 at lr 3e-5 (`--schedule-from 1000 --total 3200`, lr 3.6e-6 by step
+3000). ~184 loss rows per step, ~13 s/step on an H200. The pipeline is `/workspace/c/run.sh`
+on the pod; artifacts mirror to `artifacts/pod/` (gitignored).
+
+Held-out live chain, k=3, 20 prompts × 2000 tokens (`flash-coder-dump --eval --held-out`):
+
+| head | d1 | d2-cum | d3-cum | tokens/window | rows seen |
+| --- | --- | --- | --- | --- | --- |
+| borrowed | 78.2% | 58.0% | 40.0% | 2.763 | 0 |
+| pilot 1 (500 steps) | 82.3% | 64.6% | 48.3% | 2.95 | ~12k |
+| step 1000 (pilot 3 redo) | 85.6% | 68.9% | 54.1% | 3.087 | ~184k |
+| step 2000 | 86.2% | 70.3% | 56.0% | 3.125 | ~368k |
+| step 3200 | 86.2% | 71.1% | 57.6% | 3.149 | ~589k |
+
+Gains flatten: +0.32 tokens/window for the first 1000 steps, +0.04 for the next 1000, +0.02
+for the last 1200 (d1 saturates at ~86%; the deeper depths still creep up). In-trainer
+validation at 3200: CE .242/.465/.716, teacher hits 423/387/339 of 460/440/420.
+
+Bench (`flash-aa -n 512 --bw 4800`, mtp drafts, single stream, H200; no drafts ~242 tok/s;
+`flash-spec-test -n 96` PASS):
+
+| prompt | borrowed | step 1000 | step 3200 |
+| --- | --- | --- | --- |
+| explain | 295.3 tok/s (1.96) | 329.2 (2.20) | 319.5 (2.13) |
+| refactor | 381.6 (2.66) | 392.7 (2.74) | 398.8 (2.78) |
+| write | 304.3 (2.09) | 342.0 (2.37) | 349.7 (2.42) |
+| mean | 327.0 | 354.6 | 356.0 |
+
+Step 3200 is the head to ship: best held-out tokens/window, +9% tok/s over the borrowed head
+on the bench mean. One 512-token prompt is noisy (explain dipped vs step 1000); the 40k-token
+held-out eval is the ranking metric.
+
+### Disk-full incident
+
+The 2000→3200 segment reached step 3000, logged its validation, wrote `state.bin`, then died
+exporting `mtp.gguf` with ENOSPC: the pod's 80 GB `/workspace` held 11 checkpoints × 2.5 GB
+plus the model and dump. `std::fs::copy` of the template GGUF ran outside the export's
+cleanup closure, so the 945 MB `mtp.partial-<pid>` stayed behind. Recovery: deleted the
+intermediate checkpoints (kept 1000, 2000, 2750, 3000) and the partial (61 GB used, 20 GB
+free), then resumed from `step-003000` — `restore` needs only `state.json` + `state.bin`, so
+a missing GGUF costs nothing — for the last 200 steps into `seg-3200b`. The schedule
+continued exactly (lr 3.55e-6 at step 3003).
+
+Fix: `Weights::export` checks the destination filesystem has the template's size plus 256 MiB
+free before copying (`ensure_free`, `statvfs`), and the copy now runs inside the closure that
+removes the temp file on any error. Export was already temp-name + rename. Long runs should
+still budget ~2.5 GB per checkpoint or prune intermediates as they go.
