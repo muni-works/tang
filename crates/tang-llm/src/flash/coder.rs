@@ -2401,7 +2401,9 @@ impl Coder {
         let cap = MAX_T.max(self.batch_rows());
         ensure!((1..=cap).contains(&b), "{b} rows (at most {cap})");
         ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
-        let wide = b > MAX_T;
+        // 1..=MAX_T rows: the narrow module, always (`crate::batch::batch_module` says why);
+        // concurrency dropping to 1 under `serve --batch 64` lands here.
+        let wide = crate::batch::batch_module(b, MAX_T, self.batch_rows());
         let mut staged = Vec::with_capacity(b);
         let mut segs = Vec::with_capacity(b);
         let mut end = 0;
@@ -4393,6 +4395,14 @@ impl Coder {
         nseg: usize,
         mut probe: Option<&mut Probe>,
     ) -> Result<Vec<u32>> {
+        // The batch module's kernels assume more than MAX_T rows (see decode_batch): refuse a
+        // short window there instead of faulting the device.
+        ensure!(
+            !self.in_batch.get() || t > MAX_T,
+            "a {t}-row window in the batch module (it takes {}..={} rows)",
+            MAX_T + 1,
+            self.batch_rows()
+        );
         self.last_batch = self.in_batch.get();
         if let Some(rs) = self.row_sampler.as_ref() {
             // Every window stages its rows' words (none sampled unless a slot path set them).

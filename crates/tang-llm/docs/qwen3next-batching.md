@@ -138,9 +138,9 @@ Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
    new requests fail with "restart the server" instead of joining. Tests: `server::step_failures`.
    GPU check: `tang-llm serve $G --batch 64 --ctx 32768`, then 64 concurrent requests where one
    has a prompt near `--ctx` and `max_tokens` past it (if the slot overflows mid-decode, only that
-   request errors; the other 63 finish), and `curl -s localhost:8911/health` stays `ok`. A forced
-   fault (`TANG_FORCE_STEP_FAULT` is not wired; kill -SEGV is not the same) can't be staged
-   cheaply: check the log line `tang-llm: the engine is unhealthy:` on the next real one.
+   request errors; the other 63 finish), and `curl -s localhost:8911/health` stays `ok`. There's
+   no switch to force a device fault; on the next real one, look for the log line
+   `tang-llm: the engine is unhealthy:` and `/health` answering 503.
 
 2. **`--batch` clamped to the slots that fit.** `Coder::fit_slots` counts slots from free VRAM,
    `slot_bytes()` at `--ctx` and `TANG_SLOT_HEADROOM_GB` (default 4), and is the cap
@@ -169,3 +169,22 @@ Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
    TANG_BATCH_N=64 tang-llm flash-batch-check $G` (no assert; then without the env:
    `TANG_BATCH_N=64 tang-llm flash-batch-check $G` gives the same PASS line, tolerance numbers
    unchanged from 2026-11-03), and `flash-batch-check` at `TANG_BATCH_N=8` stays bitwise.
+
+4. **One-row steps never take the batch module.** The fault (`CUDA_ERROR_ILLEGAL_ADDRESS` at
+   the sync after a 1-row window) came from the `batch_all` experiment (88609b41 dropped it),
+   which sent every step through the batch module. The module's dense paths (K-split
+   `cx_gemvkb`, Q8X MMA, router) are all gated on `t > MAX_T`, so a short window there falls
+   through to the narrow kernels (`gemvk[t-1]`) on the batch module's scratch and int8 staging,
+   whose scales sit at `rows * k`, not `MAX_T * k`. That mixed-module path is the likely cause
+   (not reproduced here, no GPU). `cx_moe_plan_w` is safe at `n = 11` (always launched with a
+   1024-thread block) and `gemv_batch` pads the last launch to 8/16/32 rows inside the scratch.
+   The fix is the routing rule, now explicit and guarded: `batch::batch_module(rows, MAX_T,
+   batch_rows)`: only 9..=batch_rows rows use the batch module, 1..=8 always use the narrow one
+   (`decode_batch`), and `run_staged` refuses a ≤ 8-row window in the batch module with an error
+   (which #1 retires as that window's failure) instead of faulting the device. Under
+   `serve --batch 64`, concurrency dropping to 1–8 decodes narrow. Test:
+   `batch::tests::short_steps_never_take_the_batch_module`. GPU checks: `TANG_BATCH_N=64
+   tang-llm flash-batch-check $G` (same PASS and tolerance numbers as 2026-11-03); `TANG_BATCH_N=8`
+   bitwise; and `tang-llm serve $G --batch 64`, 64 concurrent requests with staggered
+   `max_tokens` (16, 32, …, 1024) so the batch drains through 64 → 9 → 8 → 1 rows, with no fault
+   and each finishing request's text equal to the same request run alone (greedy).
