@@ -653,14 +653,16 @@ fn hash(ids: &[u32]) -> u64 {
 
 impl FlashServe {
     /// `want` streams at once, clamped to the slots that fit in VRAM at `--ctx` (one spare,
-    /// see [`crate::batch::clamp_batch`]); warns when it cuts.
-    fn clamp_batch(&mut self, want: usize) -> usize {
+    /// see [`crate::batch::clamp_batch`]) and to `ceiling` (what the windows were built for);
+    /// warns when it cuts, unless `quiet` (the provisional count before the windows exist).
+    fn clamp_batch(&mut self, want: usize, ceiling: usize, quiet: bool) -> usize {
         let cap = self.e.fit_slots();
-        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap);
-        if n < want {
+        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap).min(ceiling);
+        if n < want && !quiet {
             eprintln!(
                 "tang-llm: warning: --batch {want} clamped to {n}: {cap} sequence slots fit in \
-                 free VRAM at --ctx {} (TANG_SLOT_HEADROOM_GB sets the headroom)",
+                 free VRAM at --ctx {} after the batch and wide windows \
+                 (TANG_SLOT_HEADROOM_GB sets the headroom)",
                 self.ctx
             );
         }
@@ -852,7 +854,9 @@ impl FlashServe {
                 me.e.max_slots() > 1,
                 "--batch needs an engine with sequence slots (qwen3next)"
             );
-            me.batch = me.clamp_batch(s.batch);
+            // Provisional (sizes the batch windows); the count that sticks is taken once the
+            // windows exist, from the request, so it clamps (and warns) once.
+            me.batch = me.clamp_batch(s.batch, usize::MAX, true);
             me.e.enable_row_sampling()?;
             eprintln!(
                 "tang-llm: continuous batching: up to {} requests at once (per-row sampling{})",
@@ -890,8 +894,9 @@ impl FlashServe {
                     Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
                 }
             }
-            // The windows took memory: count again before any slot exists.
-            me.batch = me.clamp_batch(me.batch);
+            // The windows took memory: count again before any slot exists, from `--batch`
+            // (not the provisional count, whose own spare slot would be taken off twice).
+            me.batch = me.clamp_batch(s.batch, me.batch, false);
         } else if !me.e.use_mtp() {
             // One stream: wide prefill windows for long prompts too (TANG_SERVE_WIDE rows).
             let rows: usize = std::env::var("TANG_SERVE_WIDE")

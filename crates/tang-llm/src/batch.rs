@@ -158,6 +158,26 @@ mod tests {
         assert_eq!(super::clamp_batch(8, 128, cap), 8);
     }
 
+    /// `serve --batch 128 --ctx 131072` on an H200 (3.30 GB a slot, 4 GB headroom): 96.6 GB
+    /// free before the windows, 93.8 GB after. The provisional count sizes the windows; the
+    /// count that sticks comes from `--batch` against the second count, once (it was 128 → 27
+    /// → 26 with two warnings, the second clamping the already clamped value).
+    #[test]
+    fn startup_clamps_once_from_the_request() {
+        const GB: usize = 1_000_000_000;
+        let per = 3_300_000_000;
+        let before = super::slots_that_fit(96_600_000_000, 4 * GB, per, 128);
+        let after = super::slots_that_fit(93_800_000_000, 4 * GB, per, 128);
+        assert_eq!((before, after), (28, 27));
+        let provisional = super::clamp_batch(128, 128, before);
+        let fin = super::clamp_batch(128, 128, after).min(provisional);
+        assert_eq!((provisional, fin), (27, 26));
+        // Room to spare after the windows: unchanged, never above what the windows fit.
+        let fin = super::clamp_batch(16, 128, after).min(super::clamp_batch(16, 128, before));
+        assert_eq!(fin, 16);
+        assert_eq!(super::clamp_batch(128, 128, 40).min(provisional), provisional);
+    }
+
     #[test]
     fn short_steps_never_take_the_batch_module() {
         // `serve --batch 64`: 64-row module, narrow 8.
