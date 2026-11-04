@@ -229,6 +229,36 @@ Eager, B=64 (ms a layer, GB/s from ~367 distinct experts + shared): gate|up 0.57
   (gate|up 0.22 → 0.26 ms), the extra prologue pass costs more than it saves.
 - **Deeper rings / more rows a warp for down** (4/8 stages, 32 rows): flat or worse.
 
+### Tensor-core batch windows, tolerance-gated (2026-11-03, H200, explain, ~1.2k context)
+
+Past 8 rows, batch windows may drop bitwise equality: `flash-batch-check` then gates on
+**greedy agreement given the same history ≥ 99%** (each sequence's steps up to and including
+its first divergence from the sequence alone) and **mean |Δlogit| ≤ 0.2** over those steps
+(`TANG_BATCH_TOL`); max |Δlogit| is reported. Narrow windows (T ≤ 8) stay bitwise.
+
+Measured noise floor at B=64 (16 steps): agreement 99.50% (986/991), mean |Δlogit| 0.122,
+max 11.9. The int8 MMA down kernel matches the per-pair dot to ~1e-6 relative
+(`TANG_CODER_MMA_CHECK=1`), so the spread isn't the kernel: a reordered fp32 sum flips the int8
+rounding of some activation downstream, and the flips compound over 48 layers. A 0.05 max bar
+is unreachable for any change of summation order in this pipeline.
+
+| commit | change | B=16 | B=32 | B=64 ms | B=64 tok/s |
+|---|---|---|---|---|---|
+| 34c91db3 | streaming experts (bitwise) | 20.01 | 31.04 | 51.16 | 1251 |
+| 90a132d9 | + MMA down experts (`cx_moe_down_m`) | 19.32 | 29.75 | 48.64 | 1316 |
+| 90a132d9 | + Q8X dense MMA (`cx_mma_q8x`) | 18.60 | 27.24 | 43.02 | 1488 |
+| 94c1b95b | + mixed matrices (GDN in on MMA) | 18.48 | 25.79 | 40.01 | 1600 |
+
+Eager B=64 at 94c1b95b, ms a step: gate|up (streaming) 10.7, down (MMA) 5.8 (~1.8 TB/s), GDN in
+4.1, GDN conv+step 4.3 (≈ the f32 state's bandwidth at 64 sequences), router 1.6, route+plan
+1.6, GDN out 1.35, attention in/out + head ~2.
+
+- **Gate|up on MMA** (`TANG_CODER_MOE_MMA=all`): no faster than streaming (10.2–11 vs 10.7 ms).
+- **Narrow streaming experts** (`TANG_CODER_NSTREAM=1`, T = 2..8, bitwise, spec-test PASS):
+  slower. T=8 oracle window 10.0 → 13.5 ms, forced-wrong windows 7.2 → 9.3 ms; T=1 unchanged
+  (4.6 ms). One sequence gives ~1 token an expert, so grouping saves no bytes, and the
+  streaming kernels stage activations per block with fewer warps than per-pair `_d4`.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
