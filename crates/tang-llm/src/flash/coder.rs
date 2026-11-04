@@ -473,6 +473,8 @@ struct Kern {
     mma_q8x: Fun,
     mma_q8x_red: Fun,
     router_b: Fun,
+    /// The F32 / BF16 router as an f32 GEMM (wide windows).
+    sgemm_wide: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -486,6 +488,9 @@ struct Kern {
     gdn_commit: Fun,
     gdn_step_seg: Fun,
     gdn_commit_seg: Fun,
+    /// Wide windows' GDN: a warp per state column (`fl_gdn_wide`), then the gated norm.
+    gdn_wide: Fun,
+    gdn_wide_norm: Fun,
     copy: Fun,
     argmax1: Fun,
     argmax2: Fun,
@@ -532,6 +537,7 @@ impl Kern {
             mma_q8x: f("cx_mma_q8x")?,
             mma_q8x_red: f("cx_mma_q8x_red")?,
             router_b: f("cx_router_b")?,
+            sgemm_wide: f("cx_sgemm_wide")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -544,6 +550,8 @@ impl Kern {
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
+            gdn_wide: self.gdn_wide,
+            gdn_wide_norm: self.gdn_wide_norm,
             copy: self.copy,
             argmax1: self.argmax1,
             argmax2: self.argmax2,
@@ -634,6 +642,7 @@ impl Kern {
             mma_q8x: f(cm, "cx_mma_q8x")?,
             mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
             router_b: f(cm, "cx_router_b")?,
+            sgemm_wide: f(cm, "cx_sgemm_wide")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -646,6 +655,8 @@ impl Kern {
             gdn_commit: f(fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(fm, "fl_gdn_conv_commit_seg")?,
+            gdn_wide: f(fm, "fl_gdn_wide")?,
+            gdn_wide_norm: f(fm, "fl_gdn_wide_norm")?,
             copy: f(em, "fe_copy")?,
             argmax1: f(em, "fe_argmax1")?,
             argmax2: f(em, "fe_argmax2")?,
@@ -2632,6 +2643,8 @@ impl Coder {
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
+            (k.gdn_wide, "gdn_wide"),
+            (k.gdn_wide_norm, "gdn_wide_norm"),
             (k.copy, "copy"),
             (k.argmax1, "argmax"),
             (k.argmax2, "argmax"),
@@ -2877,7 +2890,44 @@ impl Coder {
                 return;
             }
         }
-        if t > MAX_T && self.in_batch.get() && w.k.is_multiple_of(self.var.kq * 256) && !gemv_v1() {
+        // Wide windows: an F32 / BF16 matrix (the router + shared gate) as an f32 GEMM.
+        if t > MAX_T
+            && self.in_wide.get()
+            && w.float1
+            && w.k.is_multiple_of(32)
+            && !env_is("TANG_CODER_SGEMM", "0")
+        {
+            if let Some(wd) = v.wide {
+                let (sp, ns, rt, ki, os, ti) = (
+                    v.dev.buffer_addr(&w.segs),
+                    w.nseg,
+                    w.rows as i32,
+                    w.k as i32,
+                    ostride as i32,
+                    t as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        wd.k.sgemm_wide,
+                        (w.rows.div_ceil(64) as u32, t.div_ceil(64) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, rt, x, ki, out, os, ti],
+                    )
+                    .expect("cx_sgemm_wide");
+                }
+                self.mark(name);
+                return;
+            }
+        }
+        // Batch windows, and wide windows' matrices the GEMM doesn't take (the F32 router, GDN's
+        // mixed-type input): the batched K-split GEMV, 32 rows a launch instead of MAX_T.
+        if t > MAX_T
+            && (self.in_batch.get() || self.in_wide.get())
+            && w.k.is_multiple_of(self.var.kq * 256)
+            && !gemv_v1()
+        {
             if let Some(wd) = v.wide {
                 self.gemv_batch(wi, wd, w, x, xq, out, t, ostride);
                 self.mark(name);
@@ -3463,6 +3513,42 @@ impl Coder {
     /// rows run against its slot's state and history.
     fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: bool) {
         let v = self.stage_view(w);
+        // Wide windows (one segment, always committed): a warp per state column.
+        if self.in_wide.get() && commit && nseg == 1 && !env_is("TANG_CODER_GDNW", "0") {
+            let (stab, htab, p, sd, dt, sa, nw, y, seg, eps, wc) = (
+                v.dev.buffer_addr(&g.stab),
+                v.dev.buffer_addr(&g.htab),
+                self.proj_on(w, &g.proj),
+                stride as u32,
+                v.dev.buffer_addr(&g.dt),
+                v.dev.buffer_addr(&g.a),
+                v.dev.buffer_addr(&g.norm),
+                v.dev.buffer_addr(&v.s.y),
+                v.dev.buffer_addr(&v.s.rows) + (2 * self.tw() * 4) as u64,
+                self.eps,
+                v.dev.buffer_addr(&g.conv),
+            );
+            let t = self.wide_rows() as u32;
+            unsafe {
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide,
+                    (self.geo.gdn_hv as u32, 2, 1),
+                    512,
+                    0,
+                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc],
+                );
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide_norm,
+                    (t, self.geo.gdn_hv as u32, 1),
+                    128,
+                    0,
+                    tang_moe::args![p, sd, nw, y, seg, eps],
+                );
+            }
+            return;
+        }
         let (stab, htab, p, sd, dt, sa, nw, y, seg, cm, eps, wc) = (
             v.dev.buffer_addr(&g.stab),
             v.dev.buffer_addr(&g.htab),

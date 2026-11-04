@@ -1469,6 +1469,7 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         let narrow = t0.elapsed().as_secs_f64();
         let (t1, l1) = decode(&mut e, s1, n1, None)?;
         e.free_slot(s1);
+        e.prof_reset();
         let mut wide = Vec::new();
         let mut got = None;
         let mut forced = None;
@@ -1488,7 +1489,7 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         }
         let (n2, (t2, l2)) = got.unwrap();
         if let Some(r) = e.prof_report() {
-            println!("  GPU time by stage (TANG_CODER_PROF, narrow + wide prefills):\n{r}");
+            println!("  GPU time by stage (TANG_CODER_PROF, the two wide prefills):\n{r}");
         }
         let bits = l1
             .iter()

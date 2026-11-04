@@ -317,3 +317,37 @@ GDN conv+step 4.35, GDN in 4.06, router 1.64, GDN out 1.35, route+plan 0.79, hea
   kernel's speed for the length of the overlap. Run references before or after, never during.
 - **nsys / ncu on the RunPod image:** ncu's injection lacks `cuTensorMapEncodeIm2colWide`,
   which cudarc resolves at load, and nsys isn't installed (apt fails).
+
+### Wide prefill: k32 expert/dense GEMM tile, warp-per-column GDN, f32 router GEMM (2026-11-04, H200)
+
+`flash-wide-check --ctx 3000` (refactor ids, `TANG_CODER_WIDE=2048`, the serve width), GPU time
+of the two wide prefills by stage (`TANG_CODER_PROF=1`; the narrow prefill is now excluded):
+
+| stage | before ms | after ms |
+|---|---|---|
+| moe_gu (`cx_moe_gemm_gu`) | 1107 | 568 |
+| GDN recurrence | 441 (`fl_gdn_conv_step_seg`, 32 blocks) | 190 (`fl_gdn_wide` + norm) |
+| moe_down | 427 | 227 |
+| gdn_in (`cx_gemm_dense` + GEMV fallback) | 408 | 243 |
+| router (F32: 256 eight-row GEMVs a layer) | 393 | 89 (`cx_sgemm_wide`) |
+| gdn_out / attn_in / attn_out | 137 / 92 / 46 | 91 / 59 / 30 |
+| wide prefill, 3000 tokens | 1.63 s, **1,844 tok/s** | 0.80 s, **3,741 tok/s** |
+
+1000 / 8000 tokens: 3,428 / 3,980 tok/s. Narrow prefill (`prefill_slot`, what `flash-aa` and
+`--batch`-less paths use) is unchanged at ~810 tok/s.
+
+- `gemm_tile32` (every k32-scaled type: Q4_K/Q5_K/Q8_0/Q8X/Q4_0/Q5_0/IQ4): one m16n8k32 MMA a
+  32 columns, scales and mins once a 32 instead of per 16, the tokens' scales and per-32 code
+  sums staged in shared memory (no shuffles in the loop), and the 32 columns permuted so each
+  8-weight decode is used whole (half the decodes). Q3_K/Q6_K keep the k16 tile.
+- `fl_gdn_wide`: 8 lanes per state column (columns are independent given k, q, g, b), 3-step
+  shuffle reductions, no block barrier a token; gated norm in `fl_gdn_wide_norm`.
+  `TANG_CODER_GDNW=0` for the old kernel.
+- Router: F32 GEMM (`TANG_CODER_SGEMM=0` off); other non-GEMM matrices take the batched K-split
+  GEMV (32 rows a launch) instead of 8-row GEMVs.
+
+Serve, `/workspace/load.py 64 <port> 3` after `serve --batch 64 --ctx 32768`, same H200, HEAD
+4133d39a vs this: aggregate **302 → 421 tok/s**, TTFT p50 25.6 → 16.5 s, p95 108 → 69 s, wall
+406 → 292 s, 192/192 ok. Gates: `flash-wide-check` 3000/8000 PASS (KL 9e-7 / 3e-6); 1000 fails
+the 1e-3 bar on both (base 1.15e-2, this 7.9e-3: pre-existing, FA2 at short context);
+`flash-tcheck` t1 vs t8 bitwise; `flash-spec-test` PASS.
