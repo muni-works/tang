@@ -1321,7 +1321,8 @@ impl Coder {
     // ---- sequence slots (several sequences in one window)
 
     /// Rewrite every layer's slot tables from the live slots (slot 0: the layer's own buffers;
-    /// a free slot: 0).
+    /// a free slot: 0), and sync. Once, at load; slots coming and going update their own
+    /// entries ([`write_slot_entry`](Self::write_slot_entry)).
     fn write_slot_tables(&mut self) {
         for w in 0..self.n_stages() {
             self.write_slot_tables_on(w);
@@ -1352,6 +1353,113 @@ impl Coder {
             }
         }
         self.dev.sync();
+    }
+
+    /// Slot `i`'s entry in every table (stage layers and MTP) after it was allocated or freed:
+    /// two f32 words per table at `2 * i`, the same values a full
+    /// [`write_slot_tables`](Self::write_slot_tables) would write there (0 for a free slot),
+    /// the other entries untouched. No sync on GPU 0: the uploads are on the engine's stream,
+    /// which every kernel reading the tables runs on (or forks from by event, the side
+    /// stream), so they're ordered before the next window. The peer stage's kernels run on
+    /// its own `Ctx` stream, not its device's upload stream, so that one is synced.
+    fn write_slot_entry(&mut self, i: usize) {
+        let words = |v: u64| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)];
+        for w in 0..self.n_stages() {
+            let nl = self.stage_view(w).layers.len();
+            let mut entries = Vec::with_capacity(nl);
+            for l in 0..nl {
+                let layer = &self.stage_view(w).layers[l];
+                if layer.gdn.is_none() && layer.attn.is_none() {
+                    continue;
+                }
+                let pair = if w == 0 {
+                    self.slots[i].as_ref().and_then(|sl| {
+                        if layer.gdn.is_some() {
+                            sl.gdn[l].as_ref()
+                        } else {
+                            sl.kv[l].as_ref()
+                        }
+                    })
+                } else {
+                    let p = self.peer.as_ref().expect("no peer");
+                    p.slots[i].as_ref().and_then(|(gdn, kv)| {
+                        if layer.gdn.is_some() {
+                            gdn[l].as_ref()
+                        } else {
+                            kv[l].as_ref()
+                        }
+                    })
+                };
+                let (a, b) = pair.map_or((0, 0), |(a, b)| (self.a_on(w, a), self.a_on(w, b)));
+                entries.push((l, words(a), words(b)));
+            }
+            let (dev, layers) = if w == 0 {
+                (&self.dev, &mut self.layers)
+            } else {
+                let p = self.peer.as_deref_mut().expect("no peer");
+                (&p.dev, &mut p.layers)
+            };
+            for (l, wa, wb) in entries {
+                let layer = &mut layers[l];
+                let (da, db) = match (&mut layer.gdn, &mut layer.attn) {
+                    (Some(g), _) => (&mut g.stab, &mut g.htab),
+                    (_, Some(at)) => (&mut at.ktab, &mut at.vtab),
+                    _ => continue,
+                };
+                dev.upload_into_f32_at(da, 2 * i, &wa);
+                dev.upload_into_f32_at(db, 2 * i, &wb);
+            }
+            if w > 0 {
+                dev.sync();
+            }
+        }
+        if self.mtp.is_some() {
+            let (a, b) = self.slots[i]
+                .as_ref()
+                .and_then(|s| s.mtp_kv.as_ref())
+                .map_or((0, 0), |(a, b)| (self.a(a), self.a(b)));
+            if let Some(at) = self.mtp.as_mut().and_then(|m| m.layer.attn.as_mut()) {
+                self.dev.upload_into_f32_at(&mut at.ktab, 2 * i, &words(a));
+                self.dev.upload_into_f32_at(&mut at.vtab, 2 * i, &words(b));
+            }
+        }
+        // TANG_SLOT_TABLE_CHECK=1: the tables must equal a full rewrite's, bit for bit.
+        if std::env::var("TANG_SLOT_TABLE_CHECK").is_ok_and(|v| v == "1") {
+            let before = self.slot_table_words();
+            self.write_slot_tables();
+            assert!(
+                before == self.slot_table_words(),
+                "slot {i}: the per-entry tables differ from a full rewrite"
+            );
+        }
+    }
+
+    /// Every slot table's words (stage layers, then MTP), read back (for the check above).
+    fn slot_table_words(&self) -> Vec<u32> {
+        self.dev.sync();
+        let mut out = Vec::new();
+        for w in 0..self.n_stages() {
+            let dev = if w == 0 {
+                &self.dev
+            } else {
+                &self.peer.as_ref().expect("no peer").dev
+            };
+            dev.sync();
+            for layer in self.stage_view(w).layers {
+                let (a, b) = match (&layer.gdn, &layer.attn) {
+                    (Some(g), _) => (&g.stab, &g.htab),
+                    (_, Some(at)) => (&at.ktab, &at.vtab),
+                    _ => continue,
+                };
+                out.extend(dev.download(a).iter().map(|x| x.to_bits()));
+                out.extend(dev.download(b).iter().map(|x| x.to_bits()));
+            }
+        }
+        if let Some(at) = self.mtp.as_ref().and_then(|m| m.layer.attn.as_ref()) {
+            out.extend(self.dev.download(&at.ktab).iter().map(|x| x.to_bits()));
+            out.extend(self.dev.download(&at.vtab).iter().map(|x| x.to_bits()));
+        }
+        out
     }
 
     /// [`write_slot_tables`](Self::write_slot_tables) for stage `w`'s layers only.
@@ -1530,7 +1638,7 @@ impl Coder {
             p.slots[i] = Some((gdn, kvv));
         }
         self.slot_chain[i].clear();
-        self.write_slot_tables();
+        self.write_slot_entry(i);
         Ok(i)
     }
 
@@ -1541,7 +1649,7 @@ impl Coder {
             if let Some(p) = self.peer.as_deref_mut() {
                 p.slots[i] = None;
             }
-            self.write_slot_tables();
+            self.write_slot_entry(i);
         }
     }
 

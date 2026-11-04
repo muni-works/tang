@@ -153,3 +153,19 @@ Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
    --ctx 131072` on an H200 logs the clamp (slots ≈ (free − 4 GB) / slot size) and then 128
    concurrent requests run without an allocation failure; `--batch 64 --ctx 32768` is unchanged
    (no warning, 64 at once).
+
+3. **A fresh slot writes its own table entries.** `alloc_slot`/`free_slot` used to rebuild every
+   layer's `[u64; MAX_SLOTS]` stab/htab/ktab/vtab table (and MTP's) on the host, upload all of
+   them and sync. Now `write_slot_entry(i)` writes slot `i`'s two f32 words per table at `2 * i`
+   (`CudaComputeDevice::upload_into_f32_at`, ~2 small copies a layer), the same values the full
+   rewrite would (0 for a freed slot); the full `write_slot_tables` + sync runs once at load.
+   No sync on GPU 0: the uploads are on the engine's stream, which every reader runs on or forks
+   from by event (`ev_fork` for the side stream), and graphs read the tables by address at
+   launch. What relied on the sync: only the layer-split peer, whose kernels run on its `Ctx`
+   stream while its uploads go through its `CudaComputeDevice` stream. The old code synced only
+   GPU 0, so that was a latent race; the peer stage is now synced after its entries are written.
+   `TANG_SLOT_TABLE_CHECK=1` reads every table back after each per-entry write, does a full
+   rewrite, and asserts the words are identical. GPU checks: `TANG_SLOT_TABLE_CHECK=1
+   TANG_BATCH_N=64 tang-llm flash-batch-check $G` (no assert; then without the env:
+   `TANG_BATCH_N=64 tang-llm flash-batch-check $G` gives the same PASS line, tolerance numbers
+   unchanged from 2026-11-03), and `flash-batch-check` at `TANG_BATCH_N=8` stays bitwise.
