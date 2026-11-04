@@ -1116,6 +1116,15 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             sbk_load<TY>(wa + (sb + 1) * BB, tig, na_);
             sbk_load<TY>(wb + (sb + 1) * BB, tig, nb_);
         }
+        float dsa[8], msa[8], dsb[8], msb[8];
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            int s0, m0, s1, m1;
+            scale_min_w(s, ra.sc, s0, m0);
+            scale_min_w(s, rb2.sc, s1, m1);
+            dsa[s] = ra.d * i2f(s0); msa[s] = ra.dm * i2f(m0);
+            dsb[s] = rb2.d * i2f(s1); msb[s] = rb2.dm * i2f(m1);
+        }
         #pragma unroll
         for (int s = 0; s < 8; s++) {
             const int j = s >> 1, hi = s & 1;
@@ -1136,17 +1145,20 @@ __device__ __forceinline__ void moe_mma_rows(const unsigned char* wa, const unsi
             const unsigned b1 = *(const unsigned*)(xg + e + 16 + tig * 4);
             int d[4];
             mma_s8_16832(d, a, b0, b1);
-            // Token g's code sum over the block (the quad holds it), then columns 2 tig, 2 tig + 1's.
-            int sq = __dp4a((int)b0, 0x01010101, __dp4a((int)b1, 0x01010101, 0));
-            sq += __shfl_xor_sync(0xffffffffu, sq, 1);
-            sq += __shfl_xor_sync(0xffffffffu, sq, 2);
-            const int sqa = __shfl_sync(0xffffffffu, sq, (2 * tig) * 4);
-            const int sqb = __shfl_sync(0xffffffffu, sq, (2 * tig + 1) * 4);
-            int s0, m0, s1, m1;
-            scale_min_w(s, ra.sc, s0, m0);
-            scale_min_w(s, rb2.sc, s1, m1);
-            const float da = ra.d * i2f(s0), ma = ra.dm * i2f(m0);
-            const float db = rb2.d * i2f(s1), mb = rb2.dm * i2f(m1);
+            // Columns 2 tig, 2 tig + 1's code sums over the block: precomputed (asum), or token
+            // g's from the quad's B fragments, then shuffled to the columns.
+            int sqa, sqb;
+            if (asum) {
+                sqa = na < m ? asum[na * (K / 32) + e / 32] : 0;
+                sqb = nb < m ? asum[nb * (K / 32) + e / 32] : 0;
+            } else {
+                int sq = __dp4a((int)b0, 0x01010101, __dp4a((int)b1, 0x01010101, 0));
+                sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+                sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+                sqa = __shfl_sync(0xffffffffu, sq, (2 * tig) * 4);
+                sqb = __shfl_sync(0xffffffffu, sq, (2 * tig + 1) * 4);
+            }
+            const float da = dsa[s], ma = msa[s], db = dsb[s], mb = msb[s];
             const int blk = e / 32;
             if (na < m) {
                 const float dx = actd[na * (K / 32) + blk], sx = i2f(sqa);
@@ -1196,6 +1208,16 @@ __device__ __forceinline__ void moe_mma_body(ExW g, ExW u, ExW sg, ExW su, const
         const int p = pair_s[q];
         const int t = DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK);
         actd[i] = xdg[(size_t)t * (KA / 32) + c];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < m * (KA / 32); i += blockDim.x) {
+        const uint4 v0 = ((const uint4*)act)[2 * i], v1 = ((const uint4*)act)[2 * i + 1];
+        int sx = 0;
+        sx = __dp4a((int)v0.x, 0x01010101, sx); sx = __dp4a((int)v0.y, 0x01010101, sx);
+        sx = __dp4a((int)v0.z, 0x01010101, sx); sx = __dp4a((int)v0.w, 0x01010101, sx);
+        sx = __dp4a((int)v1.x, 0x01010101, sx); sx = __dp4a((int)v1.y, 0x01010101, sx);
+        sx = __dp4a((int)v1.z, 0x01010101, sx); sx = __dp4a((int)v1.w, 0x01010101, sx);
+        asum[i] = sx;
     }
     __syncthreads();
     const int r0 = (blockIdx.x * 8 + warp) * 16;
