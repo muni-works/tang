@@ -1828,6 +1828,7 @@ __device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const uns
 // permuted k32 tile, 144 (≡ 4) for the sbk tile's 4-byte reads. Same MMAs and accumulation
 // order as gemm_tile32 / gemm_tile_sbk, so the results are bitwise equal.
 #define XS_COLS 128
+#define GT_SCR (2 * 64 * (GT_KS / 32 + 1))
 __device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok) {
     const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
     const int n = ok ? 16 : 0;
@@ -1844,14 +1845,16 @@ __device__ __forceinline__ void xs_issue(unsigned char* xs, const unsigned char*
     }
     cp_commit();
 }
-__device__ __forceinline__ void gt_stage_scales(bool MIN, const unsigned char* const* xrow_s, const float* const* xd_s,
-                                                int ks, int nb, float (*sxd)[GT_KS / 32 + 1], int (*ssx)[GT_KS / 32 + 1]) {
+// The tokens' scale and (Q4_K / Q5_K mins) code sum per 32 columns, interleaved so a lane's
+// two tokens' four values are one 16-byte read: sds[b][t] = {dx, (float)sum}.
+typedef float2 SdsT[64];
+__device__ __forceinline__ void gt_stage_sds(bool MIN, const unsigned char* const* xrow_s, const float* const* xd_s,
+                                             int ks, int nb, SdsT* sds) {
     for (int i = threadIdx.x; i < 64 * nb; i += blockDim.x) {
-        const int t = i / nb, b = i - t * nb;
+        const int b = i >> 6, t = i & 63;
         const float* xd = xd_s[t];
-        sxd[t][b] = xd ? xd[ks / 32 + b] : 0.f;
+        int sm = 0;
         if (MIN) {
-            int sm = 0;
             const unsigned char* r = xrow_s[t];
             if (r) {
                 const uint4* q = (const uint4*)(r + ks + b * 32);
@@ -1861,26 +1864,33 @@ __device__ __forceinline__ void gt_stage_scales(bool MIN, const unsigned char* c
                 sm = __dp4a((int)u1.x, 0x01010101, sm); sm = __dp4a((int)u1.y, 0x01010101, sm);
                 sm = __dp4a((int)u1.z, 0x01010101, sm); sm = __dp4a((int)u1.w, 0x01010101, sm);
             }
-            ssx[t][b] = sm;
         }
+        sds[b][t] = make_float2(xd ? xd[ks / 32 + b] : 0.f, i2f(sm));
     }
 }
 template <int TY>
 __device__ __forceinline__ void gemm_tile32s(const unsigned char* wa, const unsigned char* wb, bool live,
                                              const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
-                                             float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
-                                             int (*ssx)[GT_KS / 32 + 1], unsigned char* xs) {
+                                             float acc[8][4], int K, SdsT* sds, unsigned char* xs) {
     constexpr bool MIN = TY == 12 || TY == 13;
     constexpr int STR = 160;
     const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
     const int nq = K / XS_COLS;
+    // The weights' next 32 columns decoded a step ahead (their loads in flight during this
+    // step's MMAs).
+    int nw0a = 0, nw1a = 0, nw0b = 0, nw1b = 0;
+    float ndwa = 0.f, nmwa = 0.f, ndwb = 0.f, nmwb = 0.f;
+    if (live) {
+        gt_dec<TY>(wa, K, 8 * tig, nw0a, nw1a, ndwa, nmwa);
+        gt_dec<TY>(wb, K, 8 * tig, nw0b, nw1b, ndwb, nmwb);
+    }
     xs_issue<STR>(xs, xrow_s, 0);
     for (int q = 0; q < nq; q++) {
         const int kb = q * XS_COLS;
         const int ks = kb - kb % GT_KS;
         if (kb == ks) {
             __syncthreads();
-            gt_stage_scales(MIN, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sxd, ssx);
+            gt_stage_sds(MIN, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sds);
         }
         unsigned char* cur = xs + (q & 1) * 64 * STR;
         if (q + 1 < nq) { xs_issue<STR>(xs + ((q + 1) & 1) * 64 * STR, xrow_s, kb + XS_COLS); cp_wait1(); }
@@ -1890,16 +1900,13 @@ __device__ __forceinline__ void gemm_tile32s(const unsigned char* wa, const unsi
             #pragma unroll
             for (int kk = 0; kk < XS_COLS; kk += 32) {
                 const int k0 = kb + kk;
-                unsigned a[4];
-                int w0, w1;
-                float dwa, mwa, dwb, mwb;
-                const int e0 = k0 + 8 * tig;
-                gt_dec<TY>(wa, K, e0, w0, w1, dwa, mwa);
-                a[0] = (unsigned)w0;
-                a[2] = (unsigned)w1;
-                gt_dec<TY>(wb, K, e0, w0, w1, dwb, mwb);
-                a[1] = (unsigned)w0;
-                a[3] = (unsigned)w1;
+                unsigned a[4] = {(unsigned)nw0a, (unsigned)nw0b, (unsigned)nw1a, (unsigned)nw1b};
+                const float dwa = ndwa, mwa = nmwa, dwb = ndwb, mwb = nmwb;
+                if (k0 + 32 < K) {
+                    const int e1 = k0 + 32 + 8 * tig;
+                    gt_dec<TY>(wa, K, e1, nw0a, nw1a, ndwa, nmwa);
+                    gt_dec<TY>(wb, K, e1, nw0b, nw1b, ndwb, nmwb);
+                }
                 const int bi = (k0 - ks) >> 5;
                 #pragma unroll
                 for (int c = 0; c < 8; c++) {
@@ -1907,12 +1914,12 @@ __device__ __forceinline__ void gemm_tile32s(const unsigned char* wa, const unsi
                     const uint2 xv = *(const uint2*)(cur + (c * 8 + g) * STR + kk + 8 * tig);
                     int d[4];
                     mma_s8_16832(d, a, xv.x, xv.y);
+                    const float4 q4 = *(const float4*)&sds[bi][c * 8 + 2 * tig];
                     #pragma unroll
                     for (int j = 0; j < 2; j++) {
-                        const int t = c * 8 + 2 * tig + j;
-                        const float dx = sxd[t][bi];
+                        const float dx = j ? q4.z : q4.x;
                         if (MIN) {
-                            const float sx = i2f(ssx[t][bi]);
+                            const float sx = j ? q4.w : q4.y;
                             acc[c][j] = fmaf(dx, fmaf(dwa, i2f(d[j]), -mwa * sx), acc[c][j]);
                             acc[c][2 + j] = fmaf(dx, fmaf(dwb, i2f(d[2 + j]), -mwb * sx), acc[c][2 + j]);
                         } else {
@@ -1928,7 +1935,7 @@ __device__ __forceinline__ void gemm_tile32s(const unsigned char* wa, const unsi
 }
 template <int TY, int HALF, int STR>
 __device__ __forceinline__ void sbks_half(const SbK& ra, const SbK& rb, const unsigned char* cur, int kb, int ks, int nch,
-                                          float acc[8][4], float (*sxd)[GT_KS / 32 + 1], int (*ssx)[GT_KS / 32 + 1]) {
+                                          float acc[8][4], const SdsT* sds) {
     const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
             #pragma unroll
             for (int s4 = 0; s4 < 4; s4++) {
@@ -1960,10 +1967,10 @@ __device__ __forceinline__ void sbks_half(const SbK& ra, const SbK& rb, const un
                     const unsigned b1 = *(const unsigned*)(xr + 16 + 4 * tig);
                     int d[4];
                     mma_s8_16832(d, a, b0, b1);
+                    const float4 q4 = *(const float4*)&sds[bi][c * 8 + 2 * tig];
                     #pragma unroll
                     for (int jj = 0; jj < 2; jj++) {
-                        const int t = c * 8 + 2 * tig + jj;
-                        const float dx = sxd[t][bi], sx = i2f(ssx[t][bi]);
+                        const float dx = jj ? q4.z : q4.x, sx = jj ? q4.w : q4.y;
                         acc[c][jj] = fmaf(dx, fmaf(da, i2f(d[jj]), -ma * sx), acc[c][jj]);
                         acc[c][2 + jj] = fmaf(dx, fmaf(db, i2f(d[2 + jj]), -mb * sx), acc[c][2 + jj]);
                     }
@@ -1973,8 +1980,7 @@ __device__ __forceinline__ void sbks_half(const SbK& ra, const SbK& rb, const un
 template <int TY>
 __device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const unsigned char* wb, bool live,
                                                const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
-                                               float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
-                                               int (*ssx)[GT_KS / 32 + 1], unsigned char* xs) {
+                                               float acc[8][4], int K, SdsT* sds, unsigned char* xs) {
     constexpr int BB = TY == 12 ? 144 : 176;
     constexpr int STR = 144;
     const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
@@ -1987,7 +1993,7 @@ __device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const un
         const int ks = kb - kb % GT_KS;
         if (kb == ks) {
             __syncthreads();
-            gt_stage_scales(true, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sxd, ssx);
+            gt_stage_sds(true, xrow_s, xd_s, ks, min(GT_KS, K - ks) / 32, sds);
         }
         unsigned char* cur = xs + (q & 1) * 64 * STR;
         if (q + 1 < nq) { xs_issue<STR>(xs + ((q + 1) & 1) * 64 * STR, xrow_s, kb + XS_COLS); cp_wait1(); }
@@ -1999,8 +2005,8 @@ __device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const un
                 sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
                 sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
             }
-            if (half) sbks_half<TY, 1, STR>(ra, rb, cur, kb, ks, nch, acc, sxd, ssx);
-            else sbks_half<TY, 0, STR>(ra, rb, cur, kb, ks, nch, acc, sxd, ssx);
+            if (half) sbks_half<TY, 1, STR>(ra, rb, cur, kb, ks, nch, acc, sds);
+            else sbks_half<TY, 0, STR>(ra, rb, cur, kb, ks, nch, acc, sds);
             if (half && (sb + 1) * 256 < K) { ra = pa; rb = pb; }
         }
         __syncthreads();
@@ -2012,7 +2018,7 @@ __device__ __forceinline__ void gemm_tile_sbks(const unsigned char* wa, const un
 // `k16`: the old per-16 tile for every type (no syncs), for blocks whose warps differ in type.
 __device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, const unsigned char* wb, bool live,
                                               const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
-                                              float acc[8][4], int K, bool k16 = false, unsigned char* xs = nullptr) {
+                                              float acc[8][4], int K, float* scr, bool k16 = false, unsigned char* xs = nullptr) {
     if (k16 || ty == 11 || ty == 14) {
         if (!live) return;
         const int g = (threadIdx.x & 31) >> 2;
@@ -2036,19 +2042,22 @@ __device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, c
         return;
     }
     // One staging area for every instance (statics in the templates would each take their own).
-    __shared__ float sxd[64][GT_KS / 32 + 1];
-    __shared__ int ssx[64][GT_KS / 32 + 1];
+    // `scr` (the caller's, GT_SCR floats of shared memory): the old tiles' sxd / ssx, or the
+    // staged tiles' interleaved sds.
+    float (*sxd)[GT_KS / 32 + 1] = (float (*)[GT_KS / 32 + 1])scr;
+    int (*ssx)[GT_KS / 32 + 1] = (int (*)[GT_KS / 32 + 1])(scr + 64 * (GT_KS / 32 + 1));
     if (xs && K % XS_COLS == 0) {
+        SdsT* sds = (SdsT*)scr;
         switch (ty) {
-            case 12: gemm_tile_sbks<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 13: gemm_tile_sbks<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 8: gemm_tile32s<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 108: gemm_tile32s<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 2: gemm_tile32s<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 20: gemm_tile32s<20>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 6: gemm_tile32s<6>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 23: gemm_tile32s<23>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
-            case 42: gemm_tile32s<42>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx, xs); return;
+            case 12: gemm_tile_sbks<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 13: gemm_tile_sbks<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 8: gemm_tile32s<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 108: gemm_tile32s<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 2: gemm_tile32s<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 20: gemm_tile32s<20>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 6: gemm_tile32s<6>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 23: gemm_tile32s<23>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
+            case 42: gemm_tile32s<42>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sds, xs); return;
             default: break;
         }
     }
@@ -2111,11 +2120,10 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, E
     __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
     // The common types called directly (through gemm_tile_any's switch the compiler outlines
     // the tile into a CALL, with acc and the operand registers through local memory).
-    __shared__ float sxd[64][GT_KS / 32 + 1];
-    __shared__ int ssx[64][GT_KS / 32 + 1];
-    if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, sxd, ssx, xs);
-    else if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, sxd, ssx, xs);
-    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, false, xs);
+    __shared__ __align__(16) float scr[GT_SCR];
+    if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, (SdsT*)scr, xs);
+    else if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, (SdsT*)scr, xs);
+    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_HID, scr, false, xs);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
@@ -2163,12 +2171,11 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     float acc[8][4];
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
-    __shared__ float sxd[64][GT_KS / 32 + 1];
-    __shared__ int ssx[64][GT_KS / 32 + 1];
+    __shared__ __align__(16) float scr[GT_SCR];
     __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
-    if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx, xs);
-    else if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, sxd, ssx, xs);
-    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF);
+    if (mty == 13) gemm_tile_sbks<13>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, (SdsT*)scr, xs);
+    else if (mty == 12) gemm_tile_sbks<12>(wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, (SdsT*)scr, xs);
+    else gemm_tile_any(mty, wa, wb, true, xrow_s, xd_s, nch, acc, CX_FF, scr);
     #pragma unroll
     for (int c = 0; c < 8; c++) {
         if (c >= nch) break;
@@ -2214,7 +2221,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_gemm_dense(const Seg* segs,
     #pragma unroll
     for (int c = 0; c < 8; c++) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
     __shared__ __align__(16) unsigned char xs[2 * 64 * 160];
-    gemm_tile_any(sg.type, wa, wb, live, xrow_s, xd_s, nch, acc, k, k16, xs);
+    __shared__ __align__(16) float scr[GT_SCR];
+    gemm_tile_any(sg.type, wa, wb, live, xrow_s, xd_s, nch, acc, k, scr, k16, xs);
     if (!live) return;
     #pragma unroll
     for (int c = 0; c < 8; c++) {
