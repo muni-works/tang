@@ -701,7 +701,8 @@ impl FlashServe {
                 &s.gguf,
                 super::coder::CoderOpts {
                     max_ctx: s.ctx,
-                    ..Default::default()
+                    // `--mtp` (the qwen3next path used to drop it: no MTP head, suffix drafts).
+                    mtp: s.mtp.clone(),
                 },
             )?;
             eprintln!("{}", c.load_report);

@@ -336,6 +336,69 @@ Found in `serve --batch 128 --ctx 131072` (`artifacts/gates-1104/serve-b128.log`
   Throughput cost: a step of N streams becomes ⌈N/8⌉ narrow windows instead of one batch
   window; measured below.
 
+## Spec decode under batching (2026-11-04, coder-serve2)
+
+Before: `serve --batch N --mtp` capped every window at `MAX_T` = 8 rows (no batch module was
+built with MTP) and shared the spare rows round-robin, so past 8 streams nothing drafted and
+past 8 every stream waited for ⌈N/8⌉ narrow windows.
+
+**Engine** (Rust control flow; no kernel changes):
+
+- `verify_batch` runs past 8 rows in the batch module: its staging, scratch and kernels, keep
+  counts in its row record, and the per-segment commit replayed there. Eager by default (row and
+  segment counts change every step; `TANG_SERVE_SPEC_GRAPHS=1` captures graphs, which measured
+  no faster). The batch module's one shared `proj` holds only the last layer's projections
+  when the commit replays every GDN layer, so verify windows write per-layer projection buffers
+  instead (`batch_gproj`, rows × `w_in.rows` per GDN layer, allocated on first use). Without
+  that the first runs accepted 23 % of drafts and diverged at token ~3.
+- `mtp_groups_wide`: MTP passes over any number of rows, read from the window's own hidden
+  rows (batch or wide scratch `x`), 8 rows a pass (the MTP kernels' width), long groups in
+  pieces with only the last chained. Batch-module decode and verify windows fill every slot's
+  MTP K/V and draft its chain; wide prefill windows fill the MTP K/V of their positions too
+  (before, a wide-prefilled prompt's MTP K/V was stale; `TANG_SERVE_WIDE_MTP=0` turns it off).
+- `Coder::slot_mtp`: skip the MTP pass after slot windows (and clear those chains).
+
+**Scheduler** (`crate::batch::spec`, pure and tested on a simulated engine):
+
+- D-Cut (arXiv 2607.14647): a stream's chain position `k` scores `∏_{j≤k} p_j` (head
+  probabilities); every position in the window is ranked, the best `budget` verified in the rows
+  the streams leave (`width − streams`; width = the batch module's rows), each stream's pick a
+  prefix. Sampled streams draft nothing.
+- Budget, TableTune-style (arXiv 2610.38968): step ms per (streams, draft rows, MTP on), EMA
+  cells measured as the server runs, a decayed least-squares fit `a + b·rows + c·mtp_rows` for
+  unseen cells, a prior before any; `α` = accepted / predicted (EMA). It picks the budget that
+  maximises `(streams + α·Σ top scores) / ms` among `⌈ρ·streams·k⌉`, ρ ∈ {¼, ½, ¾, 1}, against
+  **plain** decoding (no MTP pass at all = today's path). While plain wins it runs the head one
+  step in 64 (and verifies one draft a stream then) to keep `α` and the scores fresh.
+- `TANG_SERVE_SPEC=off|auto|<rows>` (default auto with `--mtp`), `TANG_SERVE_BATCH_ROWS` (batch
+  module rows, default `--batch` rounded up to 32), `TANG_SERVE_SPEC_LOG=1` (a line per window;
+  a `tang-llm: spec:` summary prints every 30 s regardless).
+
+**Gate** (`tang-llm flash-spec-batch-check $G --mtp mtp.gguf --ids-file explain.ids -n 128`,
+H200, trained head `seg-3200b/step-003200`, `TANG_CODER_MTP_K=2`; N sequences of the same prompt
+cut to different lengths, each `-n` tokens; budget 0 = `decode_batch`, one row a sequence,
+MTP on; logs in `artifacts/spec/`):
+
+| N (module rows) | budget 0 | best fixed budget | auto | identical to budget 0 |
+|---|---|---|---|---|
+| 2 (narrow, ≤ 8 rows) | 345 tok/s | 6: 484 (1.40×), 63 % accepted | – | 2/2 (bitwise class) |
+| 8 (32) | 697 | 32: 736 (1.06×), 68 % | 732 (1.05×) | 2/8, 54 % of tokens (budget 0 narrow, spec in the batch module: different class) |
+| 16 (32) | 796 | 32: 952 (1.20×), 88 % | 936 (1.18×) | **16/16** |
+| 32 (64) | 1,031 | 32: 1,181 (1.15×), 88 % | 1,256 (1.22×, plain) | **32/32** |
+| 64 (128) | 1,273 | 64: 1,176 (0.92×), 91 % | 1,623 (1.28×, plain) | 16/64, 56 % (> 64-row windows leave the ≤ 64-row Q8X MMA class) |
+
+Within a width class spec decode is lossless: every budget gives budget 0's tokens exactly
+(N = 2 narrow, N = 16 and 32 in the batch module). Across classes (8-row narrow vs batch module,
+≤ 64 vs > 64 rows) tokens drift at the tolerance path's usual rate.
+
+**Where the gain goes.** Acceptance is high (88–99 % at k = 2) but the MTP passes are 8 rows
+each, with a sync: at 32 streams a step runs ~8 of them, ~20 % of the step (budget 0 with MTP
+on 1,031 tok/s vs plain 1,256). Drafting pays at ≤ 16–32 streams (1.15–1.4×) and loses at 64;
+auto lands on the better of the two at each N (it picks plain at 32 and 64 here, because a
+plain step costs less than a spec step's extra tokens buy). The next lever is the MTP module
+built for the batch module's width (one pass per step instead of ⌈rows/8⌉ × k), which is kernel
+work; `TANG_CODER_MTP_K=3` didn't help at the room these N leave.
+
 ## Known issues (2026-11-04)
 
 - **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
