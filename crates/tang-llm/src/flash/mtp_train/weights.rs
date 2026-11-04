@@ -256,8 +256,10 @@ impl Weights {
         ensure!(!out.exists(), "refusing to overwrite {}", out.display());
         let temp = out.with_extension(format!("partial-{}", std::process::id()));
         ensure!(!temp.exists(), "partial checkpoint already exists");
-        std::fs::copy(self.mtp.shard_paths()[0], &temp)?;
+        let src = self.mtp.shard_paths()[0];
+        ensure_free(out, std::fs::metadata(src)?.len())?;
         let result = (|| -> Result<()> {
+            std::fs::copy(src, &temp)?;
             let mut f = std::fs::OpenOptions::new().write(true).open(&temp)?;
             for (n, p) in &self.params {
                 let ti = self.mtp.info(&format!("{}{n}", self.prefix))?;
@@ -284,6 +286,31 @@ impl Weights {
         }
         result
     }
+}
+/// Fails unless the filesystem holding `out` has `need` bytes free plus a 256 MiB margin,
+/// so an export never starts a copy that ENOSPC will cut short.
+pub fn ensure_free(out: &Path, need: u64) -> Result<()> {
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0,
+        "statvfs {}",
+        dir.display()
+    );
+    let free = st.f_bavail as u64 * st.f_frsize as u64;
+    let want = need + (256 << 20);
+    ensure!(
+        free >= want,
+        "{} has {} MiB free, export needs {} MiB",
+        dir.display(),
+        free >> 20,
+        want >> 20
+    );
+    Ok(())
 }
 pub fn encode(ty: GgmlType, v: &[f32]) -> Result<Vec<u8>> {
     ensure!(v.iter().all(|v| v.is_finite()), "nonfinite export");
@@ -321,6 +348,12 @@ pub fn encode(ty: GgmlType, v: &[f32]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ensure_free_checks_space() {
+        let out = std::env::temp_dir().join("tang-ensure-free.gguf");
+        assert!(ensure_free(&out, 1).is_ok());
+        assert!(ensure_free(&out, u64::MAX / 2).is_err());
+    }
     #[test]
     fn q8_roundtrip() {
         let v: Vec<_> = (0..64).map(|i| (i as f32 - 31.0) / 13.0).collect();
