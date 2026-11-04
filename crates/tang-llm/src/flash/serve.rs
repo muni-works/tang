@@ -578,6 +578,9 @@ pub struct FlashServe {
     warm_dir: Option<PathBuf>,
     /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
     batch: usize,
+    /// `TANG_SERVE_DETERMINISTIC=1`: every window on the narrow (bitwise) path, at most
+    /// `MAX_T` rows, so a stream's greedy output doesn't depend on what it's batched with.
+    deterministic: bool,
     slots: Vec<batch::SlotInfo>,
     /// The batch prefill scheduler's account and knobs (see `batch_step`).
     sched: crate::batch::prefill::Sched,
@@ -790,6 +793,7 @@ impl FlashServe {
             dcalib: crate::draft::Calibration::default(),
             warm_dir: None,
             batch: 1,
+            deterministic: std::env::var("TANG_SERVE_DETERMINISTIC").is_ok_and(|v| v == "1"),
             slots: Vec::new(),
             sched: Default::default(),
             prefill_policy: None,
@@ -867,8 +871,14 @@ impl FlashServe {
                     ", no drafts"
                 }
             );
+            if me.deterministic {
+                eprintln!(
+                    "tang-llm: TANG_SERVE_DETERMINISTIC=1: windows of at most {MAX_T} rows \
+                     (bitwise; greedy output independent of the batch)"
+                );
+            }
             // Past MAX_T streams (no drafts): one batch window for every decoding stream.
-            if me.batch > MAX_T && !me.e.use_mtp() {
+            if me.batch > MAX_T && !me.e.use_mtp() && !me.deterministic {
                 let rows = me.batch.next_multiple_of(32);
                 let t = Instant::now();
                 match me.e.enable_batch_rows(rows) {

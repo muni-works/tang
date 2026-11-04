@@ -465,10 +465,11 @@ impl FlashServe {
             })
             .collect();
         let mtp = self.e.use_mtp();
+        // TANG_SERVE_DETERMINISTIC=1: the narrow module only (more windows a step).
         let width = if mtp {
             MAX_T
         } else {
-            MAX_T.max(self.e.batch_rows())
+            crate::batch::window_width(MAX_T, self.e.batch_rows(), self.deterministic)
         };
         for group in ready.chunks(width) {
             // Drafts for each stream, cut at an end of turn and the token limit, then the

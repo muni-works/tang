@@ -77,6 +77,17 @@ pub fn token_limit(prompt: usize, ctx: usize, max_tokens: Option<usize>) -> Resu
         .max(1))
 }
 
+/// Streams per decode window: the batch module's width when it's built, else `narrow`;
+/// `narrow_only` (`TANG_SERVE_DETERMINISTIC=1`) keeps every window at `narrow` rows, the
+/// bitwise path, running more windows a step instead.
+pub fn window_width(narrow: usize, batch_rows: usize, narrow_only: bool) -> usize {
+    if narrow_only {
+        narrow
+    } else {
+        narrow.max(batch_rows)
+    }
+}
+
 /// A decode step of `rows` sequences runs in the batch module (`Coder::enable_batch`, built
 /// for `batch_rows`, a multiple of 32) only past the narrow module's `narrow` rows; 1..=narrow
 /// rows always take the narrow module, batch module or not. The batch module's dense paths
@@ -205,6 +216,16 @@ mod tests {
         assert_eq!(super::token_limit(100, 4096, Some(0)), Ok(1));
         let e = super::token_limit(5000, 4096, None).unwrap_err();
         assert!(e.contains("5000") && e.contains("4096"), "{e}");
+    }
+
+    #[test]
+    fn deterministic_windows_stay_narrow() {
+        assert_eq!(super::window_width(8, 64, false), 64);
+        assert_eq!(super::window_width(8, 0, false), 8);
+        assert_eq!(super::window_width(8, 64, true), 8);
+        // 64 streams in 8-row windows: 8 windows a step, each on the narrow module.
+        let w = super::window_width(8, 64, true);
+        assert!((1..=64usize).step_by(w).all(|r| !super::batch_module(w.min(65 - r), 8, 64)));
     }
 
     #[test]
