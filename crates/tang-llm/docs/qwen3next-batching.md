@@ -188,3 +188,89 @@ Qwen3-Coder-Next first GGUF shard; build with `cargo build --release -p tang-llm
    bitwise; and `tang-llm serve $G --batch 64`, 64 concurrent requests with staggered
    `max_tokens` (16, 32, …, 1024) so the batch drains through 64 → 9 → 8 → 1 rows, with no fault
    and each finishing request's text equal to the same request run alone (greedy).
+
+## Scheduler for B = 64 (2026-11-04)
+
+### What the load test spent its GPU time on
+
+From `artifacts/gates-1104/serve-c9f064b5.log` (the per-request `batch req:` lines: prefill ms,
+TTFT, decode tokens / seconds / windows) and `lt-*.json`, H200, `serve --batch 64`, prompts
+200–6000 tokens (avg ~2,600 served), 256–1024 out:
+
+| | C = 8 (24 req, 98 s) | C = 64 cold (192 req, 649 s) |
+|---|---|---|
+| prompt tokens prefilled | 29.5 k | 501 k |
+| prefill GPU time (sum of chunks) | 24 s, **25 %** of wall | 372 s, **57 %** of wall |
+| prefill speed inside a chunk | 1,220 tok/s (0.81 ms/token) | 1,350 tok/s (0.72–0.91 ms/token) |
+| output tokens | 15.2 k → 155 tok/s | 123 k → 189 tok/s |
+| streams decoding, on average | 4.8 | **2.2** |
+| decode-window wall per stream token | 31 ms | 12 ms |
+| mean TTFT | 15 s | 109 s (p95 505 s, max 631 s) |
+
+So at C = 64 the GPU was busy (57 % prefill, the rest decode windows of ~2 rows) and decode
+rows were nearly empty: admissions came out of prefill at ~0.25 a second, each decoded its
+~640 tokens in ~8 s, so ~2 rows were ever decoding. The 64-row windows (44 ms for 64 tokens,
+`r-sample64.log`) never ran full.
+
+**The ceiling is prefill speed, not the policy.** Wide prefill runs at ~1,350 prompt tok/s.
+A request of ~3,100 prompt tokens and ~640 out costs 2.3 s of prefill and, at best (64-row
+windows), 0.44 s of decode, so no schedule beats ~640 / 2.74 ≈ **233 output tok/s** on this mix
+(280 if decode were free). The 1,000 tok/s aggregate target needs prefill ≥ ~6–7k tok/s
+(the wide windows' grouped-expert / GEMM path), and TTFT p95 ≤ 30 s for a cold burst of 64
+such prompts needs the same: prefilling all 64 takes 64 × 2.3 s = 147 s at 100 % of the GPU.
+
+### The policy (`crate::batch::prefill`, used by `flash/serve_batch.rs`)
+
+- **Order: shortest-first with aging and a deadline.** Key = remaining prompt tokens −
+  `TANG_SERVE_AGE_TOKENS` (400) × seconds waited; past `TANG_SERVE_PREFILL_DEADLINE_S` (20 s) a
+  prompt goes ahead of every younger one, oldest first. A cached agent turn still jumps a cold
+  prompt; a 6000-token prompt can't sit 500 s behind short ones.
+- **Prefill share depends on decode fill.** While prompts wait and fewer than
+  `TANG_SERVE_DECODE_FILL` (0.8) × batch rows decode, prefill gets `TANG_SERVE_PREFILL_FILL_SHARE`
+  (0.85) of GPU time; once rows are full, `TANG_SERVE_PREFILL_SHARE` (0.5, the old split). A
+  decode window of `dt` pays off `dt × share / (1 − share)` seconds of prefill.
+- **Chunk size scales with free GPU time.** Decode credit banks (up to one max chunk); a chunk
+  is as many tokens as the credit buys at the measured prefill rate (EMA), between
+  `TANG_SERVE_PREFILL_SLICE` (512 with wide windows, 64 without) and
+  `TANG_SERVE_PREFILL_MAX_CHUNK` (2048 / 256). With nothing decoding: `TANG_SERVE_PREFILL_BUDGET`
+  (2048 / 256). The server logs the policy in effect at its first step.
+- The old behaviour is `TANG_SERVE_PREFILL_SLICE=256 TANG_SERVE_PREFILL_MAX_CHUNK=256
+  TANG_SERVE_PREFILL_FILL_SHARE=0.5 TANG_SERVE_AGE_TOKENS=0 TANG_SERVE_PREFILL_DEADLINE_S=0`.
+
+### Expected effect (simulated)
+
+`batch::prefill::tests` runs the load closed-loop on a simulated engine with the logged costs
+(prefill 1/1350 s a token + 4 ms a chunk, a decode window 10 ms + 0.53 ms a row). The simulation
+reproduces the old run's shape (151 tok/s, p95 680 s at C = 64). Old → new:
+
+| | agg tok/s | TTFT p50 | TTFT p95 | per-stream tok/s | rows/window |
+|---|---|---|---|---|---|
+| C = 64, old | 151 | 39 s | 680 s | 40 | 3.6 |
+| C = 64, new | **246** | 46 s | **122 s** | 5 | 36 |
+| C = 8, old | 155 | 4.8 s | 41 s | 41 | 3.5 |
+| C = 8, new | **191** | **2.0 s** | **12 s** | 28 | 5.9 |
+
+The trade is per-stream speed: with prefill at 85 % of the GPU while rows are short, a running
+stream gets fewer windows a second (C = 64: 5 tok/s a stream while 60+ prompts queue; it rises
+as rows fill and the share drops to 0.5). `TANG_SERVE_PREFILL_FILL_SHARE` is the dial
+(`cargo test -p tang-llm --lib batch::prefill::tests::sweep -- --ignored --nocapture` prints the
+sweep: 0.6 gives C = 64 182 tok/s / p95 245 s / 30 tok/s a stream). Neither target (≥ 1,000 tok/s,
+p95 ≤ 30 s at C = 64) is reachable at 1,350 prefill tok/s; the next lever is wide prefill speed.
+
+### Verify
+
+On the pod (`/workspace/tang-serve`, model `/workspace/m/`, under `flock /workspace/gpu.lock`;
+the client is the untracked `artifacts/lt/load.py`, copied over first with
+`scp -P 16399 artifacts/lt/load.py root@152.236.142.239:/workspace/load.py`):
+
+```
+cargo build --release -p tang-llm --no-default-features --features cuda
+G=$(ls /workspace/m/*.gguf | head -1)
+target/release/tang-llm serve $G --batch 64 --ctx 32768 > serve-sched.log 2>&1 &
+# wait for "listening on", then, for each C:
+for C in 8 64; do python3 /workspace/load.py $C 8080 3 > lt-sched-$C.json; done
+grep "batch prefill policy" serve-sched.log
+```
+
+Compare `agg_tps`, `ttft_p50/p95`, `stream_tps_p50` against `artifacts/gates-1104/lt-8.json` and
+`lt-64cold.json`; rerun C = 64 with `TANG_SERVE_PREFILL_FILL_SHARE=0.6` to place the dial.

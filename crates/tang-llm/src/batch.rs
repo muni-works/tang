@@ -9,6 +9,9 @@
 
 use crate::queue::{Priority, Ticket};
 
+#[path = "batch_prefill.rs"]
+pub mod prefill;
+
 /// What the rules need to know about the engine's slots right now.
 #[derive(Debug, Clone, Copy)]
 pub struct Room {

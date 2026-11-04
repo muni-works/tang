@@ -579,8 +579,9 @@ pub struct FlashServe {
     /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
     batch: usize,
     slots: Vec<batch::SlotInfo>,
-    /// Prefill seconds not yet matched by decode time (see `batch_step`).
-    prefill_debt: f64,
+    /// The batch prefill scheduler's account and knobs (see `batch_step`).
+    sched: crate::batch::prefill::Sched,
+    prefill_policy: Option<crate::batch::prefill::Policy>,
     tok: FlashTokenizer,
     /// Keeps request text out of the special tokens (see [`Shield`]).
     shield: Shield,
@@ -788,7 +789,8 @@ impl FlashServe {
             warm_dir: None,
             batch: 1,
             slots: Vec::new(),
-            prefill_debt: 0.0,
+            sched: Default::default(),
+            prefill_policy: None,
             e,
             im_start: id("<|im_start|>")?,
             shield: Shield::new(&tok.tok),
