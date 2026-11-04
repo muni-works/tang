@@ -374,6 +374,9 @@ struct Dense {
     /// segments as a second matrix.
     mma: Option<(B, i32, usize)>,
     rest: Option<Box<Dense>>,
+    /// Only F32 / BF16 segments (the router and the shared expert's gate): batch windows run
+    /// `cx_router_b`.
+    float1: bool,
 }
 
 /// A routed-expert tensor (`[n_expert][rows][k]`, GGUF type) in VRAM, as the kernels take it.
@@ -468,6 +471,7 @@ struct Kern {
     /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
     mma_q8x: Fun,
     mma_q8x_red: Fun,
+    router_b: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -526,6 +530,7 @@ impl Kern {
             moe_down_m: f("cx_moe_down_m")?,
             mma_q8x: f("cx_mma_q8x")?,
             mma_q8x_red: f("cx_mma_q8x_red")?,
+            router_b: f("cx_router_b")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -627,6 +632,7 @@ impl Kern {
             moe_down_m: f(cm, "cx_moe_down_m")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
             mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
+            router_b: f(cm, "cx_router_b")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -2635,6 +2641,49 @@ impl Coder {
         // Wide windows: the same GEMV over MAX_T rows at a time, each chunk's int8 made here
         // (fe_q8's rule, the one norm_q8 applies), so every row's sum is the one a narrow window
         // gives it.
+        if t > MAX_T
+            && self.in_batch.get()
+            && self.var.dmma
+            && w.float1
+            && w.k.is_multiple_of(128)
+            && t <= 64
+            && (w.k / 128) * w.rows * t <= DMMA_PART
+        {
+            if let Some(wd) = v.wide {
+                let ns = w.nseg;
+                let (sp, ki, ti, part, rt, si, os) = (
+                    v.dev.buffer_addr(&w.segs),
+                    w.k as i32,
+                    t as i32,
+                    v.dev.buffer_addr(&wd.part),
+                    w.rows as i32,
+                    (w.k / 128) as i32,
+                    ostride as i32,
+                );
+                unsafe {
+                    gpu::launch(
+                        wd.k.router_b,
+                        (w.rows.div_ceil(16) as u32, (w.k / 128) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, x, ki, ti, part, rt],
+                    )
+                    .expect("cx_router_b");
+                    gpu::launch(
+                        wd.k.mma_q8x_red,
+                        (w.rows.div_ceil(128) as u32, t as u32, 1),
+                        (128, 1, 1),
+                        0,
+                        v.stream,
+                        tang_moe::args![sp, ns, part, si, rt, ti, out, os],
+                    )
+                    .expect("cx_mma_q8x_red");
+                }
+                self.mark(name);
+                return;
+            }
+        }
         if t > MAX_T && self.in_batch.get() && self.var.dmma && w.q8x_ok && t <= 64 {
             if let Some(wd) = v.wide {
                 self.gemm_q8x(wi, wd, w, x, xq, out, t, ostride);
@@ -5103,13 +5152,16 @@ fn upload_dense(
             q8x_ok: false,
             mma: None,
             rest: None,
+            float1: false,
         })
     });
+    let float1 = words.chunks(6).all(|w| w[2] == 0 || w[2] == 30);
     Ok(Dense {
         gemm_ok,
         q8x_ok,
         mma,
         rest,
+        float1,
         segs: dev.upload_u32(&words),
         nseg: parts.len() as i32,
         rows: off,
