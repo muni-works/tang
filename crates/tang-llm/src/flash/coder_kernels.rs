@@ -1521,16 +1521,19 @@ extern "C" __global__ void __launch_bounds__(256) cx_router_b(const Seg* segs, i
 // loaded as float4 (the next slab in registers while this one computes), each row's segment
 // found once a block. Every output is the same fmaf chain over k ascending as cx_sgemm_wide
 // (bitwise equal). Grid (rows / 64, T / 128), block 256.
-extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide2(const Seg* segs, int nseg, int rows_total,
+template <int NT>
+__device__ __forceinline__ void sgemm_wide2_body(const Seg* segs, int nseg, int rows_total,
                                                                  const float* x, int k, float* out, int ostride,
                                                                  int T) {
+    // NT threads: 64 rows x NT / 2 tokens a block.
+    constexpr int TB = NT / 2, RL = NT / 4;  // tokens a block; rows (tokens) a loader pass
     __shared__ const unsigned char* wrow[64];
     __shared__ int wty[64], wout[64];
     __shared__ __align__(16) float ws[16][64 + 4];
-    __shared__ __align__(16) float xs[16][128 + 4];
-    const int r0 = blockIdx.x * 64, t0 = blockIdx.y * 128, tid = threadIdx.x;
-    if (tid < 64) {
-        const int rr = r0 + tid;
+    __shared__ __align__(16) float xs[16][TB + 4];
+    const int r0 = blockIdx.x * 64, t0 = blockIdx.y * TB, tid = threadIdx.x;
+    for (int rI = tid; rI < 64; rI += NT) {
+        const int rr = r0 + rI;
         const unsigned char* w = nullptr;
         int ty = 0, o = 0;
         if (rr < rows_total) {
@@ -1541,44 +1544,58 @@ extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide2(const Seg* segs
             ty = sg.type;
             o = sg.out_off + q;
         }
-        wrow[tid] = w; wty[tid] = ty; wout[tid] = o;
+        wrow[rI] = w; wty[rI] = ty; wout[rI] = o;
     }
     __syncthreads();
-    const int lr = tid >> 2, lc = (tid & 3) * 4;  // loader: row / token lr (+64), k lc..lc+3
-    const unsigned char* wl = wrow[lr];
-    const bool wbf = wty[lr] != 0;
-    const int ta = t0 + lr, tb = t0 + lr + 64;
-    const float* xa = ta < T ? x + (size_t)ta * k : nullptr;
-    const float* xb = tb < T ? x + (size_t)tb * k : nullptr;
-    auto ldw = [&](int k0) -> float4 {
-        if (!wl) return make_float4(0.f, 0.f, 0.f, 0.f);
-        if (!wbf) return *(const float4*)((const float*)wl + k0 + lc);
-        const uint2 u = *(const uint2*)((const unsigned short*)wl + k0 + lc);
+    const int lr = tid >> 2, lc = (tid & 3) * 4;  // loader: rows / tokens lr + RL m, k lc..lc+3
+    constexpr int NW = 64 / RL;                    // weight float4s a thread (1 or 2)
+    const unsigned char* wl[NW];
+    bool wbf[NW];
+    #pragma unroll
+    for (int m = 0; m < NW; m++) { wl[m] = wrow[lr + RL * m]; wbf[m] = wty[lr + RL * m] != 0; }
+    const float* xl[2];
+    #pragma unroll
+    for (int m = 0; m < 2; m++) { const int tt = t0 + lr + RL * m; xl[m] = tt < T ? x + (size_t)tt * k : nullptr; }
+    auto ldw = [&](int m, int k0) -> float4 {
+        if (!wl[m]) return make_float4(0.f, 0.f, 0.f, 0.f);
+        if (!wbf[m]) return *(const float4*)((const float*)wl[m] + k0 + lc);
+        const uint2 u = *(const uint2*)((const unsigned short*)wl[m] + k0 + lc);
         return make_float4(bf2f((unsigned short)(u.x & 0xffff)), bf2f((unsigned short)(u.x >> 16)),
                            bf2f((unsigned short)(u.y & 0xffff)), bf2f((unsigned short)(u.y >> 16)));
     };
-    float4 pw = ldw(0);
-    float4 pa = xa ? *(const float4*)(xa + lc) : make_float4(0.f, 0.f, 0.f, 0.f);
-    float4 pb = xb ? *(const float4*)(xb + lc) : make_float4(0.f, 0.f, 0.f, 0.f);
-    const int tx = tid & 15, ty = tid >> 4;
+    float4 pw[NW], px[2];
+    #pragma unroll
+    for (int m = 0; m < NW; m++) pw[m] = ldw(m, 0);
+    #pragma unroll
+    for (int m = 0; m < 2; m++) px[m] = xl[m] ? *(const float4*)(xl[m] + lc) : make_float4(0.f, 0.f, 0.f, 0.f);
+    constexpr int NTX = TB / 8;  // token lanes: tokens 4 tx.. and TB / 2 + 4 tx..
+    const int tx = tid % NTX, ty = tid / NTX;
     float acc[4][8] = {};
     for (int k0 = 0; k0 < k; k0 += 16) {
         __syncthreads();
-        ws[lc][lr] = pw.x; ws[lc + 1][lr] = pw.y; ws[lc + 2][lr] = pw.z; ws[lc + 3][lr] = pw.w;
-        xs[lc][lr] = pa.x; xs[lc + 1][lr] = pa.y; xs[lc + 2][lr] = pa.z; xs[lc + 3][lr] = pa.w;
-        xs[lc][lr + 64] = pb.x; xs[lc + 1][lr + 64] = pb.y; xs[lc + 2][lr + 64] = pb.z; xs[lc + 3][lr + 64] = pb.w;
+        #pragma unroll
+        for (int m = 0; m < NW; m++) {
+            ws[lc][lr + RL * m] = pw[m].x; ws[lc + 1][lr + RL * m] = pw[m].y;
+            ws[lc + 2][lr + RL * m] = pw[m].z; ws[lc + 3][lr + RL * m] = pw[m].w;
+        }
+        #pragma unroll
+        for (int m = 0; m < 2; m++) {
+            xs[lc][lr + RL * m] = px[m].x; xs[lc + 1][lr + RL * m] = px[m].y;
+            xs[lc + 2][lr + RL * m] = px[m].z; xs[lc + 3][lr + RL * m] = px[m].w;
+        }
         __syncthreads();
         if (k0 + 16 < k) {
-            pw = ldw(k0 + 16);
-            if (xa) pa = *(const float4*)(xa + k0 + 16 + lc);
-            if (xb) pb = *(const float4*)(xb + k0 + 16 + lc);
+            #pragma unroll
+            for (int m = 0; m < NW; m++) pw[m] = ldw(m, k0 + 16);
+            #pragma unroll
+            for (int m = 0; m < 2; m++) if (xl[m]) px[m] = *(const float4*)(xl[m] + k0 + 16 + lc);
         }
         #pragma unroll
         for (int c = 0; c < 16; c++) {
             // Rows 4 ty.., tokens 4 tx.. and 64 + 4 tx..: one 16-byte read of w, two of x a column
             // (conflict-free).
             const float4 av = *(const float4*)&ws[c][4 * ty];
-            const float4 b0 = *(const float4*)&xs[c][4 * tx], b1 = *(const float4*)&xs[c][64 + 4 * tx];
+            const float4 b0 = *(const float4*)&xs[c][4 * tx], b1 = *(const float4*)&xs[c][TB / 2 + 4 * tx];
             const float a[4] = {av.x, av.y, av.z, av.w};
             const float b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
             #pragma unroll
@@ -1594,10 +1611,20 @@ extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide2(const Seg* segs
         const int o = wout[r];
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            const int tt = t0 + (j < 4 ? 4 * tx + j : 64 + 4 * tx + j - 4);
+            const int tt = t0 + (j < 4 ? 4 * tx + j : TB / 2 + 4 * tx + j - 4);
             if (tt < T) out[(size_t)tt * ostride + o] = acc[i][j];
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide2(const Seg* segs, int nseg, int rows_total,
+                                                                 const float* x, int k, float* out, int ostride, int T) {
+    sgemm_wide2_body<256>(segs, nseg, rows_total, x, k, out, ostride, T);
+}
+// 64 rows x 64 tokens a block (twice the blocks: a fuller last wave). Block 128.
+extern "C" __global__ void __launch_bounds__(128) cx_sgemm_wide2s(const Seg* segs, int nseg, int rows_total,
+                                                                  const float* x, int k, float* out, int ostride, int T) {
+    sgemm_wide2_body<128>(segs, nseg, rows_total, x, k, out, ostride, T);
 }
 
 extern "C" __global__ void __launch_bounds__(256) cx_sgemm_wide(const Seg* segs, int nseg, int rows_total,

@@ -522,6 +522,7 @@ struct Kern {
     sgemm_wide: Fun,
     /// cx_sgemm_wide re-tiled (bitwise equal; `TANG_CODER_SGEMM2=0` for the old one).
     sgemm_wide2: Fun,
+    sgemm_wide2s: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
@@ -592,6 +593,7 @@ impl Kern {
             router_b: f("cx_router_b")?,
             sgemm_wide: f("cx_sgemm_wide")?,
             sgemm_wide2: f("cx_sgemm_wide2")?,
+            sgemm_wide2s: f("cx_sgemm_wide2s")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
@@ -702,6 +704,7 @@ impl Kern {
             router_b: f(cm, "cx_router_b")?,
             sgemm_wide: f(cm, "cx_sgemm_wide")?,
             sgemm_wide2: f(cm, "cx_sgemm_wide2")?,
+            sgemm_wide2s: f(cm, "cx_sgemm_wide2s")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
@@ -3117,11 +3120,21 @@ impl Coder {
                     t as i32,
                 );
                 unsafe {
-                    let s2 = !env_is("TANG_CODER_SGEMM2", "0") && w.k.is_multiple_of(16);
+                    // TANG_CODER_SGEMM2: 0 the old tile, 2 the 64-token tile, else the 128-token one.
+                    let s2v = std::env::var("TANG_CODER_SGEMM2").unwrap_or_default();
+                    let s2 = s2v != "0" && w.k.is_multiple_of(16);
+                    let small = s2 && s2v == "2";
+                    let (f, tb, nt) = if !s2 {
+                        (wd.k.sgemm_wide, 64, 256)
+                    } else if small {
+                        (wd.k.sgemm_wide2s, 64, 128)
+                    } else {
+                        (wd.k.sgemm_wide2, 128, 256)
+                    };
                     gpu::launch(
-                        if s2 { wd.k.sgemm_wide2 } else { wd.k.sgemm_wide },
-                        (w.rows.div_ceil(64) as u32, t.div_ceil(if s2 { 128 } else { 64 }) as u32, 1),
-                        (256, 1, 1),
+                        f,
+                        (w.rows.div_ceil(64) as u32, t.div_ceil(tb) as u32, 1),
+                        (nt, 1, 1),
                         0,
                         v.stream,
                         tang_moe::args![sp, ns, rt, x, ki, out, os, ti],
