@@ -1205,6 +1205,12 @@ pub struct Coder {
     /// window is enqueued, `last_batch` when the latest window was one (for `logits`).
     batch: Option<Wide>,
     in_batch: std::cell::Cell<bool>,
+    /// Batch-module verify windows: each GDN layer's own projection rows (by the address of
+    /// the layer's narrow `proj`), since the module's one shared `proj` holds only the last
+    /// layer's by the time the commit replays every layer's kept rows. Allocated on the first
+    /// such window; `seg_proj` while one (and its commit) is enqueued.
+    batch_gproj: Vec<(u64, B)>,
+    seg_proj: std::cell::Cell<bool>,
     last_batch: bool,
     /// The Coder kernels' shapes (for building the wide module).
     shapes: Shapes,
@@ -1234,6 +1240,10 @@ pub struct Coder {
     pub mtp_alt: Option<(u32, f32)>,
     /// Each slot's latest MTP chain (batched decode; slot 0's is `mtp_last`).
     slot_chain: Vec<Vec<(u32, f32)>>,
+    /// Run the MTP head after slot windows (`decode_batch`, `verify_batch`), batch-module
+    /// ones included; off, those windows skip it and clear their slots' chains (the
+    /// serve scheduler turns it off while drafting doesn't pay). Default on.
+    pub slot_mtp: bool,
     /// How many sequence slots fit in VRAM (set at the first `alloc_slot`); 0: not yet known.
     slot_cap: usize,
     /// Per-segment commit graphs after a batched verify window, by segment count.
@@ -1514,6 +1524,8 @@ impl Coder {
             wide_pos0: std::cell::Cell::new(0),
             batch: None,
             in_batch: std::cell::Cell::new(false),
+            batch_gproj: Vec::new(),
+            seg_proj: std::cell::Cell::new(false),
             last_batch: false,
             shapes: sh.clone(),
             seed: 0,
@@ -1539,6 +1551,7 @@ impl Coder {
             mtp_last: Vec::new(),
             mtp_alt: None,
             slot_chain: vec![Vec::new(); MAX_SLOTS],
+            slot_mtp: true,
             slot_cap: 0,
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
@@ -2127,10 +2140,19 @@ impl Coder {
     /// and returns each sequence's kept tokens (accepted drafts' successors plus the first
     /// correction), as a lone `verify` of that sequence would. With an MTP layer, also drafts
     /// each slot's next chain (`slot_drafts`).
+    ///
+    /// Past `MAX_T` rows the window runs in the batch module (`enable_batch`; its kernels,
+    /// scratch and staging, eager unless `TANG_SERVE_SPEC_GRAPHS=1`: the row and segment
+    /// counts vary step to step), its commit too, and the MTP passes read its hidden rows.
     pub fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         let b = items.len();
         let t: usize = items.iter().map(|x| 1 + x.2.len()).sum();
-        ensure!(b >= 1 && t <= MAX_T, "{b} sequences, {t} rows");
+        let wide = crate::batch::batch_module(t, MAX_T, self.batch_rows());
+        ensure!(
+            b >= 1 && (t <= MAX_T || wide),
+            "{b} sequences, {t} rows (at most {})",
+            MAX_T.max(self.batch_rows())
+        );
         ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
         ensure!(
             items.iter().all(|x| x.2.is_empty() || !self.slot_samp[x.0].sampled()),
@@ -2168,7 +2190,83 @@ impl Coder {
         }
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
         let w0 = Instant::now();
-        self.stage_rows(&staged, &segs)?;
+        self.in_batch.set(wide);
+        let r = self.verify_staged(items, &staged, &segs, &pos0, end, t, w0);
+        self.in_batch.set(false);
+        let kept = r?;
+        for (i, (slot, _, _)) in items.iter().enumerate() {
+            let p = pos0[i] + kept[i].len();
+            self.slot_tokens_mut(*slot)?.truncate(p);
+        }
+        if self.mtp_on() && self.slot_mtp {
+            let groups: Vec<(usize, usize, usize, &[u32])> = items
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (x.0, pos0[i], segs[i][0] as usize, &kept[i][..]))
+                .collect();
+            let chains = match self.batch.as_ref().filter(|_| wide) {
+                Some(w) => {
+                    let src = self.dev.buffer_addr(&w.s.x);
+                    self.mtp_groups_wide(src, &groups, true)?
+                }
+                None => self.mtp_groups(&groups, true)?,
+            };
+            for (x, c) in items.iter().zip(chains) {
+                self.slot_chain[x.0] = c.0;
+            }
+        } else {
+            for x in items {
+                self.slot_chain[x.0].clear();
+            }
+        }
+        Ok(kept)
+    }
+
+    /// [`verify_batch`](Self::verify_batch)'s window and commit, with `in_batch` set for a
+    /// batch-module window: returns each sequence's kept tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_staged(
+        &mut self,
+        items: &[(usize, u32, Vec<u32>)],
+        staged: &[(usize, usize, u32)],
+        segs: &[[u32; 4]],
+        pos0: &[usize],
+        end: usize,
+        t: usize,
+        w0: Instant,
+    ) -> Result<Vec<Vec<u32>>> {
+        let b = items.len();
+        let wide = self.in_batch.get();
+        if wide && self.batch_gproj.is_empty() {
+            let rows = self.batch_rows();
+            let mut v = Vec::new();
+            for l in &self.layers {
+                if let Some(g) = &l.gdn {
+                    v.push((self.dev.buffer_addr(&g.proj), self.dev.alloc_f32(rows * l.w_in.rows)));
+                }
+            }
+            self.batch_gproj = v;
+        }
+        self.seg_proj.set(wide);
+        let r = self.verify_window(items, staged, segs, pos0, end, t, w0);
+        self.seg_proj.set(false);
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_window(
+        &mut self,
+        items: &[(usize, u32, Vec<u32>)],
+        staged: &[(usize, usize, u32)],
+        segs: &[[u32; 4]],
+        pos0: &[usize],
+        end: usize,
+        t: usize,
+        w0: Instant,
+    ) -> Result<Vec<Vec<u32>>> {
+        let b = items.len();
+        let wide = self.in_batch.get();
+        self.stage_rows(staged, segs)?;
         let rw: Vec<(usize, usize, usize)> = items
             .iter()
             .enumerate()
@@ -2181,37 +2279,34 @@ impl Coder {
             t,
             ..Default::default()
         };
-        let targets = self.run_staged(st, w0, t, true, nchunk, b, None)?;
+        let graphs = self.use_graphs;
+        if wide && !std::env::var("TANG_SERVE_SPEC_GRAPHS").is_ok_and(|v| v == "1") {
+            self.use_graphs = false;
+        }
+        let targets = self.run_staged(st, w0, t, true, nchunk, b, None);
+        self.use_graphs = graphs;
+        let targets = targets?;
         // Each segment keeps its accepted drafts' rows: stage the counts, commit them.
         let mut kept = Vec::with_capacity(b);
-        let rec = self.io.u32s(Io::rows(self.hp.n_embd, MAX_T), ROWS_U32);
+        let tw = self.tw();
+        let rec = self.iox().u32s(Io::rows(self.hp.n_embd, tw), ROWS_PER_T * tw);
         for (i, (_, _, drafts)) in items.iter().enumerate() {
             let r0 = segs[i][0] as usize;
             let mut n = 1;
             while n <= drafts.len() && drafts[n - 1] == targets[r0 + n - 1] {
                 n += 1;
             }
-            rec[2 * MAX_T + 4 * i + 3] = n as u32;
+            rec[2 * tw + 4 * i + 3] = n as u32;
             kept.push(targets[r0..r0 + n].to_vec());
         }
-        self.commit_batch(b)?;
+        if wide {
+            // Eager, like the window: graphs would be per segment count and module.
+            self.enqueue_commit_seg(b);
+        } else {
+            self.commit_batch(b)?;
+        }
         // The commit reads the staged row record when it runs: let it, before restaging.
         self.sync_all();
-        for (i, (slot, _, _)) in items.iter().enumerate() {
-            let p = pos0[i] + kept[i].len();
-            self.slot_tokens_mut(*slot)?.truncate(p);
-        }
-        if self.mtp_on() {
-            let groups: Vec<(usize, usize, usize, &[u32])> = items
-                .iter()
-                .enumerate()
-                .map(|(i, x)| (x.0, pos0[i], segs[i][0] as usize, &kept[i][..]))
-                .collect();
-            let chains = self.mtp_groups(&groups, true)?;
-            for (x, c) in items.iter().zip(chains) {
-                self.slot_chain[x.0] = c.0;
-            }
-        }
         Ok(kept)
     }
 
@@ -2304,11 +2399,13 @@ impl Coder {
     fn enqueue_commit_seg(&self, nseg: usize) {
         for w in 0..self.n_stages() {
             let st = self.stage_view(w);
+            // The active module's record (`tw` rows: the batch module's in a batch window).
+            let tw = self.tw();
             let (rows_addr, io_rows) = (
                 st.dev.buffer_addr(&st.s.rows),
-                self.io_dev_on(w, Io::rows(self.hp.n_embd, MAX_T)),
+                self.io_dev_on(w, Io::rows(self.hp.n_embd, tw)),
             );
-            self.kcopy_on(w, rows_addr, io_rows, ROWS_U32 * 4);
+            self.kcopy_on(w, rows_addr, io_rows, ROWS_PER_T * tw * 4);
             for layer in st.layers {
                 if let Some(g) = &layer.gdn {
                     self.gdn_step_seg(w, g, layer.w_in.rows, nseg, GDN_REPLAY);
@@ -2374,6 +2471,7 @@ impl Coder {
             return Ok(());
         }
         self.batch = None;
+        self.batch_gproj.clear();
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
             "{}#define CX_SRP {}\n#define CX_PSST {}\n#define CX_PSPLIT {}\n#define CX_PSPLIT_DOWN {}\n#define CX_GCHUNK {BATCH_GCHUNK}\n#define CX_SST_DOWN {}\n#define CX_SST {}\n#define CX_SNR_GU {}\n#define CX_SNR_DOWN {}\n{}{}{}",
@@ -2728,6 +2826,21 @@ impl Coder {
             self.prof_collect();
             self.in_wide.set(false);
             r?;
+            // The MTP layer's K/V for the window's positions, from its hidden rows (the wide
+            // scratch's `x`, normed by the last layer), so a slot's drafts later attend over
+            // its prompt (`TANG_SERVE_WIDE_MTP=0`: skip, the drafts then see stale K/V there).
+            if self.mtp.is_some()
+                && self.use_mtp
+                && self.peer.is_none()
+                && !std::env::var("TANG_SERVE_WIDE_MTP").is_ok_and(|v| v == "0")
+            {
+                let tm = Instant::now();
+                let mut next = body[at + 1..at + t].to_vec();
+                next.push(*body.get(at + t).unwrap_or(&ids[ids.len() - 1]));
+                let src = self.dev.buffer_addr(&self.wide.as_ref().expect("wide").s.x);
+                self.mtp_groups_wide(src, &[(slot, pos, 0, &next)], false)?;
+                self.last_mtp_ms = tm.elapsed().as_secs_f64() * 1e3;
+            }
             if std::env::var("TANG_WIDE_TIMES").is_ok_and(|v| v == "1") {
                 eprintln!(
                     "wide window at {pos}+{t}: {:.1} ms",
@@ -2783,16 +2896,28 @@ impl Coder {
             .and_then(|_| self.run_staged(st, w0, b, false, nchunk, b, None));
         self.in_batch.set(false);
         let out = out?;
-        if self.mtp_on() && !wide {
+        if self.mtp_on() && self.slot_mtp {
             let nexts: Vec<[u32; 1]> = out.iter().map(|&k| [k]).collect();
             let groups: Vec<(usize, usize, usize, &[u32])> = staged
                 .iter()
                 .enumerate()
                 .map(|(i, r)| (r.0, r.1, i, &nexts[i][..]))
                 .collect();
-            let chains = self.mtp_groups(&groups, true)?;
+            // A batch-module window's hidden rows are in its own scratch (`m.mh` holds
+            // `MAX_T`): the MTP passes read them from there, `MAX_T` rows at a time.
+            let chains = match self.batch.as_ref().filter(|_| wide) {
+                Some(w) => {
+                    let src = self.dev.buffer_addr(&w.s.x);
+                    self.mtp_groups_wide(src, &groups, true)?
+                }
+                None => self.mtp_groups(&groups, true)?,
+            };
             for (r, c) in staged.iter().zip(chains) {
                 self.slot_chain[r.0] = c.0;
+            }
+        } else {
+            for r in &staged {
+                self.slot_chain[r.0].clear();
             }
         }
         Ok(out)
@@ -3550,7 +3675,15 @@ impl Coder {
     fn proj_on(&self, w: usize, b: &B) -> u64 {
         let v = self.stage_view(w);
         match v.wide {
-            Some(wd) => v.dev.buffer_addr(&wd.proj),
+            Some(wd) => {
+                if w == 0 && self.seg_proj.get() && self.in_batch.get() {
+                    let a = v.dev.buffer_addr(b);
+                    if let Some((_, pb)) = self.batch_gproj.iter().find(|x| x.0 == a) {
+                        return v.dev.buffer_addr(pb);
+                    }
+                }
+                v.dev.buffer_addr(&wd.proj)
+            }
             None => v.dev.buffer_addr(b),
         }
     }
@@ -4852,6 +4985,61 @@ impl Coder {
         groups: &[(usize, usize, usize, &[u32])],
         chain: bool,
     ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
+        let total: usize = groups.iter().map(|g| g.3.len()).sum();
+        if total > MAX_T {
+            return Ok(vec![(Vec::new(), None); groups.len()]);
+        }
+        self.mtp_groups_in(None, groups, &vec![chain; groups.len()])
+    }
+
+    /// [`mtp_groups`](Self::mtp_groups) for any number of rows, the groups' final hidden rows
+    /// being rows `r0..` of `src` (a batch-module or wide window's `s.x`; `m.mh` holds only
+    /// `MAX_T` rows): passes of at most `MAX_T` rows, a group longer than that in pieces (in
+    /// order, only the last one chained). Fills the MTP K/V of every row; with `chain`, drafts
+    /// each group's chain. `src` must not be the narrow `s.x` (the chain steps write it).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn mtp_groups_wide(
+        &mut self,
+        src: u64,
+        groups: &[(usize, usize, usize, &[u32])],
+        chain: bool,
+    ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
+        let mut out = vec![(Vec::new(), None); groups.len()];
+        let mut pieces = Vec::new();
+        for (gi, g) in groups.iter().enumerate() {
+            let mut o = 0;
+            while o < g.3.len() {
+                let len = (g.3.len() - o).min(MAX_T);
+                pieces.push((gi, (g.0, g.1 + o, g.2 + o, &g.3[o..o + len]), o + len == g.3.len()));
+                o += len;
+            }
+        }
+        for (lo, hi) in crate::batch::spec::pack_rows(
+            &pieces.iter().map(|p| p.1 .3.len()).collect::<Vec<_>>(),
+            MAX_T,
+        ) {
+            let chunk = &pieces[lo..hi];
+            let gs: Vec<(usize, usize, usize, &[u32])> = chunk.iter().map(|p| p.1).collect();
+            let chained: Vec<bool> = chunk.iter().map(|p| chain && p.2).collect();
+            let res = self.mtp_groups_in(Some(src), &gs, &chained)?;
+            for (p, r) in chunk.iter().zip(res) {
+                if p.2 {
+                    out[p.0] = r;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One MTP pass over `groups` (at most `MAX_T` rows in all) whose hidden rows are rows
+    /// `r0..` of `src` (`None`: `m.mh`), then the chain steps for the groups `chained` marks.
+    #[allow(clippy::type_complexity)]
+    fn mtp_groups_in(
+        &mut self,
+        src: Option<u64>,
+        groups: &[(usize, usize, usize, &[u32])],
+        chained: &[bool],
+    ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
         let mut out = vec![(Vec::new(), None); groups.len()];
         let total: usize = groups.iter().map(|g| g.3.len()).sum();
         let end = groups.iter().map(|g| g.1 + g.3.len()).max().unwrap_or(0);
@@ -4860,7 +5048,7 @@ impl Coder {
         }
         let from: Vec<usize> = groups.iter().flat_map(|g| g.2..g.2 + g.3.len()).collect();
         let mh = self.a(&self.mtp.as_ref().unwrap().mh);
-        self.mtp_gather(mh, &from);
+        self.mtp_gather(src.unwrap_or(mh), &from);
         let rows: Vec<(usize, usize, u32)> = groups
             .iter()
             .flat_map(|g| g.3.iter().enumerate().map(move |(i, &k)| (g.0, g.1 + i, k)))
@@ -4889,16 +5077,21 @@ impl Coder {
                 }
             }
         }
-        if !chain {
-            return Ok(out);
-        }
-        let mut last = Vec::with_capacity(groups.len());
+        // The chained groups, and each one's last row in the pass.
+        let mut ch = Vec::new();
+        let mut last = Vec::new();
         let mut r = 0;
         for (gi, g) in groups.iter().enumerate() {
             r += g.3.len();
-            last.push(r - 1);
-            out[gi].0.push(first[r - 1]);
-            out[gi].1 = Some(self.mtp_read_alt(r - 1));
+            if chained[gi] {
+                ch.push(gi);
+                last.push(r - 1);
+                out[gi].0.push(first[r - 1]);
+                out[gi].1 = Some(self.mtp_read_alt(r - 1));
+            }
+        }
+        if ch.is_empty() {
+            return Ok(out);
         }
         for j in 1..self.mtp_steps {
             // With a split, the chained step's source hidden rows are GPU 1's `s.x`; bring
@@ -4925,14 +5118,16 @@ impl Coder {
                 self.dev.sync();
             }
             self.mtp_gather(self.a(&self.s.x), &last);
-            let rows: Vec<(usize, usize, u32)> = groups
+            let rows: Vec<(usize, usize, u32)> = ch
                 .iter()
-                .zip(&out)
-                .map(|(g, o)| (g.0, g.1 + g.3.len() + j - 1, o.0[j - 1].0))
+                .map(|&gi| {
+                    let g = &groups[gi];
+                    (g.0, g.1 + g.3.len() + j - 1, out[gi].0[j - 1].0)
+                })
                 .collect();
             let d = self.mtp_pass(&rows)?;
-            for (o, &x) in out.iter_mut().zip(&d) {
-                o.0.push(x);
+            for (&gi, &x) in ch.iter().zip(&d) {
+                out[gi].0.push(x);
             }
             if let (Some(keep), Some(dump)) = (&keep, self.train_dump.as_mut()) {
                 // Depth j + 1 of the chain from the group's last row.
@@ -4941,7 +5136,7 @@ impl Coder {
                     dump.draft(g.1 + g.3.len() - 1, j + 1, d[0])?;
                 }
             }
-            last = (0..groups.len()).collect();
+            last = (0..ch.len()).collect();
         }
         Ok(out)
     }

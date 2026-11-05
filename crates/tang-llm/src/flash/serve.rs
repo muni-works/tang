@@ -226,10 +226,12 @@ pub trait ServeEngine {
     fn verify_batch(&mut self, _items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         bail!("this engine has no sequence slots")
     }
-    /// A slot's latest MTP chain, for its next verify.
-    fn slot_drafts(&self, _slot: usize) -> Vec<u32> {
+    /// A slot's latest MTP chain (tokens and the head's probabilities), for its next verify.
+    fn slot_drafts(&self, _slot: usize) -> Vec<(u32, f32)> {
         Vec::new()
     }
+    /// Run the MTP head after slot windows (`Coder::slot_mtp`).
+    fn set_slot_mtp(&mut self, _on: bool) {}
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
@@ -420,11 +422,11 @@ impl ServeEngine for super::coder::Coder {
     fn verify_batch(&mut self, items: &[(usize, u32, Vec<u32>)]) -> Result<Vec<Vec<u32>>> {
         super::coder::Coder::verify_batch(self, items)
     }
-    fn slot_drafts(&self, slot: usize) -> Vec<u32> {
-        super::coder::Coder::slot_drafts(self, slot)
-            .iter()
-            .map(|x| x.0)
-            .collect()
+    fn slot_drafts(&self, slot: usize) -> Vec<(u32, f32)> {
+        super::coder::Coder::slot_drafts(self, slot).to_vec()
+    }
+    fn set_slot_mtp(&mut self, on: bool) {
+        self.slot_mtp = on;
     }
     fn use_mtp(&self) -> bool {
         self.use_mtp
@@ -578,6 +580,14 @@ pub struct FlashServe {
     warm_dir: Option<PathBuf>,
     /// See [`Settings::batch`] (1: off), and the engine's sequence slots, parked or running.
     batch: usize,
+    /// `TANG_SERVE_DETERMINISTIC=1`: every window on the narrow (bitwise) path, at most
+    /// `MAX_T` rows, so a stream's greedy output doesn't depend on what it's batched with.
+    deterministic: bool,
+    /// Speculative decoding under batching: the draft budget's table (`crate::batch::spec`).
+    spec: crate::batch::spec::Tuner,
+    /// Spec-decode counters since the last summary line (steps, extra rows, drafted,
+    /// accepted, tokens, ms) and when it was printed.
+    spec_log: ([f64; 6], Instant),
     slots: Vec<batch::SlotInfo>,
     /// The batch prefill scheduler's account and knobs (see `batch_step`).
     sched: crate::batch::prefill::Sched,
@@ -653,14 +663,16 @@ fn hash(ids: &[u32]) -> u64 {
 
 impl FlashServe {
     /// `want` streams at once, clamped to the slots that fit in VRAM at `--ctx` (one spare,
-    /// see [`crate::batch::clamp_batch`]); warns when it cuts.
-    fn clamp_batch(&mut self, want: usize) -> usize {
+    /// see [`crate::batch::clamp_batch`]) and to `ceiling` (what the windows were built for);
+    /// warns when it cuts, unless `quiet` (the provisional count before the windows exist).
+    fn clamp_batch(&mut self, want: usize, ceiling: usize, quiet: bool) -> usize {
         let cap = self.e.fit_slots();
-        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap);
-        if n < want {
+        let n = crate::batch::clamp_batch(want, self.e.max_slots(), cap).min(ceiling);
+        if n < want && !quiet {
             eprintln!(
                 "tang-llm: warning: --batch {want} clamped to {n}: {cap} sequence slots fit in \
-                 free VRAM at --ctx {} (TANG_SLOT_HEADROOM_GB sets the headroom)",
+                 free VRAM at --ctx {} after the batch and wide windows \
+                 (TANG_SLOT_HEADROOM_GB sets the headroom)",
                 self.ctx
             );
         }
@@ -689,7 +701,8 @@ impl FlashServe {
                 &s.gguf,
                 super::coder::CoderOpts {
                     max_ctx: s.ctx,
-                    ..Default::default()
+                    // `--mtp` (the qwen3next path used to drop it: no MTP head, suffix drafts).
+                    mtp: s.mtp.clone(),
                 },
             )?;
             eprintln!("{}", c.load_report);
@@ -788,6 +801,9 @@ impl FlashServe {
             dcalib: crate::draft::Calibration::default(),
             warm_dir: None,
             batch: 1,
+            deterministic: std::env::var("TANG_SERVE_DETERMINISTIC").is_ok_and(|v| v == "1"),
+            spec: crate::batch::spec::Tuner::new(crate::batch::spec::Mode::from_env()),
+            spec_log: ([0.0; 6], Instant::now()),
             slots: Vec::new(),
             sched: Default::default(),
             prefill_policy: None,
@@ -852,7 +868,9 @@ impl FlashServe {
                 me.e.max_slots() > 1,
                 "--batch needs an engine with sequence slots (qwen3next)"
             );
-            me.batch = me.clamp_batch(s.batch);
+            // Provisional (sizes the batch windows); the count that sticks is taken once the
+            // windows exist, from the request, so it clamps (and warns) once.
+            me.batch = me.clamp_batch(s.batch, usize::MAX, true);
             me.e.enable_row_sampling()?;
             eprintln!(
                 "tang-llm: continuous batching: up to {} requests at once (per-row sampling{})",
@@ -863,9 +881,33 @@ impl FlashServe {
                     ", no drafts"
                 }
             );
-            // Past MAX_T streams (no drafts): one batch window for every decoding stream.
-            if me.batch > MAX_T && !me.e.use_mtp() {
-                let rows = me.batch.next_multiple_of(32);
+            if me.deterministic {
+                eprintln!(
+                    "tang-llm: TANG_SERVE_DETERMINISTIC=1: windows of at most {MAX_T} rows \
+                     (bitwise; greedy output independent of the batch)"
+                );
+            }
+            if !me.e.use_mtp() {
+                me.spec.mode = crate::batch::spec::Mode::Off;
+            }
+            if me.e.use_mtp() {
+                eprintln!(
+                    "tang-llm: speculative decoding under batching: {:?} (TANG_SERVE_SPEC)",
+                    me.spec.mode
+                );
+            }
+            // Past MAX_T streams, or MTP drafts on top of the streams: batch windows, up to
+            // TANG_SERVE_BATCH_ROWS rows (default --batch rounded up to 32; the drafts get
+            // the rows the streams leave).
+            let spec_rows = me.spec.mode != crate::batch::spec::Mode::Off;
+            if (me.batch > MAX_T || spec_rows) && !me.deterministic {
+                let rows = std::env::var("TANG_SERVE_BATCH_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(me.batch)
+                    .max(me.batch)
+                    .next_multiple_of(32)
+                    .clamp(32, 256);
                 let t = Instant::now();
                 match me.e.enable_batch_rows(rows) {
                     Ok(()) => eprintln!(
@@ -890,8 +932,9 @@ impl FlashServe {
                     Err(e) => eprintln!("tang-llm: no wide prefill ({e})"),
                 }
             }
-            // The windows took memory: count again before any slot exists.
-            me.batch = me.clamp_batch(me.batch);
+            // The windows took memory: count again before any slot exists, from `--batch`
+            // (not the provisional count, whose own spare slot would be taken off twice).
+            me.batch = me.clamp_batch(s.batch, me.batch, false);
         } else if !me.e.use_mtp() {
             // One stream: wide prefill windows for long prompts too (TANG_SERVE_WIDE rows).
             let rows: usize = std::env::var("TANG_SERVE_WIDE")
@@ -1895,6 +1938,16 @@ impl Backend for FlashServe {
     }
 
     fn after(&mut self, _req: &Request, result: &Result<(Finish, Usage)>) {
+        // A batched request logged its own line when it retired (`batch req:`); `line` and
+        // the slot-0 snapshot below belong to the one-stream path (`line.snap_ms` only ever
+        // summed the batch's prefix-state saves, which is what the phantom `req N: prompt 0
+        // ... state saves 7000 ms` after every batched completion showed).
+        if self.batch > 1 {
+            if let Err(e) = result {
+                eprintln!("tang-llm: req {}: error: {e:#}", self.requests);
+            }
+            return;
+        }
         let l = &self.line;
         match result {
             Ok(_) => eprintln!(

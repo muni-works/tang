@@ -405,6 +405,7 @@ fn main() -> Result<()> {
         "flash-spec-test" => return tang_llm::flash::cli::spec_test(&args[1..]),
         "flash-tcheck" => return tang_llm::flash::cli::tcheck(&args[1..]),
         "flash-batch-check" => return tang_llm::flash::cli::batch_check(&args[1..]),
+        "flash-spec-batch-check" => return tang_llm::flash::cli::spec_batch_check(&args[1..]),
         "flash-sample-check" => return tang_llm::flash::cli::sample_check(&args[1..]),
         "flash-wide-check" => return tang_llm::flash::cli::wide_check(&args[1..]),
         "flash-state-kl" => return tang_llm::flash::cli::state_kl(&args[1..]),

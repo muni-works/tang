@@ -2433,6 +2433,172 @@ mod step_failures {
     }
 }
 
+#[cfg(test)]
+mod context_limits {
+    use super::{Backend, DynLane, Inflight, Out, Outcome, Request};
+    use crate::chat::Piece;
+    use crate::engine::{Finish, Usage};
+    use crate::telemetry::Trace;
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    const CTX: usize = 1000;
+
+    /// A batching engine like `flash serve --batch`: a request's prompt is its first message's
+    /// length in characters, admission goes through `batch::token_limit`, and every step
+    /// generates one token for each stream until its limit.
+    struct Window;
+    /// (prompt, generated, limit)
+    type S = (usize, usize, usize);
+    impl Backend for Window {
+        fn context_window(&self) -> usize {
+            CTX
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            _: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            unreachable!()
+        }
+        fn max_batch(&self) -> usize {
+            4
+        }
+        fn can_admit(&self, _: Option<&str>) -> bool {
+            true
+        }
+        fn admit(
+            &mut self,
+            req: &Request,
+            _: Option<(String, Vec<u32>)>,
+        ) -> anyhow::Result<Inflight> {
+            let prompt = req.messages[0]["content"].as_str().unwrap().len();
+            let limit = crate::batch::token_limit(prompt, CTX, req.max_tokens)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Box::new((prompt, 0usize, limit)))
+        }
+        fn step(&mut self, lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
+            for l in lanes {
+                let s = l.stream.downcast_mut::<S>().unwrap();
+                assert!(s.0 + s.1 < CTX, "a stream ran past the context");
+                s.1 += 1;
+                (l.on)(Piece::Text("x".into()));
+            }
+            Ok(())
+        }
+        fn retire(&mut self, s: Inflight) -> anyhow::Result<Outcome> {
+            let s = s.downcast::<S>().unwrap();
+            let usage = Usage {
+                prompt_tokens: s.0,
+                completion_tokens: s.1,
+                ..Default::default()
+            };
+            Ok(Outcome::Done(Finish::Length, usage))
+        }
+        fn stream_state(&self, s: &Inflight) -> (bool, bool) {
+            let s = s.downcast_ref::<S>().unwrap();
+            (s.1 >= s.2, false)
+        }
+    }
+
+    type W = super::Worker<Window, fn(&str) -> anyhow::Result<Window>>;
+
+    fn worker() -> W {
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        fn load(_: &str) -> anyhow::Result<Window> {
+            unreachable!()
+        }
+        super::Worker {
+            node,
+            engine: Some(("m".into(), Window)),
+            load,
+            batch: Vec::new(),
+        }
+    }
+
+    fn start(w: &mut W, id: u64, prompt: usize, max: usize) -> mpsc::UnboundedReceiver<Out> {
+        let body = json!({
+            "messages": [{"role": "user", "content": "p".repeat(prompt)}],
+            "max_tokens": max,
+        });
+        let req = Box::new(super::parse(&body).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ticket = crate::queue::Ticket {
+            id,
+            priority: crate::queue::Priority::Interactive,
+            prompt_tokens: None,
+            since: std::time::Instant::now(),
+            yields: 0,
+        };
+        w.complete(ticket, req, None, tx, "m".into(), None, None, Trace::none());
+        rx
+    }
+
+    /// Drain a reply: (pieces, finish and usage, or the error).
+    fn reply(rx: &mut mpsc::UnboundedReceiver<Out>) -> (usize, Option<Result<(Finish, Usage), String>>) {
+        let (mut n, mut end) = (0, None);
+        while let Ok(o) = rx.try_recv() {
+            match o {
+                Out::Piece(_) => n += 1,
+                Out::Done(f, u) => end = Some(Ok((f, u))),
+                Out::Error(e) => end = Some(Err(e)),
+            }
+        }
+        (n, end)
+    }
+
+    #[test]
+    fn a_prompt_past_the_context_is_refused_at_admission() {
+        let mut w = worker();
+        let mut rx = start(&mut w, 1, CTX + 5, 10);
+        assert!(w.batch.is_empty(), "it never joined the batch");
+        let (n, end) = reply(&mut rx);
+        assert_eq!(n, 0);
+        let e = end.unwrap().unwrap_err();
+        assert!(e.contains("context_length_exceeded") && e.contains("1005"), "{e}");
+    }
+
+    #[test]
+    fn a_stream_reaching_the_context_stops_with_length_and_others_go_on() {
+        let mut w = worker();
+        // 990 + max 50 > 1000: it gets 9 tokens. The other wants 30.
+        let mut long = start(&mut w, 1, 990, 50);
+        let mut other = start(&mut w, 2, 10, 30);
+        assert_eq!(w.batch.len(), 2);
+        for _ in 0..40 {
+            w.step_batch();
+        }
+        assert!(w.batch.is_empty());
+        let (n, end) = reply(&mut long);
+        let (f, u) = end.unwrap().unwrap();
+        assert_eq!((n, f, u.completion_tokens), (9, Finish::Length, 9));
+        assert_eq!(super::finish_reason(f), "length");
+        let (n, end) = reply(&mut other);
+        let (_, u) = end.unwrap().unwrap();
+        assert_eq!((n, u.completion_tokens), (30, 30));
+    }
+
+    #[tokio::test]
+    async fn an_admission_error_answers_400() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Out::Error(
+            crate::batch::token_limit(5000, CTX, None).unwrap_err(),
+        ))
+        .unwrap();
+        let r = super::collect_response("m".into(), "id".into(), 0, rx).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 /// A chat completion body as an engine request.
 pub fn parse(body: &Value) -> Result<Request, String> {
     let messages = body

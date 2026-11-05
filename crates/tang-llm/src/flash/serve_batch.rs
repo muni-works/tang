@@ -16,39 +16,20 @@
 //!   presence penalty (the engine's per-row sampler; greedy rows are the plain argmax). A
 //!   sampled stream takes no MTP drafts (verification is greedy). An engine without per-row
 //!   sampling refuses a sampled request instead of running it greedy.
-//! - No drafts in batched windows yet (per-slot verify is engine work still to come).
+//! - **Drafts under batching** (`crate::batch::spec`): every greedy stream's MTP chain, ranked
+//!   across the window by cumulative probability (D-Cut); the window verifies the best ones in
+//!   the rows the streams leave (batch module up to its width, else `MAX_T`), the budget picked
+//!   from a measured step-cost table, none at full load. `TANG_SERVE_SPEC=off|auto|<rows>`.
 
 use super::{FlashServe, Memo};
 use crate::batch::prefill::{prefill_plan, Policy, Waiting};
 use crate::chat::{Chunk, Detok, Parser, Piece};
 use crate::engine::{Finish, Outcome, Request, Usage};
 use crate::server::{DynLane, Inflight, StepFailure};
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
-
-/// Draft rows per stream in one window, for streams wanting `want[i]` drafts: one row each for
-/// its token, and the window's spare rows (`MAX_T` minus the streams) shared out round-robin, so
-/// a lone stream can draft its whole chain and a full window drafts nothing.
-fn share_drafts(want: &[usize]) -> Vec<usize> {
-    let mut give = vec![0; want.len()];
-    let mut spare = MAX_T.saturating_sub(want.len());
-    while spare > 0 {
-        let mut moved = false;
-        for (g, &w) in give.iter_mut().zip(want) {
-            if spare > 0 && *g < w {
-                *g += 1;
-                spare -= 1;
-                moved = true;
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    give
-}
 
 /// A parked or running sequence slot.
 pub(super) struct SlotInfo {
@@ -70,8 +51,9 @@ pub(super) struct Stream {
     reused: usize,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
-    /// MTP drafts for the next window (the engine's chain for this slot).
-    drafts: Vec<u32>,
+    /// MTP drafts for the next window (the engine's chain for this slot, with the head's
+    /// probabilities).
+    drafts: Vec<(u32, f32)>,
     /// Draft rows verified and accepted, and verify windows run.
     drafted: usize,
     accepted: usize,
@@ -89,6 +71,8 @@ pub(super) struct Stream {
     t0: Instant,
     first: Option<f64>,
     prefill_s: f64,
+    /// Of `prefill_s`, saving prefix states at its marks.
+    snap_s: f64,
     decode_from: Option<Instant>,
     prefill_only: bool,
     /// Sampled (temperature > 0): no drafts.
@@ -213,12 +197,10 @@ impl FlashServe {
         let t0 = Instant::now();
         let (ids, text, _spliced) = self.prompt(req)?;
         self.record_warm(req);
-        ensure!(
-            ids.len() + 1 < self.ctx,
-            "prompt is {} tokens; the context window is {}",
-            ids.len(),
-            self.ctx
-        );
+        // Refused here, before a slot is taken (a 400 for the client); a prompt that fits
+        // generates up to the window's end and stops there with `length`.
+        let limit = crate::batch::token_limit(ids.len(), self.ctx, req.max_tokens)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let (temperature, top_k, top_p, presence) = self.request_sampling(req);
         let samp = crate::flash::sampler::RowSampling {
             temperature,
@@ -237,11 +219,6 @@ impl FlashServe {
         }
         let mut marks = self.marks(&ids, &text);
         marks.retain(|&(p, _)| p > reused);
-        let limit = req
-            .max_tokens
-            .unwrap_or(usize::MAX)
-            .min(self.ctx - ids.len() - 1)
-            .max(1);
         let gen_at = text
             .rfind("<|im_start|>assistant\n")
             .map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());
@@ -272,6 +249,7 @@ impl FlashServe {
             t0,
             first: None,
             prefill_s: 0.0,
+            snap_s: 0.0,
             decode_from: None,
             prefill_only: req.prefill_only,
             sampled: samp.sampled(),
@@ -440,6 +418,7 @@ impl FlashServe {
                     .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
                 s.prefill_s += t.elapsed().as_secs_f64();
+                s.snap_s += t.elapsed().as_secs_f64();
             }
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -468,15 +447,13 @@ impl FlashServe {
             })
             .collect();
         let mtp = self.e.use_mtp();
-        let width = if mtp {
-            MAX_T
-        } else {
-            MAX_T.max(self.e.batch_rows())
-        };
+        // Streams per window: the batch module's width (spare rows go to drafts), or MAX_T
+        // (no batch module, or TANG_SERVE_DETERMINISTIC=1).
+        let width = crate::batch::window_width(MAX_T, self.e.batch_rows(), self.deterministic);
         for group in ready.chunks(width) {
-            // Drafts for each stream, cut at an end of turn and the token limit, then the
-            // window's spare rows shared out.
-            let want: Vec<Vec<u32>> = group
+            // Each stream's chain, cut at an end of turn and the token limit; sampled streams
+            // draft nothing (verification is greedy).
+            let chains: Vec<Vec<(u32, f32)>> = group
                 .iter()
                 .map(|&i| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
@@ -484,26 +461,46 @@ impl FlashServe {
                         return Vec::new();
                     }
                     let room = s.limit.saturating_sub(s.out.len() + 1);
-                    let mut d: Vec<u32> = s.drafts.iter().take(room).copied().collect();
-                    if let Some(k) = d.iter().position(|x| self.eos.contains(x)) {
+                    let mut d: Vec<(u32, f32)> = s.drafts.iter().take(room).copied().collect();
+                    if let Some(k) = d.iter().position(|x| self.eos.contains(&x.0)) {
                         d.truncate(k);
                     }
                     d
                 })
                 .collect();
-            let give = share_drafts(&want.iter().map(Vec::len).collect::<Vec<_>>());
+            // D-Cut over the window's spare rows, the budget from the measured table.
+            let conf: Vec<Vec<f32>> = chains
+                .iter()
+                .map(|c| c.iter().map(|x| x.1).collect())
+                .collect();
+            // A window of sampled streams only: no drafts, no MTP pass.
+            let greedy = group.iter().any(|&i| {
+                !lanes[i].stream.downcast_ref::<Stream>().unwrap().sampled
+            });
+            let choice = if greedy {
+                self.spec.choose(&conf, width.saturating_sub(group.len()))
+            } else {
+                crate::batch::spec::Choice {
+                    drafts: vec![0; group.len()],
+                    predicted: 0.0,
+                    raw: 0.0,
+                    mtp: false,
+                }
+            };
+            self.e.set_slot_mtp(mtp && choice.mtp);
             let items: Vec<(usize, u32, Vec<u32>)> = group
                 .iter()
-                .zip(want.iter().zip(&give))
-                .map(|(&i, (d, &g))| {
+                .zip(chains.iter().zip(&choice.drafts))
+                .map(|(&i, (c, &g))| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    (s.slot, s.pending.unwrap(), d[..g].to_vec())
+                    (s.slot, s.pending.unwrap(), c[..g].iter().map(|x| x.0).collect())
                 })
                 .collect();
+            let extra: usize = choice.drafts.iter().sum();
             let t = Instant::now();
             // A window's failure is its rows' (a slot past its context, say), unless it's a
             // device fault (`StepFailure::lanes` marks those fatal).
-            let kept = if mtp {
+            let kept = if extra > 0 {
                 self.e.verify_batch(&items)
             } else {
                 let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
@@ -512,9 +509,21 @@ impl FlashServe {
                     .map(|k| k.into_iter().map(|k| vec![k]).collect())
             }
             .map_err(|e| StepFailure::lanes(group.to_vec(), e))?;
+            let dt = t.elapsed().as_secs_f64();
             let share = policy.share_for(ready.len(), self.batch, prompts_waiting);
-            self.sched
-                .decoded(t.elapsed().as_secs_f64(), share, &policy);
+            self.sched.decoded(dt, share, &policy);
+            let accepted: usize = kept.iter().map(|k| k.len() - 1).sum();
+            if mtp {
+                self.spec.observe(
+                    group.len(),
+                    extra,
+                    choice.mtp,
+                    dt * 1e3,
+                    choice.raw,
+                    accepted,
+                );
+                self.spec_note(group.len(), extra, accepted, dt);
+            }
             for ((&i, toks), item) in group.iter().zip(&kept).zip(&items) {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
@@ -569,6 +578,40 @@ impl FlashServe {
         Ok(())
     }
 
+    /// Count one window for the spec-decode summary (`tang-llm: spec:` every 30 s while
+    /// windows run; every window with `TANG_SERVE_SPEC_LOG=1`).
+    fn spec_note(&mut self, live: usize, extra: usize, accepted: usize, dt: f64) {
+        let (c, at) = &mut self.spec_log;
+        for (k, v) in [1.0, extra as f64, extra as f64, accepted as f64, (live + accepted) as f64, dt * 1e3]
+            .into_iter()
+            .enumerate()
+        {
+            c[k] += v;
+        }
+        if std::env::var("TANG_SERVE_SPEC_LOG").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "tang-llm: spec window: {live} streams + {extra} drafts, {accepted} accepted, {:.1} ms, alpha {:.2}",
+                dt * 1e3,
+                self.spec.alpha
+            );
+        }
+        if at.elapsed().as_secs_f64() >= 30.0 {
+            eprintln!(
+                "tang-llm: spec: {:.0} windows, {:.1} draft rows a window, {:.0}/{:.0} accepted ({:.0} %), {:.2} tokens a stream-window, {:.0} tok/s in windows, alpha {:.2}",
+                c[0],
+                c[1] / c[0].max(1.0),
+                c[3],
+                c[2],
+                100.0 * c[3] / c[2].max(1.0),
+                c[4] / (c[4] - c[3]).max(1.0),
+                c[4] / (c[5] / 1e3).max(1e-9),
+                self.spec.alpha
+            );
+            *c = [0.0; 6];
+            *at = Instant::now();
+        }
+    }
+
     pub(super) fn batch_state(s: &Inflight) -> (bool, bool) {
         let s = s.downcast_ref::<Stream>().expect("a flash stream");
         (s.finish.is_some(), s.done_prompt < s.ids.len())
@@ -614,12 +657,13 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms, state saves {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
             s.slot,
             s.ids.len(),
             s.reused,
             prefilled,
             s.prefill_s * 1e3,
+            s.snap_s * 1e3,
             s.first.unwrap_or(0.0),
             s.out.len(),
             decode_s,
@@ -640,19 +684,5 @@ impl FlashServe {
                 ..Default::default()
             },
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spare_rows_go_to_drafts_round_robin() {
-        assert_eq!(share_drafts(&[2]), vec![2]);
-        assert_eq!(share_drafts(&[2, 2, 2]), vec![2, 2, 1]);
-        assert_eq!(share_drafts(&[0, 3, 1]), vec![0, 3, 1]);
-        assert_eq!(share_drafts(&[2; 8]), vec![0; 8]);
-        assert_eq!(share_drafts(&[2; 6]), vec![1, 1, 0, 0, 0, 0]);
     }
 }

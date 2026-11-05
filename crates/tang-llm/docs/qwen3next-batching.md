@@ -378,6 +378,158 @@ ms). It's the mode to flip if the bars are restated relative to the floor, for e
 "mean KL ≤ 1.2× an RBITS=2 run, no upward trend". The win is small: 0.6 ms (2%) at B=64, none
 single-stream.
 
+## Load-test bug sweep (2026-11-04, coder-serve2)
+
+Found in `serve --batch 128 --ctx 131072` (`artifacts/gates-1104/serve-b128.log` in coder-serve).
+
+- **(a) `--batch` clamped twice (128 → 27 → 26).** `flash serve` counts slots before and after
+  building the batch and wide windows; the second pass clamped the already clamped value and
+  warned again. The first count is now provisional and silent (it sizes the batch windows); the
+  count that sticks is `--batch` against the count after the windows, capped by the provisional
+  one, with one warning: `--batch 128 clamped to 26: 27 sequence slots fit … after the batch and
+  wide windows`. The drop to 26 itself is real: the windows took 2.8 GB (96.6 → 93.8 GB free),
+  most of a 3.30 GB slot at 131k. (`fit_slots` adds back what live slots hold, and none exist
+  at startup, so it wasn't counting its own allocation.) Test:
+  `batch::tests::startup_clamps_once_from_the_request`.
+- **(b) The phantom `req 128: prompt 0 … state saves 7.0–7.5 s` after every completion.** The
+  worker calls `Backend::after` for batched requests too, and `FlashServe::after` printed the
+  one-stream path's stale `line`, whose `snap_ms` every batched prefix-state save kept adding
+  to: 7 s was the running total over all requests, not work per completion. The slot-0 running
+  snapshot after it never ran (slot 0 holds no tokens under `--batch`; the log has no
+  `saved the running state` line). Not a throughput bug. `after` now returns for batched
+  requests (it logs only an error), and the `batch req:` line carries the request's own
+  `state saves N ms` (part of its prefill time). No unit test (FlashServe needs a model).
+- **(c) Over-context requests.** One rule, `batch::token_limit`: a prompt with no room for a
+  generated token (`prompt + 1 >= --ctx`) is refused at admission, before a slot is taken, with
+  `context_length_exceeded: the prompt is N tokens; the context window is C`; otherwise
+  `max_tokens` is cut so the sequence ends inside the window and the request finishes with
+  `finish_reason: "length"` there. Tests (`server::context_limits`, a fake batching engine): the
+  refused request never joins the batch, a stream reaching the window stops with `length` while
+  the stream beside it finishes, and the admission error answers HTTP 400 to a non-streaming
+  client. A streaming client has its 200 headers already, so it gets the same message as an SSE
+  `error` event (the tokenizer runs on the worker for the flash engine, so the check can't run
+  before the response starts). Real probe (`--ctx 4096` keeps prompts small):
+
+  ```
+  tang-llm serve $G --batch 8 --ctx 4096 --port 8921 &
+  python3 - <<'PY'
+  import json, urllib.request as u, concurrent.futures as cf
+  def chat(text, mt, stream=False):
+      b = json.dumps({"messages": [{"role": "user", "content": text}], "max_tokens": mt,
+                      "temperature": 0, "stream": stream}).encode()
+      r = u.Request("http://127.0.0.1:8921/v1/chat/completions", b, {"content-type": "application/json"})
+      try:
+          with u.urlopen(r) as f: return f.status, json.load(f)
+      except u.HTTPError as e: return e.code, json.load(e)
+  print(chat("word " * 6000, 16))             # 400, context_length_exceeded
+  with cf.ThreadPoolExecutor(4) as ex:         # near the window + max_tokens past it, beside 3 normal
+      fs = [ex.submit(chat, "word " * 3900, 1000)] + [ex.submit(chat, "count to 50", 200) for _ in range(3)]
+      for f in fs: s, j = f.result(); print(s, j["choices"][0]["finish_reason"], j["usage"])
+  PY
+  curl -s localhost:8921/health
+  ```
+  Expect the first 400, the near-window request `200 length` with `prompt + completion < 4096`,
+  the other three finishing normally, `/health` ok. **Result** (H200, `artifacts/spec/probe2.txt`;
+  the near-window prompt also asks to count to 3000 so it can't stop on its own): 400
+  `context_length_exceeded: the prompt is 6009 tokens; the context window is 4096`; near-window
+  `200 length`, 3929 + 166 = 4095 tokens; the three others `stop` at 170; `/health` ok.
+- **(d) `TANG_SERVE_DETERMINISTIC=1`.** Batched greedy ≠ solo greedy past 8 rows (7/64
+  identical in the drain test) is the batch module's tolerance path (K-split GEMVs, grouped
+  experts, MMA) and stays. The switch doesn't build the batch module and runs every decode
+  window at ≤ `MAX_T` (8) rows on the narrow, bitwise module (`batch::window_width`), more
+  windows a step, so a stream's greedy output is independent of what it's batched with.
+  Throughput cost (decode-heavy load below, `--batch 64`, no drafts): C = 8 617 vs 614 tok/s
+  (no change: ≤ 8 streams were narrow anyway), C = 32 630 vs 851 (−26 %), C = 64 620 vs 987
+  (−37 %); per-stream p50 at C = 64 10.7 vs 18.1 tok/s.
+- **GPU checks of (a)/(b)**: `serve --batch 128 --ctx 131072` now logs one line, `--batch 128
+  clamped to 26: 27 sequence slots fit … after the batch and wide windows`
+  (`artifacts/spec/serve-clamp.log`); no `req N: prompt 0` lines in any batched serve log (the
+  only `req` line left is the refused request's error).
+- **Also found: `--mtp` was ignored on the qwen3next serve path** (`CoderOpts` built with
+  `..Default::default()`), so `serve --mtp` ran suffix drafts with no MTP head. Fixed.
+
+## Spec decode under batching (2026-11-04, coder-serve2)
+
+Before: `serve --batch N --mtp` capped every window at `MAX_T` = 8 rows (no batch module was
+built with MTP) and shared the spare rows round-robin, so past 8 streams nothing drafted and
+past 8 every stream waited for ⌈N/8⌉ narrow windows.
+
+**Engine** (Rust control flow; no kernel changes):
+
+- `verify_batch` runs past 8 rows in the batch module: its staging, scratch and kernels, keep
+  counts in its row record, and the per-segment commit replayed there. Eager by default (row and
+  segment counts change every step; `TANG_SERVE_SPEC_GRAPHS=1` captures graphs, which measured
+  no faster). The batch module's one shared `proj` holds only the last layer's projections
+  when the commit replays every GDN layer, so verify windows write per-layer projection buffers
+  instead (`batch_gproj`, rows × `w_in.rows` per GDN layer, allocated on first use). Without
+  that the first runs accepted 23 % of drafts and diverged at token ~3.
+- `mtp_groups_wide`: MTP passes over any number of rows, read from the window's own hidden
+  rows (batch or wide scratch `x`), 8 rows a pass (the MTP kernels' width), long groups in
+  pieces with only the last chained. Batch-module decode and verify windows fill every slot's
+  MTP K/V and draft its chain; wide prefill windows fill the MTP K/V of their positions too
+  (before, a wide-prefilled prompt's MTP K/V was stale; `TANG_SERVE_WIDE_MTP=0` turns it off).
+- `Coder::slot_mtp`: skip the MTP pass after slot windows (and clear those chains).
+
+**Scheduler** (`crate::batch::spec`, pure and tested on a simulated engine):
+
+- D-Cut (arXiv 2607.14647): a stream's chain position `k` scores `∏_{j≤k} p_j` (head
+  probabilities); every position in the window is ranked, the best `budget` verified in the rows
+  the streams leave (`width − streams`; width = the batch module's rows), each stream's pick a
+  prefix. Sampled streams draft nothing.
+- Budget, TableTune-style (arXiv 2610.38968): step ms per (streams, draft rows, MTP on), EMA
+  cells measured as the server runs, a decayed least-squares fit `a + b·rows + c·mtp_rows` for
+  unseen cells, a prior before any; `α` = accepted / predicted (EMA). It picks the budget that
+  maximises `(streams + α·Σ top scores) / ms` among `⌈ρ·streams·k⌉`, ρ ∈ {¼, ½, ¾, 1}, against
+  **plain** decoding (no MTP pass at all = today's path). While plain wins it runs the head one
+  step in 64 (and verifies one draft a stream then) to keep `α` and the scores fresh.
+- `TANG_SERVE_SPEC=off|auto|<rows>` (default **off**, see the serve numbers below), `TANG_SERVE_BATCH_ROWS` (batch
+  module rows, default `--batch` rounded up to 32), `TANG_SERVE_SPEC_LOG=1` (a line per window;
+  a `tang-llm: spec:` summary prints every 30 s regardless).
+
+**Gate** (`tang-llm flash-spec-batch-check $G --mtp mtp.gguf --ids-file explain.ids -n 128`,
+H200, trained head `seg-3200b/step-003200`, `TANG_CODER_MTP_K=2`; N sequences of the same prompt
+cut to different lengths, each `-n` tokens; budget 0 = `decode_batch`, one row a sequence,
+MTP on; logs in `artifacts/spec/`):
+
+| N (module rows) | budget 0 | best fixed budget | auto | identical to budget 0 |
+|---|---|---|---|---|
+| 2 (narrow, ≤ 8 rows) | 345 tok/s | 6: 484 (1.40×), 63 % accepted | – | 2/2 (bitwise class) |
+| 8 (32) | 697 | 32: 736 (1.06×), 68 % | 732 (1.05×) | 2/8, 54 % of tokens (budget 0 narrow, spec in the batch module: different class) |
+| 16 (32) | 796 | 32: 952 (1.20×), 88 % | 936 (1.18×) | **16/16** |
+| 32 (64) | 1,031 | 32: 1,181 (1.15×), 88 % | 1,256 (1.22×, plain) | **32/32** |
+| 64 (128) | 1,273 | 64: 1,176 (0.92×), 91 % | 1,623 (1.28×, plain) | 16/64, 56 % (> 64-row windows leave the ≤ 64-row Q8X MMA class) |
+
+Within a width class spec decode is lossless: every budget gives budget 0's tokens exactly
+(N = 2 narrow, N = 16 and 32 in the batch module). Across classes (8-row narrow vs batch module,
+≤ 64 vs > 64 rows) tokens drift at the tolerance path's usual rate.
+
+**Serve** (`serve --mtp mtp.gguf --batch 64 --ctx 32768`, decode-heavy closed loop: prompts
+200–800 tokens, 512–1024 out, 10 % sampled at T 0.8, R = 2 a worker; `load_dec.py`,
+`artifacts/spec/lt-*.json`). Aggregate tok/s (per-stream p50):
+
+| C | off (plain batch windows) | auto | fixed 32 rows | deterministic (off) |
+|---|---|---|---|---|
+| 8 | **614** (89) | 593 (84) | 540 (88) | 617 (89) |
+| 16 | **677** (48) | 652 (46) | 655 (56) | – |
+| 32 | **851** (30) | 800 (29) | 785 (30) | 630 (22) |
+| 64 | **987** (18) | 892 (16) | – | 620 (11) |
+
+Drafts were accepted at 83–95 % in serve too, but no setting beat plain windows: at serve load
+the drafting steps cost more than in the engine check (prefill chunks interleave, 10 % of
+streams are sampled and draft nothing, the extra MTP passes after every window and over every
+wide-prefilled prompt), and auto, once it measures plain steps, settles on plain and pays only
+its probes and the MTP head's prefill fill (3–10 %). The first auto run (before the tuner
+measured plain steps) drafted throughout and was 10 % under plain. Hence `TANG_SERVE_SPEC`
+defaults to **off**; `auto` is there for loads with fewer, longer greedy streams.
+
+**Where the gain goes.** Acceptance is high (88–99 % at k = 2) but the MTP passes are 8 rows
+each, with a sync: at 32 streams a step runs ~8 of them, ~20 % of the step (budget 0 with MTP
+on 1,031 tok/s vs plain 1,256). Drafting pays at ≤ 16–32 streams (1.15–1.4×) and loses at 64;
+auto lands on the better of the two at each N (it picks plain at 32 and 64 here, because a
+plain step costs less than a spec step's extra tokens buy). The next lever is the MTP module
+built for the batch module's width (one pass per step instead of ⌈rows/8⌉ × k), which is kernel
+work; `TANG_CODER_MTP_K=3` didn't help at the room these N leave.
+
 ## Known issues (2026-11-04)
 
 - **`flash-wide-check` at 128 / 1000 tokens misses the 1e-3 KL bar** with FA2 attention (KL

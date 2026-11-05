@@ -11,6 +11,8 @@ use crate::queue::{Priority, Ticket};
 
 #[path = "batch_prefill.rs"]
 pub mod prefill;
+#[path = "batch_spec.rs"]
+pub mod spec;
 
 /// What the rules need to know about the engine's slots right now.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +61,33 @@ pub fn clamp_batch(batch: usize, max_slots: usize, cap: usize) -> usize {
         .min(max_slots.saturating_sub(1))
         .min(cap.saturating_sub(1))
         .max(1)
+}
+
+/// Admission against the context window: a prompt of `prompt` tokens needs room for itself
+/// and one generated token, else it's refused (the message says so, for a 400); otherwise
+/// the most tokens it may generate: `max_tokens`, cut so the sequence ends inside `ctx`
+/// (finish reason `length` there), at least one.
+pub fn token_limit(prompt: usize, ctx: usize, max_tokens: Option<usize>) -> Result<usize, String> {
+    if prompt + 1 >= ctx {
+        return Err(format!(
+            "context_length_exceeded: the prompt is {prompt} tokens; the context window is {ctx}"
+        ));
+    }
+    Ok(max_tokens
+        .unwrap_or(usize::MAX)
+        .min(ctx - prompt - 1)
+        .max(1))
+}
+
+/// Streams per decode window: the batch module's width when it's built, else `narrow`;
+/// `narrow_only` (`TANG_SERVE_DETERMINISTIC=1`) keeps every window at `narrow` rows, the
+/// bitwise path, running more windows a step instead.
+pub fn window_width(narrow: usize, batch_rows: usize, narrow_only: bool) -> usize {
+    if narrow_only {
+        narrow
+    } else {
+        narrow.max(batch_rows)
+    }
 }
 
 /// A decode step of `rows` sequences runs in the batch module (`Coder::enable_batch`, built
@@ -156,6 +185,49 @@ mod tests {
         assert_eq!(cap, 127);
         assert_eq!(super::clamp_batch(200, 128, cap), 126);
         assert_eq!(super::clamp_batch(8, 128, cap), 8);
+    }
+
+    /// `serve --batch 128 --ctx 131072` on an H200 (3.30 GB a slot, 4 GB headroom): 96.6 GB
+    /// free before the windows, 93.8 GB after. The provisional count sizes the windows; the
+    /// count that sticks comes from `--batch` against the second count, once (it was 128 → 27
+    /// → 26 with two warnings, the second clamping the already clamped value).
+    #[test]
+    fn startup_clamps_once_from_the_request() {
+        const GB: usize = 1_000_000_000;
+        let per = 3_300_000_000;
+        let before = super::slots_that_fit(96_600_000_000, 4 * GB, per, 128);
+        let after = super::slots_that_fit(93_800_000_000, 4 * GB, per, 128);
+        assert_eq!((before, after), (28, 27));
+        let provisional = super::clamp_batch(128, 128, before);
+        let fin = super::clamp_batch(128, 128, after).min(provisional);
+        assert_eq!((provisional, fin), (27, 26));
+        // Room to spare after the windows: unchanged, never above what the windows fit.
+        let fin = super::clamp_batch(16, 128, after).min(super::clamp_batch(16, 128, before));
+        assert_eq!(fin, 16);
+        assert_eq!(super::clamp_batch(128, 128, 40).min(provisional), provisional);
+    }
+
+    #[test]
+    fn prompts_past_the_context_are_refused_and_outputs_stop_inside_it() {
+        assert!(super::token_limit(4096, 4096, None).is_err());
+        assert!(super::token_limit(5000, 4096, Some(1)).is_err());
+        assert!(super::token_limit(4095, 4096, None).is_err());
+        assert_eq!(super::token_limit(4094, 4096, None), Ok(1));
+        assert_eq!(super::token_limit(4000, 4096, Some(1000)), Ok(95));
+        assert_eq!(super::token_limit(100, 4096, Some(256)), Ok(256));
+        assert_eq!(super::token_limit(100, 4096, Some(0)), Ok(1));
+        let e = super::token_limit(5000, 4096, None).unwrap_err();
+        assert!(e.contains("5000") && e.contains("4096"), "{e}");
+    }
+
+    #[test]
+    fn deterministic_windows_stay_narrow() {
+        assert_eq!(super::window_width(8, 64, false), 64);
+        assert_eq!(super::window_width(8, 0, false), 8);
+        assert_eq!(super::window_width(8, 64, true), 8);
+        // 64 streams in 8-row windows: 8 windows a step, each on the narrow module.
+        let w = super::window_width(8, 64, true);
+        assert!((1..=64usize).step_by(w).all(|r| !super::batch_module(w.min(65 - r), 8, 64)));
     }
 
     #[test]
