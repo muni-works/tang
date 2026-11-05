@@ -206,9 +206,9 @@ impl Default for Variants {
             nstream: false,
             persist_gu: false,
             persist_down: false,
-            tcx: false,
+            tcx: tcx_on(),
             tcx_narrow: false,
-            tcx32: false,
+            tcx32: true,
         }
     }
 }
@@ -251,7 +251,7 @@ impl Variants {
             },
             tcx: tcx_on(),
             tcx_narrow: env_is("TANG_CODER_TCX_NARROW", "1"),
-            tcx32: env_is("TANG_CODER_TCX32", "1"),
+            tcx32: !env_is("TANG_CODER_TCX32", "0"),
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -264,8 +264,10 @@ impl Variants {
     }
 }
 
+/// Routed and shared Q4_K / Q5_K experts live on the device as TCX tiles only (the default;
+/// `TANG_CODER_TCX=0` keeps the GGUF rows and the old kernels).
 fn tcx_on() -> bool {
-    env_is("TANG_CODER_TCX", "1")
+    !env_is("TANG_CODER_TCX", "0")
 }
 
 fn gemv_v1() -> bool {
@@ -3945,7 +3947,8 @@ impl Coder {
         };
         let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
         let srp = if self.in_batch.get() { stream_srp() } else { 2 };
-        if self.var.tcx && layer.gate.t.ty >= 112 && (self.in_batch.get() || (self.var.tcx_narrow && !self.in_wide.get())) {
+        // Tiles are the only device copy when present: batch windows must take the TCX kernels.
+        if layer.gate.t.ty >= 112 && (self.in_batch.get() || (self.var.tcx_narrow && !self.in_wide.get())) {
             let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
@@ -5851,6 +5854,22 @@ fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<E
         bytes.len(),
         ne * rows * rb
     );
+    let q5 = t.ty == GgmlType::Q5K;
+    if tcx_on() && (q5 || t.ty == GgmlType::Q4K) && rows % 16 == 0 && k % 256 == 0 {
+        // Tiles only: every expert reader (narrow per-pair dots, wide GEMMs, batch MMAs) takes them.
+        let mut tiles = super::tcx::repack(q5, &bytes, ne, rows, k)?;
+        drop(bytes);
+        tiles.extend_from_slice(&[0u8; 16]);
+        let tb = dev.upload_bytes(&tiles);
+        let tile = super::tcx::tile_bytes(q5);
+        let tw = ExW {
+            base: dev.buffer_addr(&tb),
+            estride: ((rows / 16) * (k / 256) * tile) as u64,
+            ty: if q5 { super::tcx::TY_Q5 } else { super::tcx::TY_Q4 },
+            row_bytes: ((k / 256) * tile) as i32,
+        };
+        return Ok(Experts { w: tw, _w: tb, _t: None, t: tw });
+    }
     bytes.extend_from_slice(&[0u8; 16]);
     let w = dev.upload_bytes(&bytes);
     let base = dev.buffer_addr(&w);
@@ -5863,23 +5882,7 @@ fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<E
         ty: ty as i32,
         row_bytes: rb as i32,
     };
-    let q5 = t.ty == GgmlType::Q5K;
-    let (tb, tw) = if tcx_on() && (q5 || t.ty == GgmlType::Q4K) && rows % 16 == 0 && k % 256 == 0 {
-        let mut tiles = super::tcx::repack(q5, &bytes[..ne * rows * rb], ne, rows, k)?;
-        tiles.extend_from_slice(&[0u8; 16]);
-        let tb = dev.upload_bytes(&tiles);
-        let tile = super::tcx::tile_bytes(q5);
-        let tw = ExW {
-            base: dev.buffer_addr(&tb),
-            estride: ((rows / 16) * (k / 256) * tile) as u64,
-            ty: if q5 { super::tcx::TY_Q5 } else { super::tcx::TY_Q4 },
-            row_bytes: ((k / 256) * tile) as i32,
-        };
-        (Some(tb), tw)
-    } else {
-        (None, w0)
-    };
-    Ok(Experts { w: w0, _w: w, _t: tb, t: tw })
+    Ok(Experts { w: w0, _w: w, _t: None, t: w0 })
 }
 
 /// Is the GGUF at `path` a `qwen3next` model (this engine) rather than Flash-Next?

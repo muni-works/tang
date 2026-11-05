@@ -366,7 +366,61 @@ __device__ __forceinline__ void cx_dotq_m(const unsigned char* w, const unsigned
         acc[t] = a;
     }
 }
+// Q4_K / Q5_K per-row dot reading a TCX tile (tcx.rs) instead of the GGUF row: the same lane
+// mapping, the same 16 qs / qh bytes a lane (they sit in the tile as they are), the same
+// scales and min values, the same arithmetic and reduction as cx_dotq_fast (HALF 0) /
+// cx_dotq_half (HALF 1): bitwise equal. `tb` the row's tile column (16-aligned), `row` 0..16.
+template <int TY, int HALF>
+__device__ __forceinline__ float cx_dotq_tile(const unsigned char* tb, int row, const unsigned char* xc, const float* xd, int k) {
+    const int lane = HALF ? (threadIdx.x & 15) : (threadIdx.x & 31);
+    constexpr int TB = TY == 12 ? 2368 : 2880, SO = TY == 12 ? 2048 : 2560;
+    const int sbl = lane >> 3, j = (lane & 7) >> 1, l0 = (lane & 1) * 16;
+    float acc = 0.f;
+    for (int sb = sbl; sb < k / 256; sb += (HALF ? 2 : 4)) {
+        const unsigned char* b = tb + sb * TB;
+        const unsigned dw = *(const unsigned*)(b + SO + row * 4);
+        const float d = h2f((unsigned short)(dw & 0xFFFFu)), dmin = h2f((unsigned short)(dw >> 16));
+        const unsigned char* sm = b + SO + 64 + row * 16;
+        const int s0 = sm[2 * j], s1 = sm[2 * j + 1], m0 = sm[8 + 2 * j], m1 = sm[8 + 2 * j + 1];
+        const uint4 q = *(const uint4*)(b + (j * 16 + row) * 32 + l0);
+        uint4 hb = make_uint4(0, 0, 0, 0);
+        if (TY == 13) hb = *(const uint4*)(b + 2048 + row * 32 + l0);
+        const int e = sb * 256 + j * 64 + l0;
+        const uint4 x0 = *(const uint4*)(xc + e), x1 = *(const uint4*)(xc + e + 32);
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {hb.x, hb.y, hb.z, hb.w};
+        const unsigned xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+        int sa = 0, sh = 0, ca = 0, ch = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned lo = qw[i] & 0x0F0F0F0Fu, hi = (qw[i] >> 4) & 0x0F0F0F0Fu;
+            if (TY == 13) {
+                lo |= ((hw[i] >> (2 * j)) & 0x01010101u) << 4;
+                hi |= ((hw[i] >> (2 * j + 1)) & 0x01010101u) << 4;
+            }
+            sa = __dp4a((int)lo, (int)xa[i], sa);
+            sh = __dp4a((int)hi, (int)xb[i], sh);
+            ca = __dp4a(0x01010101, (int)xa[i], ca);
+            ch = __dp4a(0x01010101, (int)xb[i], ch);
+        }
+        const float dx0 = xd[e / 32], dx1 = xd[e / 32 + 1];
+        acc = fmaf(dx0, fmaf(d * i2f(s0), i2f(sa), -dmin * i2f(m0) * i2f(ca)), acc);
+        acc = fmaf(dx1, fmaf(d * i2f(s1), i2f(sh), -dmin * i2f(m1) * i2f(ch)), acc);
+    }
+    for (int o = HALF ? 8 : 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    return acc;
+}
+// A TCX row is passed around as its tile column's address plus the row (0..16) in the low bits
+// (tile columns are 16-aligned).
+__device__ __forceinline__ const unsigned char* tcx_rowp(const unsigned char* base, unsigned long long estride, int rb,
+                                                         unsigned e, int r) {
+    return base + (size_t)e * estride + (size_t)(r >> 4) * rb + (r & 15);
+}
 __device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k, int fast) {
+    if (ty == 112 || ty == 113) {
+        const unsigned char* tb = (const unsigned char*)((unsigned long long)w & ~15ull);
+        const int row = (int)((unsigned long long)w & 15);
+        return ty == 112 ? cx_dotq_tile<12, 0>(tb, row, xc, xd, k) : cx_dotq_tile<13, 0>(tb, row, xc, xd, k);
+    }
     if (fast && (((unsigned long long)w | (unsigned long long)xc) & 15) == 0) {
         if (ty == 12) return cx_dotq_fast<12>(w, xc, xd, k);
         if (ty == 13) return cx_dotq_fast<13>(w, xc, xd, k);
@@ -447,6 +501,7 @@ __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const 
         const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
         const int ro = r < CX_FF ? r : r - CX_FF;
         ty[j] = m.ty;
+        if (m.ty >= 112) { w[j] = tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, ro); continue; }
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
         w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
@@ -499,6 +554,7 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
     for (int j = 0; j < R; j++) {
         const int r = (blockIdx.x * 8 + warp) * R + j;
         rr[j] = r;
+        if (m.ty >= 112) { w[j] = tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, r); continue; }
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
         w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
@@ -523,6 +579,20 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
         __syncwarp();
         hcodes = hq + (size_t)p * CX_FF;
         hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
+    }
+    if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && m.ty >= 112 && (((unsigned long long)hcodes) & 15) == 0) {
+        // The TCX tile twin of the half-warp branch below (bitwise equal).
+        const int h = lane >> 4;
+        #pragma unroll
+        for (int j0 = 0; j0 < R; j0 += 2) {
+            const unsigned long long wp = (unsigned long long)w[j0 + h];
+            const unsigned char* tb = (const unsigned char*)(wp & ~15ull);
+            const int row = (int)(wp & 15);
+            const float a = m.ty == 112 ? cx_dotq_tile<12, 1>(tb, row, hcodes, hd, CX_FF)
+                                        : cx_dotq_tile<13, 1>(tb, row, hcodes, hd, CX_FF);
+            if ((lane & 15) == 0) out[(size_t)p * CX_HID + rr[j0 + h]] = a;
+        }
+        return;
     }
     const bool aligned = ((((unsigned long long)w[0]) | ((unsigned long long)w[R - 1]) | (unsigned long long)hcodes) & 15) == 0;
     if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
@@ -1185,6 +1255,34 @@ __device__ __forceinline__ void sbk_load(const unsigned char* b, int tig, SbK& o
         o.h[0] = o.h[1] = 0;
     }
 }
+// sbk_load from a TCX tile (tcx.rs): row g + 8 half of the tile at `t`, the same SbK the GGUF
+// row gives (the 12 scale bytes re-packed from the unpacked 6-bit values: every bit is used,
+// so they are the GGUF's bytes).
+template <int TY>
+__device__ __forceinline__ void sbk_load_t(const unsigned char* t, int g, int tig, int half, SbK& o) {
+    constexpr int SO = TY == 12 ? 2048 : 2560;
+    const int row = g + 8 * half;
+    const unsigned dw = *(const unsigned*)(t + SO + row * 4);
+    o.d = h2f((unsigned short)(dw & 0xFFFFu));
+    o.dm = h2f((unsigned short)(dw >> 16));
+    const uint4 sm = *(const uint4*)(t + SO + 64 + row * 16);
+    // s0..3 = sm.x bytes, s4..7 = sm.y, m0..3 = sm.z, m4..7 = sm.w.
+    const unsigned s03 = sm.x, s47 = sm.y, m03 = sm.z, m47 = sm.w;
+    o.sc[0] = s03 | ((s47 >> 4) & 0x03030303u) << 6;
+    o.sc[1] = m03 | ((m47 >> 4) & 0x03030303u) << 6;
+    o.sc[2] = (s47 & 0x0F0F0F0Fu) | (m47 & 0x0F0F0F0Fu) << 4;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        o.q[j][0] = *(const unsigned*)(t + (j * 16 + row) * 32 + tig * 4);
+        o.q[j][1] = *(const unsigned*)(t + (j * 16 + row) * 32 + 16 + tig * 4);
+    }
+    if (TY == 13) {
+        o.h[0] = *(const unsigned*)(t + 2048 + row * 32 + tig * 4);
+        o.h[1] = *(const unsigned*)(t + 2048 + row * 32 + 16 + tig * 4);
+    } else {
+        o.h[0] = o.h[1] = 0;
+    }
+}
 #ifndef CX_MMA_PF
 #define CX_MMA_PF 1
 #endif
@@ -1371,14 +1469,26 @@ __device__ __forceinline__ void mma_s8_16832c(int* d, const unsigned* a, unsigne
 #ifndef CX_TCX_SDN
 #define CX_TCX_SDN 2
 #endif
+// h: qh words (row g, cols 4 tig..), (row g, 16 + 4 tig..), (row g + 8, ..), (row g + 8, 16 + ..).
 struct TcxT { uint4 c[4]; uint4 h; unsigned dw0, dw1; uint4 s0, s1; };
 template <bool Q5>
 __device__ __forceinline__ void tcx_load(const unsigned char* t, int lane, TcxT& o) {
-    const int g = lane >> 2;
+    const int g = lane >> 2, tig = lane & 3;
+    // codes [q][row][32]: register c = word at (q, g + 8 (c & 1), 16 (c >> 1) + 4 tig).
     #pragma unroll
-    for (int q = 0; q < 4; q++) o.c[q] = __ldg((const uint4*)(t + (q * 32 + lane) * 16));
+    for (int q = 0; q < 4; q++) {
+        const unsigned char* r0 = t + (q * 16 + g) * 32 + 4 * tig;
+        o.c[q] = make_uint4(__ldg((const unsigned*)r0), __ldg((const unsigned*)(r0 + 256)),
+                            __ldg((const unsigned*)(r0 + 16)), __ldg((const unsigned*)(r0 + 256 + 16)));
+    }
     const unsigned char* sc = t + 2048;
-    if (Q5) { o.h = __ldg((const uint4*)(t + 2048 + lane * 16)); sc += 512; }
+    if (Q5) {
+        const unsigned char* qh = t + 2048;
+        o.h = make_uint4(__ldg((const unsigned*)(qh + g * 32 + 4 * tig)), __ldg((const unsigned*)(qh + g * 32 + 16 + 4 * tig)),
+                         __ldg((const unsigned*)(qh + (g + 8) * 32 + 4 * tig)),
+                         __ldg((const unsigned*)(qh + (g + 8) * 32 + 16 + 4 * tig)));
+        sc += 512;
+    }
     o.dw0 = __ldg((const unsigned*)(sc + g * 4));
     o.dw1 = __ldg((const unsigned*)(sc + (g + 8) * 4));
     o.s0 = __ldg((const uint4*)(sc + 64 + g * 16));
@@ -1408,9 +1518,9 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
                 const unsigned w = u4w(cur.c[qp], c);
                 unsigned v = (s & 1) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
                 if (Q5) {
-                    const int r = 4 * s + c;
-                    const unsigned h = u4w(cur.h, r >> 3);
-                    v |= (r & 7) <= 4 ? (h << (4 - (r & 7))) & 0x10101010u : (h >> ((r & 7) - 4)) & 0x10101010u;
+                    // register c: row half c & 1, column half c >> 1; bit s of those qh bytes.
+                    const unsigned h = u4w(cur.h, 2 * (c & 1) + (c >> 1));
+                    v |= s <= 4 ? (h << (4 - s)) & 0x10101010u : (h >> (s - 4)) & 0x10101010u;
                 }
                 a[c] = v;
             }
@@ -1996,7 +2106,7 @@ __device__ __forceinline__ void gemm_tile32(const unsigned char* wa, const unsig
 // gemm_tile32 for Q4_K / Q5_K rows: a superblock's operands (d, dmin, scales, this lane's qs
 // words) loaded once per 256 columns with the next superblock's loads in flight (sbk_load, as
 // the batch MMA kernels), instead of 4-5 scattered loads per 8 weights. Same staging and math.
-template <int TY>
+template <int TY, bool TL = false>
 __device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const unsigned char* wb, bool live,
                                               const unsigned char* const* xrow_s, const float* const* xd_s, int nch,
                                               float acc[8][4], int K, float (*sxd)[GT_KS / 32 + 1],
@@ -2007,7 +2117,12 @@ __device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const uns
     #pragma unroll
     for (int c = 0; c < 8; c++) xr[c] = xrow_s[c * 8 + g];
     SbK ra, rb, pa, pb;
-    if (live) { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
+    // TL: wa is the rows' TCX tile column (wb unused), 2368 / 2880 bytes a superblock.
+    constexpr int TB = TY == 12 ? 2368 : 2880;
+    if (live) {
+        if (TL) { sbk_load_t<TY>(wa, g, tig, 0, ra); sbk_load_t<TY>(wa, g, tig, 1, rb); }
+        else { sbk_load<TY>(wa, tig, ra); sbk_load<TY>(wb, tig, rb); }
+    }
     for (int ks = 0; ks < K; ks += GT_KS) {
         const int kn = min(GT_KS, K - ks), nb = kn / 32;
         __syncthreads();
@@ -2032,8 +2147,8 @@ __device__ __forceinline__ void gemm_tile_sbk(const unsigned char* wa, const uns
         for (int k0 = ks; k0 < ks + kn; k0 += 256) {
             const int sb = k0 / 256;
             if ((sb + 1) * 256 < K) {
-                sbk_load<TY>(wa + (sb + 1) * BB, tig, pa);
-                sbk_load<TY>(wb + (sb + 1) * BB, tig, pb);
+                if (TL) { sbk_load_t<TY>(wa + (sb + 1) * TB, g, tig, 0, pa); sbk_load_t<TY>(wa + (sb + 1) * TB, g, tig, 1, pb); }
+                else { sbk_load<TY>(wa + (sb + 1) * BB, tig, pa); sbk_load<TY>(wb + (sb + 1) * BB, tig, pb); }
             }
             #pragma unroll
             for (int st = 0; st < 8; st++) {
@@ -2112,6 +2227,8 @@ __device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, c
     switch (ty) {
         case 12: gemm_tile_sbk<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 13: gemm_tile_sbk<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 112: gemm_tile_sbk<12, true>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+        case 113: gemm_tile_sbk<13, true>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 8: gemm_tile32<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 108: gemm_tile32<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 2: gemm_tile32<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
@@ -2152,7 +2269,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_gu(ExW g, ExW u, E
     const int r0 = (blockIdx.x * 8 + warp) * 16;
     const ExW& m = shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u);
     const int ro = r0 < CX_FF ? r0 : r0 - CX_FF;
-    const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(ro + gq) * m.row_bytes;
+    const unsigned char* wa = m.ty >= 112 ? tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, ro)
+                                          : (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(ro + gq) * m.row_bytes;
     const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
     float acc[8][4];
     #pragma unroll
@@ -2199,7 +2317,8 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gemm_down(ExW d, ExW sd
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
     const int r0 = (blockIdx.x * 8 + warp) * 16;
     const ExW& m = shared ? sd : d;
-    const unsigned char* wa = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(r0 + gq) * m.row_bytes;
+    const unsigned char* wa = m.ty >= 112 ? tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, r0)
+                                          : (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)(r0 + gq) * m.row_bytes;
     const unsigned char* wb = wa + (size_t)8 * m.row_bytes;
     float acc[8][4];
     #pragma unroll

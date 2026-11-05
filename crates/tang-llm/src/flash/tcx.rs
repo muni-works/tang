@@ -4,13 +4,12 @@
 //! A matrix `[rows][k]` (rows % 16 == 0, k % 256 == 0) becomes tiles of 16 rows × 256 columns
 //! (one superblock), ordered `[row tile][superblock]`, each tile:
 //!
-//! - codes, 2048 bytes: `[step pair q 0..4][lane 0..32][word c 0..4]` (one uint4 a lane a step
-//!   pair). Word `c` is A-fragment register `c` of the m16n8k32 MMA for lane `lane`
-//!   (g = lane / 4, tig = lane % 4): register c's byte b is the code at row `g + 8 (c & 1)`,
-//!   column `32 s + 16 (c >> 1) + 4 tig + b` of the superblock; low nibbles hold step
-//!   `s = 2q`, high nibbles step `2q + 1`.
-//! - Q5_K only, 512 bytes: the codes' fifth bits, `[lane][word w 0..4]`; word w covers
-//!   registers `r = 4 s + c` in `8w .. 8w + 8`, register r's byte b at bit `r % 8` of byte b.
+//! - codes, 2048 bytes: `[q 0..4][row 0..16][32 bytes]`, the GGUF `qs[32 q ..][..32]` of each
+//!   row as they are. The m16n8k32 A-fragment register `c` of lane (g = lane / 4,
+//!   tig = lane % 4) for steps 2q (low nibbles) and 2q + 1 (high) is the word at
+//!   `(q, g + 8 (c & 1), 16 (c >> 1) + 4 tig)`: codes at row `g + 8 (c & 1)`, columns
+//!   `32 s + 16 (c >> 1) + 4 tig + b`. The per-row dot reads its 16 bytes unchanged.
+//! - Q5_K only, 512 bytes: the GGUF `qh` (32 bytes) of each of the 16 rows.
 //! - scales, 320 bytes: `[16 rows] u32` (d | dmin << 16, the GGUF f16s) then
 //!   `[16 rows][s0..s8, m0..m8]` (the unpacked 6-bit sub-block scales and mins).
 //!
@@ -105,15 +104,16 @@ fn repack_into(q5: bool, src: &[u8], e0: usize, out: &mut [u8], rows: usize, k: 
                                 let col = |s: usize| 32 * s + 16 * (c >> 1) + 4 * tig + b;
                                 let lo = dec[row].4[col(2 * qp)];
                                 let hi = dec[row].4[col(2 * qp + 1)];
-                                t[(qp * 32 + lane) * 16 + c * 4 + b] = (lo & 15) | ((hi & 15) << 4);
-                                if q5 {
-                                    for (s, v) in [(2 * qp, lo), (2 * qp + 1, hi)] {
-                                        let r = 4 * s + c;
-                                        t[2048 + lane * 16 + (r / 8) * 4 + b] |= ((v >> 4) & 1) << (r % 8);
-                                    }
-                                }
+                                t[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig + b] = (lo & 15) | ((hi & 15) << 4);
                             }
                         }
+                    }
+                }
+                if q5 {
+                    for r in 0..16 {
+                        let row = e * rows + rt * 16 + r;
+                        let o = (row * nsb + sb) * bb;
+                        t[2048 + r * 32..2048 + r * 32 + 32].copy_from_slice(&src[o + 16..o + 48]);
                     }
                 }
                 let so = 2048 + if q5 { 512 } else { 0 };
@@ -143,16 +143,16 @@ pub fn dequant(q5: bool, t: &[u8], ne: usize, rows: usize, k: usize) -> Vec<f32>
                     let (g, tig) = (lane / 4, lane % 4);
                     for qp in 0..4 {
                         for c in 0..4 {
-                            let w = u32::from_le_bytes(tl[(qp * 32 + lane) * 16 + c * 4..][..4].try_into().unwrap());
+                            let row = g + 8 * (c & 1);
+                            let w = u32::from_le_bytes(tl[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig..][..4].try_into().unwrap());
                             for (s, word) in [(2 * qp, w & 0x0F0F0F0F), (2 * qp + 1, (w >> 4) & 0x0F0F0F0F)] {
-                                let r = 4 * s + c;
+                                // qh bytes l = 16 (c >> 1) + 4 tig + b, bit s (the kernel's word load).
                                 let hw = if q5 {
-                                    u32::from_le_bytes(tl[2048 + lane * 16 + (r / 8) * 4..][..4].try_into().unwrap())
+                                    u32::from_le_bytes(tl[2048 + row * 32 + 16 * (c >> 1) + 4 * tig..][..4].try_into().unwrap())
                                 } else {
                                     0
                                 };
-                                let word = word | ((hw >> (r % 8)) & 0x01010101) << 4;
-                                let row = g + 8 * (c & 1);
+                                let word = word | ((hw >> s) & 0x01010101) << 4;
                                 let dw = u32::from_le_bytes(tl[so + row * 4..][..4].try_into().unwrap());
                                 let (d, dm) = (f16_to_f32(dw as u16), f16_to_f32((dw >> 16) as u16));
                                 let (sj, mj) = (tl[so + 64 + row * 16 + s], tl[so + 64 + row * 16 + 8 + s]);
@@ -205,6 +205,22 @@ mod tests {
             dequantize(if q5 { GgmlType::Q5K } else { GgmlType::Q4K }, &src, &mut want).unwrap();
             let t = repack(q5, &src, ne, rows, k).unwrap();
             assert_eq!(t.len(), ne * rows / 16 * k / 256 * tile_bytes(q5));
+            // The per-row dot's view: words (q, c, 4g ..) are the GGUF qs bytes as they are.
+            let (bb, tb, nsb) = (if q5 { 176 } else { 144 }, tile_bytes(q5), k / 256);
+            for row in 0..ne * rows {
+                let (e, r) = (row / rows, row % rows);
+                for sb in 0..nsb {
+                    let tl = &t[((e * (rows / 16) + r / 16) * nsb + sb) * tb..][..tb];
+                    let g = &src[(row * nsb + sb) * bb..][..bb];
+                    let qs = &g[if q5 { 48 } else { 16 }..];
+                    for q in 0..4 {
+                        for h in 0..2 {
+                            let o = (q * 16 + r % 16) * 32 + 16 * h;
+                            assert_eq!(&tl[o..o + 16], &qs[32 * q + 16 * h..][..16]);
+                        }
+                    }
+                }
+            }
             let got = dequant(q5, &t, ne, rows, k);
             for i in 0..want.len() {
                 assert_eq!(got[i].to_bits(), want[i].to_bits(), "q5={q5} at {i}: {} vs {}", got[i], want[i]);
