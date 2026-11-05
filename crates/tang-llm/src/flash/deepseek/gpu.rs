@@ -42,11 +42,6 @@ pub struct DevW {
 }
 
 impl DevW {
-    /// A weight built on the device (e.g. a rank's column slice), owning its buffers.
-    pub fn from_parts(w: DevBuf, s: Option<DevBuf>, v: DsW) -> Self {
-        DevW { _w: w, _s: s, v }
-    }
-
     /// Upload `name` from the checkpoint as stored: f32, bf16, fp8 with 32 × 32 block scales,
     /// or I8-packed fp4 with per-row × 32 scales.
     pub fn upload(st: &St, name: &str) -> Result<Self> {
@@ -219,7 +214,6 @@ const MORE: &[&str] = &[
     "ds_spec_dist",
     "ds_spec_walk",
     "ds_moe_plan",
-    "ds_copy2d",
     "ds_moe_reduce",
     "ds_moe_reduce_sh",
     "ds_route_plan_q",
@@ -1573,8 +1567,6 @@ impl Kernels {
         (t, n, slots, inter, d): (usize, usize, usize, usize, usize),
         lim: f32,
     ) -> Result<()> {
-        // h's row pitch: the routed intermediate (s1 may be this rank's slice of the shared)
-        let shs = inter as i32;
         let f = self.moe_ks_sh[fmt as usize - 2][s1.fmt as usize - 2][0];
         // xq == 0: route_plan_q already quantized the activation into ks_x
         let (codes, scales) = if xq == 0 {
@@ -1605,7 +1597,7 @@ impl Kernels {
                     s,
                     tang_moe::args![
                         w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3,
-                        ts, ni, shs, ci
+                        ts, ni, ci
                     ],
                 )?
             }
@@ -1619,8 +1611,7 @@ impl Kernels {
                 smem as u32,
                 s,
                 tang_moe::args![
-                    w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3, ts,
-                    ni, shs
+                    w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si, nbri, s1, s3, ts, ni
                 ],
             )?
         }
@@ -1642,7 +1633,6 @@ impl Kernels {
         (t, n, slots, d, inter): (usize, usize, usize, usize, usize),
     ) -> Result<()> {
         let f = self.moe_ks_sh[fmt as usize - 2][s2.fmt as usize - 2][1];
-        let shs = inter as i32;
         let rows = n + if on { t } else { 0 };
         let (codes, scales) = self.ks_quantize(s, hq, rows, inter)?;
         let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
@@ -1665,9 +1655,7 @@ impl Kernels {
                     (256, 1, 1),
                     smem as u32,
                     s,
-                    tang_moe::args![
-                        w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni, shs, ci
-                    ],
+                    tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni, ci],
                 )?
             }
             return Ok(());
@@ -1679,7 +1667,7 @@ impl Kernels {
                 (256, 1, 1),
                 smem as u32,
                 s,
-                tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni, shs],
+                tang_moe::args![w2s, elist, off, codes, scales, part, si, nbri, s2, ts, ni],
             )?
         }
         Ok(())
