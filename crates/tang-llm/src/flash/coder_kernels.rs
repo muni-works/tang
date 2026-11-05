@@ -1706,6 +1706,151 @@ extern "C" __global__ void __launch_bounds__(256) cx_silu_q8k(const float* gu, u
     q8k_store(silu_f2(gv) * uv, hk, CX_NP, CX_FF, p, c);
 }
 
+
+// ---- GGUF-native batch experts: TCX32's kernel on the GGUF Q4_K / Q5_K rows themselves ----
+//
+// The m16n8k32 A register c of lane (g, tig) at step s is row g + 8 (c & 1)'s qs word at
+// 32 (s / 2) + 16 (c >> 1) + 4 tig (sbk_load's q words, low nibbles for even s, high for odd),
+// so the rows feed the MMA as they are. Per superblock a lane unpacks its two rows' 6-bit scales
+// and mins into byte lanes once (bit ops on the three scale words); per step: the codes MMA, the
+// mins MMA (A' = m_j replicated: gives m_j sum(x)), per-32 activations read from global, float
+// epilogue as cx_moe_*_t32. Grid (rows · S / 128, groups), block 256, no smem, no barrier past
+// the plan.
+__device__ __forceinline__ void sc_unpack(const unsigned* sc, unsigned& s03, unsigned& s47, unsigned& m03, unsigned& m47) {
+    s03 = sc[0] & 0x3F3F3F3Fu;
+    m03 = sc[1] & 0x3F3F3F3Fu;
+    s47 = (sc[2] & 0x0F0F0F0Fu) | (((sc[0] >> 6) & 0x03030303u) << 4);
+    m47 = ((sc[2] >> 4) & 0x0F0F0F0Fu) | (((sc[1] >> 6) & 0x03030303u) << 4);
+}
+template <int TY, int K>
+__device__ __forceinline__ void gg_rows(const unsigned char* wa, const unsigned char* wb, int m, const unsigned char* xg,
+                                        const float* da, const float* db, float acc[4], int sb0, int sb1) {
+    constexpr int BB = TY == 12 ? 144 : 176;
+    const int lane = threadIdx.x & 31, tig = lane & 3;
+    const int na = 2 * tig, nb = 2 * tig + 1;
+    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+    SbK ra, rb, pa, pb;
+    sbk_load<TY>(wa + sb0 * BB, tig, ra);
+    sbk_load<TY>(wb + sb0 * BB, tig, rb);
+    for (int sb = sb0; sb < sb1; sb++) {
+        if (sb + 1 < sb1) { sbk_load<TY>(wa + (sb + 1) * BB, tig, pa); sbk_load<TY>(wb + (sb + 1) * BB, tig, pb); }
+        unsigned sa[2], ma[2], sbw[2], mbw[2];
+        sc_unpack(ra.sc, sa[0], sa[1], ma[0], ma[1]);
+        sc_unpack(rb.sc, sbw[0], sbw[1], mbw[0], mbw[1]);
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int qp = s >> 1;
+            unsigned a[4];
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const SbK& r = (c & 1) ? rb : ra;
+                const unsigned w = r.q[qp][c >> 1];
+                unsigned v = (s & 1) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
+                if (TY == 13) v |= ((r.h[c >> 1] >> s) & 0x01010101u) << 4;
+                a[c] = v;
+            }
+            uint2 bb;
+            bb.x = __ldg((const unsigned*)(xg + sb * 256 + s * 32));
+            bb.y = __ldg((const unsigned*)(xg + sb * 256 + s * 32 + 16));
+            int d[4], mm[4];
+            mma_s8_16832(d, a, bb.x, bb.y);
+            const unsigned sel = (unsigned)(s & 3) * 0x1111u;
+            const unsigned mw0 = ma[s >> 2], mw1 = mbw[s >> 2];
+            const unsigned am[4] = {__byte_perm(mw0, 0, sel), __byte_perm(mw1, 0, sel), __byte_perm(mw0, 0, sel),
+                                    __byte_perm(mw1, 0, sel)};
+            mma_s8_16832(mm, am, bb.x, bb.y);
+            const int s0 = (int)__byte_perm(sa[s >> 2], 0, 0x4440u | (s & 3));
+            const int s1 = (int)__byte_perm(sbw[s >> 2], 0, 0x4440u | (s & 3));
+            const float fs0 = ra.d * i2f(s0), fs1 = rb.d * i2f(s1);
+            const int blk = sb * 8 + s;
+            if (na < m) {
+                const float dx = __ldg(da + blk);
+                acc[0] = fmaf(dx, fmaf(fs0, i2f(d[0]), -ra.dm * i2f(mm[0])), acc[0]);
+                acc[2] = fmaf(dx, fmaf(fs1, i2f(d[2]), -rb.dm * i2f(mm[2])), acc[2]);
+            }
+            if (nb < m) {
+                const float dx = __ldg(db + blk);
+                acc[1] = fmaf(dx, fmaf(fs0, i2f(d[1]), -ra.dm * i2f(mm[1])), acc[1]);
+                acc[3] = fmaf(dx, fmaf(fs1, i2f(d[3]), -rb.dm * i2f(mm[3])), acc[3]);
+            }
+        }
+        if (sb + 1 < sb1) { ra = pa; rb = pb; }
+    }
+}
+template <bool DOWN>
+__device__ __forceinline__ void moe_gg_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids, const unsigned char* xq,
+                                            float* out, int T, int fast, const unsigned* plan) {
+    constexpr int KA = DOWN ? CX_FF : CX_HID;
+    constexpr int S = DOWN ? CX_TCX_SDN : CX_TCX_SGU;
+    constexpr int NSB = KA / 256;
+    const int gi = blockIdx.y;
+    if (gi >= (int)plan[0]) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int a = plan[1 + gi], b = plan[2 + gi], m = b - a;
+    const int p0 = plan[CX_PLAN_LIST + a];
+    const bool shared = p0 >= T * CX_TOPK;
+    const unsigned e = shared ? 0u : ids[p0];
+    const int ks = warp % S;
+    const int r0 = (blockIdx.x * (8 / S) + warp / S) * 16;
+    const ExW& mw = DOWN ? (shared ? sg : g) : (shared ? (r0 < CX_FF ? sg : su) : (r0 < CX_FF ? g : u));
+    const int ro = DOWN ? r0 : (r0 < CX_FF ? r0 : r0 - CX_FF);
+    const size_t ostride = DOWN ? CX_HID : 2 * CX_FF;
+    __shared__ int pair_s[8];
+    __shared__ float4 red_s[8][32];
+    if (threadIdx.x < 8) pair_s[threadIdx.x] = threadIdx.x < m ? (int)plan[CX_PLAN_LIST + a + threadIdx.x] : 0;
+    __syncthreads();
+    auto tok = [&](int p) { return DOWN ? p : (shared ? p - T * CX_TOPK : p / CX_TOPK); };
+    const unsigned char* wbase = (const unsigned char*)mw.base + (size_t)e * mw.estride;
+    const float* xdg = (const float*)(xq + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+    if (mw.ty != 12 && mw.ty != 13) {
+        for (int r = ks; r < 16; r += S) {
+            const unsigned char* w = wbase + (size_t)(ro + r) * mw.row_bytes;
+            for (int q = 0; q < m; q++) {
+                const int t = tok(pair_s[q]);
+                const float v = cx_dot(mw.ty, w, xq + (size_t)t * KA, xdg + (size_t)t * (KA / 32), KA, fast);
+                if (lane == 0) out[(size_t)pair_s[q] * ostride + r0 + r] = v;
+            }
+        }
+        return;
+    }
+    const int gq = lane >> 2, tig = lane & 3;
+    const unsigned char* xg = xq + (size_t)tok(pair_s[gq < m ? gq : 0]) * KA + tig * 4;
+    const float* da = xdg + (size_t)tok(pair_s[2 * tig < m ? 2 * tig : 0]) * (KA / 32);
+    const float* db = xdg + (size_t)tok(pair_s[2 * tig + 1 < m ? 2 * tig + 1 : 0]) * (KA / 32);
+    const unsigned char* wa = wbase + (size_t)(ro + gq) * mw.row_bytes;
+    const unsigned char* wb = wa + (size_t)8 * mw.row_bytes;
+    const int sb0 = ks * NSB / S, sb1 = (ks + 1) * NSB / S;
+    float acc[4];
+    if (mw.ty == 12) gg_rows<12, KA>(wa, wb, m, xg, da, db, acc, sb0, sb1);
+    else gg_rows<13, KA>(wa, wb, m, xg, da, db, acc, sb0, sb1);
+    if (S > 1) {
+        red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+        __syncthreads();
+        if (ks != 0) return;
+        for (int j = 1; j < S; j++) {
+            const float4 v = red_s[warp + j][lane];
+            acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w;
+        }
+    }
+    if (2 * tig < m) {
+        out[(size_t)pair_s[2 * tig] * ostride + r0 + gq] = acc[0];
+        out[(size_t)pair_s[2 * tig] * ostride + r0 + gq + 8] = acc[2];
+    }
+    if (2 * tig + 1 < m) {
+        out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq] = acc[1];
+        out[(size_t)pair_s[2 * tig + 1] * ostride + r0 + gq + 8] = acc[3];
+    }
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_q(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                             const unsigned char* xq, float* out, int T, int fast,
+                                                             const unsigned* plan) {
+    moe_gg_body<false>(g, u, sg, su, ids, xq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_q(ExW d, ExW sd, const unsigned* ids,
+                                                               const unsigned char* hq, float* out, int T, int fast,
+                                                               const unsigned* plan) {
+    moe_gg_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
+}
 // ---- dense Q8X (Q8_0 repacked) on int8 tensor cores for batch windows ----
 //
 // A warp owns 16 rows of one segment (M) and all T <= 64 tokens (up to 8 n-tiles of 8); K steps
