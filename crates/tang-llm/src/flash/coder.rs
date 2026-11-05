@@ -471,6 +471,20 @@ struct Mtp {
     _m: Module,
 }
 
+/// The MTP layer's batch-width buffers and kernels (`enable_batch` with an MTP layer): one MTP
+/// pass over every row of a batch window instead of one per `MAX_T` rows.
+struct MtpWide {
+    rows: usize,
+    mh: B,
+    emb: B,
+    cat: B,
+    ids: B,
+    prob: B,
+    f_in: Fun,
+    f_pick: Fun,
+    _m: Module,
+}
+
 struct Dense {
     _w: Vec<B>,
     segs: B,
@@ -1204,6 +1218,8 @@ pub struct Coder {
     /// many rows, with their scratch (head included) and staging; `in_batch` while such a
     /// window is enqueued, `last_batch` when the latest window was one (for `logits`).
     batch: Option<Wide>,
+    /// The MTP layer at the batch module's width (with `batch` and an MTP layer).
+    mtp_w: Option<MtpWide>,
     in_batch: std::cell::Cell<bool>,
     /// Batch-module verify windows: each GDN layer's own projection rows (by the address of
     /// the layer's narrow `proj`), since the module's one shared `proj` holds only the last
@@ -1523,6 +1539,7 @@ impl Coder {
             in_wide: std::cell::Cell::new(false),
             wide_pos0: std::cell::Cell::new(0),
             batch: None,
+            mtp_w: None,
             in_batch: std::cell::Cell::new(false),
             batch_gproj: Vec::new(),
             seg_proj: std::cell::Cell::new(false),
@@ -2471,6 +2488,7 @@ impl Coder {
             return Ok(());
         }
         self.batch = None;
+        self.mtp_w = None;
         self.batch_gproj.clear();
         self.graphs.retain(|k, _| k.0 <= MAX_T);
         let src = format!(
@@ -2528,10 +2546,29 @@ impl Coder {
             .iter()
             .map(|l| l.w_out.k.max(l.w_in.k))
             .max()
-            .unwrap_or(n);
+            .unwrap_or(n)
+            // The MTP layer's `fc` takes `[emb | h]` rows.
+            .max(if self.mtp.is_some() { 2 * n } else { 0 });
         let xq = self
             .dev
             .alloc_f32((rows * kmax + rows * kmax / 32 * 4).div_ceil(4));
+        if self.mtp.is_some() && !env_is("TANG_SERVE_MTP_WIDE", "0") {
+            let m = self
+                .gpu
+                .module(&MTP_SRC.replace("#define MTP_ALT 8", &format!("#define MTP_ALT {rows}")))
+                .map_err(|e| anyhow!("MTP kernels ({rows} rows): {e}"))?;
+            self.mtp_w = Some(MtpWide {
+                rows,
+                mh: self.dev.alloc_f32(rows * n),
+                emb: self.dev.alloc_f32(rows * n),
+                cat: self.dev.alloc_f32(rows * 2 * n),
+                ids: self.dev.alloc_f32(2 * rows),
+                prob: self.dev.alloc_f32(2 * rows),
+                f_in: m.func("cx_mtp_in").map_err(|e| anyhow!("{e}"))?,
+                f_pick: m.func("cx_mtp_pick").map_err(|e| anyhow!("{e}"))?,
+                _m: m,
+            });
+        }
         self.dev.sync();
         self.batch = Some(Wide {
             rows,
@@ -5005,28 +5042,199 @@ impl Coder {
         chain: bool,
     ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
         let mut out = vec![(Vec::new(), None); groups.len()];
+        // With the batch-width MTP layer, one pass takes up to its rows (shorter packs, and
+        // splits, take the narrow passes).
+        let cap = self.mtp_w.as_ref().map_or(MAX_T, |w| w.rows);
         let mut pieces = Vec::new();
         for (gi, g) in groups.iter().enumerate() {
             let mut o = 0;
             while o < g.3.len() {
-                let len = (g.3.len() - o).min(MAX_T);
+                let len = (g.3.len() - o).min(cap);
                 pieces.push((gi, (g.0, g.1 + o, g.2 + o, &g.3[o..o + len]), o + len == g.3.len()));
                 o += len;
             }
         }
         for (lo, hi) in crate::batch::spec::pack_rows(
             &pieces.iter().map(|p| p.1 .3.len()).collect::<Vec<_>>(),
-            MAX_T,
+            cap,
         ) {
             let chunk = &pieces[lo..hi];
             let gs: Vec<(usize, usize, usize, &[u32])> = chunk.iter().map(|p| p.1).collect();
             let chained: Vec<bool> = chunk.iter().map(|p| chain && p.2).collect();
-            let res = self.mtp_groups_in(Some(src), &gs, &chained)?;
+            let rows: usize = gs.iter().map(|g| g.3.len()).sum();
+            let res = if rows > MAX_T {
+                self.mtp_groups_batch(src, &gs, &chained)?
+            } else {
+                self.mtp_groups_in(Some(src), &gs, &chained)?
+            };
             for (p, r) in chunk.iter().zip(res) {
                 if p.2 {
                     out[p.0] = r;
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// Copy rows `from[i]` of `src` to rows `i` of the batch-width `mh`, a copy a run of
+    /// consecutive rows.
+    fn mtp_gather_batch(&self, src: u64, from: &[usize]) {
+        let mw = self.mtp_w.as_ref().expect("batch MTP");
+        let (mh, b) = (self.a(&mw.mh), self.hp.n_embd * 4);
+        let mut i = 0;
+        while i < from.len() {
+            let mut j = i + 1;
+            while j < from.len() && from[j] == from[j - 1] + 1 {
+                j += 1;
+            }
+            self.kcopy_on(0, mh + (i * b) as u64, src + (from[i] * b) as u64, (j - i) * b);
+            i = j;
+        }
+    }
+
+    /// One MTP pass over `rows` (`(slot, pos, next token)`, `MAX_T + 1..=` the batch width) in
+    /// the batch module, its hidden rows already in the batch-width `mh`: each row's draft and
+    /// runner-up. Its rows' normed outputs stay in the batch scratch's `x`.
+    #[allow(clippy::type_complexity)]
+    fn mtp_pass_batch(
+        &mut self,
+        rows: &[(usize, usize, u32)],
+    ) -> Result<(Vec<(u32, f32)>, Vec<(u32, f32)>)> {
+        let (t, n) = (rows.len(), self.hp.n_embd);
+        let tw = self.batch_rows();
+        let end = rows.iter().map(|r| r.1 + 2).max().unwrap_or(0);
+        ensure!(t > MAX_T && t <= tw && end <= self.max_ctx, "MTP batch pass of {t} rows");
+        let emb_t = self.g.info("token_embd.weight")?.clone();
+        {
+            let io = &self.batch.as_ref().unwrap().io;
+            let emb = io.f32s(Io::EMB, t * n);
+            for (i, r) in rows.iter().enumerate() {
+                let row = self.g.rows(&emb_t, r.2 as usize, 1)?;
+                emb[i * n..(i + 1) * n].copy_from_slice(&row);
+            }
+            let rec = io.u32s(Io::rows(n, tw), ROWS_PER_T * tw);
+            rec.fill(0);
+            for (i, r) in rows.iter().enumerate() {
+                rec[i] = (r.1 + 1) as u32;
+                rec[tw + i] = r.0 as u32;
+            }
+        }
+        let nchunk = self.nchunk(end);
+        let wide0 = self.in_wide.replace(false);
+        self.in_batch.set(true);
+        let m = self.mtp.as_ref().unwrap();
+        let mw = self.mtp_w.as_ref().unwrap();
+        let s = self.stage_view(0).s;
+        self.kcopy_on(0, self.a(&s.rows), self.io_dev_on(0, Io::rows(n, tw)), ROWS_PER_T * tw * 4);
+        self.kcopy_on(0, self.a(&mw.emb), self.io_dev_on(0, Io::EMB), t * n * 4);
+        let (emb, mh, we, wh, eps, ni, cat) = (
+            self.a(&mw.emb),
+            self.a(&mw.mh),
+            self.a(&m.enorm),
+            self.a(&m.hnorm),
+            self.eps,
+            n as i32,
+            self.a(&mw.cat),
+        );
+        unsafe {
+            self.launch_on(
+                &self.stream,
+                mw.f_in,
+                (t as u32, 2, 1),
+                1024,
+                0,
+                tang_moe::args![emb, mh, we, wh, eps, ni, cat],
+            )
+        };
+        self.gemv(0, "mtp_fc", &m.fc, cat, None, self.a(&s.r), t, n);
+        self.norm_q8(0, None, &m.layer.attn_norm, t);
+        self.enqueue_mixer(0, MTP_L, t, true, nchunk, 1);
+        self.norm_q8(0, Some(self.a(&s.mix)), &m.layer.post_norm, t);
+        self.enqueue_moe(0, MTP_L, t, &m.onorm, false);
+        let v = self.hp.n_vocab;
+        self.gemv(0, "mtp_head", &self.head, self.a(&s.x), Some(self.a(&s.mxq)), self.a(&s.head), t, v);
+        let (lg, vi, ids, prob) = (self.a(&s.head), v as i32, self.a(&mw.ids), self.a(&mw.prob));
+        unsafe {
+            self.launch_on(
+                &self.stream,
+                mw.f_pick,
+                (t as u32, 1, 1),
+                1024,
+                0,
+                tang_moe::args![lg, vi, ids, prob],
+            )
+        };
+        self.in_batch.set(false);
+        self.in_wide.set(wide0);
+        let ids = self.dev.download(&mw.ids);
+        let prob = self.dev.download(&mw.prob);
+        let pick = |o: usize| -> Vec<(u32, f32)> {
+            (0..t).map(|i| (ids[o + i].to_bits(), prob[o + i])).collect()
+        };
+        Ok((pick(0), pick(tw)))
+    }
+
+    /// [`mtp_groups_in`](Self::mtp_groups_in) for `MAX_T + 1..=` the batch width rows, read
+    /// from rows `r0..` of `src`: one batch-module pass, then each chain step over every
+    /// chained group at once (in the batch module past `MAX_T` of them, else narrow).
+    #[allow(clippy::type_complexity)]
+    fn mtp_groups_batch(
+        &mut self,
+        src: u64,
+        groups: &[(usize, usize, usize, &[u32])],
+        chained: &[bool],
+    ) -> Result<Vec<(Vec<(u32, f32)>, Option<(u32, f32)>)>> {
+        let mut out = vec![(Vec::new(), None); groups.len()];
+        let end = groups.iter().map(|g| g.1 + g.3.len()).max().unwrap_or(0);
+        if end + self.mtp_steps + 1 >= self.max_ctx {
+            return Ok(out);
+        }
+        let from: Vec<usize> = groups.iter().flat_map(|g| g.2..g.2 + g.3.len()).collect();
+        self.mtp_gather_batch(src, &from);
+        let rows: Vec<(usize, usize, u32)> = groups
+            .iter()
+            .flat_map(|g| g.3.iter().enumerate().map(move |(i, &k)| (g.0, g.1 + i, k)))
+            .collect();
+        let (first, alt) = self.mtp_pass_batch(&rows)?;
+        let mut ch = Vec::new();
+        let mut last = Vec::new();
+        let mut r = 0;
+        for (gi, g) in groups.iter().enumerate() {
+            r += g.3.len();
+            if chained[gi] {
+                ch.push(gi);
+                last.push(r - 1);
+                out[gi].0.push(first[r - 1]);
+                out[gi].1 = Some(alt[r - 1]);
+            }
+        }
+        if ch.is_empty() {
+            return Ok(out);
+        }
+        // Where the last pass's normed rows are: the batch scratch's `x`, or the narrow `s.x`.
+        let bx = self.a(&self.batch.as_ref().unwrap().s.x);
+        let mut at = bx;
+        for j in 1..self.mtp_steps {
+            let rows: Vec<(usize, usize, u32)> = ch
+                .iter()
+                .map(|&gi| {
+                    let g = &groups[gi];
+                    (g.0, g.1 + g.3.len() + j - 1, out[gi].0[j - 1].0)
+                })
+                .collect();
+            let d = if rows.len() > MAX_T {
+                // `at` is the batch `x` here (a wide step only follows a wide one).
+                self.mtp_gather_batch(at, &last);
+                self.mtp_pass_batch(&rows)?.0
+            } else {
+                self.mtp_gather(at, &last);
+                at = self.a(&self.s.x);
+                self.mtp_pass(&rows)?
+            };
+            for (&gi, &x) in ch.iter().zip(&d) {
+                out[gi].0.push(x);
+            }
+            last = (0..ch.len()).collect();
         }
         Ok(out)
     }
