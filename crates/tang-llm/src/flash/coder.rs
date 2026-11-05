@@ -567,10 +567,15 @@ struct Kern {
     router_b: Fun,
     /// The F32 / BF16 router as an f32 GEMM (wide windows).
     sgemm_wide: Fun,
+    /// cx_sgemm_wide re-tiled (bitwise equal; `TANG_CODER_SGEMM2=0` for the old one).
+    sgemm_wide2: Fun,
+    sgemm_wide2s: Fun,
     /// Tensor-core grouped expert GEMM (wide windows).
     moe_gemm_gu: Fun,
     moe_gemm_down: Fun,
     gemm_dense: Fun,
+    /// cx_gemm_dense with 32 rows a warp for Q8X (block 128; `TANG_CODER_DENSE32=1`, off by default: slower on the 3090).
+    gemm_dense32: Fun,
     moe_add_norm: Fun,
     prep: Fun,
     part: Fun,
@@ -582,6 +587,8 @@ struct Kern {
     gdn_commit_seg: Fun,
     /// Wide windows' GDN: a warp per state column (`fl_gdn_wide`), then the gated norm.
     gdn_wide: Fun,
+    /// fl_gdn_wide's per-token inputs (conv, norms, gates), every token in parallel.
+    gdn_wide_prep: Fun,
     gdn_wide_norm: Fun,
     copy: Fun,
     argmax1: Fun,
@@ -632,9 +639,12 @@ impl Kern {
             mma_q8x_red: f("cx_mma_q8x_red")?,
             router_b: f("cx_router_b")?,
             sgemm_wide: f("cx_sgemm_wide")?,
+            sgemm_wide2: f("cx_sgemm_wide2")?,
+            sgemm_wide2s: f("cx_sgemm_wide2s")?,
             moe_gemm_gu: f("cx_moe_gemm_gu")?,
             moe_gemm_down: f("cx_moe_gemm_down")?,
             gemm_dense: f("cx_gemm_dense")?,
+            gemm_dense32: f("cx_gemm_dense32")?,
             moe_add_norm: f("cx_moe_add_norm")?,
             prep: f("cx_attn_prep")?,
             part: f("cx_attn_part")?,
@@ -645,6 +655,7 @@ impl Kern {
             gdn_step_seg: self.gdn_step_seg,
             gdn_commit_seg: self.gdn_commit_seg,
             gdn_wide: self.gdn_wide,
+            gdn_wide_prep: self.gdn_wide_prep,
             gdn_wide_norm: self.gdn_wide_norm,
             copy: self.copy,
             argmax1: self.argmax1,
@@ -743,9 +754,12 @@ impl Kern {
             mma_q8x_red: f(cm, "cx_mma_q8x_red")?,
             router_b: f(cm, "cx_router_b")?,
             sgemm_wide: f(cm, "cx_sgemm_wide")?,
+            sgemm_wide2: f(cm, "cx_sgemm_wide2")?,
+            sgemm_wide2s: f(cm, "cx_sgemm_wide2s")?,
             moe_gemm_gu: f(cm, "cx_moe_gemm_gu")?,
             moe_gemm_down: f(cm, "cx_moe_gemm_down")?,
             gemm_dense: f(cm, "cx_gemm_dense")?,
+            gemm_dense32: f(cm, "cx_gemm_dense32")?,
             moe_add_norm: f(cm, "cx_moe_add_norm")?,
             prep: f(cm, "cx_attn_prep")?,
             part: f(cm, "cx_attn_part")?,
@@ -756,6 +770,7 @@ impl Kern {
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
             gdn_commit_seg: f(fm, "fl_gdn_conv_commit_seg")?,
             gdn_wide: f(fm, "fl_gdn_wide")?,
+            gdn_wide_prep: f(fm, "fl_gdn_wide_prep")?,
             gdn_wide_norm: f(fm, "fl_gdn_wide_norm")?,
             copy: f(em, "fe_copy")?,
             argmax1: f(em, "fe_argmax1")?,
@@ -800,11 +815,18 @@ impl Kern {
             self.fa2,
         ] {
             unsafe {
+                // Static shared memory counts against the opt-in cap (matters on sm_86).
+                let mut st = 0i32;
+                cudarc::driver::sys::cuFuncGetAttribute(
+                    &mut st,
+                    cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                    f,
+                );
                 gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
                         f,
                         cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem_max,
+                        smem_max - st.max(0),
                     ),
                     "cuFuncSetAttribute",
                 )
@@ -961,6 +983,8 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
 const BATCH_GCHUNK: usize = 8;
+/// Wide modules group an expert's pairs by one GEMM tile (64 tokens).
+const WIDE_GCHUNK: usize = 64;
 
 /// The batch module's dense-MMA split-K partials (f32 values: splits x rows x tokens).
 const DMMA_PART: usize = 1 << 22;
@@ -1171,7 +1195,12 @@ impl Coder {
     pub fn load(path: &Path, opts: CoderOpts) -> Result<Self> {
         let t0 = Instant::now();
         let g = Gguf::open(path)?;
-        let hp = Hparams::from_gguf(&g)?;
+        let mut hp = Hparams::from_gguf(&g)?;
+        // Debug: `TANG_CODER_MAX_LAYERS=N` loads only the first N layers (profiling on a small
+        // GPU; outputs are garbage, the kernels are real).
+        if let Some(n) = std::env::var("TANG_CODER_MAX_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            hp.n_layer = hp.n_layer.min(n.max(1));
+        }
         ensure!(hp.arch == Arch::Qwen3Next, "not a qwen3next GGUF");
         ensure!(
             hp.ssm_d_state == 128 && hp.ssm_d_conv == 4,
@@ -2377,8 +2406,10 @@ impl Coder {
         if let Some(p) = self.peer.as_deref_mut() {
             p.wide = None;
         }
+        // Groups of at most 64 pairs (one GEMM tile): the expert GEMM's grid is (rows,
+        // groups, 1) instead of a z tile per 64 rows of the window, nearly all empty.
         let src = format!(
-            "{}{}{}{}",
+            "#define CX_GCHUNK {WIDE_GCHUNK}\n{}{}{}{}",
             // Debug switches of the wide module: `TANG_FA2_BF16=1` runs cx_attn_fa2 on bf16 Q / P / K / V
             // (the pre-fp16 kernel); `TANG_ATTN_JITTER=1e-6` scales each attention output by
             // 1 ± up to that (the perturbation control of docs/qwen3next-batching.md "Known issues").
@@ -2887,6 +2918,7 @@ impl Coder {
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
             (k.gdn_commit_seg, "gdn_commit"),
+            (k.gdn_wide_prep, "gdn_wide_prep"),
             (k.gdn_wide, "gdn_wide"),
             (k.gdn_wide_norm, "gdn_wide_norm"),
             (k.copy, "copy"),
@@ -3025,10 +3057,11 @@ impl Coder {
                     t as i32,
                 );
                 unsafe {
+                    let d32 = env_is("TANG_CODER_DENSE32", "1");
                     gpu::launch(
-                        wd.k.gemm_dense,
+                        if d32 { wd.k.gemm_dense32 } else { wd.k.gemm_dense },
                         (w.rows.div_ceil(128) as u32, t.div_ceil(64) as u32, 1),
-                        (256, 1, 1),
+                        (if d32 { 128 } else { 256 }, 1, 1),
                         0,
                         v.stream,
                         tang_moe::args![sp, ns, xq, ki, out, os, ti],
@@ -3151,10 +3184,22 @@ impl Coder {
                     t as i32,
                 );
                 unsafe {
+                    // TANG_CODER_SGEMM2: 0 the old tile, 1 the 128-token tile, else the 64-token
+                    // one (H200 router, two 3k prefills: 87 / 41 / 34 ms).
+                    let s2v = std::env::var("TANG_CODER_SGEMM2").unwrap_or_default();
+                    let s2 = s2v != "0" && w.k.is_multiple_of(16);
+                    let small = s2 && s2v != "1";
+                    let (f, tb, nt) = if !s2 {
+                        (wd.k.sgemm_wide, 64, 256)
+                    } else if small {
+                        (wd.k.sgemm_wide2s, 64, 128)
+                    } else {
+                        (wd.k.sgemm_wide2, 128, 256)
+                    };
                     gpu::launch(
-                        wd.k.sgemm_wide,
-                        (w.rows.div_ceil(64) as u32, t.div_ceil(64) as u32, 1),
-                        (256, 1, 1),
+                        f,
+                        (w.rows.div_ceil(64) as u32, t.div_ceil(tb) as u32, 1),
+                        (nt, 1, 1),
                         0,
                         v.stream,
                         tang_moe::args![sp, ns, rt, x, ki, out, os, ti],
@@ -3824,14 +3869,27 @@ impl Coder {
                 v.dev.buffer_addr(&g.conv),
             );
             let t = self.wide_rows() as u32;
+            // The prep's rows (q, k, v, g, b a token) borrow the expert gate|up buffer, free
+            // until this layer's MoE.
+            let xrow = 2 * self.geo.gdn_hk * 128 + self.geo.gdn_hv * 128 + 2 * self.geo.gdn_hv;
+            assert!((self.hp.n_expert_used + 1) * 2 * self.hp.n_ff_exp >= xrow, "gdn prep rows fit egu");
+            let x = v.dev.buffer_addr(&v.s.egu);
             unsafe {
+                self.launch_on(
+                    v.stream,
+                    v.k.gdn_wide_prep,
+                    (t, 1, 1),
+                    256,
+                    0,
+                    tang_moe::args![htab, p, sd, dt, sa, seg, eps, wc, x],
+                );
                 self.launch_on(
                     v.stream,
                     v.k.gdn_wide,
                     (self.geo.gdn_hv as u32, 2, 1),
-                    512,
+                    256,
                     0,
-                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc],
+                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
                 );
                 self.launch_on(
                     v.stream,
@@ -4013,6 +4071,8 @@ impl Coder {
             // Batch modules split an expert's pairs into groups of `BATCH_GCHUNK`.
             let groups = if self.in_batch.get() {
                 n.min(hp.n_expert + 1 + n / BATCH_GCHUNK)
+            } else if self.in_wide.get() {
+                n.min(hp.n_expert + 1 + n / WIDE_GCHUNK)
             } else {
                 n.min(hp.n_expert + 1)
             } as u32;
@@ -4028,7 +4088,8 @@ impl Coder {
                 // Wide windows: the tensor-core GEMM, 128 rows × 64 of a group's tokens a block.
                 let gemm = (self.in_wide.get() || (self.in_batch.get() && self.var.bgemm))
                     && self.var.wgemm;
-                let tiles = t.div_ceil(64) as u32;
+                // Batch and wide modules' groups are at most 64 pairs: one tile.
+                let tiles = if self.in_batch.get() || self.in_wide.get() { 1 } else { t.div_ceil(64) as u32 };
                 if gemm && self.var.wgemm_gu {
                     self.launch_on(
                         stream,

@@ -1336,11 +1336,62 @@ __device__ __forceinline__ float sum8(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 4);
     return v;
 }
-extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
+// fl_gdn_wide's per-token inputs, every token in parallel (they don't depend on the state):
+// conv + SiLU of q, k, v, l2 norm of q and k, the decay g and beta b. X row t (GW_XROW floats):
+// q [GDN_HK][128], k [GDN_HK][128], v [GDN_HV][128], g [GDN_HV], b [GDN_HV]. The same
+// arithmetic as the recurrence kernel staged itself (bitwise). Grid n, block 256.
+#define GW_XROW (2 * GDN_HK * 128 + GDN_HV * 128 + 2 * GDN_HV)
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide_prep(
+    const u64* __restrict__ Htab, const float* __restrict__ P, unsigned int stride,
+    const float* __restrict__ DT, const float* __restrict__ SA, const unsigned int* __restrict__ SEG,
+    float eps, const float* __restrict__ Wc, float* __restrict__ X) {
+    __shared__ float xs[2 * GDN_HK * 128];
+    const unsigned int r0 = SEG[0], slot = SEG[2], t = blockIdx.x;
+    const float* H0 = (const float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    float* Xr = X + (u64)t * GW_XROW;
+    const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (unsigned int ch = tid; ch < GDN_CONV; ch += 256) {
+        const float4 w = ((const float4*)Wc)[ch];
+        float e[4];
+        #pragma unroll
+        for (unsigned int q = 0; q < 4; q++) {
+            const unsigned int p = t + q;
+            e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
+        }
+        float acc = e[0] * w.x;
+        acc = __fmaf_rn(e[1], w.y, acc);
+        acc = __fmaf_rn(e[2], w.z, acc);
+        acc = __fmaf_rn(e[3], w.w, acc);
+        const float v = silu(acc);
+        if (ch < 2 * GDN_HK * 128) xs[ch] = v;
+        else Xr[ch] = v;
+    }
+    if (tid < GDN_HV) {
+        const float a = Pr[(u64)t * stride + GDN_A + tid] + DT[tid];
+        const float sp = a > 20.0f ? a : log1pf(expf(a));
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + tid] = expf(sp * SA[tid]);
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + GDN_HV + tid] = sigm(Pr[(u64)t * stride + GDN_B + tid]);
+    }
+    __syncthreads();
+    for (unsigned int h = warp; h < 2 * GDN_HK; h += 8) {
+        const float* r = xs + h * 128;
+        const float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
+        const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
+        const float rs = 1.0f / sqrtf(ss + eps);
+        float* o = Xr + h * 128;
+        o[lane] = x0 * rs; o[lane + 32] = x1 * rs; o[lane + 64] = x2 * rs; o[lane + 96] = x3 * rs;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
     const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
-    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc) {
-    __shared__ float sq[GW_C][128], sk[GW_C][128], sv[GW_C][64];
+    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc,
+    const float* __restrict__ X) {
+    __shared__ __align__(16) float sq[GW_C][128];
+    __shared__ __align__(16) float sk[GW_C][128];
+    __shared__ __align__(16) float sv[GW_C][64];
     __shared__ float sg[GW_C], sb[GW_C];
     const unsigned int r0 = SEG[0], n = SEG[1], slot = SEG[2];
     gst_t* S = (gst_t*)Stab[slot];
@@ -1349,80 +1400,99 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_wide(
     float* Yr = Y + (u64)r0 * GDN_V;
     const unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x;
     const unsigned int warp = tid >> 5, lane = tid & 31, sub = lane & 7;
-    const unsigned int jl = warp * 4 + (lane >> 3), j = blockIdx.y * 64 + jl;
-    float st[16];
+    const unsigned int jl = (warp * 4 + (lane >> 3)) * 2, j = blockIdx.y * 64 + jl;
+    float st0[16], st1[16];
     #pragma unroll
-    for (int i = 0; i < 16; i++) st[i] = gst_ld(&S[((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j]);
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
+        st0[i] = gst_ld(&S[o]);
+        st1[i] = gst_ld(&S[o + 1]);
+    }
     for (unsigned int t0 = 0; t0 < n; t0 += GW_C) {
         const unsigned int nn = min(n - t0, (unsigned int)GW_C);
         __syncthreads();
-        // conv + SiLU: q, k (256 channels) and this block's 64 v channels, nn tokens.
-        for (unsigned int i = tid; i < GW_C * (256 + 64); i += 512) {
-            const unsigned int t = i / (256 + 64), c = i % (256 + 64);
+        // This chunk's inputs from fl_gdn_wide_prep: q, k of head hk, this block's 64 v
+        // columns, g and b of head hv.
+        for (unsigned int i = tid; i < GW_C * 80; i += 256) {
+            const unsigned int t = i / 80, c = i % 80;
             if (t >= nn) continue;
-            const unsigned int ch = c < 128 ? hk * 128 + c
-                                  : c < 256 ? GDN_HK * 128 + hk * 128 + (c - 128)
-                                            : 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64 + (c - 256);
-            const float4 w = ((const float4*)Wc)[ch];
-            float e[4];
-            #pragma unroll
-            for (unsigned int q = 0; q < 4; q++) {
-                const unsigned int p = t0 + t + q;
-                e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
+            const float* xr = X + (u64)(t0 + t) * GW_XROW;
+            float4 v4;
+            // q, k permuted: row R = sub + 8 i (i = 4 q4 + r) at 32 q4 + 4 sub + r, so a lane's
+            // float4 reads give rows sub + 8 i in i order (afa748e7's rows and sums, bitwise).
+            if (c < 64) {
+                float* dst = c < 32 ? sq[t] : sk[t];
+                const int c4 = c & 31;
+                v4 = ((const float4*)(xr + (c < 32 ? 0 : GDN_HK * 128) + hk * 128))[c4];
+                const float e4[4] = {v4.x, v4.y, v4.z, v4.w};
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    const int R = 4 * c4 + u, i8 = R >> 3;
+                    dst[32 * (i8 >> 2) + 4 * (R & 7) + (i8 & 3)] = e4[u];
+                }
             }
-            float acc = e[0] * w.x;
-            acc = __fmaf_rn(e[1], w.y, acc);
-            acc = __fmaf_rn(e[2], w.z, acc);
-            acc = __fmaf_rn(e[3], w.w, acc);
-            const float v = silu(acc);
-            if (c < 128) sq[t][c] = v;
-            else if (c < 256) sk[t][c - 128] = v;
-            else sv[t][c - 256] = v;
+            else { v4 = ((const float4*)(xr + 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64))[c - 64]; *(float4*)&sv[t][4 * (c - 64)] = v4; }
         }
         if (tid < nn) {
-            const float a = Pr[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
-            const float sp = a > 20.0f ? a : log1pf(expf(a));
-            sg[tid] = expf(sp * SA[hv]);
-            sb[tid] = sigm(Pr[(u64)(t0 + tid) * stride + GDN_B + hv]);
-        }
-        __syncthreads();
-        // l2 norm of q and k: a warp per (token, q | k).
-        for (unsigned int u = warp; u < 2 * nn; u += 16) {
-            float* r = (u & 1) ? sk[u >> 1] : sq[u >> 1];
-            float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
-            const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
-            const float rs = 1.0f / sqrtf(ss + eps);
-            r[lane] = x0 * rs; r[lane + 32] = x1 * rs; r[lane + 64] = x2 * rs; r[lane + 96] = x3 * rs;
+            const float* xr = X + (u64)(t0 + tid) * GW_XROW + 2 * GDN_HK * 128 + GDN_HV * 128;
+            sg[tid] = xr[hv];
+            sb[tid] = xr[GDN_HV + hv];
         }
         __syncthreads();
         for (unsigned int t = 0; t < nn; t++) {
             const float g = sg[t];
-            float p0 = 0.0f, p1 = 0.0f;
+            float kk[16];
+            #pragma unroll
+            for (int q4 = 0; q4 < 4; q4++) {
+                const float4 v4 = *(const float4*)&sk[t][32 * q4 + 4 * sub];
+                kk[4 * q4] = v4.x; kk[4 * q4 + 1] = v4.y; kk[4 * q4 + 2] = v4.z; kk[4 * q4 + 3] = v4.w;
+            }
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
-                st[i] *= g;
-                st[i + 1] *= g;
-                p0 = __fmaf_rn(st[i], sk[t][sub + 8 * i], p0);
-                p1 = __fmaf_rn(st[i + 1], sk[t][sub + 8 * i + 8], p1);
+                st0[i] *= g; st0[i + 1] *= g; st1[i] *= g; st1[i + 1] *= g;
+                p0 = __fmaf_rn(st0[i], kk[i], p0);
+                p1 = __fmaf_rn(st0[i + 1], kk[i + 1], p1);
+                p2 = __fmaf_rn(st1[i], kk[i], p2);
+                p3 = __fmaf_rn(st1[i + 1], kk[i + 1], p3);
             }
-            const float p = sum8(p0 + p1);
-            const float d = (sv[t][jl] - p) * sb[t];
-            float o0 = 0.0f, o1 = 0.0f;
+            const float pa = sum8(p0 + p1), pb = sum8(p2 + p3);
+            const float2 vv = *(const float2*)&sv[t][jl];
+            const float bt = sb[t];
+            const float d0 = (vv.x - pa) * bt, d1 = (vv.y - pb) * bt;
+            float qq[16];
+            #pragma unroll
+            for (int q4 = 0; q4 < 4; q4++) {
+                const float4 v4 = *(const float4*)&sq[t][32 * q4 + 4 * sub];
+                qq[4 * q4] = v4.x; qq[4 * q4 + 1] = v4.y; qq[4 * q4 + 2] = v4.z; qq[4 * q4 + 3] = v4.w;
+            }
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
             #pragma unroll
             for (int i = 0; i < 16; i += 2) {
-                const float s0 = __fmaf_rn(sk[t][sub + 8 * i], d, st[i]);
-                const float s1 = __fmaf_rn(sk[t][sub + 8 * i + 8], d, st[i + 1]);
-                o0 = __fmaf_rn(s0, sq[t][sub + 8 * i], o0);
-                o1 = __fmaf_rn(s1, sq[t][sub + 8 * i + 8], o1);
-                st[i] = gst_rt(s0);
-                st[i + 1] = gst_rt(s1);
+                const float s00 = __fmaf_rn(kk[i], d0, st0[i]);
+                const float s01 = __fmaf_rn(kk[i + 1], d0, st0[i + 1]);
+                const float s10 = __fmaf_rn(kk[i], d1, st1[i]);
+                const float s11 = __fmaf_rn(kk[i + 1], d1, st1[i + 1]);
+                o0 = __fmaf_rn(s00, qq[i], o0);
+                o1 = __fmaf_rn(s01, qq[i + 1], o1);
+                o2 = __fmaf_rn(s10, qq[i], o2);
+                o3 = __fmaf_rn(s11, qq[i + 1], o3);
+                st0[i] = gst_rt(s00);
+                st0[i + 1] = gst_rt(s01);
+                st1[i] = gst_rt(s10);
+                st1[i + 1] = gst_rt(s11);
             }
-            const float o = sum8(o0 + o1);
-            if (sub == 0) Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = o * INV_SQRT_D;
+            const float oa = sum8(o0 + o1), ob = sum8(o2 + o3);
+            if (sub == 0)
+                *(float2*)&Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = make_float2(oa * INV_SQRT_D, ob * INV_SQRT_D);
         }
     }
     #pragma unroll
-    for (int i = 0; i < 16; i++) gst_st(&S[((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j], st[i]);
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
+        gst_st(&S[o], st0[i]);
+        gst_st(&S[o + 1], st1[i]);
+    }
 }
 
 // fl_gdn_wide's gated norm, in place on Y: y = o · rms(o)⁻¹ · w · gate(z). Grid (len, GDN_HV),

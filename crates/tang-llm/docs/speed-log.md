@@ -506,3 +506,140 @@ instead of bf16: attention outputs 8x closer to split-K (rel L2 0.9-3.2e-3 → 1
 flash-wide-check warm tok/s, bf16 → fp16, H200: 1000 4,005 → 3,997, 3000 4,284 → 4,265, 8000
 4,436 → 4,390 (−1%); H100: 1000 3,989 → 4,046, 3000 4,318 → 4,313, 8000 4,463 → 4,417.
 Short-context KL unchanged (see qwen3next-batching.md Known issues: a 1e-7 jitter fails it too).
+
+### Wide prefill under ncu: what held the GEMMs and GDN (2026-11-04, RTX 3090 on mew)
+
+First profiler data for the wide path. ncu can't inject on the RunPod images. On mew it runs as
+root (`RmProfilingAdminOnly=1`) against a build with cudarc `cuda-12060`, because ncu
+2025.1.1's injection library lacks `cuTensorMapEncodeIm2colWide`. Other jobs held 20 GB of the
+3090, so `TANG_CODER_MAX_LAYERS=1` (new debug knob) loads one layer of
+Qwen3-Coder-Next UD-Q4_K_XL. `flash-wide-check --ctx 2048`, `TANG_CODER_WIDE=2048`. Reports
+are in `artifacts/` (`prof_base` = afa748e7, `psd` = after).
+
+| kernel (afa748e7) | time | occ. | regs | issue | tensor | L1 / L2 hit | top stalls (cycles/issue) | smem conflicts |
+|---|---|---|---|---|---|---|---|---|
+| cx_gemm_dense gdn_in (97×32) | 5.43 ms | 34% | 128 (2 blk/SM) | 18% | 8.5% | 76 / 54% | long_sb 18.0, wait 1.6 | 0 |
+| cx_gemm_dense gdn_out (16×32) | 1.75 ms | 33% | 128 | 21% | 10.4% | 76 / 90% | long_sb 14.1, wait 1.6 | 0 |
+| cx_moe_gemm_gu (8×513×32) | 6.63 ms | 32% | 128 | 25% | 6.8% | 84 / 82% | long_sb 9.9, lg_throttle 1.5 | 0 |
+| cx_moe_gemm_down (16×513×32) | 3.00 ms | 32% | 128 | 29% | 7.7% | 78 / 59% | long_sb 8.1, wait 1.6 | 642k st |
+| fl_gdn_wide (32×2, 512 thr) | 3.03 ms | 33% (66% theor.) | 64 | 45% | – | 82 / 77% | mio 2.0, short_sb 1.8, long_sb 1.2 | 0 |
+
+Root causes, from the SASS-level samples:
+- GEMMs: IMMA waiting on its B operand. Every warp loads its own copy of the tokens straight
+  from global (generic `LD`, 8 B a lane a chunk) and uses it at once.
+- Expert GEMMs: the grid's z gave 32 tiles an expert, about 96% of the 131k blocks empty. Each
+  of them copied the four `ExW` param structs to local memory (`const ExW& m = ...`) before it
+  exited.
+- My first staged Q4_K tile indexed `SbK.q[j]` with a runtime superblock half, which sent the
+  operands through local memory (37M LDL). Fixed by templating the half.
+- fl_gdn_wide: the per-chunk conv + SiLU + l2 norm staging (global-latency FFMAs, index math)
+  ran serially in only 64 blocks. The recurrence's smem reads were 4× redundant, with four
+  columns a warp reading the same k / q.
+
+Fixes (all GEMM outputs bitwise equal to afa748e7; the GDN summation order changed, so the KL
+vs narrow went from 2.3e-6 to 2e-13 at 3000):
+- Token tiles staged in shared memory: 128-column slabs, cp.async double buffer, row strides
+  160 / 144 B (conflict-free). Tokens' scale and code sum interleaved into one 16-byte read.
+  Dense, gate|up and down GEMMs.
+- Wide modules group an expert's pairs by 64 (`CX_GCHUNK`), so the grid is (rows, groups, 1).
+  Batch modules also launch z = 1 (their groups are ≤ 8). ExW read field by field.
+- Q4_K/Q5_K expert tiles called directly. Through `gemm_tile_any`'s switch the compiler emits a
+  CALL.
+- `fl_gdn_wide_prep`: conv, SiLU, norms, g and b for every token in parallel, written into the
+  free `egu` buffer. The recurrence streams them, holds two state columns a lane, and reads k / q
+  as float4.
+
+| kernel (ncu, 3090, 1 layer, 2048 rows) | before | after |
+|---|---|---|
+| moe_gu | 6.63 ms | 2.74 ms (tensor 16%, issue 46%) |
+| moe_down | 3.00 | 1.48 |
+| gdn_in (dense) | 5.43 | 2.99 |
+| gdn_out (dense) | 1.75 | 0.83 |
+| gdn recurrence | 3.03 | 1.43 + 0.26 prep |
+
+Per-stage GPU time with `TANG_CODER_PROF`, two 3000-token wide prefills on one layer
+(per-layer stages only): 57.6 → 31.9 ms (1.8×).
+
+What's left: the dense Q8X tile is now MIO-bound. Each MMA needs about 3 smem wavefronts
+(B 2, scales 1), close to the MMA's own rate. The next step is 32 rows a warp so each B
+fragment feeds two MMAs.
+
+Tried and reverted: GDN at one column a lane with 32 columns a block (128 blocks): 3.9 ms.
+Four columns a lane: 1.86 ms. Token staging with the runtime-half bug: slower.
+
+H200 results, pod o7lpawaxjvnm9b. afa748e7 and this branch were run back to back with the same
+settings: `flash-wide-check --ids-file refactor.ids -n 32`, `TANG_CODER_WIDE=2048`. Logs are in
+`artifacts/h200/`.
+
+| | afa748e7 | this branch |
+|---|---|---|
+| wide prefill, 1000 tokens | 3,967 tok/s | **5,829 tok/s** |
+| wide prefill, 3000 tokens | 4,263 tok/s | **6,679 tok/s** |
+| wide prefill, 8000 tokens | 4,391 tok/s | **7,172 tok/s** |
+| 3000: moe_gu / moe_down | 410 / 197 ms | 201 / 114 ms |
+| 3000: gdn_in / gdn_out | 240 / 92 ms | 144 / 53 ms |
+| 3000: GDN recurrence | 181 ms | 132 + 11 ms prep |
+| 3000: attn_in / attn_out | 57 / 30 ms | 26 / 18 ms |
+| 3000: router (unchanged) | 87 ms | 87 ms |
+| serve C=64 ×3, aggregate | 443 tok/s | **543 tok/s** |
+| serve C=64: TTFT p50 / p95 | 15.5 / 63.3 s | 7.2 / 42.0 s |
+| serve C=64: wall | 277 s | 226 s |
+
+Gates:
+- **tcheck:** t1 / t8 / t8-verify bitwise on both.
+- **spec-test:** PASS on both.
+- **batch-check:** N=8 PASS bitwise and N=64 PASS within tolerance. The logits checksums are
+  identical to afa748e7, so the batch path is unchanged.
+- **wide-check KL vs narrow, -n 32:**
+
+| | afa748e7 | this branch |
+|---|---|---|
+| 3000 | 8.6e-5 | 1.1e-4 |
+| 8000 | 4.4e-6 | 1.1e-5 |
+| 1000 | 3.1e-2 | 8.7e-2 |
+
+  At 3000 and 8000 the greedy output is equal on both builds. Both builds miss the 1e-5 bar at
+  3000 with these settings. 1000 fails on both (the known FA2 short-context issue). The GEMMs
+  are bitwise, so the KL change comes from the GDN summation order.
+
+`TANG_CODER_DENSE32=1` (Q8X at 32 rows a warp) is slower on the H200 too: gdn_in 144 → 191 ms,
+3000 tokens 6,675 → 6,392 tok/s, KL 5.5e-4. It stays off by default.
+
+### Wide prefill: router SGEMM re-tiled, wide GDN bitwise to afa748e7 again (2026-11-04, H200)
+
+Follow-up on the same branch. Runs used `flash-wide-check --ids-file refactor.ids -n 32` with
+`TANG_CODER_WIDE=2048` on pod o7lpawaxjvnm9b, shared with the serving agent under
+`/workspace/gpu.lock`. Logs are in `artifacts/h200/r3`.
+
+- **Router:** `cx_sgemm_wide2` replaces `cx_sgemm_wide`. It uses 64-row tiles, float4 k slabs
+  prefetched in registers, conflict-free float4 smem reads, and finds each row's segment once a
+  block. Every output is the same `fmaf` chain over k ascending, so the result is bitwise equal
+  and top-10 expert selection is unchanged (no tf32 or bf16 needed). Router time, two 3k
+  prefills:
+
+| tile | router ms |
+|---|---|
+| old `cx_sgemm_wide` | 87.3 |
+| 64 x 128 (`TANG_CODER_SGEMM2=1`) | 40.7 |
+| 64 x 64, block 128 (default) | 34.2 |
+
+  The 25 ms target isn't met. The rest would take tf32 or bf16 tensor cores, which would change
+  routing.
+- **GDN KL:** q and k are now staged permuted, so each lane's float4 reads give afa748e7's rows
+  (`sub + 8 i`) in order. The wide GDN is bitwise equal to afa748e7 again. KL vs narrow is back
+  to 8.61e-5 at 3000 and 4.43e-6 at 8000, and gdn_wide is not slower: 132 → 120 ms.
+
+| | afa748e7 | branch |
+|---|---|---|
+| wide prefill, 1000 tokens | 3,967 tok/s | 6,424 tok/s |
+| wide prefill, 3000 tokens | 4,263 tok/s | 7,143 tok/s (7,223 with the 64-token router tile) |
+| wide prefill, 8000 tokens | 4,391 tok/s | 7,534 tok/s |
+| serve C=64 ×3, aggregate | 443 tok/s | **583 tok/s** |
+| serve C=64: TTFT p50 / p95 | 15.5 / 63.3 s | 2.9 / 37.2 s |
+| serve C=64: wall | 277 s | 210 s |
+
+The load test ran with the 128-token router tile, before the 64-token tile became the default.
+
+Gates: tcheck t1 / t8 / t8-verify bitwise; batch-check N=8 bitwise, checksum unchanged
+(2066e91aa9110ab5); wide-check 3000 and 8000 PASS. spec-test was not re-run here; it passed
+earlier on this branch.
