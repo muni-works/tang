@@ -4406,6 +4406,45 @@ mod tests {
         );
     }
 
+    /// The TCX grouped MoE (`DS_MOE_TCX=1`, `ds_moe_tcx_*_f3`) against the K-split grouped
+    /// kernels it replaces, both with the shared expert out of the grouped launches: the same
+    /// group order, operands and slice reduce, so decode steps and 6-token verify windows match
+    /// bit for bit. Skipped under DS_EXACT (neither path runs).
+    #[test]
+    fn gpu_tiny_moe_tcx_matches_ks() {
+        let Some((_, meta)) = open() else { return };
+        let dir = Path::new(&tiny()).join("hf");
+        let ids = prompt(&meta);
+        let (mut a, mut b) = (GpuModel::open(&dir).unwrap(), GpuModel::open(&dir).unwrap());
+        if a.k.exact {
+            return;
+        }
+        a.k.moe_tcx_on.set(true);
+        (a.moe_sh, b.moe_sh) = (false, false);
+        let v = a.cpu.cfg.vocab_size;
+        let (la, _) = a.forward(&ids, 0, None).unwrap();
+        let (lb, _) = b.forward(&ids, 0, None).unwrap();
+        assert_eq!(la, lb, "prefill");
+        let mut tok = argmax(&la);
+        let mut pos = ids.len();
+        for i in 0..6 {
+            let (la, ma) = a.forward(&[tok], pos, None).unwrap();
+            let (lb, mb) = b.forward(&[tok], pos, None).unwrap();
+            assert_eq!(la, lb, "decode step {i}");
+            assert_eq!(ma, mb, "decode step {i} hiddens");
+            tok = argmax(&la);
+            pos += 1;
+        }
+        for round in 0..3 {
+            let win: Vec<usize> = (0..6).map(|i| (tok + 31 * i + round) % v).collect();
+            let (la, _) = a.forward_all(&win, pos).unwrap();
+            let (lb, _) = b.forward_all(&win, pos).unwrap();
+            assert_eq!(la, lb, "verify window {round}");
+            pos += 6;
+            tok = argmax(&la[5 * v..]);
+        }
+    }
+
     /// The K-split mHC glue (default path) against the exact one (`hc_exact`), on the
     /// fixture's teacher-forced steps (prefill, then decode): every layer's hidden within
     /// rel 2e-2, the same argmax, logits KL < 1e-3 (bit for bit under DS_EXACT=1).
