@@ -379,6 +379,17 @@ impl CudaComputeDevice {
     }
 
     /// Wrap storage + len into a pooled CudaBuffer (returned to pool on drop).
+    /// The OOM path's end: the pool is cleared and the retry still failed. The device's
+    /// alloc signature is infallible (ComputeDevice::alloc -> Self::Buffer), so this is a
+    /// panic — but one that names the cause and the ask (a fallible alloc is the real fix,
+    /// so a full GPU answers 503 per request instead of killing the server).
+    fn oom(bytes: usize, e: &cudarc::driver::DriverError) -> ! {
+        panic!(
+            "tang-compute: CUDA alloc of {} MB failed after clearing the buffer pool: {e:?}              (the GPU is genuinely full — another process or model holds the rest; a per-             request 503 needs a fallible alloc, see crates/tang-compute/src/cuda.rs)",
+            bytes / (1024 * 1024),
+        )
+    }
+
     fn make_buf(&self, storage: CudaStorage, len: usize) -> CudaBuffer {
         CudaBuffer {
             storage: Some(storage),
@@ -413,8 +424,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
-                self.make_buf(CudaStorage::F32(slice), len)
+                match self.stream.alloc_zeros::<f32>(len) {
+                    Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+                    Err(e) => Self::oom(len * 4, &e),
+                }
             }
         }
     }
@@ -436,8 +449,10 @@ impl CudaComputeDevice {
             Err(_) => {
                 // OOM — evict pool and retry
                 self.pool.lock().unwrap().clear();
-                let slice = unsafe { self.stream.alloc::<f32>(len).unwrap() };
-                self.make_buf(CudaStorage::F32(slice), len)
+                match unsafe { self.stream.alloc::<f32>(len) } {
+                    Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+                    Err(e) => Self::oom(len * 4, &e),
+                }
             }
         }
     }
@@ -458,8 +473,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
-                self.make_buf(CudaStorage::Bf16(slice), len)
+                match self.stream.alloc_zeros::<u16>(len) {
+                    Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+                    Err(e) => Self::oom(len * 2, &e),
+                }
             }
         }
     }
@@ -479,8 +496,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = unsafe { self.stream.alloc::<u16>(len).unwrap() };
-                self.make_buf(CudaStorage::Bf16(slice), len)
+                match unsafe { self.stream.alloc::<u16>(len) } {
+                    Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+                    Err(e) => Self::oom(len * 2, &e),
+                }
             }
         }
     }
