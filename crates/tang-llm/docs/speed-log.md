@@ -761,3 +761,64 @@ The load test ran with the 128-token router tile, before the 64-token tile becam
 Gates: tcheck t1 / t8 / t8-verify bitwise; batch-check N=8 bitwise, checksum unchanged
 (2066e91aa9110ab5); wide-check 3000 and 8000 PASS. spec-test was not re-run here; it passed
 earlier on this branch.
+
+## 2026-11-05: serve3 — `--mtp` at no cost with spec off, and a shorter TTFT tail
+
+Branch `frog/coder-serve3` from `frog/integrate-2026-11-03` @ 99f8c6f9. H200 8utiorjlxzui34,
+`serve --batch 64 --ctx 32768 --mtp mtp.gguf` (step 3200), `TANG_SERVE_SPEC` default (off), port
+8911. Mix = `load.py` (prompts 200–6000, out 256–1024, 10 % sampled), decode-heavy =
+`load_dec.py` (prompts 200–800, out 512–1024). The scripts now also report TTFT p99 and ITL
+(gaps between streamed chunks). 0 errors in every run.
+
+**What `--mtp` cost.** serve2's MTP K/V fill ran over every wide-prefilled prompt as 8-row
+MTP passes, each a full MTP layer (MoE, 152k-vocab head, pick) plus a sync: 256 passes per
+2048-row window. With spec off nothing drafts from it. `TANG_SERVE_WIDE_MTP=0` on the base:
+482 → 600 tok/s (no `--mtp`: 610).
+
+**What set the TTFT tail.** The slow requests are all the cold burst's long prompts
+(t0 ≈ 0). Their prefill isn't slow (~7k tok/s in wide windows of 25 ms + 0.12 ms a token), but
+every request pinned its prompt's state to disk (`marks`: the second `<|im_start|>`, which for
+a one-turn chat is the whole prompt), and that serialized ~100 MB per value-by-value and took a
+second device copy of the positions on the serve thread: 70–180 ms per request, 31 % of the
+burst's prefill time.
+
+Changes:
+- **MTP fill.** Passes nothing drafts from (no chain, no training dump) stop after the MTP
+  mixer, which writes the K/V: no MoE, head or pick. The serve loop fills only when spec is on
+  and a decode window has spare rows (`Coder::mtp_fill`, `TANG_SERVE_WIDE_MTP=0|1` pins it); a
+  slot prefilled without it drafts from stale K/V there, verification keeps the output exact.
+- **Scheduler.** Prefill gets `fill_share` (0.85) once a prompt has waited
+  `TANG_SERVE_PREFILL_URGENT_S` (4 s), even with decode rows full (was `share`, 0.5, which is
+  how a burst's last long prompts drained); a leftover chunk below a slice waits for the next
+  step unless it finishes its prompt; the wide slice is 1024 (was 512; a wide window's fixed
+  ~25 ms).
+- **Disk pins.** The state file is serialized and written on the writer thread from the host
+  copies the snapshot already made (its position segments cover the prompt), not a second
+  device read. Round trip checked: a pinned system prompt read back after a restart, same
+  greedy reply.
+
+| | before (99f8c6f9, `--mtp`) | before, no `--mtp` | after (`--mtp`) |
+|---|---|---|---|
+| mix C=64: aggregate | 482 tok/s | 610 | **725** |
+| mix C=64: TTFT p50 / p95 / p99 | 14.2 / 56.6 / 74.7 s | 3.3 / 36.7 / 50.0 s | **1.0 / 26.5 / 32.4 s** |
+| mix C=64: ITL p50 / p95 / p99 | 38 / 360 / 494 ms | 41 / 308 / 419 ms | 42 / 250 / 323 ms |
+| mix C=64: stream p50 | 9.7 tok/s | 11.0 | 12.9 |
+| mix C=8: aggregate | 358 tok/s | 420 | **464** |
+| mix C=8: TTFT p50 / p95 / p99 | 1.32 / 7.42 / 9.08 s | 0.93 / 5.21 / 6.35 s | 0.67 / 3.74 / 4.63 s |
+| mix C=8: ITL p50 / p95 / p99 | 11.2 / 12.6 / 282 ms | 11.2 / 11.6 / 243 ms | 11.2 / 11.7 / 160 ms |
+| decode-heavy C=64: aggregate | 1,056 tok/s | 1,153 | **1,287** |
+| decode-heavy C=64: TTFT p50 / p95 / p99 | 1.59 / 17.1 / 19.6 s | 1.19 / 13.0 / 15.0 s | 0.76 / 7.2 / 8.0 s |
+| decode-heavy C=64: ITL p50 / p95 / p99 | 36 / 226 / 324 ms | 36 / 178 / 274 ms | 36 / 50 / 252 ms |
+
+Steps (mix C=64, `--mtp` unless noted): base 482 → fill gated 606 (p95 37.1 s) → + urgent share
+630 (34.2 s) → + slice 1024 642 (33.0 s) → + disk pins off-thread 725 (26.5 s). Without `--mtp`,
+slice 2048 alone gave 654 / 33.2 s but ITL p99 580 ms.
+
+The burst floor is now prefill work: the first 64 prompts are ~172k tokens, ~25 s of wide
+prefill at 85 % of the GPU, which is the p95. Lower takes faster prefill or packing several
+prompts into one wide window.
+
+Gates (this build): flash-tcheck bitwise (0 of 151936); batch-check N=8 bitwise, checksum
+2066e91aa9110ab5; N=64 tolerance 99.36 %, mean 0.123; spec-batch-check 16 streams k=2 every
+budget 16/16 identical (budget 16 990 tok/s, 1.21×); sample-check N=64 PASS; `cargo test -p
+tang-llm` 208 passed.

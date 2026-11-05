@@ -1229,7 +1229,8 @@ pub struct Coder {
     var: Variants,
     mtp: Option<Mtp>,
     /// MTP pass graphs by (rows, attention chunks).
-    mtp_graphs: HashMap<(usize, usize), Graph>,
+    /// MTP pass graphs by `(rows, nchunk, fill-only)`.
+    mtp_graphs: HashMap<(usize, usize, bool), Graph>,
     /// Draft with the MTP layer after each window (when loaded and greedy).
     pub use_mtp: bool,
     /// Chain length (`TANG_CODER_MTP_K`, default 2).
@@ -1244,6 +1245,11 @@ pub struct Coder {
     /// ones included; off, those windows skip it and clear their slots' chains (the
     /// serve scheduler turns it off while drafting doesn't pay). Default on.
     pub slot_mtp: bool,
+    /// Fill the MTP K/V over wide prefill windows (`prefill_wide`). The serve scheduler turns
+    /// it off while every slot is busy (no spare rows, so no drafts); a slot prefilled without
+    /// it drafts from stale K/V over that prompt (verification keeps the output exact).
+    /// `TANG_SERVE_WIDE_MTP=0`/`1` pins it off/on. Default on.
+    pub mtp_fill: bool,
     /// How many sequence slots fit in VRAM (set at the first `alloc_slot`); 0: not yet known.
     slot_cap: usize,
     /// Per-segment commit graphs after a batched verify window, by segment count.
@@ -1552,6 +1558,7 @@ impl Coder {
             mtp_alt: None,
             slot_chain: vec![Vec::new(); MAX_SLOTS],
             slot_mtp: true,
+            mtp_fill: true,
             slot_cap: 0,
             commit_seg_graphs: (0..=MAX_T).map(|_| None).collect(),
             last_mtp_ms: 0.0,
@@ -2108,7 +2115,7 @@ impl Coder {
                 ..Default::default()
             };
             next = self.run_staged(st, w0, t, false, nchunk, 1, None)?[t - 1];
-            if self.mtp_on() {
+            if self.mtp_on() && self.mtp_fill_on() {
                 let toks = self.slot_tokens(slot);
                 let mut nx = toks[pos + 1..pos + t].to_vec();
                 nx.push(if pos + t == end { next } else { toks[pos + t] });
@@ -2828,11 +2835,11 @@ impl Coder {
             r?;
             // The MTP layer's K/V for the window's positions, from its hidden rows (the wide
             // scratch's `x`, normed by the last layer), so a slot's drafts later attend over
-            // its prompt (`TANG_SERVE_WIDE_MTP=0`: skip, the drafts then see stale K/V there).
+            // its prompt (`mtp_fill_on`: off, the drafts then see stale K/V there).
             if self.mtp.is_some()
                 && self.use_mtp
                 && self.peer.is_none()
-                && !std::env::var("TANG_SERVE_WIDE_MTP").is_ok_and(|v| v == "0")
+                && self.mtp_fill_on()
             {
                 let tm = Instant::now();
                 let mut next = body[at + 1..at + t].to_vec();
@@ -4786,7 +4793,9 @@ impl Coder {
     /// The MTP layer on `t` staged rows: input from `m.emb` (staged) and `m.mh`, attention over
     /// `nchunk` chunks, then the head; ids and probabilities to the pinned `IDS` words. Its rows'
     /// normed outputs stay in `s.x` (a chained step's input, gathered by the host).
-    fn enqueue_mtp(&self, t: usize, nchunk: usize) {
+    /// The MTP layer over `t` rows; `fill_only`: through the mixer only (it writes the K/V),
+    /// no MoE, head or pick: for rows nothing drafts from.
+    fn enqueue_mtp(&self, t: usize, nchunk: usize, fill_only: bool) {
         let m = self.mtp.as_ref().expect("MTP layer");
         let (s, n) = (&self.s, self.hp.n_embd);
         self.kcopy_on(
@@ -4834,6 +4843,9 @@ impl Coder {
         );
         self.norm_q8(0, None, &m.layer.attn_norm, t);
         self.enqueue_mixer(0, MTP_L, t, true, nchunk, 1);
+        if fill_only {
+            return;
+        }
         self.norm_q8(0, Some(self.dev.buffer_addr(&s.mix)), &m.layer.post_norm, t);
         self.enqueue_moe(0, MTP_L, t, &m.onorm, false);
         let v = self.hp.n_vocab;
@@ -4919,6 +4931,12 @@ impl Coder {
     /// (in row order) for position `pos` of `slot` and the token `next` at `pos + 1`, and
     /// guesses the token at `pos + 2`. Returns each row's guess and its probability.
     fn mtp_pass(&mut self, rows: &[(usize, usize, u32)]) -> Result<Vec<(u32, f32)>> {
+        self.mtp_pass_as(rows, false)
+    }
+
+    /// [`mtp_pass`](Self::mtp_pass); `fill_only`: only the K/V of `rows` (no drafts, returns
+    /// nothing), the MoE and head skipped.
+    fn mtp_pass_as(&mut self, rows: &[(usize, usize, u32)], fill_only: bool) -> Result<Vec<(u32, f32)>> {
         let (t, n) = (rows.len(), self.hp.n_embd);
         let end = rows.iter().map(|r| r.1 + 2).max().unwrap_or(0);
         ensure!((1..=MAX_T).contains(&t) && end <= self.max_ctx);
@@ -4936,18 +4954,18 @@ impl Coder {
         }
         let nchunk = self.nchunk(end);
         if self.use_graphs && self.prof.is_none() {
-            let key = (t, nchunk);
+            let key = (t, nchunk, fill_only);
             if let Some(g) = self.mtp_graphs.get(&key) {
                 g.launch(&self.stream).map_err(|e| anyhow!("{e}"))?;
             } else {
-                self.enqueue_mtp(t, nchunk);
+                self.enqueue_mtp(t, nchunk, fill_only);
                 self.dev.sync();
-                let out = self.mtp_read(t);
+                let out = if fill_only { Vec::new() } else { self.mtp_read(t) };
                 let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
                 let me = self as *const Self;
                 let gr = Graph::capture(&stream, |_| {
                     // SAFETY: `self` is not otherwise touched during capture.
-                    unsafe { &*me }.enqueue_mtp(t, nchunk);
+                    unsafe { &*me }.enqueue_mtp(t, nchunk, fill_only);
                     Ok(())
                 })
                 .map_err(|e| anyhow!("capture MTP T={t}: {e}"))?;
@@ -4955,10 +4973,10 @@ impl Coder {
                 return Ok(out);
             }
         } else {
-            self.enqueue_mtp(t, nchunk);
+            self.enqueue_mtp(t, nchunk, fill_only);
         }
         self.dev.sync();
-        Ok(self.mtp_read(t))
+        Ok(if fill_only { Vec::new() } else { self.mtp_read(t) })
     }
 
     /// Copy rows `from[i]` of `src` (`n_embd` f32 each) to rows `i` of `m.mh`, through `m.cat`.
@@ -5069,6 +5087,11 @@ impl Coder {
             }
             _ => None,
         };
+        // Nothing chained and no training dump: only the K/V is wanted.
+        if keep.is_none() && !chained.contains(&true) {
+            self.mtp_pass_as(&rows, true)?;
+            return Ok(out);
+        }
         let first = self.mtp_pass(&rows)?;
         if let (Some(keep), Some(d)) = (&keep, self.train_dump.as_mut()) {
             for (i, (r, &k)) in rows.iter().zip(keep).enumerate() {
@@ -5184,6 +5207,16 @@ impl Coder {
         self.mtp_alt = alt;
         self.last_mtp_ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(())
+    }
+
+    /// Fill the MTP K/V over prefilled prompts: [`mtp_fill`](Self::mtp_fill), unless
+    /// `TANG_SERVE_WIDE_MTP=0`/`1` pins it.
+    fn mtp_fill_on(&self) -> bool {
+        match std::env::var("TANG_SERVE_WIDE_MTP").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => self.mtp_fill,
+        }
     }
 
     /// MTP drafting applies: a layer is loaded, `use_mtp`, and the windows are greedy.

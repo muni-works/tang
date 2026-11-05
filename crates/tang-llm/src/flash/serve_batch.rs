@@ -388,8 +388,19 @@ impl FlashServe {
             })
             .clone();
         let plan = prefill_plan(&waiting, &policy, self.sched.budget(&policy, decoding));
-        let prompts_waiting = !waiting.is_empty();
+        let oldest = waiting.iter().map(|w| w.age).reduce(f64::max);
         let n_chunks = plan.len();
+        // The prompts' MTP K/V only pays if they'll draft: skip the fill with spec off, or
+        // while every row of a decode window is taken (drafts need spare rows), as at C = 64.
+        if self.e.use_mtp() && !plan.is_empty() {
+            let live = lanes
+                .iter()
+                .filter(|l| l.stream.downcast_ref::<Stream>().unwrap().finish.is_none())
+                .count();
+            let width = crate::batch::window_width(MAX_T, self.e.batch_rows(), self.deterministic);
+            let spec = self.spec.mode != crate::batch::spec::Mode::Off;
+            self.e.set_mtp_fill(spec && live < width);
+        }
         for (i, n) in plan {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -510,7 +521,7 @@ impl FlashServe {
             }
             .map_err(|e| StepFailure::lanes(group.to_vec(), e))?;
             let dt = t.elapsed().as_secs_f64();
-            let share = policy.share_for(ready.len(), self.batch, prompts_waiting);
+            let share = policy.share_for(ready.len(), self.batch, oldest);
             self.sched.decoded(dt, share, &policy);
             let accepted: usize = kept.iter().map(|k| k.len() - 1).sum();
             if mtp {
