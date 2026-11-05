@@ -232,6 +232,8 @@ pub trait ServeEngine {
     }
     /// Run the MTP head after slot windows (`Coder::slot_mtp`).
     fn set_slot_mtp(&mut self, _on: bool) {}
+    /// Fill the MTP K/V over wide prefill windows (`Coder::mtp_fill`).
+    fn set_mtp_fill(&mut self, _on: bool) {}
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
@@ -428,6 +430,9 @@ impl ServeEngine for super::coder::Coder {
     fn set_slot_mtp(&mut self, on: bool) {
         self.slot_mtp = on;
     }
+    fn set_mtp_fill(&mut self, on: bool) {
+        self.mtp_fill = on;
+    }
     fn use_mtp(&self) -> bool {
         self.use_mtp
     }
@@ -450,7 +455,7 @@ impl ServeEngine for super::coder::Coder {
 /// A saved running state and the tokens it follows.
 struct Snap {
     tokens: Vec<u32>,
-    state: RunningState,
+    state: Arc<RunningState>,
     /// Positions `0..tokens.len()` of the positional state (another sequence may have
     /// overwritten them on the device since), in segments shared with the states it extends.
     pos: Vec<Arc<Positional>>,
@@ -1116,7 +1121,8 @@ impl FlashServe {
             return Ok(());
         }
         let t = Instant::now();
-        let state = self.e.save_running_at(slot)?;
+        let state = Arc::new(self.e.save_running_at(slot)?);
+        let t_run = t.elapsed().as_secs_f64() * 1e3;
         let n = toks.len();
         // Only the positions past the longest saved state this one extends are copied.
         let base = (0..self.snaps.len())
@@ -1129,11 +1135,13 @@ impl FlashServe {
         if from < n {
             pos.push(Arc::new(self.e.save_positional_at(slot, from, n)?));
         }
+        let t_pos = t.elapsed().as_secs_f64() * 1e3;
         let tokens = toks;
         if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
-            let full = self.e.save_positional_at(slot, 0, n)?;
-            self.save_disk(&tokens, &state, &full);
+            // From the host copies just made (the segments cover 0..n), on the writer thread.
+            self.save_disk(&tokens, state.clone(), pos.clone());
         }
+        let t_disk = t.elapsed().as_secs_f64() * 1e3;
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
         self.snaps.push(Snap {
             tokens,
@@ -1178,6 +1186,14 @@ impl FlashServe {
                     .unwrap();
                 self.snaps.swap_remove(lru);
             }
+        }
+        if std::env::var("TANG_SNAP_TIMES").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "snapshot {n} tok pinned {pinned}: running {t_run:.0} ms, positional {:.0}, disk {:.0}, evict {:.0}",
+                t_pos - t_run,
+                t_disk - t_pos,
+                t.elapsed().as_secs_f64() * 1e3 - t_disk
+            );
         }
         Ok(())
     }
@@ -1237,8 +1253,10 @@ impl FlashServe {
         }
     }
 
-    /// Write a pinned state to disk (on a thread; the file appears complete or not at all).
-    fn save_disk(&self, ids: &[u32], s: &RunningState, pos: &Positional) {
+    /// Write a pinned state to disk: positions `0..ids.len()` are `pos`'s segments in order.
+    /// Serialized and written on a thread (the file appears complete or not at all), so the
+    /// serve loop only pays the device copies.
+    fn save_disk(&self, ids: &[u32], s: Arc<RunningState>, pos: Vec<Arc<Positional>>) {
         let Some(path) = self.disk_path(ids) else {
             return;
         };
@@ -1246,30 +1264,48 @@ impl FlashServe {
             crate::retention::touch(&path);
             return;
         }
-        let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
-        bytes.extend_from_slice(b"TANGRS02");
-        bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
-        for &i in ids {
-            bytes.extend_from_slice(&i.to_le_bytes());
-        }
-        let parts = s.parts();
-        bytes.extend_from_slice(&(parts.len() as u64).to_le_bytes());
-        for p in parts {
-            bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-            for &x in p {
-                bytes.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        bytes.extend_from_slice(&(pos.parts().len() as u64).to_le_bytes());
-        for p in pos.parts() {
-            bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(p);
-        }
+        let ids = ids.to_vec();
         let budget = std::env::var("TANG_FLASH_DISK_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .map_or(8e9, |g| g * 1e9) as u64;
         std::thread::spawn(move || {
+            let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
+            bytes.extend_from_slice(b"TANGRS02");
+            bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+            for &i in &ids {
+                bytes.extend_from_slice(&i.to_le_bytes());
+            }
+            let parts = s.parts();
+            bytes.extend_from_slice(&(parts.len() as u64).to_le_bytes());
+            for p in parts {
+                bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
+                // One copy of the f32s' little-endian bytes (a per-value loop here cost ~100 ms a
+                // save on the serve thread, in every pinned prompt's TTFT).
+                if cfg!(target_endian = "little") {
+                    // SAFETY: `p` is a valid `[f32]`; any byte view of it is valid `u8`s.
+                    bytes.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(
+                            p.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(p),
+                        )
+                    });
+                } else {
+                    for &x in p {
+                        bytes.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+            // Each buffer's rows over 0..n: its part of every segment, in order.
+            let nbuf = pos.first().map_or(0, |p| p.parts().len());
+            bytes.extend_from_slice(&(nbuf as u64).to_le_bytes());
+            for b in 0..nbuf {
+                let len: usize = pos.iter().map(|p| p.parts()[b].len()).sum();
+                bytes.extend_from_slice(&(len as u64).to_le_bytes());
+                for p in &pos {
+                    bytes.extend_from_slice(&p.parts()[b]);
+                }
+            }
             let tmp = path.with_extension("tmp");
             let r = std::fs::File::create(&tmp)
                 .and_then(|mut f| f.write_all(&bytes))
@@ -1366,7 +1402,7 @@ impl FlashServe {
             }
             Ok(Snap {
                 tokens,
-                state: RunningState::from_parts(n, self.gdn_layers, parts)?,
+                state: Arc::new(RunningState::from_parts(n, self.gdn_layers, parts)?),
                 pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
                 pinned: true,
                 used: 0,

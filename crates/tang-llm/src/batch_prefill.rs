@@ -11,7 +11,7 @@ pub struct Policy {
     /// Prompt tokens a step when nothing decodes (`TANG_SERVE_PREFILL_BUDGET`).
     pub full: usize,
     /// The smallest chunk while something decodes (`TANG_SERVE_PREFILL_SLICE`): a window's fixed
-    /// cost is amortized over at least this many tokens.
+    /// cost (~25 ms wide on H200) is amortized over at least this many tokens.
     pub slice: usize,
     /// The largest chunk while something decodes (`TANG_SERVE_PREFILL_MAX_CHUNK`). Between
     /// `slice` and this, a chunk is as long as the decode credit banked buys.
@@ -29,13 +29,17 @@ pub struct Policy {
     /// Seconds after which a prompt goes ahead of every younger one, oldest first
     /// (`TANG_SERVE_PREFILL_DEADLINE_S`).
     pub deadline: f64,
+    /// Seconds a prompt may wait before prefill gets `fill_share` even with decode rows full
+    /// (`TANG_SERVE_PREFILL_URGENT_S`): a cold burst's long prompts otherwise drain at `share`
+    /// behind the rows the short ones filled, which sets the TTFT tail.
+    pub urgent: f64,
 }
 
 impl Policy {
     /// The defaults; `wide` is the engine's wide window width (0: none).
     pub fn defaults(wide: usize) -> Self {
         let (full, slice, max_chunk) = if wide > 0 {
-            (2048.min(wide), 512.min(wide), 2048.min(wide))
+            (2048.min(wide), 1024.min(wide), 2048.min(wide))
         } else {
             (256, 64, 256)
         };
@@ -48,6 +52,7 @@ impl Policy {
             fill: 0.8,
             age_tokens: 400.0,
             deadline: 20.0,
+            urgent: 4.0,
         }
     }
 
@@ -86,12 +91,19 @@ impl Policy {
         if let Some(v) = num("TANG_SERVE_PREFILL_DEADLINE_S") {
             p.deadline = if v > 0.0 { v } else { f64::INFINITY };
         }
+        if let Some(v) = num("TANG_SERVE_PREFILL_URGENT_S") {
+            p.urgent = if v > 0.0 { v } else { f64::INFINITY };
+        }
         p
     }
 
-    /// Prefill's GPU share with `rows` streams decoding in a batch of `batch`, prompts waiting.
-    pub fn share_for(&self, rows: usize, batch: usize, prompts_waiting: bool) -> f64 {
-        if prompts_waiting && (rows as f64) < self.fill * batch as f64 {
+    /// Prefill's GPU share with `rows` streams decoding in a batch of `batch`; `oldest`: the
+    /// longest a waiting prompt has waited (`None`: none waits).
+    pub fn share_for(&self, rows: usize, batch: usize, oldest: Option<f64>) -> f64 {
+        let Some(age) = oldest else {
+            return self.share;
+        };
+        if (rows as f64) < self.fill * batch as f64 || age >= self.urgent {
             self.fill_share
         } else {
             self.share
@@ -194,6 +206,11 @@ pub fn prefill_plan(waiting: &[Waiting], p: &Policy, budget: usize) -> Vec<(usiz
         }
         let rem = waiting.iter().find(|x| x.idx == i).unwrap().rem;
         let n = rem.min(budget);
+        // A leftover too small to amortize a window (narrow below a slice) waits for the next
+        // step, unless it finishes the prompt.
+        if !plan.is_empty() && n < rem && n < p.slice {
+            break;
+        }
         plan.push((i, n));
         budget -= n;
     }
@@ -216,6 +233,7 @@ mod tests {
             fill: 0.8,
             age_tokens: 0.0,
             deadline: f64::INFINITY,
+            urgent: f64::INFINITY,
         }
     }
 
@@ -290,7 +308,7 @@ mod tests {
                     age: clock - reqs[i].t0,
                 })
                 .collect();
-            let prompts_waiting = !waiting.is_empty();
+            let oldest = waiting.iter().map(|w| w.age).reduce(f64::max);
             for (i, n) in prefill_plan(&waiting, p, sched.budget(p, decoding)) {
                 let dt = 0.004 + n as f64 * PF;
                 clock += dt;
@@ -312,7 +330,7 @@ mod tests {
             if !rows.is_empty() {
                 let dt = window(rows.len());
                 clock += dt;
-                sched.decoded(dt, p.share_for(rows.len(), batch, prompts_waiting), p);
+                sched.decoded(dt, p.share_for(rows.len(), batch, oldest), p);
                 windows += 1;
                 row_sum += rows.len();
                 for &i in &rows {
@@ -471,16 +489,16 @@ mod tests {
             2048,
             "nothing decoding: the full budget"
         );
-        assert_eq!(s.budget(&p, true), 512, "no credit: the minimum slice");
+        assert_eq!(s.budget(&p, true), p.slice, "no credit: the minimum slice");
         s.prefilled(512, 0.4, true);
         assert_eq!(s.budget(&p, true), 0, "prefill ahead of its share waits");
-        // Five 40 ms windows at the fill share (0.85) pay 1.13 s: 0.4 s debt, 0.73 s banked,
-        // which buys ~950 tokens.
-        for _ in 0..5 {
+        // Eight 40 ms windows at the fill share (0.85) pay 1.81 s: 0.4 s debt, 1.41 s banked
+        // (capped at one max chunk), which buys past the slice.
+        for _ in 0..8 {
             s.decoded(0.040, p.fill_share, &p);
         }
         let b = s.budget(&p, true);
-        assert!((512..=2048).contains(&b) && b > 512, "{b}");
+        assert!((p.slice..=2048).contains(&b) && b > p.slice, "{b}");
         // Credit is capped at one max chunk.
         for _ in 0..1000 {
             s.decoded(0.040, 0.95, &p);
@@ -493,9 +511,10 @@ mod tests {
     #[test]
     fn decode_rows_fill_before_prefill_is_throttled() {
         let p = Policy::defaults(2048);
-        assert_eq!(p.share_for(10, 64, true), p.fill_share);
-        assert_eq!(p.share_for(52, 64, true), p.share);
-        assert_eq!(p.share_for(10, 64, false), p.share);
+        assert_eq!(p.share_for(10, 64, Some(0.0)), p.fill_share);
+        assert_eq!(p.share_for(52, 64, Some(0.0)), p.share);
+        assert_eq!(p.share_for(52, 64, Some(p.urgent)), p.fill_share);
+        assert_eq!(p.share_for(10, 64, None), p.share);
     }
 
     #[test]
