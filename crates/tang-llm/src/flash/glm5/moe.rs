@@ -460,6 +460,10 @@ pub fn ffn(p: &MoeParams, x: &[f32], t_len: usize) -> Result<Vec<f32>> {
 /// executed on the fixtures by `scripts/glm5_moe_cuda_host.sh`.
 pub const SRC: &str = include_str!("moe_cuda.cuh");
 
+/// The GGUF-native int8 MMA experts (`g5x_*`, opt-in `TANG_GLM5_TCX=1`), appended to [`SRC`] in
+/// the fast-path module only.
+pub const TCX_SRC: &str = include_str!("moe_tcx.cuh");
+
 /// The KDA projection kernels ([`kda_dev::K5_SRC`]), appended to [`SRC`] at compile so
 /// `g5_dot`/`g5_deq` are in scope for them.
 pub const K5_SRC: &str = concat!(include_str!("moe_cuda.cuh"), "\n", include_str!("kda_k5.cuh"));
@@ -471,3 +475,13 @@ pub mod gpu;
 #[cfg(test)]
 #[path = "moe_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "moe_tcx_ref.rs"]
+mod tcx_ref;
+
+/// moe_gpu.rs `tcx_groups` (the TCX grid's fixed group count), host-side for the plan test.
+#[cfg(test)]
+fn tcx_groups_cpu(n: usize, ne: usize) -> usize {
+    n.min(ne + 2 + n / 8)
+}

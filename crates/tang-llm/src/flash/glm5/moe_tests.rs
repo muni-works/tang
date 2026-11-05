@@ -494,13 +494,18 @@ mod cuda {
         let m = DevMoe::new(p).unwrap();
         let t_len = x.len() / p.hidden;
         let want = ffn(p, x, t_len).unwrap();
-        for (mode, fast, act2, tl) in [
-            ("naive", false, true, tol),
-            ("fast q8x2", true, true, tol),
-            ("fast q8", true, false, tol_fast),
+        for (mode, fast, act2, tl, tcx) in [
+            ("naive", false, true, tol, false),
+            ("fast q8x2", true, true, tol, false),
+            ("fast q8", true, false, tol_fast, false),
+            // the TCX experts (moe_tcx.cuh) at every window size; Q4_K / Q5_K layers only
+            ("tcx q8x2", true, true, tol, true),
+            ("tcx q8", true, false, tol_fast, true),
         ] {
             k.fast = fast;
             k.act2 = act2;
+            k.tcx = tcx;
+            k.tcx_min_t = 1;
             k.poison = fast;
             let got = ffn_host(&k, &m, x, t_len).unwrap();
             let err = max_err(&got, &want);
@@ -713,11 +718,17 @@ mod cuda {
                 let yd = DevBuf::zeroed(x.len() * 4).unwrap();
                 let s = Stream::blocking().unwrap();
                 let mut outs = Vec::new();
-                for (mode, fast, act2) in
-                    [("naive", false, true), ("fast-q8x2", true, true), ("fast-q8", true, false)]
-                {
+                for (mode, fast, act2, tcx) in [
+                    ("naive", false, true, false),
+                    ("fast-q8x2", true, true, false),
+                    ("fast-q8", true, false, false),
+                    ("tcx-q8x2", true, true, true),
+                    ("tcx-q8", true, false, true),
+                ] {
                     k.fast = fast;
                     k.act2 = act2;
+                    k.tcx = tcx;
+                    k.tcx_min_t = 1;
                     k.poison = fast;
                     let got = ffn_host(&k, &m, &x, t_len).unwrap();
                     let st = stat(&got, &want, 2e-2);
@@ -758,10 +769,13 @@ mod cuda {
                     }
                     outs.push(got);
                 }
-                for (i, name) in [(1, "fast-q8x2"), (2, "fast-q8")] {
+                for (i, name) in [(1, "fast-q8x2"), (2, "fast-q8"), (3, "tcx-q8x2"), (4, "tcx-q8")] {
                     let ab = stat(&outs[i], &outs[0], 2e-2);
                     eprintln!("moebench l{l} T{t_len} {name}-vs-naive rel {:.3e}", ab.rel_l2);
                 }
+                // TCX vs the g5f path it replaces (same activations): the tolerance gate
+                let tg = stat(&outs[3], &outs[1], 2e-2);
+                eprintln!("moebench l{l} T{t_len} tcx-vs-g5f rel {:.3e} max {:.3e}", tg.rel_l2, tg.max_abs);
             }
         }
         eprintln!("moebench worst fast-q8x2 rel l2 {worst_fast:.3e}");

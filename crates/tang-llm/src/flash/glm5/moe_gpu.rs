@@ -52,7 +52,9 @@ const P_XQ2: usize = 10;
 const P_HQ2: usize = 11;
 const P_YP: usize = 12;
 const P_CNT: usize = 13;
-const P_N: usize = 14;
+const P_GU: usize = 14;
+const P_PLAN: usize = 15;
+const P_N: usize = 16;
 
 /// Device scratch reused across calls (grown on demand), plus the stream `ffn_host` runs on.
 #[derive(Default)]
@@ -103,6 +105,21 @@ pub struct Kernels {
     f_gux: Func,
     f_gu4: Func,
     f_down4: Func,
+    x_plan: Func,
+    x_gu: Func,
+    x_gu2: Func,
+    x_down: Func,
+    x_down2: Func,
+    x_silu: Func,
+    /// GGUF-native int8 MMA experts (`g5x_*` in moe_tcx.cuh, ported from coder's `cx_moe_*_q`;
+    /// `TANG_GLM5_TCX=1`, default OFF until GPU-verified): routed Q4_K / Q5_K gate|up (and down,
+    /// unless `TANG_GLM5_TCX_DOWN=0`) for windows of at least `tcx_min_t` tokens. Tolerance-gated
+    /// (float epilogue order differs from g5f), not bitwise.
+    pub tcx: bool,
+    pub tcx_down: bool,
+    /// Smallest window the TCX path takes (`TANG_GLM5_TCX_MIN_T`, default 2: coder's single-stream
+    /// windows gained nothing from TCX; batch / verify windows are where the MMA n-tile fills).
+    pub tcx_min_t: usize,
     /// Round-4 gate|up / down (`g5f_gu4` / `g5f_down4`, `TANG_GLM5_MOE_K4=1`, default OFF: no
     /// end-to-end gain on the B300 and logit KL 2.2e-3 > the 1e-3 bar, see NOTES):
     /// activation-resident lane-contiguous rows, NOT bit-identical to `g5f_gux` /
@@ -192,12 +209,16 @@ impl Kernels {
         let k4minb = rows("TANG_GLM5_MOE_K4MINB", 4).clamp(1, 16);
         let k4ns = rows("TANG_GLM5_MOE_K4NS", 3).clamp(2, 8);
         let rrel = i32::from(env_on("TANG_GLM5_MOE_ROUTE_REL", true));
+        // TANG_GLM5_TCX_SGU / _SDN: warps splitting K of a TCX 16-row tile (gate|up / down;
+        // coder's tuned 2 / 1; divisors of 8)
+        let (sgu, sdn) = tcx_split();
         let src = format!(
-            "#define G5F_K4_R {k4r}\n#define G5F_K4_NR {k4nr}\n#define G5F_K4_DR {k4dr}\n#define G5F_K4_DNR {k4dnr}\n#define G5F_K4_MINB {k4minb}\n#define G5F_K4_NS {k4ns}\n#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_ROUTE_REL {rrel}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n{}",
+            "#define G5F_K4_R {k4r}\n#define G5F_K4_NR {k4nr}\n#define G5F_K4_DR {k4dr}\n#define G5F_K4_DNR {k4dnr}\n#define G5F_K4_MINB {k4minb}\n#define G5F_K4_NS {k4ns}\n#define G5F_GUX_R {}\n#define G5F_SEL2 {sel2}\n#define G5F_ROUTE_REL {rrel}\n#define G5F_LDU {ldu}\n#define G5F_MINB {minb}\n#define G5F_DOT32 {dot32}\n#define G5F_UNROLL {unroll}\n#define G5F_FUSE2 {fuse2}\n#define G5F_GUR {}\n#define G5F_DNR {}\n#define G5F_PF {pf}\n#define G5X_SGU {sgu}\n#define G5X_SDN {sdn}\n{}\n{}",
             gux.max(1),
             gur.max(1),
             dnr.max(2),
-            super::SRC
+            super::SRC,
+            super::TCX_SRC
         );
         let m = g.module(&src)?;
         let debug = std::env::var("TANG_GLM5_MOE_DEBUG").is_ok_and(|v| v == "1");
@@ -223,6 +244,15 @@ impl Kernels {
             f_gux: m.func("g5f_gux")?,
             f_gu4: m.func("g5f_gu4")?,
             f_down4: m.func("g5f_down4")?,
+            x_plan: m.func("g5x_plan")?,
+            x_gu: m.func("g5x_gu_q")?,
+            x_gu2: m.func("g5x_gu_q2")?,
+            x_down: m.func("g5x_down_q")?,
+            x_down2: m.func("g5x_down_q2")?,
+            x_silu: m.func("g5x_silu")?,
+            tcx: env_on("TANG_GLM5_TCX", false),
+            tcx_down: env_on("TANG_GLM5_TCX_DOWN", true),
+            tcx_min_t: rows("TANG_GLM5_TCX_MIN_T", 2).max(1),
             k4: env_on("TANG_GLM5_MOE_K4", false),
             k4r,
             k4dr,
@@ -903,6 +933,12 @@ fn ffn_fast(
         (0u64, 0u64, 1i32, 1i32)
     };
 
+    if routed && k.tcx && t >= k.tcx_min_t && tcx_fits(gate, up, ff, ffs, hid, t * slots) {
+        let lims = p.limit_shexp;
+        let geo = TcxGeo { t, slots, nr, ne: ne as usize, hid, ff, ffs, hs, lim, lims };
+        return ffn_tcx(k, pool, s, &geo, [gate, up, down, sg, su, sd], [x, xq, xq2, xd, idp, wtp, y]);
+    }
+
     // grouped gate|up -> h, q8(h)
     let nh = t * slots * hs;
     let h = pool.get(P_H, nh * 4)?;
@@ -1032,6 +1068,155 @@ fn ffn_fast(
                 tang_moe::args![down, sd, idp, wtp, kk, ne, h, hq, hq2, hd, hsi, y, ffi, ffsi, hidi, r16d, swi],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Shapes of one TCX call (see [`ffn_tcx`]).
+struct TcxGeo {
+    t: usize,
+    slots: usize,
+    nr: usize,
+    ne: usize,
+    hid: usize,
+    ff: usize,
+    ffs: usize,
+    hs: usize,
+    lim: f32,
+    lims: f32,
+}
+
+/// moe_tcx.cuh `G5X_NP` / `G5X_LIST`.
+const TCX_NP: usize = 1024;
+const TCX_LIST: usize = 2 + TCX_NP;
+
+/// TCX applies: routed gate and up Q4_K / Q5_K, tiles that don't straddle gate|up, whole
+/// superblocks, at most `TCX_NP` pairs.
+fn tcx_fits(gate: G5W, up: G5W, ff: usize, ffs: usize, hid: usize, pairs: usize) -> bool {
+    let kq = |w: G5W| w.ty == 12 || w.ty == 13;
+    kq(gate) && kq(up) && ff % 256 == 0 && ffs % 256 == 0 && hid % 256 == 0 && pairs <= TCX_NP
+}
+
+/// Fixed group count for a window shape (graph-safe): one group per 8 pairs of each key.
+pub(crate) fn tcx_groups(n: usize, ne: usize) -> usize {
+    n.min(ne + 2 + n / 8)
+}
+
+/// Warps splitting K of a TCX tile (`TANG_GLM5_TCX_SGU` / `_SDN`, divisors of 8).
+fn tcx_split() -> (usize, usize) {
+    let n = |key: &str, d: usize| match std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(v @ (1 | 2 | 4 | 8)) => v,
+        _ => d,
+    };
+    (n("TANG_GLM5_TCX_SGU", 2), n("TANG_GLM5_TCX_SDN", 1))
+}
+
+/// Routed experts on the int8 MMA kernels: plan, gate|up -> gu [pairs][2 hs], `g5x_silu` -> h,
+/// `g5f_q8` -> hq / hq2 / hd, down per pair into yp (`g5x_down_q*` for Q4_K / Q5_K down, else the
+/// g5f split down on the same h), `g5f_sum`. `w` = gate, up, down, sh gate, up, down; `d` = x, xq,
+/// xq2 (0 = one-level), xd, ids, wts, y.
+fn ffn_tcx(k: &Kernels, pool: &mut Pool, s: &Stream, g: &TcxGeo, w: [G5W; 6], d: [u64; 7]) -> Result<()> {
+    let [gate, up, down, sg, su, sd] = w;
+    let [x, xq, xq2, xd, idp, wtp, y] = d;
+    let n = g.t * g.slots;
+    let groups = tcx_groups(n, g.ne) as u32;
+    let (sgu, sdn) = tcx_split();
+    let plan = pool.get(P_PLAN, (TCX_LIST + n) * 4)?;
+    let gu = pool.get(P_GU, n * 2 * g.hs * 4)?;
+    let h = pool.get(P_H, n * g.hs * 4)?;
+    let hq = pool.get(P_HQ, n * g.hs)?;
+    let hd = pool.get(P_HD, n * g.hs / 32 * 4)?;
+    let hq2 = if xq2 != 0 { pool.get(P_HQ2, n * g.hs)? } else { 0u64 };
+    let yp = pool.get(P_YP, n * g.hid * 4)?;
+    if k.poison {
+        nan_fill(h, n * g.hs, s)?;
+        nan_fill(y, g.t * g.hid, s)?;
+    }
+    let (ki, nei, si, ni) = (g.nr as i32, g.ne as i32, g.slots as i32, n as i32);
+    let (hsi, ffi, ffsi, hidi) = (g.hs as i32, g.ff as i32, g.ffs as i32, g.hid as i32);
+    let (lim, lims) = (g.lim, g.lims);
+    let blk = (128u32, 1u32, 1u32);
+    let wide = (256u32, 1u32, 1u32);
+    let rb = |w: G5W| w.row_bytes as u64;
+    let gu_b = g.t as u64 * (g.nr as u64 * g.ff as u64 * (rb(gate) + rb(up)) + g.ffs as u64 * (rb(sg) + rb(su)));
+    let dn_b = g.t as u64 * g.hid as u64 * (g.nr as u64 * rb(down) + rb(sd));
+    let tcx_dn = k.tcx_down && (down.ty == 12 || down.ty == 13);
+    unsafe {
+        gpu::launch(k.x_plan, (1, 1, 1), (1024, 1, 1), 0, s, tang_moe::args![idp, ki, nei, si, ni, plan])?;
+        gpu::trace::bytes(gu_b);
+        let gx = (2 * g.hs * sgu).div_ceil(128) as u32;
+        if xq2 != 0 {
+            gpu::launch(
+                k.x_gu2,
+                (gx, groups, 1),
+                wide,
+                0,
+                s,
+                tang_moe::args![gate, up, sg, su, idp, ki, nei, si, x, xq, xq2, xd, gu, hsi, ffi, ffsi, hidi, plan],
+            )?;
+        } else {
+            gpu::launch(
+                k.x_gu,
+                (gx, groups, 1),
+                wide,
+                0,
+                s,
+                tang_moe::args![gate, up, sg, su, idp, ki, nei, si, x, xq, xd, gu, hsi, ffi, ffsi, hidi, plan],
+            )?;
+        }
+        let rows = (g.hs.div_ceil(128) as u32, n as u32, 1);
+        gpu::launch(k.x_silu, rows, blk, 0, s, tang_moe::args![gu, h, idp, ki, nei, si, hsi, ffi, ffsi, lim, lims])?;
+        gpu::launch(k.f_q8, rows, blk, 0, s, tang_moe::args![h, hq, hq2, hd, hsi])?;
+        gpu::trace::bytes(dn_b);
+        if tcx_dn {
+            let dx = (g.hid * sdn).div_ceil(128) as u32;
+            if hq2 != 0 {
+                gpu::launch(
+                    k.x_down2,
+                    (dx, groups, 1),
+                    wide,
+                    0,
+                    s,
+                    tang_moe::args![down, sd, idp, wtp, ki, nei, si, h, hq, hq2, hd, yp, hsi, ffi, ffsi, hidi, plan],
+                )?;
+            } else {
+                gpu::launch(
+                    k.x_down,
+                    (dx, groups, 1),
+                    wide,
+                    0,
+                    s,
+                    tang_moe::args![down, sd, idp, wtp, ki, nei, si, h, hq, hd, yp, hsi, ffi, ffsi, hidi, plan],
+                )?;
+            }
+        } else if k.dnr > 0 {
+            gpu::launch(
+                k.f_down_splitn,
+                (g.hid.div_ceil(4 * k.dnr) as u32, g.slots as u32, g.t as u32),
+                blk,
+                0,
+                s,
+                tang_moe::args![down, sd, idp, wtp, ki, nei, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi],
+            )?;
+        } else {
+            let r16 = 0i32;
+            gpu::launch(
+                k.f_down_split,
+                (g.hid.div_ceil(8) as u32, g.slots as u32, g.t as u32),
+                blk,
+                0,
+                s,
+                tang_moe::args![down, sd, idp, wtp, ki, nei, h, hq, hq2, hd, hsi, yp, ffi, ffsi, hidi, r16],
+            )?;
+        }
+        gpu::launch(
+            k.f_sum,
+            (g.hid.div_ceil(128) as u32, g.t as u32, 1),
+            blk,
+            0,
+            s,
+            tang_moe::args![yp, y, si, hidi],
+        )?;
     }
     Ok(())
 }
