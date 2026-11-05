@@ -35,6 +35,7 @@ pub mod serve;
 #[cfg(feature = "cuda")]
 pub mod split;
 pub mod tokenize;
+pub mod tcx;
 pub mod tree;
 
 use crate::gguf::{Gguf, TensorInfo};

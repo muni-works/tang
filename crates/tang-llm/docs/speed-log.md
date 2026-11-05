@@ -337,6 +337,124 @@ lever is fewer instructions a byte (a different quant layout or tensor-core deco
 decision for Cam. The T=8 narrow run was skipped: the best variant is the default shape, and
 narrow streaming (`TANG_CODER_NSTREAM=1`) is already recorded as slower.
 
+### TCX: experts repacked into tensor-core tiles (2026-11-04, H200 srznguhpkj2lqo, explain)
+
+`TANG_CODER_TCX=1` (`flash::tcx`, `cx_moe_gu_t` / `cx_moe_down_t`): at load each Q4_K / Q5_K
+expert matrix is also stored as 16-row × 256-column tiles whose 4-bit codes are the
+m16n8k32 A fragments as they are (one shift and mask a register; Q5's fifth bits a separate
+plane), with d / dmin f16 and the 6-bit sub-block scales and mins unpacked to bytes
+(repack → dequant is bit-exact vs GGUF, unit-tested). A 32-column step is two MMAs: the
+codes, and the mins replicated (gives m_j · Σx); the 6-bit scale is one IMAD a value, and the
+activations are int8 with one scale a token a 256 (Q8_K-style, `cx_q8k` / `cx_silu_q8k`), so
+float math happens once a superblock. 4 (gate|up) / 2 (down) warps split a tile's K. Runs in
+every grouped window, narrow and batch. Repack: +156 s load (weights 116 → 272 s); both copies
+held for now (49.6 → 97.3 GB).
+
+| B | default ms | TCX ms | Δ |
+|---|---|---|---|
+| 1 | 4.07 | 4.40 | +8% |
+| 8 | 9.97 | 11.30 | +13% |
+| 16 | 17.50 | 14.55 | −17% |
+| 32 | 24.81 | 21.30 | −14% |
+| 64 | 38.94 | 35.67 | −8% |
+
+Tolerance at B=64 (alone vs batch, both TCX): 99.17% agreement, mean |Δlogit| 0.144 (default
+99.50% / 0.122). flash-aa explain no drafts: 245.5 → 226.8 tok/s.
+
+Iteration 2 (3e0d5405+): the per-block activation staging was the cost, not the math.
+`TANG_BATCH_QUICK=1 TANG_CODER_PROF=1`, B=64, ms a step (gate|up / down; default 10.6 / 5.65):
+
+| change | gate\|up | down | quick ms |
+|---|---|---|---|
+| staged activations, K split 4 / 2 | 10.1 | 5.25 | 34.96 |
+| staged, split 8 / 2 | 15.1 | 5.26 | 39.97 |
+| staged, split 2 / 1 | 7.0 | 4.92 | 31.49 |
+| activations from global in B order (no staging, no barrier), split 2 / 1 | **6.2** | **4.96** | 30.72 |
+| same, split 1 / 1 | 8.6 | 4.93 | 33.11 |
+| same, split 4 / 2 | 8.6 | 5.4 | 33.66 |
+| same, per-32 activations (`TANG_CODER_TCX32=1`, float math a step) | 6.7 | 5.7 | — |
+
+Gate|up at 6.2 ms ≈ 0.13 ms a layer ≈ 3.7 TB/s of distinct expert bytes; down ~2.9 TB/s.
+The default kernels at the same instruction count per byte as before sat at ~2 TB/s and so
+did TCX while it staged activations: the per-block prologue (stage, barrier) was the limit.
+
+Full `flash-batch-check` N=64 (explain, graphs), ms a step:
+
+| B | default | TCX (Q8_K acts) | TCX32 (per-32 acts) |
+|---|---|---|---|
+| 1–8 | 4.07 / 4.79 / 6.57 / 9.97 | same (narrow stays per-pair) | same |
+| 16 | 17.46 | 16.43 | 16.33 |
+| 32 | 24.78 | 21.98 | 22.31 |
+| 64 | 38.91 | **32.30** (1982 tok/s) | **33.87** (1890 tok/s) |
+| tolerance | 99.50% / 0.122 | **98.96% / 0.134: FAIL** | 99.29% / 0.121 PASS |
+
+Per-256 activations cost ~0.5% agreement: under the 99% bar. TCX32 passes at the noise floor.
+Narrow windows on TCX (`TANG_CODER_TCX_NARROW=1`) lose: flash-aa explain no drafts 233.9 →
+203.7 tok/s (split 2/1), mtp windows 6.66 → 8.1 ms (2.13 → 2.23 tok/window at 319.8 → 273.9
+tok/s). One token an expert has too few warps a tile, and the per-pair `_d4` path wins there.
+Repack: +156 s serial, threaded now; both copies held (97 GB).
+
+### TCX tiles as the only expert copy; TCX32 the batch default (2026-11-04, H200 srznguhpkj2lqo)
+
+Routed + shared Q4_K / Q5_K experts are now uploaded only as TCX tiles (`TANG_CODER_TCX=0`
+for the GGUF rows). Tile v3: codes `[q][row][32 B]` = each row's GGUF `qs` slices as they
+are, Q5 `qh` per row as is, scales unpacked. Every reader takes them: narrow per-pair dots
+(`cx_dotq_tile`, cx_dotq_fast / _half's lane loads and arithmetic on the tile: bitwise), wide
+GEMMs (`sbk_load_t`: the same SbK, scale bytes re-packed: bitwise), batch windows
+(`cx_moe_*_t32`, per-32 activations). Layer 46's Q8_0 shared expert unchanged.
+
+VRAM after load: 50.8 GB (52.6 with the MTP head), was 97.3 with both copies and 49.6 GGUF only.
+Gates: flash-aa outputs (explain / refactor / write × none / suffix / mtp, 512 tokens) identical
+to TCX=0; flash-tcheck t1 = t8 = t8-verify bitwise; flash-spec-test PASS (step-3200 head);
+batch-check N=8 bitwise; wide-check KL 8.61e-5 (3000) / 4.43e-6 (8000), afa748e7's values;
+batch-check N=64 tolerance 99.29% / 0.121 PASS.
+
+| B | TCX=0 ms | tiles ms | Δ |
+|---|---|---|---|
+| 1 | 4.07 | 4.27 | +4.9% |
+| 2 | 4.79 | 5.08 | +6% |
+| 4 | 6.57 | 7.00 | +6.5% |
+| 8 | 9.97 | 10.53 | +5.6% |
+| 16 | 17.46 | 16.56 | −5% |
+| 32 | 24.78 | 22.61 | −9% |
+| 64 | 38.91 | 34.17 | −12% (1873 tok/s) |
+
+flash-aa (--bw 4800, step-3200 head), TCX=0 → tiles: none 233.9 → 222.7; mtp explain 319.8 →
+304.4, refactor 401.8 → 382.0, write 351.7 → 334.7. The narrow per-pair dots lose ~5% on the
+tile layout (a lane's qs / scales / qh for a row are in three regions of the tile instead of
+one 144 / 176-byte block). Tile v2 (codes in MMA-lane order) was worse: none 219.3.
+
+### GGUF-native batch experts (`cx_moe_*_q`), GGUF rows the only copy again (2026-11-05, H200 srznguhpkj2lqo)
+
+Tiles reverted to opt-in (`TANG_CODER_TCX_TILES=1`). Batch windows take `cx_moe_gu_q` /
+`cx_moe_down_q` (default; `TANG_CODER_TCX=0` for the previous streaming / `_m` kernels): the
+TCX32 kernel on GGUF Q4_K / Q5_K rows. A lane loads 8 contiguous qs bytes a 32-byte chunk
+(and 8 qh bytes), so the m16n8k32 k order inside a step is a permutation of the columns; the B
+fragment (x at 8 tig, one uint2 from global, no staging) takes the same one. Scales and mins
+unpacked once a superblock with bit ops on the three scale words; mins as a second MMA; per-32
+activation scales. K split 2 / 1.
+
+- The ~5% narrow loss blamed on the tile layout was the tile branch inside `cx_dot` and the
+  narrow bodies (code size / registers in `_d4`), not the layout: with the branch compiled out
+  (only under TANG_CODER_TCX_TILES) narrow is back to 4.07 ms at B=1.
+- First version with sbk_load's 4-byte qs words: gate|up 8.5 / down 6.0 ms a step (quick +
+  profile), B=64 37.45 ms. With 8-byte lane loads: 7.2 / 5.7, B=64 35.34.
+
+Gates: flash-aa outputs identical to TCX=0 (9 runs), tok/s none 234.6 / 234.8 / 234.7, mtp
+320.1 / 402.0 / 351.9 (explain / refactor / write); tcheck bitwise; spec-test PASS;
+batch-check N=8 bitwise; wide-check KL 8.61e-5 / 4.43e-6; N=64 tolerance 99.29% / 0.121.
+VRAM 49.6 GB (51.4 with the MTP head).
+
+| B | TCX=0 ms | `_q` ms | Δ |
+|---|---|---|---|
+| 1 | 4.28* | 4.07 | |
+| 8 | 10.46* | 9.98 | |
+| 16 | 17.57 | 16.95 | −3.5% |
+| 32 | 24.85 | 23.41 | −5.8% |
+| 64 | 39.00 | **35.34** (1811 tok/s) | −9.4% |
+
+(*TCX=0 on the build that still had the tile branch compiled in; B ≤ 8 is the same code either way.)
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
