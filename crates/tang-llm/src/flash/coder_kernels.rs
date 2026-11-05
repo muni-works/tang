@@ -1386,7 +1386,8 @@ __device__ __forceinline__ void tcx_load(const unsigned char* t, int lane, TcxT&
 }
 __device__ __forceinline__ unsigned u4w(const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
 // xg: token g's permuted codes (+ 8 tig); da / db: tokens 2 tig, 2 tig + 1's per-256 scales.
-template <bool Q5, int K>
+// P32: per-32 activations (fe_q8 codes, unpermuted; da / db per-32 scales), float math a step.
+template <bool Q5, int K, bool P32>
 __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const unsigned char* xg, const float* da,
                                          const float* db, float acc[4], int sb0, int sb1, const TcxT& first) {
     constexpr int NSB = K / 256;
@@ -1413,7 +1414,13 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
                 }
                 a[c] = v;
             }
-            const uint2 bb = __ldg((const uint2*)(xg + sb * 256 + s * 32));
+            uint2 bb;
+            if (P32) {
+                bb.x = __ldg((const unsigned*)(xg + sb * 256 + s * 32));
+                bb.y = __ldg((const unsigned*)(xg + sb * 256 + s * 32 + 16));
+            } else {
+                bb = __ldg((const uint2*)(xg + sb * 256 + s * 32));
+            }
             int d[4];
             mma_s8_16832(d, a, bb.x, bb.y);
             const unsigned sw0 = u4w(cur.s0, s >> 2), sw1 = u4w(cur.s1, s >> 2);
@@ -1421,9 +1428,29 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
             const unsigned sel = (unsigned)(s & 3) * 0x1111u;
             const unsigned am[4] = {__byte_perm(mw0, 0, sel), __byte_perm(mw1, 0, sel), __byte_perm(mw0, 0, sel),
                                     __byte_perm(mw1, 0, sel)};
-            mma_s8_16832c(i2, am, bb.x, bb.y);
             const int s0 = (int)__byte_perm(sw0, 0, 0x4440u | (s & 3));
             const int s1 = (int)__byte_perm(sw1, 0, 0x4440u | (s & 3));
+            if (P32) {
+                int mm[4];
+                mma_s8_16832(mm, am, bb.x, bb.y);
+                const float d0 = h2f((unsigned short)(cur.dw0 & 0xFFFFu)), m0 = h2f((unsigned short)(cur.dw0 >> 16));
+                const float d1 = h2f((unsigned short)(cur.dw1 & 0xFFFFu)), m1 = h2f((unsigned short)(cur.dw1 >> 16));
+                const float fs0 = d0 * i2f(s0), fs1 = d1 * i2f(s1);
+                const float fm0 = m0, fm1 = m1;  // the mins MMA already carries m_j
+                const int blk = sb * 8 + s;
+                if (na < m) {
+                    const float dx = __ldg(da + blk);
+                    acc[0] = fmaf(dx, fmaf(fs0, i2f(d[0]), -fm0 * i2f(mm[0])), acc[0]);
+                    acc[2] = fmaf(dx, fmaf(fs1, i2f(d[2]), -fm1 * i2f(mm[2])), acc[2]);
+                }
+                if (nb < m) {
+                    const float dx = __ldg(db + blk);
+                    acc[1] = fmaf(dx, fmaf(fs0, i2f(d[1]), -fm0 * i2f(mm[1])), acc[1]);
+                    acc[3] = fmaf(dx, fmaf(fs1, i2f(d[3]), -fm1 * i2f(mm[3])), acc[3]);
+                }
+                continue;
+            }
+            mma_s8_16832c(i2, am, bb.x, bb.y);
             i1[0] += s0 * d[0];
             i1[1] += s0 * d[1];
             i1[2] += s1 * d[2];
@@ -1431,6 +1458,7 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
         }
         const float d0 = h2f((unsigned short)(cur.dw0 & 0xFFFFu)), m0 = h2f((unsigned short)(cur.dw0 >> 16));
         const float d1 = h2f((unsigned short)(cur.dw1 & 0xFFFFu)), m1 = h2f((unsigned short)(cur.dw1 >> 16));
+        if (P32) { if (sb + 1 < sb1) cur = nxt; continue; }
         if (na < m) {
             const float dx = __ldg(da + sb);
             acc[0] = fmaf(dx, fmaf(d0, i2f(i1[0]), -m0 * i2f(i2[0])), acc[0]);
@@ -1444,7 +1472,7 @@ __device__ __forceinline__ void tcx_rows(const unsigned char* tile, int m, const
         if (sb + 1 < sb1) cur = nxt;
     }
 }
-template <bool DOWN>
+template <bool DOWN, bool P32>
 __device__ __forceinline__ void moe_tcx_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                              const unsigned char* xk, const unsigned char* xq, float* out, int T,
                                              int fast, const unsigned* plan) {
@@ -1491,15 +1519,17 @@ __device__ __forceinline__ void moe_tcx_body(ExW g, ExW u, ExW sg, ExW su, const
     if (mw.ty == 112) tcx_load<false>(tile + sb0 * 2368, lane, first);
     else tcx_load<true>(tile + sb0 * 2880, lane, first);
     // Activations straight from global (cx_q8k wrote them in B-fragment order; L1 / L2 hits).
-    const float* xdg = (const float*)(xk + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
+    const unsigned char* xa = P32 ? xq : xk;
+    constexpr int SB = P32 ? 32 : 256;
+    const float* xdg = (const float*)(xa + (size_t)(DOWN ? CX_NP : XQ8_T) * KA);
     const int gq = lane >> 2, tig = lane & 3;
     const int tg_ = tok(pair_s[gq < m ? gq : 0]);
-    const unsigned char* xg = xk + (size_t)tg_ * KA + tig * 8;
-    const float* da = xdg + (size_t)tok(pair_s[2 * tig < m ? 2 * tig : 0]) * (KA / 256);
-    const float* db = xdg + (size_t)tok(pair_s[2 * tig + 1 < m ? 2 * tig + 1 : 0]) * (KA / 256);
+    const unsigned char* xg = xa + (size_t)tg_ * KA + tig * (P32 ? 4 : 8);
+    const float* da = xdg + (size_t)tok(pair_s[2 * tig < m ? 2 * tig : 0]) * (KA / SB);
+    const float* db = xdg + (size_t)tok(pair_s[2 * tig + 1 < m ? 2 * tig + 1 : 0]) * (KA / SB);
     float acc[4];
-    if (mw.ty == 112) tcx_rows<false, KA>(tile, m, xg, da, db, acc, sb0, sb1, first);
-    else tcx_rows<true, KA>(tile, m, xg, da, db, acc, sb0, sb1, first);
+    if (mw.ty == 112) tcx_rows<false, KA, P32>(tile, m, xg, da, db, acc, sb0, sb1, first);
+    else tcx_rows<true, KA, P32>(tile, m, xg, da, db, acc, sb0, sb1, first);
     if (S > 1) {
         red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
         __syncthreads();
@@ -1521,12 +1551,22 @@ __device__ __forceinline__ void moe_tcx_body(ExW g, ExW u, ExW sg, ExW su, const
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_t(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                              const unsigned char* xk, const unsigned char* xq,
                                                              float* out, int T, int fast, const unsigned* plan) {
-    moe_tcx_body<false>(g, u, sg, su, ids, xk, xq, out, T, fast, plan);
+    moe_tcx_body<false, false>(g, u, sg, su, ids, xk, xq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_t32(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                               const unsigned char* xk, const unsigned char* xq,
+                                                               float* out, int T, int fast, const unsigned* plan) {
+    moe_tcx_body<false, true>(g, u, sg, su, ids, xk, xq, out, T, fast, plan);
 }
 extern "C" __global__ void __launch_bounds__(256) cx_moe_down_t(ExW d, ExW sd, const unsigned* ids,
                                                                const unsigned char* hk, const unsigned char* hq,
                                                                float* out, int T, int fast, const unsigned* plan) {
-    moe_tcx_body<true>(d, d, sd, sd, ids, hk, hq, out, T, fast, plan);
+    moe_tcx_body<true, false>(d, d, sd, sd, ids, hk, hq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_t32(ExW d, ExW sd, const unsigned* ids,
+                                                                 const unsigned char* hk, const unsigned char* hq,
+                                                                 float* out, int T, int fast, const unsigned* plan) {
+    moe_tcx_body<true, true>(d, d, sd, sd, ids, hk, hq, out, T, fast, plan);
 }
 // Per-256 int8 activations (Q8_K-style, for the TCX experts): codes [rows][K] then f32 scales
 // [rows][K / 256], d = amax / 127. Grid (K / 256, rows), block 256.

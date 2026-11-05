@@ -178,6 +178,11 @@ struct Variants {
     /// Experts repacked at load into tensor-core tiles (`flash::tcx`) and run on
     /// `cx_moe_*_t` in every grouped window, narrow and batch (`TANG_CODER_TCX=1`). Not bitwise.
     tcx: bool,
+    /// TCX in windows of up to `MAX_T` rows too (`TANG_CODER_TCX_NARROW=1`; slower so far).
+    tcx_narrow: bool,
+    /// TCX on the per-32 int8 activations (`cx_moe_*_t32`; float math a step, closer to the
+    /// default's rounding): `TANG_CODER_TCX32=1`.
+    tcx32: bool,
 }
 
 impl Default for Variants {
@@ -202,6 +207,8 @@ impl Default for Variants {
             persist_gu: false,
             persist_down: false,
             tcx: false,
+            tcx_narrow: false,
+            tcx32: false,
         }
     }
 }
@@ -243,6 +250,8 @@ impl Variants {
                 m == "all" || m == "down"
             },
             tcx: tcx_on(),
+            tcx_narrow: env_is("TANG_CODER_TCX_NARROW", "1"),
+            tcx32: env_is("TANG_CODER_TCX32", "1"),
             mma_gu: {
                 let m = std::env::var("TANG_CODER_MOE_MMA").unwrap_or_else(|_| "down".into());
                 m == "all" || m == "gu"
@@ -528,6 +537,8 @@ struct Kern {
     moe_down_m: Fun,
     moe_gu_t: Fun,
     moe_down_t: Fun,
+    moe_gu_t32: Fun,
+    moe_down_t32: Fun,
     q8k: Fun,
     silu_q8k: Fun,
     /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
@@ -599,6 +610,8 @@ impl Kern {
             moe_down_m: f("cx_moe_down_m")?,
             moe_gu_t: f("cx_moe_gu_t")?,
             moe_down_t: f("cx_moe_down_t")?,
+            moe_gu_t32: f("cx_moe_gu_t32")?,
+            moe_down_t32: f("cx_moe_down_t32")?,
             q8k: f("cx_q8k")?,
             silu_q8k: f("cx_silu_q8k")?,
             mma_q8x: f("cx_mma_q8x")?,
@@ -710,6 +723,8 @@ impl Kern {
             moe_down_m: f(cm, "cx_moe_down_m")?,
             moe_gu_t: f(cm, "cx_moe_gu_t")?,
             moe_down_t: f(cm, "cx_moe_down_t")?,
+            moe_gu_t32: f(cm, "cx_moe_gu_t32")?,
+            moe_down_t32: f(cm, "cx_moe_down_t32")?,
             q8k: f(cm, "cx_q8k")?,
             silu_q8k: f(cm, "cx_silu_q8k")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
@@ -2848,6 +2863,8 @@ impl Coder {
             (k.moe_down_m, "moe_down"),
             (k.moe_gu_t, "moe_gu"),
             (k.moe_down_t, "moe_down"),
+            (k.moe_gu_t32, "moe_gu"),
+            (k.moe_down_t32, "moe_down"),
             (k.q8k, "moe_q8k"),
             (k.silu_q8k, "silu_q"),
             (k.moe_gemm_gu, "moe_gu"),
@@ -3928,7 +3945,7 @@ impl Coder {
         };
         let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
         let srp = if self.in_batch.get() { stream_srp() } else { 2 };
-        if self.var.tcx && layer.gate.t.ty >= 112 && !self.in_wide.get() {
+        if self.var.tcx && layer.gate.t.ty >= 112 && (self.in_batch.get() || (self.var.tcx_narrow && !self.in_wide.get())) {
             let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
@@ -3954,24 +3971,28 @@ impl Coder {
                     tang_moe::args![ids, ti, pb, ni, plan],
                 );
                 // The routed call (pbase 0) quantizes x; the side stream's shared call reuses it.
-                if pbase == 0 {
+                let p32 = self.var.tcx32;
+                let (fgu, fdn) = if p32 { (v.k.moe_gu_t32, v.k.moe_down_t32) } else { (v.k.moe_gu_t, v.k.moe_down_t) };
+                if pbase == 0 && !p32 {
                     self.launch_on(stream, v.k.q8k, ((nh / 256) as u32, ti as u32, 1), 256, 0, tang_moe::args![x, xk]);
                 }
                 self.launch_on(
                     stream,
-                    v.k.moe_gu_t,
+                    fgu,
                     ((2 * ff * ck::tcx_split().0 / 128) as u32, groups, 1),
                     256,
                     0,
                     tang_moe::args![tg, tu, tsg, tsu, ids, xk, mxq, egu, ti, fastk, plan],
                 );
-                self.launch_on(stream, v.k.silu_q8k, ((ff / 256) as u32, np, 1), 256, 0, tang_moe::args![egu, hk, pb]);
-                if td.ty < 112 || tsd.ty < 112 {
+                if !p32 {
+                    self.launch_on(stream, v.k.silu_q8k, ((ff / 256) as u32, np, 1), 256, 0, tang_moe::args![egu, hk, pb]);
+                }
+                if p32 || td.ty < 112 || tsd.ty < 112 {
                     self.launch_on(stream, v.k.silu_q, ((ff / 32) as u32, np, 1), 32, 0, tang_moe::args![egu, hq, pb]);
                 }
                 self.launch_on(
                     stream,
-                    v.k.moe_down_t,
+                    fdn,
                     ((nh * ck::tcx_split().1 / 128) as u32, groups, 1),
                     256,
                     0,

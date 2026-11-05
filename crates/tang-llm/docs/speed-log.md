@@ -361,6 +361,39 @@ held for now (49.6 → 97.3 GB).
 Tolerance at B=64 (alone vs batch, both TCX): 99.17% agreement, mean |Δlogit| 0.144 (default
 99.50% / 0.122). flash-aa explain no drafts: 245.5 → 226.8 tok/s.
 
+Iteration 2 (3e0d5405+): the per-block activation staging was the cost, not the math.
+`TANG_BATCH_QUICK=1 TANG_CODER_PROF=1`, B=64, ms a step (gate|up / down; default 10.6 / 5.65):
+
+| change | gate\|up | down | quick ms |
+|---|---|---|---|
+| staged activations, K split 4 / 2 | 10.1 | 5.25 | 34.96 |
+| staged, split 8 / 2 | 15.1 | 5.26 | 39.97 |
+| staged, split 2 / 1 | 7.0 | 4.92 | 31.49 |
+| activations from global in B order (no staging, no barrier), split 2 / 1 | **6.2** | **4.96** | 30.72 |
+| same, split 1 / 1 | 8.6 | 4.93 | 33.11 |
+| same, split 4 / 2 | 8.6 | 5.4 | 33.66 |
+| same, per-32 activations (`TANG_CODER_TCX32=1`, float math a step) | 6.7 | 5.7 | — |
+
+Gate|up at 6.2 ms ≈ 0.13 ms a layer ≈ 3.7 TB/s of distinct expert bytes; down ~2.9 TB/s.
+The default kernels at the same instruction count per byte as before sat at ~2 TB/s and so
+did TCX while it staged activations: the per-block prologue (stage, barrier) was the limit.
+
+Full `flash-batch-check` N=64 (explain, graphs), ms a step:
+
+| B | default | TCX (Q8_K acts) | TCX32 (per-32 acts) |
+|---|---|---|---|
+| 1–8 | 4.07 / 4.79 / 6.57 / 9.97 | same (narrow stays per-pair) | same |
+| 16 | 17.46 | 16.43 | 16.33 |
+| 32 | 24.78 | 21.98 | 22.31 |
+| 64 | 38.91 | **32.30** (1982 tok/s) | **33.87** (1890 tok/s) |
+| tolerance | 99.50% / 0.122 | **98.96% / 0.134: FAIL** | 99.29% / 0.121 PASS |
+
+Per-256 activations cost ~0.5% agreement: under the 99% bar. TCX32 passes at the noise floor.
+Narrow windows on TCX (`TANG_CODER_TCX_NARROW=1`) lose: flash-aa explain no drafts 233.9 →
+203.7 tok/s (split 2/1), mtp windows 6.66 → 8.1 ms (2.13 → 2.23 tok/window at 319.8 → 273.9
+tok/s). One token an expert has too few warps a tile, and the per-pair `_d4` path wins there.
+Repack: +156 s serial, threaded now; both copies held (97 GB).
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
