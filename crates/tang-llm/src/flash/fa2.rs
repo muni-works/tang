@@ -1,7 +1,7 @@
 //! Launch planning for `cx_attn_fa2` (the FA2-style wide-prefill attention of the Coder engine,
 //! `TANG_CODER_ATTN=fa2`; design in docs/bench/fa2-prefill.md), and in the tests a CPU model of
 //! the kernel + `cx_attn_merge`: the same GQA vector packing, key splits, 32-key tiles, causal
-//! masking, online softmax and bf16 rounding of Q and P, checked against plain f64 attention. It
+//! masking, online softmax and fp16 rounding of Q and P, checked against plain f64 attention. It
 //! pins the tiling / split / merge arithmetic; the kernel's fragment layouts are checked on the
 //! GPU by `flash-wide-check`.
 
@@ -33,6 +33,13 @@ mod tests {
         // Round to nearest even, as f2bf.
         let b = x.to_bits();
         f32::from_bits(((b + 0x7fff + ((b >> 16) & 1)) >> 16) << 16)
+    }
+
+    fn f16(x: f32) -> f32 {
+        // Round to nearest even at fp16's 10 mantissa bits, as cvt.rn.f16x2.f32 (normal range;
+        // the test's values stay in it).
+        let b = x.to_bits();
+        f32::from_bits(((b + 0xfff + ((b >> 13) & 1)) >> 13) << 13)
     }
 
     struct Shape {
@@ -73,7 +80,7 @@ mod tests {
                         let (row, h) = (vv / g, vv % g);
                         let pos = pos0 + row;
                         let qv: Vec<f32> = (0..hd)
-                            .map(|d| bf16(q[(row * nh + grp * g + h) * hd + d] * scale))
+                            .map(|d| f16(q[(row * nh + grp * g + h) * hd + d] * scale))
                             .collect();
                         let (mut m, mut l, mut o) = (f32::NEG_INFINITY, 0f32, vec![0f32; hd]);
                         let mut kb = k0;
@@ -98,7 +105,7 @@ mod tests {
                                 for (i, &pi) in p.iter().enumerate() {
                                     let key = kb + i;
                                     if key < k1 {
-                                        o[d] += bf16(pi) * v[(key * nkv + grp) * hd + d];
+                                        o[d] += f16(pi) * v[(key * nkv + grp) * hd + d];
                                     }
                                 }
                             }
@@ -185,7 +192,7 @@ mod tests {
             .map(|(&a, &b)| (a as f64 - b).abs())
             .fold(0.0, f64::max);
         assert!(
-            worst < 2e-2,
+            worst < 4e-3,
             "t {t} pos0 {pos0} splits {nsplit}: max |err| {worst:.3e}"
         );
     }

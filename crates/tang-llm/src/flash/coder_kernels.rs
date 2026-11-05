@@ -2292,6 +2292,9 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
         }
     }
     const float gt = proj[(size_t)c * stride + h * 2 * CX_HD + CX_HD + d];
+#ifdef CX_JITTER
+    o *= 1.f + CX_JITTER * (float)((c * 131 + h * 7 + d) % 17 - 8) / 8.f;
+#endif
     out[((size_t)c * CX_NH + h) * CX_HD + d] = (o / L) * sigm_f(gt);
 }
 // ---- FA2-style tensor-core prefill attention (wide windows, `TANG_CODER_ATTN=fa2`) ----
@@ -2311,7 +2314,7 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 // Shared rows are padded by 8 bf16 (FA_LD), which makes the fragment loads and ldmatrix
 // conflict-free (same effect as FA2's XOR swizzle, simpler addressing).
 // Grid (ceil(t * G / FA_BM), NKV, nsplit), block 128 (4 warps × 16 vectors), FA_SMEM dynamic smem.
-// Not split-K's summation order (bf16 Q and P): gated by flash-wide-check's greedy + KL bar.
+// Not split-K's summation order (fp16 Q and P): gated by flash-wide-check's greedy + KL bar.
 #define FA_BM 64
 #define FA_BN 32
 #define FA_LD (CX_HD + 8)
@@ -2319,16 +2322,42 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 static_assert(FA_BM % CX_G == 0, "FA2 tile: whole rows of G heads");
 static_assert(CX_HD % 16 == 0, "FA2 tile: head dim a multiple of 16");
 
+// Q, P and the K/V tiles go through the tensor cores as fp16, not bf16: the K/V cache is bf16, which
+// fp16 holds exactly (8 mantissa bits into 11; clamped to fp16's range), and Q (rmsnormed, pre-scaled)
+// and P (in [0, 1]) keep 3 more mantissa bits. bf16 Q and P cost KL ~4e-3 against split-K at 1000
+// tokens (flash-wide-check); fp16 is 8x finer at the same mma rate.
+#define FA_HMAX 65504.f
 __device__ __forceinline__ unsigned fa_pack(float lo, float hi) {
+#ifdef FA_BF16
     return (unsigned)f2bf(lo) | ((unsigned)f2bf(hi) << 16);
+#elif __CUDA_ARCH__ >= 800
+    unsigned r;
+    lo = fminf(fmaxf(lo, -FA_HMAX), FA_HMAX);
+    hi = fminf(fmaxf(hi, -FA_HMAX), FA_HMAX);
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+#else
+    return 0;
+#endif
+}
+// Two bf16 (a K or V element pair) to two fp16, in place.
+__device__ __forceinline__ unsigned fa_bf2h(unsigned x) {
+    return fa_pack(__uint_as_float(x << 16), __uint_as_float(x & 0xffff0000u));
 }
 __device__ __forceinline__ void fa_mma(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                        unsigned b1) {
 #if __CUDA_ARCH__ >= 800
+#ifdef FA_BF16
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 #else
     __trap();
 #endif
@@ -2409,6 +2438,20 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
         cx_async_commit();
         cx_async_wait<1>();
         __syncthreads();
+#ifndef FA_BF16
+        // The landed K/V tile, bf16 -> fp16 in place (once a block, not per warp fragment).
+        for (int e = tid; e < 2 * FA_BN * (CX_HD / 8); e += 128) {
+            const int r = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8;
+            uint4* pv = (uint4*)((r < FA_BN ? sk + (b * FA_BN + r) * FA_LD : sv + (b * FA_BN + r - FA_BN) * FA_LD) + d);
+            uint4 x = *pv;
+            x.x = fa_bf2h(x.x);
+            x.y = fa_bf2h(x.y);
+            x.z = fa_bf2h(x.z);
+            x.w = fa_bf2h(x.w);
+            *pv = x;
+        }
+        __syncthreads();
+#endif
         // S = Q K^T (16 vectors × FA_BN keys a warp).
         float s[FA_BN / 8][4];
         #pragma unroll

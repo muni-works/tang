@@ -380,21 +380,45 @@ single-stream.
 
 ## Known issues (2026-11-04)
 
-- **`flash-wide-check` at 1000 tokens misses the 1e-3 KL bar**, on 4133d39a too (KL 1.15e-2;
-  greedy tokens still equal). Bisected with the wide-window switches on 4133d39a (H200,
-  refactor ids, 2048-row windows, teacher-forced max KL over 8 steps):
+- **`flash-wide-check` at 128 / 1000 tokens misses the 1e-3 KL bar** with FA2 attention (KL
+  1.15e-2 at 1000 on 4133d39a). Investigated 2026-11-04 (frog/coder-fa2fix): **no FA2 indexing,
+  masking, split or merge bug; the bar can't be met at these lengths by any non-bitwise stage.**
+  - `TANG_FA2_CMP=1` runs split-K on the same window after FA2 and prints, per layer, the relative
+    L2 difference of the attention outputs: bf16 FA2 0.9-3.2e-3, flat across rows (no tile-edge or
+    first-tile pattern), the same at 128 / 1000 / 3000 tokens and 1 / 2 / 4 key splits.
+  - Perturbation control: split-K (bitwise with narrow when every other wide switch is off) with
+    each attention output scaled by 1 ± 1e-7 (`TANG_ATTN_JITTER`, about one f32 ulp) gives KL
+    **2.7e-2 at 128 and 6.2e-3 at 1000**; 1e-6 / 1e-5: 2.6e-2 / 2.8e-2 at 128, 1.2e-2 / 1.3e-3
+    at 1000. The refactor prompt cycled to 128 / 1000 tokens has teacher-forced steps where
+    the logits jump on any last-bit change (probably MoE top-10 near-ties; not pinned down).
+    At 3000 / 8000 (third+ copy of the prompt) the same perturbations stay under 1e-5.
+  - So FA2 now runs on fp16 tensor cores instead of bf16 (Q, P and the bf16 K/V tiles, which
+    fp16 holds exactly): attention error vs split-K 8x lower (1.1-4.2e-4 rel L2), wide prefill
+    -0.4% at 3000 and -1% at 8000. KL unchanged, as the control predicts.
 
-  | `TANG_CODER_ATTN` | `TANG_CODER_WGEMM` | KL |
-  |---|---|---|
-  | fa2 (default) | on (default) | 1.15e-2 |
-  | fa2 | 0 | **1.52e-2** |
-  | splitk | on | 2.04e-3 |
-  | splitk | 0 | 0 (bitwise) |
-  | fa2 | gu only | 4.73e-3 |
-  | fa2 | down only | 9.70e-3 |
+  KL(narrow || wide), refactor ids, 2048-row windows, teacher-forced max over 8 steps (H200):
 
-  The FA2 attention (`cx_attn_fa2` + merge) is the stage that diverges at short context; the
-  tensor-core GEMMs add ~2e-3 on their own. At 3000 / 8000 tokens both are under 1e-5. Not fixed.
+  | config | 128 | 512 | 1000 | 3000 | 8000 |
+  |---|---|---|---|---|---|
+  | split-K, other wide switches off¹ | 0 | 0 | 0 | 0 | — |
+  | split-K + jitter 1e-7, switches off | 2.7e-2 | — | 6.2e-3 | — | — |
+  | FA2 bf16, switches off | 2.7e-2 | 5.7e-4 | 1.5e-2 | 7.7e-6 | 2.1e-6 |
+  | FA2 fp16, switches off | 2.2e-2 | 7.4e-4 | 1.3e-2 | 1.2e-5 | 4.1e-6 |
+  | defaults, FA2 bf16 (before) | 3.4e-2 | 1.7e-4 | 7.9e-3 | 9.0e-7 | 3.1e-6 |
+  | defaults, split-K | 6.5e-2 | 1.3e-4 | 9.1e-3 | 9.7e-7 | 3.4e-6 |
+  | defaults, FA2 fp16 (after) | 3.1e-2² | 6.2e-4 | 9.5e-3 | 1.5e-6 | 1.5e-6 |
+
+  ¹ `TANG_CODER_WGEMM=0 TANG_CODER_GDNW=0 TANG_CODER_SGEMM=0`: since afb81919 the warp-per-column
+  GDN and the router GEMM are also non-bitwise, so `WGEMM=0` alone is no longer bitwise
+  (split-K + `WGEMM=0`: 1.9e-2 at 128, 3.1e-2 at 1000).
+
+  ² next greedy token differs at 128 (bf16: equal), the same last-bit sensitivity. Rows from H200
+  (tensor-core pod) and H100 (fa2fix pod) agree exactly; logs in artifacts/fa2fix/. tcheck t1/t8
+  bitwise, spec-test PASS (H100).
+
+  What would make the gate meaningful at short context: compare against the jitter control
+  (fail only when KL is well above what a 1e-7 perturbation gives at the same length), or use
+  prompts that aren't a cycled copy. Not done here.
 - **`flash-tcheck` panics at `cli.rs:1913`** (index out of bounds on an empty per-layer
   capture) after printing `t1 vs t8: logits differ in 0`, on 4133d39a too. The bitwise logits
   line is the gate; the per-layer table needs a capture the Coder engine doesn't fill.

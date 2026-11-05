@@ -2378,7 +2378,20 @@ impl Coder {
             p.wide = None;
         }
         let src = format!(
-            "{}{}{}",
+            "{}{}{}{}",
+            // Debug switches of the wide module: `TANG_FA2_BF16=1` runs cx_attn_fa2 on bf16 Q / P / K / V
+            // (the pre-fp16 kernel); `TANG_ATTN_JITTER=1e-6` scales each attention output by
+            // 1 ± up to that (the perturbation control of docs/qwen3next-batching.md "Known issues").
+            format!(
+                "{}{}",
+                if env_is("TANG_FA2_BF16", "1") {
+                    "#define FA_BF16 1\n"
+                } else {
+                    ""
+                },
+                std::env::var("TANG_ATTN_JITTER")
+                    .map_or(String::new(), |v| format!("#define CX_JITTER {v}f\n"))
+            ),
             ck::prelude(&self.shapes, rows),
             kernels::GEMV_SRC,
             ck::SRC
@@ -3608,25 +3621,107 @@ impl Coder {
                 t
             };
             let qrow = (hp.n_head * hp.head_dim * 4) as u64;
+            let run_splitk = || {
+                for r0 in (0..t).step_by(slice) {
+                    let c = slice.min(t - r0);
+                    let nc = if self.in_wide.get() {
+                        self.nchunk(self.wide_pos0.get() + r0 + c)
+                    } else {
+                        nchunk
+                    } as i32;
+                    let (q0, rows0, proj0, attn0) = (
+                        q + r0 as u64 * qrow,
+                        rows + (r0 * 4) as u64,
+                        proj + (r0 * stride * 4) as u64,
+                        attn + r0 as u64 * qrow,
+                    );
+                    unsafe {
+                        self.launch_on(
+                            self.stream_on(w),
+                            self.kn_on(w).part,
+                            (c as u32, hp.n_head_kv as u32, nc as u32),
+                            128,
+                            0,
+                            tang_moe::args![q0, kt, vt, rows0, part, nc],
+                        );
+                        self.launch_on(
+                            self.stream_on(w),
+                            self.kn_on(w).merge,
+                            (c as u32, hp.n_head as u32, 1),
+                            hp.head_dim as u32,
+                            0,
+                            tang_moe::args![part, nc, proj0, st, attn0],
+                        );
+                    }
+                }
+            };
             if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
-                unsafe {
-                    self.launch_on(
-                        self.stream_on(w),
-                        self.kn_on(w).fa2,
-                        (tiles as u32, hp.n_head_kv as u32, ns as u32),
-                        128,
-                        ck::fa2_smem(hp.head_dim) as u32,
-                        tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
-                    );
-                    self.launch_on(
-                        self.stream_on(w),
-                        self.kn_on(w).merge,
-                        (t as u32, hp.n_head as u32, 1),
-                        hp.head_dim as u32,
-                        0,
-                        tang_moe::args![part, ns as i32, proj, st, attn],
+                let run_fa2 = || {
+                    unsafe {
+                        self.launch_on(
+                            self.stream_on(w),
+                            self.kn_on(w).fa2,
+                            (tiles as u32, hp.n_head_kv as u32, ns as u32),
+                            128,
+                            ck::fa2_smem(hp.head_dim) as u32,
+                            tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
+                        );
+                        self.launch_on(
+                            self.stream_on(w),
+                            self.kn_on(w).merge,
+                            (t as u32, hp.n_head as u32, 1),
+                            hp.head_dim as u32,
+                            0,
+                            tang_moe::args![part, ns as i32, proj, st, attn],
+                        );
+                    }
+                };
+                run_fa2();
+                if let Ok(cmp) = std::env::var("TANG_FA2_CMP") {
+                    // Debug: the same window's split-K attention against FA2's (then FA2's again, or with
+                    // TANG_FA2_CMP=2 split-K's). Per layer: relative L2 error and the worst row.
+                    let v = self.stage_view(w);
+                    let n = t * hp.n_head * hp.head_dim;
+                    self.sync_all();
+                    let fa = v.dev.download(&v.s.attn)[..n].to_vec();
+                    run_splitk();
+                    self.sync_all();
+                    let sk = v.dev.download(&v.s.attn)[..n].to_vec();
+                    if cmp != "2" {
+                        run_fa2();
+                    }
+                    let rw = hp.n_head * hp.head_dim;
+                    let (mut num, mut den, mut worst) = (0f64, 0f64, (0f64, 0usize));
+                    let mut by = [0f64; 8];
+                    let mut byn = [0f64; 8];
+                    for r in 0..t {
+                        let (mut nr, mut dr) = (0f64, 0f64);
+                        for i in r * rw..(r + 1) * rw {
+                            let d = (fa[i] - sk[i]) as f64;
+                            nr += d * d;
+                            dr += (sk[i] as f64) * (sk[i] as f64);
+                        }
+                        num += nr;
+                        den += dr;
+                        let e = (nr / dr.max(1e-30)).sqrt();
+                        if e > worst.0 {
+                            worst = (e, r);
+                        }
+                        let bk = (r * 8 / t).min(7);
+                        by[bk] += nr;
+                        byn[bk] += dr;
+                    }
+                    let byr: Vec<String> =
+                        (0..8).map(|i| format!("{:.1e}", (by[i] / byn[i].max(1e-30)).sqrt())).collect();
+                    eprintln!(
+                        "fa2-cmp pos0 {} t {t} ns {ns}: rel L2 {:.2e}, worst row {} ({:.2e}); by eighth [{}]",
+                        self.wide_pos0.get(),
+                        (num / den).sqrt(),
+                        worst.1,
+                        worst.0,
+                        byr.join(" ")
                     );
                 }
                 self.gemv(
@@ -3641,38 +3736,7 @@ impl Coder {
                 );
                 return;
             }
-            for r0 in (0..t).step_by(slice) {
-                let c = slice.min(t - r0);
-                let nc = if self.in_wide.get() {
-                    self.nchunk(self.wide_pos0.get() + r0 + c)
-                } else {
-                    nchunk
-                } as i32;
-                let (q0, rows0, proj0, attn0) = (
-                    q + r0 as u64 * qrow,
-                    rows + (r0 * 4) as u64,
-                    proj + (r0 * stride * 4) as u64,
-                    attn + r0 as u64 * qrow,
-                );
-                unsafe {
-                    self.launch_on(
-                        self.stream_on(w),
-                        self.kn_on(w).part,
-                        (c as u32, hp.n_head_kv as u32, nc as u32),
-                        128,
-                        0,
-                        tang_moe::args![q0, kt, vt, rows0, part, nc],
-                    );
-                    self.launch_on(
-                        self.stream_on(w),
-                        self.kn_on(w).merge,
-                        (c as u32, hp.n_head as u32, 1),
-                        hp.head_dim as u32,
-                        0,
-                        tang_moe::args![part, nc, proj0, st, attn0],
-                    );
-                }
-            }
+            run_splitk();
             self.gemv(
                 w,
                 "attn_out",
