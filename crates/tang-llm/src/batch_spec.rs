@@ -71,7 +71,7 @@ pub fn dcut(conf: &[Vec<f32>], budget: usize) -> (Vec<usize>, f64) {
     (give, sum)
 }
 
-/// What the tuner may do (`TANG_SERVE_SPEC`: `off` (default), `auto`, or a fixed budget).
+/// What the tuner may do (`TANG_SERVE_SPEC`: `auto` (default), `off`, or a fixed budget).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
     /// No drafts and no MTP pass after batch windows: the plain batched path.
@@ -85,10 +85,10 @@ pub enum Mode {
 impl Mode {
     pub fn from_env() -> Self {
         match std::env::var("TANG_SERVE_SPEC").ok().as_deref() {
-            // Off by default: on the 2026-11-04 serve load test drafting under batching didn't
-            // beat plain batch windows at any concurrency (docs/qwen3next-batching.md).
-            Some("off") | Some("0") | None | Some("") => Mode::Off,
-            Some("auto") => Mode::Auto,
+            // Auto by default: with batch-width MTP passes it matches plain windows at 8 and 64
+            // streams and beats them at 16-32 (2026-11-05, docs/qwen3next-batching.md).
+            Some("off") | Some("0") => Mode::Off,
+            Some("auto") | None | Some("") => Mode::Auto,
             Some(n) => n.parse().map_or(Mode::Auto, Mode::Fixed),
         }
     }
