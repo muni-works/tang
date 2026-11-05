@@ -482,7 +482,7 @@ past 8 every stream waited for ⌈N/8⌉ narrow windows.
   maximises `(streams + α·Σ top scores) / ms` among `⌈ρ·streams·k⌉`, ρ ∈ {¼, ½, ¾, 1}, against
   **plain** decoding (no MTP pass at all = today's path). While plain wins it runs the head one
   step in 64 (and verifies one draft a stream then) to keep `α` and the scores fresh.
-- `TANG_SERVE_SPEC=off|auto|<rows>` (default **off**, see the serve numbers below), `TANG_SERVE_BATCH_ROWS` (batch
+- `TANG_SERVE_SPEC=off|auto|<rows>` (default **auto** since 2026-11-05, see the serve numbers below), `TANG_SERVE_BATCH_ROWS` (batch
   module rows, default `--batch` rounded up to 32), `TANG_SERVE_SPEC_LOG=1` (a line per window;
   a `tang-llm: spec:` summary prints every 30 s regardless).
 
@@ -574,3 +574,36 @@ work; `TANG_CODER_MTP_K=3` didn't help at the room these N leave.
 - **`flash-tcheck` panics at `cli.rs:1913`** (index out of bounds on an empty per-layer
   capture) after printing `t1 vs t8: logits differ in 0`, on 4133d39a too. The bitwise logits
   line is the gate; the per-layer table needs a capture the Coder engine doesn't fill.
+
+## Batch-width MTP passes (2026-11-05, coder-spec3)
+
+The ~20 % spec overhead under batching was the MTP head run `MAX_T` = 8 rows a pass, with a host
+sync each: ⌈rows/8⌉ first passes plus ⌈streams/8⌉ per chain step, each a full MoE layer and the
+151k-row head (16 passes a step at 64 streams, k = 2). `enable_batch` now also builds the MTP
+layer at the batch module's width (`MtpWide`: `cx_mtp_in`/`cx_mtp_pick` compiled with
+`MTP_ALT = rows`, its own `mh`/`emb`/`cat`); `mtp_groups_wide` packs up to that many rows a pass
+and runs it through the batch module's kernels (`mtp_pass_batch`, on the batch scratch), each
+chain step over every chained stream at once (narrow under 9 rows). A step's MTP work is now
+one pass plus one per chain step. `TANG_SERVE_MTP_WIDE=0` keeps the old 8-row passes. Wide
+prefill's MTP K/V fill uses the same passes (64 rows instead of 8), which speeds spec-off serve
+too. The tuner also skips the MTP pass outright when a window has no spare rows.
+
+Gate (`flash-spec-batch-check`, 16 streams, k = 2, rows 32, H200): budget 0 849 (was 815), 16:
+1099 tok/s 1.29× (was 998, 1.22×). Budget 0's tokens are identical with either MTP setting
+(hash d6e82b51531bbf25). On explain one sequence of 16 diverges at budgets ≥ 16 at token ~110
+with wide MTP. That's the batch module's tolerance class (different drafts give different
+window compositions), not a corruption: the old narrow MTP diverges the same way on `write`
+(15/16 at budgets 8 and 16), and refactor is 16/16 at every budget both ways.
+
+Serve (`load_dec.py`, R = 4 after a warm-up run, `--batch 64 --mtp`, H200), aggregate tok/s
+(per-stream p50):
+
+| C | before: off | before: auto | after: off | after: auto |
+|---|---|---|---|---|
+| 8 | 656 (86) | 653 (85) | 667 (87) | 665 (86) |
+| 16 | 702 (47) | 725 (57) | 714 (47) | **785** (63) |
+| 32 | 896 (30) | 900 (31) | 923 (31) | **985** (39) |
+| 64 | 1103 (18) | 1101 (18) | 1145 (19) | 1146 (19) |
+
+Prompt-heavy mix (`load.py` 64, R = 3): before off 486 / auto 491, after off 543 / auto 551,
+0 errors throughout. Hence `TANG_SERVE_SPEC` defaults to `auto`.

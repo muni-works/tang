@@ -54,7 +54,12 @@ pub fn dcut(conf: &[Vec<f32>], budget: usize) -> (Vec<usize>, f64) {
     let mut all: Vec<(f64, usize, usize)> = conf
         .iter()
         .enumerate()
-        .flat_map(|(i, c)| scores(c).into_iter().enumerate().map(move |(k, s)| (s, k, i)))
+        .flat_map(|(i, c)| {
+            scores(c)
+                .into_iter()
+                .enumerate()
+                .map(move |(k, s)| (s, k, i))
+        })
         .collect();
     all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let mut give = vec![0; conf.len()];
@@ -66,7 +71,7 @@ pub fn dcut(conf: &[Vec<f32>], budget: usize) -> (Vec<usize>, f64) {
     (give, sum)
 }
 
-/// What the tuner may do (`TANG_SERVE_SPEC`: `off` (default), `auto`, or a fixed budget).
+/// What the tuner may do (`TANG_SERVE_SPEC`: `auto` (default), `off`, or a fixed budget).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
     /// No drafts and no MTP pass after batch windows: the plain batched path.
@@ -80,10 +85,10 @@ pub enum Mode {
 impl Mode {
     pub fn from_env() -> Self {
         match std::env::var("TANG_SERVE_SPEC").ok().as_deref() {
-            // Off by default: on the 2026-11-04 serve load test drafting under batching didn't
-            // beat plain batch windows at any concurrency (docs/qwen3next-batching.md).
-            Some("off") | Some("0") | None | Some("") => Mode::Off,
-            Some("auto") => Mode::Auto,
+            // Auto by default: with batch-width MTP passes it matches plain windows at 8 and 64
+            // streams and beats them at 16-32 (2026-11-05, docs/qwen3next-batching.md).
+            Some("off") | Some("0") => Mode::Off,
+            Some("auto") | None | Some("") => Mode::Auto,
             Some(n) => n.parse().map_or(Mode::Auto, Mode::Fixed),
         }
     }
@@ -151,10 +156,18 @@ impl Tuner {
     /// Estimated ms of a step: the cell, else the fit, else a prior (H200 batch windows: 10 ms
     /// plus 0.53 ms a row; an MTP pass ~0.15 ms a row).
     pub fn cost(&self, live: usize, extra: usize, mtp: bool) -> f64 {
-        if let Some(c) = self.cells.get(&Self::key(live, extra, mtp)).filter(|c| c.n >= 2) {
+        if let Some(c) = self
+            .cells
+            .get(&Self::key(live, extra, mtp))
+            .filter(|c| c.n >= 2)
+        {
             return c.ms;
         }
-        let x = [1.0, (live + extra) as f64, if mtp { (live + extra) as f64 } else { 0.0 }];
+        let x = [
+            1.0,
+            (live + extra) as f64,
+            if mtp { (live + extra) as f64 } else { 0.0 },
+        ];
         if let Some(b) = solve3(self.xtx, self.xty) {
             let v = b[0] * x[0] + b[1] * x[1] + b[2] * x[2];
             if v.is_finite() && v > 0.0 {
@@ -166,7 +179,15 @@ impl Tuner {
 
     /// A step ran: `live` streams, `extra` draft rows, MTP or not, `ms` long; `predicted`
     /// accepted drafts (uncalibrated) and `accepted` actually.
-    pub fn observe(&mut self, live: usize, extra: usize, mtp: bool, ms: f64, raw: f64, accepted: usize) {
+    pub fn observe(
+        &mut self,
+        live: usize,
+        extra: usize,
+        mtp: bool,
+        ms: f64,
+        raw: f64,
+        accepted: usize,
+    ) {
         self.steps += 1;
         let c = self.cells.entry(Self::key(live, extra, mtp)).or_default();
         c.ms = if c.n == 0 { ms } else { 0.8 * c.ms + 0.2 * ms };
@@ -209,6 +230,11 @@ impl Tuner {
             raw: 0.0,
             mtp,
         };
+        // No spare rows: nothing could be verified next step either (same streams, same
+        // window), so the MTP pass would only refresh chains nobody reads.
+        if room == 0 {
+            return none(false);
+        }
         match self.mode {
             Mode::Off => return none(false),
             Mode::Fixed(k) => {
@@ -223,7 +249,12 @@ impl Tuner {
             Mode::Auto => {}
         }
         self.learn_depth(conf);
-        let k = conf.iter().map(Vec::len).max().unwrap_or(0).max(self.depth.len());
+        let k = conf
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(self.depth.len());
         // With no fresh chains, judge from the typical scores (to decide whether to probe).
         let fresh = conf.iter().any(|c| !c.is_empty());
         let typical: Vec<Vec<f32>>;
@@ -267,7 +298,10 @@ impl Tuner {
         // Plain steps are only measured while plain decoding runs: while drafting wins, run
         // one plain step now and then (often until its cell has samples), so a wrong guess of
         // its cost (the prior, or a fit from drafting steps only) can't keep drafting going.
-        let plain_n = self.cells.get(&Self::key(live, 0, false)).map_or(0, |c| c.n);
+        let plain_n = self
+            .cells
+            .get(&Self::key(live, 0, false))
+            .map_or(0, |c| c.n);
         let every = if plain_n < 2 { PROBE / 8 } else { PROBE };
         if b > 0 && self.steps % every == every / 2 {
             return none(false);
@@ -342,6 +376,16 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_runs_no_mtp_pass() {
+        for mode in [Mode::Auto, Mode::Fixed(8)] {
+            let mut t = Tuner::new(mode);
+            let c = t.choose(&[vec![0.9, 0.9], vec![0.9]], 0);
+            assert_eq!(c.drafts, vec![0, 0]);
+            assert!(!c.mtp);
+        }
+    }
+
+    #[test]
     fn off_and_fixed_modes() {
         let conf = vec![vec![0.9, 0.8]; 4];
         let mut t = Tuner::new(Mode::Off);
@@ -376,13 +420,28 @@ mod tests {
                 mtp: false,
             };
             for _ in 0..200 {
-                let c = if t.mtp_live { conf.clone() } else { vec![vec![]; live] };
+                let c = if t.mtp_live {
+                    conf.clone()
+                } else {
+                    vec![vec![]; live]
+                };
                 last = t.choose(&c, room);
                 let extra: usize = last.drafts.iter().sum();
                 let (_, raw) = dcut(&c, extra);
-                t.observe(live, extra, last.mtp, cost(live, extra, last.mtp), raw, raw.round() as usize);
+                t.observe(
+                    live,
+                    extra,
+                    last.mtp,
+                    cost(live, extra, last.mtp),
+                    raw,
+                    raw.round() as usize,
+                );
             }
-            assert_eq!(last.drafts.iter().sum::<usize>() > 0, drafts, "live {live}: {last:?}");
+            assert_eq!(
+                last.drafts.iter().sum::<usize>() > 0,
+                drafts,
+                "live {live}: {last:?}"
+            );
         }
     }
 
@@ -392,13 +451,24 @@ mod tests {
         let conf = vec![vec![0.9f32, 0.9]; 8];
         let mut extra = 0;
         for _ in 0..299 {
-            let c = if t.mtp_live { conf.clone() } else { vec![vec![]; 8] };
+            let c = if t.mtp_live {
+                conf.clone()
+            } else {
+                vec![vec![]; 8]
+            };
             let ch = t.choose(&c, 56);
             extra = ch.drafts.iter().sum();
             let (_, raw) = dcut(&c, extra);
             // The head is overconfident: nothing is ever accepted.
             let rows = (8 + extra) as f64;
-            t.observe(8, extra, ch.mtp, 10.0 + 0.53 * rows + if ch.mtp { 0.15 * rows } else { 0.0 }, raw, 0);
+            t.observe(
+                8,
+                extra,
+                ch.mtp,
+                10.0 + 0.53 * rows + if ch.mtp { 0.15 * rows } else { 0.0 },
+                raw,
+                0,
+            );
         }
         assert_eq!(extra, 0);
         assert!(t.alpha < 0.5, "{}", t.alpha);
@@ -420,11 +490,22 @@ mod tests {
         };
         let mut plain = 0;
         for step in 0..400 {
-            let c = if t.mtp_live { conf.clone() } else { vec![vec![]; live] };
+            let c = if t.mtp_live {
+                conf.clone()
+            } else {
+                vec![vec![]; live]
+            };
             let ch = t.choose(&c, 24);
             let extra: usize = ch.drafts.iter().sum();
             let (_, raw) = dcut(&c, extra);
-            t.observe(live, extra, ch.mtp, cost(extra, ch.mtp), raw, raw.round() as usize);
+            t.observe(
+                live,
+                extra,
+                ch.mtp,
+                cost(extra, ch.mtp),
+                raw,
+                raw.round() as usize,
+            );
             if step >= 300 && !ch.mtp {
                 plain += 1;
             }
@@ -439,7 +520,14 @@ mod tests {
             for extra in [0, 5, 13] {
                 for mtp in [false, true] {
                     let rows = (live + extra) as f64;
-                    t.observe(live, extra, mtp, 7.0 + 0.4 * rows + if mtp { 0.1 * rows } else { 0.0 }, 0.0, 0);
+                    t.observe(
+                        live,
+                        extra,
+                        mtp,
+                        7.0 + 0.4 * rows + if mtp { 0.1 * rows } else { 0.0 },
+                        0.0,
+                        0,
+                    );
                 }
             }
         }
