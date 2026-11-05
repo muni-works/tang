@@ -487,3 +487,14 @@ this step's MMAs): dense GEMMs got slower (gdn_in 242 → 406 ms), likely regist
   231 ms, wide 4,276 → 4,285 tok/s (noise level); not kept. Weight-load latency isn't what holds
   the dense GEMMs at ~45 TOPS; next suspects are the token-operand loads (8 bytes a lane a chunk
   from global, 8 rows) and 2 blocks an SM. Needs a profiler (ncu doesn't run on these pods).
+
+### 16-bit GDN state (`TANG_CODER_GDN_STATE`, 2026-11-04, H200 ru6a6zybgtu80q, explain)
+
+The recurrent state is stored as bf16 or f16, rounded every token in registers, so windows stay
+bitwise. Quick ms/step f32 → bf16: B=8 9.06 → 8.94, B=32 19.15 → 18.78, B=64 30.24 → 29.63
+(f16 29.43). GDN conv+step per step (eager prof): B=32 2.19 → 1.89, B=64 4.29 → 3.68. No change
+single-stream (T=1 window 7.47 → 7.53 ms). The f32 step wasn't at the state-bandwidth floor
+(≈2 ms of its 4.29 at B=64), so halving the bytes saves 0.6 ms, not the predicted 2.1.
+Quality and gates are in `qwen3next-batching.md` ("bf16 GDN state"). Default stays f32: any
+non-bitwise state lands at a ~2–3e-3 KL floor (RBITS=2 does too), f16 matches that floor, and
+bf16 is 1.5× it.
