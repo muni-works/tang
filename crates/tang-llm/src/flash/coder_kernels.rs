@@ -17,12 +17,13 @@ pub fn tcx_split() -> (usize, usize) {
 
 pub fn prelude(c: &Shapes, maxt: usize) -> String {
     let (sgu, sdn) = tcx_split();
+    let tiles = if std::env::var("TANG_CODER_TCX_TILES").is_ok_and(|v| v == "1") { "#define CX_TCX_TILES 1\n" } else { "" };
     format!(
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
          #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n\
-         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n",
+         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n{tiles}",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -416,11 +417,13 @@ __device__ __forceinline__ const unsigned char* tcx_rowp(const unsigned char* ba
     return base + (size_t)e * estride + (size_t)(r >> 4) * rb + (r & 15);
 }
 __device__ __forceinline__ float cx_dot(int ty, const unsigned char* w, const unsigned char* xc, const float* xd, int k, int fast) {
+#ifdef CX_TCX_TILES
     if (ty == 112 || ty == 113) {
         const unsigned char* tb = (const unsigned char*)((unsigned long long)w & ~15ull);
         const int row = (int)((unsigned long long)w & 15);
         return ty == 112 ? cx_dotq_tile<12, 0>(tb, row, xc, xd, k) : cx_dotq_tile<13, 0>(tb, row, xc, xd, k);
     }
+#endif
     if (fast && (((unsigned long long)w | (unsigned long long)xc) & 15) == 0) {
         if (ty == 12) return cx_dotq_fast<12>(w, xc, xd, k);
         if (ty == 13) return cx_dotq_fast<13>(w, xc, xd, k);
@@ -501,7 +504,9 @@ __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const 
         const ExW& m = shared ? (r < CX_FF ? sg : su) : (r < CX_FF ? g : u);
         const int ro = r < CX_FF ? r : r - CX_FF;
         ty[j] = m.ty;
+#ifdef CX_TCX_TILES
         if (m.ty >= 112) { w[j] = tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, ro); continue; }
+#endif
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)ro * m.row_bytes;
         w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
@@ -554,7 +559,9 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
     for (int j = 0; j < R; j++) {
         const int r = (blockIdx.x * 8 + warp) * R + j;
         rr[j] = r;
+#ifdef CX_TCX_TILES
         if (m.ty >= 112) { w[j] = tcx_rowp((const unsigned char*)m.base, m.estride, m.row_bytes, e, r); continue; }
+#endif
         const unsigned char* src = (const unsigned char*)m.base + (size_t)e * m.estride + (size_t)r * m.row_bytes;
         w[j] = STAGE ? cx_stage(src, m.row_bytes, dsm + (warp * R + j) * r16, lane) : src;
     }
@@ -580,6 +587,7 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
         hcodes = hq + (size_t)p * CX_FF;
         hd = (const float*)(hq + (size_t)CX_NP * CX_FF) + p * (CX_FF / 32);
     }
+#ifdef CX_TCX_TILES
     if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && m.ty >= 112 && (((unsigned long long)hcodes) & 15) == 0) {
         // The TCX tile twin of the half-warp branch below (bitwise equal).
         const int h = lane >> 4;
@@ -594,6 +602,7 @@ __device__ __forceinline__ void moe_down_body(ExW d, ExW sd, const unsigned* ids
         }
         return;
     }
+#endif
     const bool aligned = ((((unsigned long long)w[0]) | ((unsigned long long)w[R - 1]) | (unsigned long long)hcodes) & 15) == 0;
     if (R % 2 == 0 && fast >= 2 && CX_FF == 512 && (m.ty == 12 || m.ty == 13) && aligned) {
         // fast = 2: rows two at a time on the two halves of the warp.
@@ -1722,6 +1731,25 @@ __device__ __forceinline__ void sc_unpack(const unsigned* sc, unsigned& s03, uns
     s47 = (sc[2] & 0x0F0F0F0Fu) | (((sc[0] >> 6) & 0x03030303u) << 4);
     m47 = ((sc[2] >> 4) & 0x0F0F0F0Fu) | (((sc[1] >> 6) & 0x03030303u) << 4);
 }
+// A row's superblock for gg_rows: lane tig takes qs bytes 32 j + 8 tig .. + 8 (one uint2 a j) and
+// qh bytes 8 tig .. + 8. The MMA's k order inside a 32-column step is then a permutation of the
+// columns (A register 0 = columns 8 tig .. + 4, register 2 = 8 tig + 4 ..), and the B fragment
+// (x at 8 tig, one uint2) takes the same one: dot products and per-32 scales are unchanged.
+struct GgR { float d, dm; unsigned sc[3]; uint2 q[4]; uint2 h; };
+template <int TY>
+__device__ __forceinline__ void gg_load(const unsigned char* b, int tig, GgR& o) {
+    constexpr int QS = TY == 12 ? 16 : 48;
+    const unsigned dw = __ldg((const unsigned*)b);
+    o.d = h2f((unsigned short)(dw & 0xFFFFu));
+    o.dm = h2f((unsigned short)(dw >> 16));
+    o.sc[0] = __ldg((const unsigned*)(b + 4));
+    o.sc[1] = __ldg((const unsigned*)(b + 8));
+    o.sc[2] = __ldg((const unsigned*)(b + 12));
+    #pragma unroll
+    for (int j = 0; j < 4; j++) o.q[j] = __ldg((const uint2*)(b + QS + j * 32 + tig * 8));
+    if (TY == 13) o.h = __ldg((const uint2*)(b + 16 + tig * 8));
+    else o.h = make_uint2(0, 0);
+}
 template <int TY, int K>
 __device__ __forceinline__ void gg_rows(const unsigned char* wa, const unsigned char* wb, int m, const unsigned char* xg,
                                         const float* da, const float* db, float acc[4], int sb0, int sb1) {
@@ -1729,11 +1757,11 @@ __device__ __forceinline__ void gg_rows(const unsigned char* wa, const unsigned 
     const int lane = threadIdx.x & 31, tig = lane & 3;
     const int na = 2 * tig, nb = 2 * tig + 1;
     acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
-    SbK ra, rb, pa, pb;
-    sbk_load<TY>(wa + sb0 * BB, tig, ra);
-    sbk_load<TY>(wb + sb0 * BB, tig, rb);
+    GgR ra, rb, pa, pb;
+    gg_load<TY>(wa + sb0 * BB, tig, ra);
+    gg_load<TY>(wb + sb0 * BB, tig, rb);
     for (int sb = sb0; sb < sb1; sb++) {
-        if (sb + 1 < sb1) { sbk_load<TY>(wa + (sb + 1) * BB, tig, pa); sbk_load<TY>(wb + (sb + 1) * BB, tig, pb); }
+        if (sb + 1 < sb1) { gg_load<TY>(wa + (sb + 1) * BB, tig, pa); gg_load<TY>(wb + (sb + 1) * BB, tig, pb); }
         unsigned sa[2], ma[2], sbw[2], mbw[2];
         sc_unpack(ra.sc, sa[0], sa[1], ma[0], ma[1]);
         sc_unpack(rb.sc, sbw[0], sbw[1], mbw[0], mbw[1]);
@@ -1743,15 +1771,13 @@ __device__ __forceinline__ void gg_rows(const unsigned char* wa, const unsigned 
             unsigned a[4];
             #pragma unroll
             for (int c = 0; c < 4; c++) {
-                const SbK& r = (c & 1) ? rb : ra;
-                const unsigned w = r.q[qp][c >> 1];
+                const GgR& r = (c & 1) ? rb : ra;
+                const unsigned w = (c >> 1) ? r.q[qp].y : r.q[qp].x;
                 unsigned v = (s & 1) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
-                if (TY == 13) v |= ((r.h[c >> 1] >> s) & 0x01010101u) << 4;
+                if (TY == 13) v |= ((((c >> 1) ? r.h.y : r.h.x) >> s) & 0x01010101u) << 4;
                 a[c] = v;
             }
-            uint2 bb;
-            bb.x = __ldg((const unsigned*)(xg + sb * 256 + s * 32));
-            bb.y = __ldg((const unsigned*)(xg + sb * 256 + s * 32 + 16));
+            const uint2 bb = __ldg((const uint2*)(xg + sb * 256 + s * 32));
             int d[4], mm[4];
             mma_s8_16832(d, a, bb.x, bb.y);
             const unsigned sel = (unsigned)(s & 3) * 0x1111u;
@@ -1814,7 +1840,7 @@ __device__ __forceinline__ void moe_gg_body(ExW g, ExW u, ExW sg, ExW su, const 
         return;
     }
     const int gq = lane >> 2, tig = lane & 3;
-    const unsigned char* xg = xq + (size_t)tok(pair_s[gq < m ? gq : 0]) * KA + tig * 4;
+    const unsigned char* xg = xq + (size_t)tok(pair_s[gq < m ? gq : 0]) * KA + tig * 8;
     const float* da = xdg + (size_t)tok(pair_s[2 * tig < m ? 2 * tig : 0]) * (KA / 32);
     const float* db = xdg + (size_t)tok(pair_s[2 * tig + 1 < m ? 2 * tig + 1 : 0]) * (KA / 32);
     const unsigned char* wa = wbase + (size_t)(ro + gq) * mw.row_bytes;
@@ -2372,8 +2398,10 @@ __device__ __forceinline__ void gemm_tile_any(int ty, const unsigned char* wa, c
     switch (ty) {
         case 12: gemm_tile_sbk<12>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 13: gemm_tile_sbk<13>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+#ifdef CX_TCX_TILES
         case 112: gemm_tile_sbk<12, true>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 113: gemm_tile_sbk<13, true>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
+#endif
         case 8: gemm_tile32<8>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 108: gemm_tile32<108>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
         case 2: gemm_tile32<2>(wa, wb, live, xrow_s, xd_s, nch, acc, K, sxd, ssx); break;
