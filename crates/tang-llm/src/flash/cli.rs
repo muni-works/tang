@@ -1538,8 +1538,17 @@ pub fn wide_check(args: &[String]) -> Result<()> {
                 .fold(0.0, f64::max)
         };
         let max_kl = forced.as_ref().map_or(0.0, |f| kl(&l1, f));
-        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens, KL <= 1e-3.
-        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= 1e-3);
+        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens and KL under
+        // the gated fp16 FA2 bar (docs/plans/gates-2026-11-04.md): 3000 tokens <= 2.0e-4,
+        // 8000 <= 3.2e-5; shorter, ungated lengths keep the general 1e-3.
+        let bar = if len >= 8000 {
+            3.2e-5
+        } else if len >= 3000 {
+            2.0e-4
+        } else {
+            1e-3
+        };
+        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= bar);
         println!("  teacher-forced max KL(narrow || wide) over {steps} steps: {max_kl:.2e}");
         println!(
             "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
@@ -1551,7 +1560,13 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         );
         println!(
             "wide-check {len}: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
-            if !ok { "FAIL" } else if bits == 0 { "PASS (bitwise)" } else { "PASS (greedy equal, KL <= 1e-3)" },
+            if !ok {
+                format!("FAIL (KL bar {bar:.1e})")
+            } else if bits == 0 {
+                "PASS (bitwise)".to_string()
+            } else {
+                format!("PASS (greedy equal, KL <= {bar:.1e})")
+            },
             if n1 == n2 { "equal" } else { "DIFFERS" },
             if t1 == t2 { "equal" } else { "DIFFER" },
             l1.len()
