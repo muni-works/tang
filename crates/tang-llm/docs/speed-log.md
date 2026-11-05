@@ -394,6 +394,36 @@ Narrow windows on TCX (`TANG_CODER_TCX_NARROW=1`) lose: flash-aa explain no draf
 tok/s). One token an expert has too few warps a tile, and the per-pair `_d4` path wins there.
 Repack: +156 s serial, threaded now; both copies held (97 GB).
 
+### TCX tiles as the only expert copy; TCX32 the batch default (2026-11-04, H200 srznguhpkj2lqo)
+
+Routed + shared Q4_K / Q5_K experts are now uploaded only as TCX tiles (`TANG_CODER_TCX=0`
+for the GGUF rows). Tile v3: codes `[q][row][32 B]` = each row's GGUF `qs` slices as they
+are, Q5 `qh` per row as is, scales unpacked. Every reader takes them: narrow per-pair dots
+(`cx_dotq_tile`, cx_dotq_fast / _half's lane loads and arithmetic on the tile: bitwise), wide
+GEMMs (`sbk_load_t`: the same SbK, scale bytes re-packed: bitwise), batch windows
+(`cx_moe_*_t32`, per-32 activations). Layer 46's Q8_0 shared expert unchanged.
+
+VRAM after load: 50.8 GB (52.6 with the MTP head), was 97.3 with both copies and 49.6 GGUF only.
+Gates: flash-aa outputs (explain / refactor / write × none / suffix / mtp, 512 tokens) identical
+to TCX=0; flash-tcheck t1 = t8 = t8-verify bitwise; flash-spec-test PASS (step-3200 head);
+batch-check N=8 bitwise; wide-check KL 8.61e-5 (3000) / 4.43e-6 (8000), afa748e7's values;
+batch-check N=64 tolerance 99.29% / 0.121 PASS.
+
+| B | TCX=0 ms | tiles ms | Δ |
+|---|---|---|---|
+| 1 | 4.07 | 4.27 | +4.9% |
+| 2 | 4.79 | 5.08 | +6% |
+| 4 | 6.57 | 7.00 | +6.5% |
+| 8 | 9.97 | 10.53 | +5.6% |
+| 16 | 17.46 | 16.56 | −5% |
+| 32 | 24.78 | 22.61 | −9% |
+| 64 | 38.91 | 34.17 | −12% (1873 tok/s) |
+
+flash-aa (--bw 4800, step-3200 head), TCX=0 → tiles: none 233.9 → 222.7; mtp explain 319.8 →
+304.4, refactor 401.8 → 382.0, write 351.7 → 334.7. The narrow per-pair dots lose ~5% on the
+tile layout (a lane's qs / scales / qh for a row are in three regions of the tile instead of
+one 144 / 176-byte block). Tile v2 (codes in MMA-lane order) was worse: none 219.3.
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
