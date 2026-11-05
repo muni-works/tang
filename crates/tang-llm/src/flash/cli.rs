@@ -1538,9 +1538,23 @@ pub fn wide_check(args: &[String]) -> Result<()> {
                 .fold(0.0, f64::max)
         };
         let max_kl = forced.as_ref().map_or(0.0, |f| kl(&l1, f));
-        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens, KL <= 1e-3.
-        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= 1e-3);
-        println!("  teacher-forced max KL(narrow || wide) over {steps} steps: {max_kl:.2e}");
+        // Bitwise (grouped decode kernels), or the GEMM bar: same greedy tokens and KL under the
+        // per-length bar (gates-2026-11-04.md: fp16 FA2 values at 3000 / 8000, 1e-3 below).
+        // TANG_WIDE_KL_BAR overrides it.
+        let bar = std::env::var("TANG_WIDE_KL_BAR")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(if len >= 8000 {
+                3.2e-5
+            } else if len >= 3000 {
+                2.0e-4
+            } else {
+                1e-3
+            });
+        let ok = n1 == n2 && t1 == t2 && (bits == 0 || max_kl <= bar);
+        println!(
+            "  teacher-forced max KL(narrow || wide) over {steps} steps: {max_kl:.2e} (bar {bar:.1e})"
+        );
         println!(
             "prefill {len} tokens: narrow {:.2} s ({:.0} tok/s), wide {:.2} s cold / {:.2} s warm ({:.0} tok/s)",
             narrow,
@@ -1551,7 +1565,7 @@ pub fn wide_check(args: &[String]) -> Result<()> {
         );
         println!(
             "wide-check {len}: {} (next token {}, {steps} decoded tokens {}, logits differ in {bits} of {})",
-            if !ok { "FAIL" } else if bits == 0 { "PASS (bitwise)" } else { "PASS (greedy equal, KL <= 1e-3)" },
+            if !ok { "FAIL" } else if bits == 0 { "PASS (bitwise)" } else { "PASS (greedy equal, KL under bar)" },
             if n1 == n2 { "equal" } else { "DIFFERS" },
             if t1 == t2 { "equal" } else { "DIFFER" },
             l1.len()
