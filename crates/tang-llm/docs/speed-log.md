@@ -424,6 +424,37 @@ flash-aa (--bw 4800, step-3200 head), TCX=0 → tiles: none 233.9 → 222.7; mtp
 tile layout (a lane's qs / scales / qh for a row are in three regions of the tile instead of
 one 144 / 176-byte block). Tile v2 (codes in MMA-lane order) was worse: none 219.3.
 
+### GGUF-native batch experts (`cx_moe_*_q`), GGUF rows the only copy again (2026-11-05, H200 srznguhpkj2lqo)
+
+Tiles reverted to opt-in (`TANG_CODER_TCX_TILES=1`). Batch windows take `cx_moe_gu_q` /
+`cx_moe_down_q` (default; `TANG_CODER_TCX=0` for the previous streaming / `_m` kernels): the
+TCX32 kernel on GGUF Q4_K / Q5_K rows. A lane loads 8 contiguous qs bytes a 32-byte chunk
+(and 8 qh bytes), so the m16n8k32 k order inside a step is a permutation of the columns; the B
+fragment (x at 8 tig, one uint2 from global, no staging) takes the same one. Scales and mins
+unpacked once a superblock with bit ops on the three scale words; mins as a second MMA; per-32
+activation scales. K split 2 / 1.
+
+- The ~5% narrow loss blamed on the tile layout was the tile branch inside `cx_dot` and the
+  narrow bodies (code size / registers in `_d4`), not the layout: with the branch compiled out
+  (only under TANG_CODER_TCX_TILES) narrow is back to 4.07 ms at B=1.
+- First version with sbk_load's 4-byte qs words: gate|up 8.5 / down 6.0 ms a step (quick +
+  profile), B=64 37.45 ms. With 8-byte lane loads: 7.2 / 5.7, B=64 35.34.
+
+Gates: flash-aa outputs identical to TCX=0 (9 runs), tok/s none 234.6 / 234.8 / 234.7, mtp
+320.1 / 402.0 / 351.9 (explain / refactor / write); tcheck bitwise; spec-test PASS;
+batch-check N=8 bitwise; wide-check KL 8.61e-5 / 4.43e-6; N=64 tolerance 99.29% / 0.121.
+VRAM 49.6 GB (51.4 with the MTP head).
+
+| B | TCX=0 ms | `_q` ms | Δ |
+|---|---|---|---|
+| 1 | 4.28* | 4.07 | |
+| 8 | 10.46* | 9.98 | |
+| 16 | 17.57 | 16.95 | −3.5% |
+| 32 | 24.85 | 23.41 | −5.8% |
+| 64 | 39.00 | **35.34** (1811 tok/s) | −9.4% |
+
+(*TCX=0 on the build that still had the tile branch compiled in; B ≤ 8 is the same code either way.)
+
 ### Dead ends (Coder-Next)
 
 - **22 → 12 launches a layer with no faster kernels:** +2% (156 → 159 on H100). The step is
