@@ -134,7 +134,7 @@ Gates:
 - Every `wide-check <len>:` line in `fa2.log` says `PASS (greedy equal, KL <= <bar>)`. That means
   the next token is equal, all 64 greedy decoded tokens are equal to narrow, and the
   teacher-forced max KL(narrow ‖ wide) is under the bar: 3.2e-5 at ≥ 8000 tokens, 2.0e-4 at
-  ≥ 3000 (the fp16 FA2 bars, docs/plans/gates-2026-11-04.md), 1e-3 below that. The command exits non-zero on any FAIL.
+  ≥ 3000 (the fp16 FA2 bars, docs/plans/gates-2026-11-04.md), 1e-3 below that (`TANG_WIDE_KL_BAR` overrides). The command exits non-zero on any FAIL.
 - Compare the `wide … warm` times on the `prefill <len> tokens:` lines between the two logs. To
   make fa2 the default, it needs a clear win at 30k and 54k and no loss at 8k.
 

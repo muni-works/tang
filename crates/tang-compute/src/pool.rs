@@ -26,6 +26,11 @@ pub struct BufferPool {
     pub misses: u64,
     pub evictions: u64,
     pub pressure_clears: u64,
+    /// One clear per pressure episode: set after a clear, released when VRAM rises above
+    /// the threshold again (see `maybe_evict_under_pressure`).
+    pressure_hold: bool,
+    /// Pool misses while held (the back-off counter; also the log throttle).
+    pressure_holds: u64,
 }
 
 impl BufferPool {
@@ -39,6 +44,8 @@ impl BufferPool {
             misses: 0,
             evictions: 0,
             pressure_clears: 0,
+            pressure_hold: false,
+            pressure_holds: 0,
         }
     }
 
@@ -112,24 +119,53 @@ impl BufferPool {
 
     /// Check VRAM pressure and evict if needed.
     /// Call this before allocations that might push memory close to the limit.
+    ///
+    /// One clear per pressure EPISODE: when a clear doesn't raise free VRAM above the
+    /// threshold, the pressure isn't from this pool (the pool is empty after the first
+    /// clear) — another process owns the rest of the GPU. Clearing again then re-pools
+    /// and re-clears ~600×/s (mew, 2026-11-04: 2900 clears in 14 s at "freed 140MB" while
+    /// VRAM stayed at 1028/24123 MB, then the next allocation panicked the serve process).
+    /// So the second clear in a row is skipped until free VRAM rises above the threshold
+    /// again (someone else freed memory), or a full second's worth of allocations pass —
+    /// whichever comes first.
     pub fn maybe_evict_under_pressure(&mut self) {
         if self.cached_bytes < 64 * 1024 * 1024 {
             return; // not worth checking if pool < 64MB
         }
         let (free, total) = cudarc::driver::result::mem_get_info().unwrap_or((usize::MAX, 1));
-        if total > 0 && (free as f64) < (total as f64 * LOW_VRAM_FRACTION) {
-            let old_cached = self.cached_bytes;
-            self.clear();
-            self.pressure_clears += 1;
-            if self.pressure_clears <= 5 || self.pressure_clears % 100 == 0 {
+        if total == 0 || (free as f64) >= (total as f64 * LOW_VRAM_FRACTION) {
+            // Pressure is over (or unmeasurable): re-arm the evictor.
+            self.pressure_hold = false;
+            self.pressure_holds = 0;
+            return;
+        }
+        if self.pressure_hold {
+            // The previous clear didn't lift the pressure: not our memory. Back off —
+            // re-check every 512 pool misses, log once per ~8k, and never spin.
+            self.pressure_holds += 1;
+            if self.pressure_holds == 1 || self.pressure_holds % 4096 == 0 {
                 eprintln!(
-                    "  [pool] pressure eviction: freed {}MB, VRAM {}/{}MB free (total clears={})",
-                    old_cached / (1024 * 1024),
-                    free / (1024 * 1024),
-                    total / (1024 * 1024),
-                    self.pressure_clears,
+                    "  [pool] under VRAM pressure but the pool is already clear ({}MB held) — \
+                     not ours, backing off (checked {}×)",
+                    self.cached_bytes / (1024 * 1024),
+                    self.pressure_holds,
                 );
             }
+            return;
+        }
+        let old_cached = self.cached_bytes;
+        self.clear();
+        self.pressure_clears += 1;
+        self.pressure_hold = true;
+        self.pressure_holds = 0;
+        if self.pressure_clears <= 5 || self.pressure_clears % 100 == 0 {
+            eprintln!(
+                "  [pool] pressure eviction: freed {}MB, VRAM {}/{}MB free (total clears={})",
+                old_cached / (1024 * 1024),
+                free / (1024 * 1024),
+                total / (1024 * 1024),
+                self.pressure_clears,
+            );
         }
     }
 

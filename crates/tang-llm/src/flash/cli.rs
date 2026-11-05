@@ -1679,8 +1679,9 @@ pub fn spec_batch_check(args: &[String]) -> Result<()> {
     let (base, dt0, w0, _, _) = run(&mut e, None)?;
     let tok = (nb * steps) as f64;
     println!(
-        "spec-batch-check: {nb} sequences x {steps} tokens, windows up to {rows} rows; budget 0: {w0} windows, {:.1} tok/s",
-        tok / dt0
+        "spec-batch-check: {nb} sequences x {steps} tokens, windows up to {rows} rows; budget 0: {w0} windows, {:.1} tok/s, tokens hash {:016x}",
+        tok / dt0,
+        base.iter().flatten().fold(0xcbf29ce484222325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100000001b3))
     );
     let mut all_eq = true;
     for b in &budgets {
