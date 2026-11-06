@@ -765,11 +765,14 @@ pub(super) fn emit_decompose(s: &mut String, g: &str, shape: &[usize], prefix: &
 }
 
 pub(super) fn lit(v: f64) -> String {
-    if v == f64::NEG_INFINITY {
-        return "-3.4028235e38".into();
+    // ±f32::MAX (the max monoid's identity stands in for ±∞) as an exact hex float. The
+    // shortest decimal, 3.4028235e38, is above f32::MAX before rounding: naga accepts it,
+    // but Tint (Chrome's WebGPU) rejects it as unrepresentable.
+    if v == f64::NEG_INFINITY || (v as f32) == f32::MIN {
+        return "-0x1.fffffep+127f".into();
     }
-    if v == f64::INFINITY {
-        return "3.4028235e38".into();
+    if v == f64::INFINITY || (v as f32) == f32::MAX {
+        return "0x1.fffffep+127f".into();
     }
     let s = format!("{:?}", v as f32);
     if s.contains('.') || s.contains('e') {
