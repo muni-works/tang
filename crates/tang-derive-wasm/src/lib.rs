@@ -45,7 +45,10 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(s: &'a str) -> Self {
-        Parser { s: s.as_bytes(), i: 0 }
+        Parser {
+            s: s.as_bytes(),
+            i: 0,
+        }
     }
     fn ws(&mut self) {
         while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
@@ -146,7 +149,11 @@ impl<'a> Parser<'a> {
             }
             Some(c) if c.is_ascii_digit() || c == b'.' => {
                 let st = self.i;
-                while self.i < self.s.len() && (self.s[self.i].is_ascii_digit() || self.s[self.i] == b'.' || self.s[self.i] == b'e') {
+                while self.i < self.s.len()
+                    && (self.s[self.i].is_ascii_digit()
+                        || self.s[self.i] == b'.'
+                        || self.s[self.i] == b'e')
+                {
                     self.i += 1;
                 }
                 let t = std::str::from_utf8(&self.s[st..self.i]).unwrap();
@@ -154,10 +161,14 @@ impl<'a> Parser<'a> {
             }
             Some(c) if c.is_ascii_alphabetic() => {
                 let st = self.i;
-                while self.i < self.s.len() && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_') {
+                while self.i < self.s.len()
+                    && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+                {
                     self.i += 1;
                 }
-                let name = std::str::from_utf8(&self.s[st..self.i]).unwrap().to_string();
+                let name = std::str::from_utf8(&self.s[st..self.i])
+                    .unwrap()
+                    .to_string();
                 if self.eat("(") {
                     let mut args = vec![self.or()?];
                     while self.eat(",") {
@@ -184,7 +195,9 @@ fn uses(a: &Ast, v: char) -> bool {
         Ast::Num(_) => false,
         Ast::Var(c) => *c == v,
         Ast::Neg(x) => uses(x, v),
-        Ast::Bin(_, x, y) | Ast::Cmp(_, x, y) | Ast::And(x, y) | Ast::Or(x, y) => uses(x, v) || uses(y, v),
+        Ast::Bin(_, x, y) | Ast::Cmp(_, x, y) | Ast::And(x, y) | Ast::Or(x, y) => {
+            uses(x, v) || uses(y, v)
+        }
         Ast::Call(_, xs) => xs.iter().any(|x| uses(x, v)),
     }
 }
@@ -240,7 +253,13 @@ fn lower(a: &Ast, env: &dyn Fn(char) -> ExprId) -> Result<ExprId, String> {
             for x in xs {
                 v.push(lower(x, env)?);
             }
-            let arity = |k: usize| if v.len() == k { Ok(()) } else { Err(format!("{f} takes {k} argument(s)")) };
+            let arity = |k: usize| {
+                if v.len() == k {
+                    Ok(())
+                } else {
+                    Err(format!("{f} takes {k} argument(s)"))
+                }
+            };
             match f.as_str() {
                 "exp" => {
                     arity(1)?;
@@ -301,11 +320,15 @@ pub struct Variant {
 }
 
 pub fn parse_variant(score: &str, mask: &str) -> Result<Variant, String> {
-    let score = Parser::new(score).parse().map_err(|e| format!("score: {e}"))?;
+    let score = Parser::new(score)
+        .parse()
+        .map_err(|e| format!("score: {e}"))?;
     let mask = if mask.trim().is_empty() {
         None
     } else {
-        let m = Parser::new(mask).parse().map_err(|e| format!("mask: {e}"))?;
+        let m = Parser::new(mask)
+            .parse()
+            .map_err(|e| format!("mask: {e}"))?;
         if uses(&m, 's') {
             return Err("mask: the mask may use i, j, n and d, not s".into());
         }
@@ -316,7 +339,12 @@ pub fn parse_variant(score: &str, mask: &str) -> Result<Variant, String> {
 
 /// The naive graph: `O = softmax(score(q·kᵀ/√d, i, j) masked)·v`. Inputs q, k `[n,d]`, v
 /// `[n,d]` and, for the backward, dO `[n,d]`. Returns the outputs to compute.
-pub fn naive_graph(v: &Variant, n: usize, d: usize, backward: bool) -> Result<(TensorGraph, Vec<TensorId>), String> {
+pub fn naive_graph(
+    v: &Variant,
+    n: usize,
+    d: usize,
+    backward: bool,
+) -> Result<(TensorGraph, Vec<TensorId>), String> {
     let e = |r: Result<TensorId, tang_compile::tensor::ShapeError>| r.map_err(|e| format!("{e:?}"));
     let mut g = TensorGraph::new();
     let q = g.input(&[n, d]);
@@ -390,7 +418,9 @@ pub fn naive_graph(v: &Variant, n: usize, d: usize, backward: bool) -> Result<(T
     let prod = e(g.map(&[y, dout], |x| x[0] * x[1]))?;
     let r1 = e(g.reduce(prod, 1, Monoid::sum()))?;
     let loss = e(g.reduce(r1, 0, Monoid::sum()))?;
-    let grads = g.backward(loss, &[q, k, vv]).map_err(|e| format!("{e:?}"))?;
+    let grads = g
+        .backward(loss, &[q, k, vv])
+        .map_err(|e| format!("{e:?}"))?;
     Ok((g, grads))
 }
 
@@ -436,7 +466,11 @@ fn program_json(p: &WgslProgram, outs: &[TensorId], n: usize) -> String {
         if x > 0 {
             s.push(',');
         }
-        let reads: Vec<String> = k.reads.iter().map(|t| p.storage(*t).index().to_string()).collect();
+        let reads: Vec<String> = k
+            .reads
+            .iter()
+            .map(|t| p.storage(*t).index().to_string())
+            .collect();
         let _ = write!(
             s,
             "{{\"source\":\"{}\",\"node\":{},\"reads\":[{}],\"points\":{},\"count\":{},\"workgroup_size\":{}}}",
@@ -454,11 +488,29 @@ fn program_json(p: &WgslProgram, outs: &[TensorId], n: usize) -> String {
             s.push(',');
         }
         let input = b.input.map_or("null".into(), |i| i.to_string());
-        let _ = write!(s, "{{\"node\":{},\"len\":{},\"input\":{}}}", b.node.index(), b.len, input);
+        let _ = write!(
+            s,
+            "{{\"node\":{},\"len\":{},\"input\":{}}}",
+            b.node.index(),
+            b.len,
+            input
+        );
     }
-    let outs: Vec<String> = outs.iter().map(|t| p.storage(*t).index().to_string()).collect();
-    let big = p.buffers.iter().filter(|b| b.input.is_none() && b.len >= nn).count();
-    let _ = write!(s, "],\"outputs\":[{}],\"nxn_buffers\":{}}}", outs.join(","), big);
+    let outs: Vec<String> = outs
+        .iter()
+        .map(|t| p.storage(*t).index().to_string())
+        .collect();
+    let big = p
+        .buffers
+        .iter()
+        .filter(|b| b.input.is_none() && b.len >= nn)
+        .count();
+    let _ = write!(
+        s,
+        "],\"outputs\":[{}],\"nxn_buffers\":{}}}",
+        outs.join(","),
+        big
+    );
     s
 }
 
@@ -484,13 +536,25 @@ pub fn derive(score: &str, mask: &str, n: usize, d: usize, backward: bool) -> St
                 let name = if split > 0 {
                     format!("split · {split} threads")
                 } else if tile.0 > 0 {
-                    let r = if reg.0 * reg.1 > 1 { format!(" · {}×{} regs", reg.0, reg.1) } else { String::new() };
+                    let r = if reg.0 * reg.1 > 1 {
+                        format!(" · {}×{} regs", reg.0, reg.1)
+                    } else {
+                        String::new()
+                    };
                     format!("tile · {}×{}{r}", tile.0, tile.1)
                 } else {
                     "one thread per point".into()
                 };
-                let name = if derived.kernels.len() > 1 { format!("kernel {} · {name}", k.node.index()) } else { name };
-                cands.push(format!("{{\"name\":\"{}\",\"program\":{}}}", esc(&name), program_json(&v.to_wgsl(&douts), &douts, n)));
+                let name = if derived.kernels.len() > 1 {
+                    format!("kernel {} · {name}", k.node.index())
+                } else {
+                    name
+                };
+                cands.push(format!(
+                    "{{\"name\":\"{}\",\"program\":{}}}",
+                    esc(&name),
+                    program_json(&v.to_wgsl(&douts), &douts, n)
+                ));
                 if cands.len() >= 12 {
                     break;
                 }
@@ -514,15 +578,33 @@ pub fn derive(score: &str, mask: &str, n: usize, d: usize, backward: bool) -> St
 /// concatenation of q, k, v (and dO for the backward), each `n·d` values. Returns the
 /// outputs concatenated (O, or dq ‖ dk ‖ dv).
 #[wasm_bindgen]
-pub fn reference(score: &str, mask: &str, n: usize, d: usize, backward: bool, inputs: &[f32]) -> Vec<f32> {
-    let Ok(v) = parse_variant(score, mask) else { return vec![] };
-    let Ok((g, outs)) = naive_graph(&v, n, d, backward) else { return vec![] };
+pub fn reference(
+    score: &str,
+    mask: &str,
+    n: usize,
+    d: usize,
+    backward: bool,
+    inputs: &[f32],
+) -> Vec<f32> {
+    let Ok(v) = parse_variant(score, mask) else {
+        return vec![];
+    };
+    let Ok((g, outs)) = naive_graph(&v, n, d, backward) else {
+        return vec![];
+    };
     let k = if backward { 4 } else { 3 };
     if inputs.len() != k * n * d {
         return vec![];
     }
-    let ins: Vec<Vec<f64>> = inputs.chunks(n * d).map(|c| c.iter().map(|&x| x as f64).collect()).collect();
-    g.eval(&ins, &outs).into_iter().flatten().map(|x| x as f32).collect()
+    let ins: Vec<Vec<f64>> = inputs
+        .chunks(n * d)
+        .map(|c| c.iter().map(|&x| x as f64).collect())
+        .collect();
+    g.eval(&ins, &outs)
+        .into_iter()
+        .flatten()
+        .map(|x| x as f32)
+        .collect()
 }
 
 #[cfg(test)]
@@ -544,11 +626,25 @@ mod tests {
                 // the forward never writes n×n; the WGSL backward still materializes a few
                 // (nested contractions, which remove them, are lowered on CUDA only)
                 if !bwd {
-                    assert!(derived.contains("\"nxn_buffers\":0"), "{score} / {mask}: derived forward writes n×n");
+                    assert!(
+                        derived.contains("\"nxn_buffers\":0"),
+                        "{score} / {mask}: derived forward writes n×n"
+                    );
                 }
-                let nx = |p: &str| p.rsplit("\"nxn_buffers\":").next().unwrap().trim_end_matches(['}']).parse::<usize>().unwrap();
+                let nx = |p: &str| {
+                    p.rsplit("\"nxn_buffers\":")
+                        .next()
+                        .unwrap()
+                        .trim_end_matches(['}'])
+                        .parse::<usize>()
+                        .unwrap()
+                };
                 let naive = &j[..j.find("\"derived\"").unwrap()];
-                eprintln!("{score:>16} | {mask:<22} | bwd {bwd:<5} | n×n naive {} derived {}", nx(naive.trim_end_matches(',')), nx(derived.trim_end_matches(',')));
+                eprintln!(
+                    "{score:>16} | {mask:<22} | bwd {bwd:<5} | n×n naive {} derived {}",
+                    nx(naive.trim_end_matches(',')),
+                    nx(derived.trim_end_matches(','))
+                );
             }
         }
     }
@@ -563,9 +659,13 @@ mod tests {
     #[test]
     fn reference_matches_shape() {
         let (n, d) = (16, 4);
-        let x: Vec<f32> = (0..3 * n * d).map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0).collect();
+        let x: Vec<f32> = (0..3 * n * d)
+            .map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0)
+            .collect();
         assert_eq!(reference("s", "j <= i", n, d, false, &x).len(), n * d);
-        let x: Vec<f32> = (0..4 * n * d).map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0).collect();
+        let x: Vec<f32> = (0..4 * n * d)
+            .map(|i| ((i * 37 % 17) as f32 - 8.0) / 8.0)
+            .collect();
         assert_eq!(reference("s", "j <= i", n, d, true, &x).len(), 3 * n * d);
     }
 }
