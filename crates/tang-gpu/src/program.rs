@@ -846,7 +846,7 @@ impl Program {
             let k = &self.program.kernels[i];
             let blocks = k.count.div_ceil(k.workgroup_size);
             (max_blocks == 0 || blocks <= max_blocks)
-                && threads % k.workgroup_size == 0
+                && threads.is_multiple_of(k.workgroup_size)
                 && threads / k.workgroup_size <= 15
                 && crate::cuda::dynamic_smem(&k.source) == 0
         };
@@ -903,7 +903,7 @@ impl Program {
                 .iter()
                 .map(|&s| {
                     let (p, _sync) = slots[s].device_ptr(&d.stream);
-                    p as u64
+                    p
                 })
                 .collect();
             let table = d.stream.memcpy_stod(&ptrs).expect("pointer table");
@@ -1644,7 +1644,10 @@ mod tests {
         );
         // the decode lowering: warp kernels, the kind a megakernel fuses
         let lower = || {
-            let dp = g.to_cuda_decode(&outs, &tang_compile::tensor::cuda_gemv::DecodeOpts::default());
+            let dp = g.to_cuda_decode(
+                &outs,
+                &tang_compile::tensor::cuda_gemv::DecodeOpts::default(),
+            );
             Program::new(&rt, dp.program, &[&va, &vb, &vc])
         };
         let want = {

@@ -192,15 +192,11 @@ fn coherent_loads(src: &str, konst: &[bool]) -> String {
             let after = &rest[at + "__ldg(".len()..];
             // skip casts and parens to the pointer token
             let mut t = after.trim_start();
-            loop {
-                if let Some(r) = t.strip_prefix('(') {
-                    t = r.trim_start();
-                    if t.starts_with("const ") {
-                        let close = t.find(')').unwrap_or(0);
-                        t = t[close + 1..].trim_start();
-                    }
-                } else {
-                    break;
+            while let Some(r) = t.strip_prefix('(') {
+                t = r.trim_start();
+                if t.starts_with("const ") {
+                    let close = t.find(')').unwrap_or(0);
+                    t = t[close + 1..].trim_start();
                 }
             }
             let ident: String = t
@@ -252,7 +248,7 @@ fn stage_source(i: usize, st: &MegaStage, konst: &[bool]) -> (String, usize) {
             let sp = ty_name.trim_end().rfind(' ').expect("shared decl");
             let (ty, name) = (ty_name[..sp].trim(), ty_name[sp..].trim());
             let n: usize = dims
-                .split(|c| c == '[' || c == ']')
+                .split(['[', ']'])
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim().parse::<usize>().expect("constant dim"))
                 .product();
