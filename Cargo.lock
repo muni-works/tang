@@ -6243,6 +6243,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-derive-wasm"
+version = "0.1.0"
+dependencies = [
+ "tang-compile",
+ "tang-expr",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tang-expr"
 version = "0.2.0"
 dependencies = [

@@ -86,19 +86,42 @@ impl Forest {
 
     /// The window rows for root `cur` at `pos0`, and one segment per chain.
     pub fn layout(&self, cur: u32, pos0: usize) -> (Vec<Row>, Vec<Seg>) {
-        let mut rows = vec![Row { tok: cur, pos: pos0, off: 0 }];
+        let mut rows = vec![Row {
+            tok: cur,
+            pos: pos0,
+            off: 0,
+        }];
         if self.chains.is_empty() {
-            return (rows, vec![Seg { r0: 0, len: 1, plen: 0 }]);
+            return (
+                rows,
+                vec![Seg {
+                    r0: 0,
+                    len: 1,
+                    plen: 0,
+                }],
+            );
         }
         let (mut segs, mut off) = (Vec::new(), 0);
         for (b, c) in self.chains.iter().enumerate() {
             segs.push(if b == 0 {
-                Seg { r0: 0, len: 1 + c.len(), plen: 0 }
+                Seg {
+                    r0: 0,
+                    len: 1 + c.len(),
+                    plen: 0,
+                }
             } else {
-                Seg { r0: rows.len(), len: c.len(), plen: 1 }
+                Seg {
+                    r0: rows.len(),
+                    len: c.len(),
+                    plen: 1,
+                }
             });
             for (i, &t) in c.iter().enumerate() {
-                rows.push(Row { tok: t, pos: pos0 + 1 + i, off });
+                rows.push(Row {
+                    tok: t,
+                    pos: pos0 + 1 + i,
+                    off,
+                });
             }
             off += c.len();
         }
@@ -176,7 +199,11 @@ pub fn choose(p: &[Vec<f32>], cost: &[f32]) -> Vec<usize> {
         if b == p.len() {
             let rows = used.max(1);
             if rows < cost.len() {
-                let q: Vec<Vec<f32>> = p.iter().zip(lens.iter()).map(|(c, &l)| c[..l].to_vec()).collect();
+                let q: Vec<Vec<f32>> = p
+                    .iter()
+                    .zip(lens.iter())
+                    .map(|(c, &l)| c[..l].to_vec())
+                    .collect();
                 let r = expected(&q) / cost[rows];
                 if r > best.1 + 1e-6 {
                     *best = (lens.clone(), r);
@@ -223,7 +250,11 @@ mod tests {
         assert_eq!(off, vec![0, 0, 0, 2, 2, 4]);
         assert_eq!(f.rows_len(), rows.len());
         // Window keys never collide: cache index pos + off is unique past the root.
-        let mut idx: Vec<usize> = rows.iter().filter(|r| r.pos > 100).map(|r| r.pos + r.off).collect();
+        let mut idx: Vec<usize> = rows
+            .iter()
+            .filter(|r| r.pos > 100)
+            .map(|r| r.pos + r.off)
+            .collect();
         idx.sort();
         idx.dedup();
         assert_eq!(idx.len(), 5);
@@ -232,7 +263,12 @@ mod tests {
 
     #[test]
     fn new_dedupes_and_fits_max_t() {
-        let f = Forest::new(vec![vec![1, 2, 3, 4, 5], vec![1, 9], vec![], vec![7, 8, 9, 10]]);
+        let f = Forest::new(vec![
+            vec![1, 2, 3, 4, 5],
+            vec![1, 9],
+            vec![],
+            vec![7, 8, 9, 10],
+        ]);
         assert_eq!(f.chains, vec![vec![1, 2, 3, 4, 5], vec![7, 8]]);
         assert!(f.rows_len() <= MAX_T);
     }
@@ -314,12 +350,16 @@ mod tests {
     #[test]
     fn choose_prefers_branches_when_cheap_and_chain_when_good() {
         // Steep cost (today): short single chain.
-        let steep: Vec<f32> = (0..=MAX_T).map(|t| 1.0 + 0.33 * (t.max(1) - 1) as f32).collect();
+        let steep: Vec<f32> = (0..=MAX_T)
+            .map(|t| 1.0 + 0.33 * (t.max(1) - 1) as f32)
+            .collect();
         let p = vec![vec![0.35, 0.6, 0.6, 0.6], vec![0.15, 0.6]];
         let c = choose(&p, &steep);
         assert_eq!(c[1], 0, "{c:?}");
         // Flat cost: the second chain earns its rows.
-        let flat: Vec<f32> = (0..=MAX_T).map(|t| 1.0 + 0.05 * (t.max(1) - 1) as f32).collect();
+        let flat: Vec<f32> = (0..=MAX_T)
+            .map(|t| 1.0 + 0.05 * (t.max(1) - 1) as f32)
+            .collect();
         let c = choose(&p, &flat);
         assert!(c[0] >= 3 && c[1] >= 1, "{c:?}");
         // Worthless drafts: none.
