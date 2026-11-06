@@ -73,6 +73,9 @@ mod msl_mma;
 pub mod opencl;
 #[path = "tensor_opencl_gemv.rs"]
 pub mod opencl_gemv;
+#[path = "tensor_place.rs"]
+pub mod place;
+pub use place::{Boundary, MemorySchedule, Place, Placed};
 #[path = "tensor_precision.rs"]
 pub mod precision;
 #[path = "tensor_tile.rs"]
