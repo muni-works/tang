@@ -15,8 +15,8 @@
 //! `MOE_DIMS=T,D,E,K,F` overrides the timed config (default 8,2048,128,10,512:
 //! Qwen3-Next-80B-A3B's hidden / expert-ffn / top-k with 128 of its 512 experts).
 
-use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
 use tang::Scalar;
+use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 use tang_gpu::program::{Program, Runtime};
 
@@ -259,12 +259,19 @@ fn reference(m: Dims, w: &[Vec<f32>]) -> (Vec<f64>, Vec<usize>) {
     let mut sels = Vec::new();
     for ti in 0..t {
         let logits: Vec<f64> = (0..e)
-            .map(|ei| (0..d).map(|di| x[ti * d + di] as f64 * wr[di * e + ei] as f64).sum())
+            .map(|ei| {
+                (0..d)
+                    .map(|di| x[ti * d + di] as f64 * wr[di * e + ei] as f64)
+                    .sum()
+            })
             .collect();
         let mut order: Vec<usize> = (0..e).collect();
         order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
         let top = &order[..k];
-        let ex: Vec<f64> = top.iter().map(|&i| (logits[i] - logits[top[0]]).exp()).collect();
+        let ex: Vec<f64> = top
+            .iter()
+            .map(|&i| (logits[i] - logits[top[0]]).exp())
+            .collect();
         let norm: f64 = ex.iter().sum();
         for (j, &ei) in top.iter().enumerate() {
             sels.push(ei);
@@ -279,7 +286,9 @@ fn reference(m: Dims, w: &[Vec<f32>]) -> (Vec<f64>, Vec<usize>) {
                 *a = gt / (1.0 + (-gt).exp()) * up;
             }
             for di in 0..d {
-                let yv: f64 = (0..f).map(|fi| act[fi] * w2[(ei * d + di) * f + fi] as f64).sum();
+                let yv: f64 = (0..f)
+                    .map(|fi| act[fi] * w2[(ei * d + di) * f + fi] as f64)
+                    .sum();
                 out[ti * d + di] += ex[j] / norm * yv;
             }
         }
@@ -297,9 +306,8 @@ fn max_rel(got: &[f32], want: &[f64]) -> f64 {
 
 fn weights(m: Dims, rng: &mut tang_bench::Rng) -> Vec<Vec<f32>> {
     let Dims { t, d, e, f, .. } = m;
-    let mut rand = |n: usize, s: f32| -> Vec<f32> {
-        (0..n).map(|_| (rng.f32() * 2.0 - 1.0) * s).collect()
-    };
+    let mut rand =
+        |n: usize, s: f32| -> Vec<f32> { (0..n).map(|_| (rng.f32() * 2.0 - 1.0) * s).collect() };
     let sd = 1.0 / (d as f32).sqrt();
     let sf = 1.0 / (f as f32).sqrt();
     vec![
@@ -339,13 +347,18 @@ fn main() {
         .map(|v| v.iter().map(|&x| x as f64).collect())
         .collect();
     let ev = moe.g.eval(&w64, &[moe.out, moe.sel]);
-    let sel_ok = ev[1].iter().map(|&s| s as usize).eq(want_sel.iter().copied());
+    let sel_ok = ev[1]
+        .iter()
+        .map(|&s| s as usize)
+        .eq(want_sel.iter().copied());
     let err_ir: f64 = ev[0]
         .iter()
         .zip(&want)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f64::max);
-    println!("small {small:?}: interpreter vs reference max |Δ| {err_ir:.2e}, top-k match {sel_ok}");
+    println!(
+        "small {small:?}: interpreter vs reference max |Δ| {err_ir:.2e}, top-k match {sel_ok}"
+    );
     assert!(sel_ok && err_ir < 1e-9);
     let (h, outs) = optimized(&moe.g, &[moe.out, moe.sel]);
     let evh = h.eval(&w64, &outs);
@@ -365,7 +378,10 @@ fn main() {
     exe.run(&rt);
     let got = exe.read(&rt, outs[0]);
     let gsel = exe.read(&rt, outs[1]);
-    let gpu_sel_ok = gsel.iter().map(|&s| s as usize).eq(want_sel.iter().copied());
+    let gpu_sel_ok = gsel
+        .iter()
+        .map(|&s| s as usize)
+        .eq(want_sel.iter().copied());
     let e_gpu = max_rel(&got, &want);
     println!("  gpu vs reference: max rel err {e_gpu:.2e}, top-k match {gpu_sel_ok}");
     // CUDA runs the router GEMM as a TF32 `mma.sync` tile (10-bit mantissa)
@@ -404,14 +420,20 @@ fn main() {
     exe.run(&rt);
     let got = exe.read(&rt, outs[0]);
     let gsel = exe.read(&rt, outs[1]);
-    let sel_ok = gsel.iter().map(|&s| s as usize).eq(want_sel.iter().copied());
+    let sel_ok = gsel
+        .iter()
+        .map(|&s| s as usize)
+        .eq(want_sel.iter().copied());
     println!(
         "\ntimed {m:?}: gpu vs reference max rel err {:.2e}, top-k match {sel_ok}",
         max_rel(&got, &want)
     );
     let iters = 50;
     let total = exe.time(&rt, iters);
-    println!("  whole layer: {total:.3} ms ({} kernels)", exe.program.kernels.len());
+    println!(
+        "  whole layer: {total:.3} ms ({} kernels)",
+        exe.program.kernels.len()
+    );
     let describe = |h: &TensorGraph, node: TensorId| -> String {
         let c = h.comp_at(node.index()).unwrap();
         let sched = &h.nodes()[node.index()];
@@ -461,10 +483,15 @@ fn main() {
         let (x, wr) = (&w[0], &w[1]);
         for ti in 0..t {
             let logit = |ei: usize| -> f64 {
-                (0..d).map(|di| x[ti * d + di] as f64 * wr[di * m.e + ei] as f64).sum()
+                (0..d)
+                    .map(|di| x[ti * d + di] as f64 * wr[di * m.e + ei] as f64)
+                    .sum()
             };
             let top = &want_sel[ti * k..(ti + 1) * k];
-            let ex: Vec<f64> = top.iter().map(|&i| (logit(i) - logit(top[0])).exp()).collect();
+            let ex: Vec<f64> = top
+                .iter()
+                .map(|&i| (logit(i) - logit(top[0])).exp())
+                .collect();
             let norm: f64 = ex.iter().sum();
             for (j, &ei) in top.iter().enumerate() {
                 wt[ti * k + j] = (ex[j] / norm) as f32;

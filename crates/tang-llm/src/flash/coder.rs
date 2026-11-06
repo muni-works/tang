@@ -111,7 +111,11 @@ fn gdn_s16() -> bool {
 
 /// Bytes per GDN state element.
 fn gdn_state_elt() -> usize {
-    if gdn_s16() { 2 } else { 4 }
+    if gdn_s16() {
+        2
+    } else {
+        4
+    }
 }
 
 /// f32 words a layer's GDN state buffer takes (`hv` v heads of 128 × 128).
@@ -1083,14 +1087,27 @@ fn stream_sst_down() -> usize {
 fn persist_shape() -> (usize, usize, usize, usize) {
     static S: std::sync::OnceLock<(usize, usize, usize, usize)> = std::sync::OnceLock::new();
     *S.get_or_init(|| {
-        let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        (n("TANG_CODER_PSST", 3), n("TANG_CODER_PSPLIT", 1), n("TANG_CODER_PSPLIT_DOWN", 1), n("TANG_CODER_PCTA", 2))
+        let n = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (
+            n("TANG_CODER_PSST", 3),
+            n("TANG_CODER_PSPLIT", 1),
+            n("TANG_CODER_PSPLIT_DOWN", 1),
+            n("TANG_CODER_PCTA", 2),
+        )
     })
 }
 
 /// Rows a warp stages per ring step in the streaming gate|up kernel (`TANG_CODER_SRP`, 2 or 4).
 fn stream_srp() -> usize {
-    std::env::var("TANG_CODER_SRP").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+    std::env::var("TANG_CODER_SRP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
 }
 
 fn persist_grid() -> u32 {
@@ -1291,7 +1308,10 @@ impl Coder {
         let mut hp = Hparams::from_gguf(&g)?;
         // Debug: `TANG_CODER_MAX_LAYERS=N` loads only the first N layers (profiling on a small
         // GPU; outputs are garbage, the kernels are real).
-        if let Some(n) = std::env::var("TANG_CODER_MAX_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var("TANG_CODER_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             hp.n_layer = hp.n_layer.min(n.max(1));
         }
         ensure!(hp.arch == Arch::Qwen3Next, "not a qwen3next GGUF");
@@ -1853,7 +1873,11 @@ impl Coder {
             self.fit_slots();
         }
         let live = self.slots.iter().skip(1).filter(|s| s.is_some()).count();
-        ensure!(live < self.slot_cap, "all {} slots that fit in VRAM in use", self.slot_cap);
+        ensure!(
+            live < self.slot_cap,
+            "all {} slots that fit in VRAM in use",
+            self.slot_cap
+        );
         let i = (1..MAX_SLOTS)
             .find(|&i| self.slots[i].is_none())
             .ok_or_else(|| anyhow!("all {} slots in use", MAX_SLOTS))?;
@@ -1891,12 +1915,12 @@ impl Coder {
             let mut gdn = Vec::with_capacity(p.layers.len());
             let mut kvv = Vec::with_capacity(p.layers.len());
             for layer in &p.layers {
-                gdn.push(
-                    layer
-                        .gdn
-                        .as_ref()
-                        .map(|_| (p.dev.alloc_f32(gdn_state_words(hv)), p.dev.alloc_f32(3 * conv))),
-                );
+                gdn.push(layer.gdn.as_ref().map(|_| {
+                    (
+                        p.dev.alloc_f32(gdn_state_words(hv)),
+                        p.dev.alloc_f32(3 * conv),
+                    )
+                }));
                 kvv.push(
                     layer
                         .attn
@@ -2022,7 +2046,12 @@ impl Coder {
         let (rows, segs) = forest.layout(cur, pos0);
         let t = rows.len();
         ensure!(t <= MAX_T, "{t} rows");
-        ensure!(pos0 + t <= self.max_ctx, "context {} > max {}", pos0 + t, self.max_ctx);
+        ensure!(
+            pos0 + t <= self.max_ctx,
+            "context {} > max {}",
+            pos0 + t,
+            self.max_ctx
+        );
         let staged: Vec<(usize, usize, u32)> = rows.iter().map(|r| (0, r.pos, r.tok)).collect();
         let sg: Vec<[u32; 4]> = segs.iter().map(|s| seg_words(s, 0)).collect();
         let w0 = Instant::now();
@@ -2034,7 +2063,10 @@ impl Coder {
             rec[7 * MAX_T + i] = pos0 as u32;
         }
         let nchunk = self.nchunk(pos0 + t);
-        let st = WinStats { t, ..Default::default() };
+        let st = WinStats {
+            t,
+            ..Default::default()
+        };
         let targets = self.run_staged(st, w0, t, true, nchunk, sg.len(), None)?;
         let (b, m) = forest.accept(&targets);
         self.last_tree = (b, m);
@@ -2073,7 +2105,12 @@ impl Coder {
         let n = self.hp.n_embd;
         let rec = self.io.u32s(Io::rows(n, MAX_T), ROWS_U32);
         rec[2 * MAX_T..2 * MAX_T + 4].copy_from_slice(&seg_words(seg, keep));
-        self.kcopy_on(0, self.a(&self.s.rows), self.io_dev_on(0, Io::rows(n, MAX_T)), ROWS_U32 * 4);
+        self.kcopy_on(
+            0,
+            self.a(&self.s.rows),
+            self.io_dev_on(0, Io::rows(n, MAX_T)),
+            ROWS_U32 * 4,
+        );
         for layer in &self.layers {
             if let Some(g) = &layer.gdn {
                 self.gdn_step_seg(0, g, layer.w_in.rows, 1, GDN_REPLAY);
@@ -2107,7 +2144,10 @@ impl Coder {
     /// token. Greedy; the sampler isn't per slot yet.
     pub fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prompt");
-        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        ensure!(
+            self.sampler.is_none(),
+            "slot windows sample per row, not with the engine sampler"
+        );
         let mut pos = self.slot_tokens(slot).len();
         self.slot_tokens_mut(slot)?.extend_from_slice(ids);
         let end = pos + ids.len();
@@ -2177,9 +2217,14 @@ impl Coder {
             "{b} sequences, {t} rows (at most {})",
             MAX_T.max(self.batch_rows())
         );
-        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
         ensure!(
-            items.iter().all(|x| x.2.is_empty() || !self.slot_samp[x.0].sampled()),
+            self.sampler.is_none(),
+            "slot windows sample per row, not with the engine sampler"
+        );
+        ensure!(
+            items
+                .iter()
+                .all(|x| x.2.is_empty() || !self.slot_samp[x.0].sampled()),
             "drafts are verified greedily: a sampled slot takes no drafts"
         );
         if items.iter().all(|x| x.2.is_empty()) {
@@ -2266,7 +2311,10 @@ impl Coder {
             let mut v = Vec::new();
             for l in &self.layers {
                 if let Some(g) = &l.gdn {
-                    v.push((self.dev.buffer_addr(&g.proj), self.dev.alloc_f32(rows * l.w_in.rows)));
+                    v.push((
+                        self.dev.buffer_addr(&g.proj),
+                        self.dev.alloc_f32(rows * l.w_in.rows),
+                    ));
                 }
             }
             self.batch_gproj = v;
@@ -2313,7 +2361,9 @@ impl Coder {
         // Each segment keeps its accepted drafts' rows: stage the counts, commit them.
         let mut kept = Vec::with_capacity(b);
         let tw = self.tw();
-        let rec = self.iox().u32s(Io::rows(self.hp.n_embd, tw), ROWS_PER_T * tw);
+        let rec = self
+            .iox()
+            .u32s(Io::rows(self.hp.n_embd, tw), ROWS_PER_T * tw);
         for (i, (_, _, drafts)) in items.iter().enumerate() {
             let r0 = segs[i][0] as usize;
             let mut n = 1;
@@ -2873,11 +2923,7 @@ impl Coder {
             // The MTP layer's K/V for the window's positions, from its hidden rows (the wide
             // scratch's `x`, normed by the last layer), so a slot's drafts later attend over
             // its prompt (`mtp_fill_on`: off, the drafts then see stale K/V there).
-            if self.mtp.is_some()
-                && self.use_mtp
-                && self.peer.is_none()
-                && self.mtp_fill_on()
-            {
+            if self.mtp.is_some() && self.use_mtp && self.peer.is_none() && self.mtp_fill_on() {
                 let tm = Instant::now();
                 let mut next = body[at + 1..at + t].to_vec();
                 next.push(*body.get(at + t).unwrap_or(&ids[ids.len() - 1]));
@@ -2904,7 +2950,10 @@ impl Coder {
         let b = rows.len();
         let cap = MAX_T.max(self.batch_rows());
         ensure!((1..=cap).contains(&b), "{b} rows (at most {cap})");
-        ensure!(self.sampler.is_none(), "slot windows sample per row, not with the engine sampler");
+        ensure!(
+            self.sampler.is_none(),
+            "slot windows sample per row, not with the engine sampler"
+        );
         // 1..=MAX_T rows: the narrow module, always (`crate::batch::batch_module` says why);
         // concurrency dropping to 1 under `serve --batch 64` lands here.
         let wide = crate::batch::batch_module(b, MAX_T, self.batch_rows());
@@ -2924,8 +2973,11 @@ impl Coder {
             segs.push([i as u32, 1, slot as u32, 1]);
         }
         ensure!(end <= self.max_ctx, "context {end} > max {}", self.max_ctx);
-        let rw: Vec<(usize, usize, usize)> =
-            staged.iter().enumerate().map(|(i, r)| (i, r.0, r.1)).collect();
+        let rw: Vec<(usize, usize, usize)> = staged
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, r.0, r.1))
+            .collect();
         self.stage_row_words(&rw);
         let w0 = Instant::now();
         let nchunk = self.nchunk(end);
@@ -3265,11 +3317,7 @@ impl Coder {
         }
         let v = self.stage_view(wi);
         // Wide windows: the tensor-core GEMM over every row (TANG_CODER_WGEMM=0: the GEMVs below).
-        if t > MAX_T
-            && self.var.wgemm
-            && w.gemm_ok
-            && (!self.in_batch.get() || self.var.bgemm)
-        {
+        if t > MAX_T && self.var.wgemm && w.gemm_ok && (!self.in_batch.get() || self.var.bgemm) {
             if let Some(wd) = v.wide {
                 let xq = match xq {
                     Some(q) => q,
@@ -3300,7 +3348,11 @@ impl Coder {
                 unsafe {
                     let d32 = env_is("TANG_CODER_DENSE32", "1");
                     gpu::launch(
-                        if d32 { wd.k.gemm_dense32 } else { wd.k.gemm_dense },
+                        if d32 {
+                            wd.k.gemm_dense32
+                        } else {
+                            wd.k.gemm_dense
+                        },
                         (w.rows.div_ceil(128) as u32, t.div_ceil(64) as u32, 1),
                         (if d32 { 128 } else { 256 }, 1, 1),
                         0,
@@ -3856,7 +3908,13 @@ impl Coder {
                 t,
                 stride,
             );
-            self.gdn_step_seg(w, g, stride, nseg, if verify { GDN_VERIFY } else { GDN_COMMIT });
+            self.gdn_step_seg(
+                w,
+                g,
+                stride,
+                nseg,
+                if verify { GDN_VERIFY } else { GDN_COMMIT },
+            );
             if !verify {
                 self.gdn_commit_seg(w, g, stride, nseg);
             }
@@ -3952,25 +4010,23 @@ impl Coder {
             if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
-                let run_fa2 = || {
-                    unsafe {
-                        self.launch_on(
-                            self.stream_on(w),
-                            self.kn_on(w).fa2,
-                            (tiles as u32, hp.n_head_kv as u32, ns as u32),
-                            128,
-                            ck::fa2_smem(hp.head_dim) as u32,
-                            tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
-                        );
-                        self.launch_on(
-                            self.stream_on(w),
-                            self.kn_on(w).merge,
-                            (t as u32, hp.n_head as u32, 1),
-                            hp.head_dim as u32,
-                            0,
-                            tang_moe::args![part, ns as i32, proj, st, attn],
-                        );
-                    }
+                let run_fa2 = || unsafe {
+                    self.launch_on(
+                        self.stream_on(w),
+                        self.kn_on(w).fa2,
+                        (tiles as u32, hp.n_head_kv as u32, ns as u32),
+                        128,
+                        ck::fa2_smem(hp.head_dim) as u32,
+                        tang_moe::args![q, kt, vt, rows, t as i32, part, ns as i32],
+                    );
+                    self.launch_on(
+                        self.stream_on(w),
+                        self.kn_on(w).merge,
+                        (t as u32, hp.n_head as u32, 1),
+                        hp.head_dim as u32,
+                        0,
+                        tang_moe::args![part, ns as i32, proj, st, attn],
+                    );
                 };
                 run_fa2();
                 if let Ok(cmp) = std::env::var("TANG_FA2_CMP") {
@@ -4007,8 +4063,9 @@ impl Coder {
                         by[bk] += nr;
                         byn[bk] += dr;
                     }
-                    let byr: Vec<String> =
-                        (0..8).map(|i| format!("{:.1e}", (by[i] / byn[i].max(1e-30)).sqrt())).collect();
+                    let byr: Vec<String> = (0..8)
+                        .map(|i| format!("{:.1e}", (by[i] / byn[i].max(1e-30)).sqrt()))
+                        .collect();
                     eprintln!(
                         "fa2-cmp pos0 {} t {t} ns {ns}: rel L2 {:.2e}, worst row {} ({:.2e}); by eighth [{}]",
                         self.wide_pos0.get(),
@@ -4103,7 +4160,11 @@ impl Coder {
     fn gdn_step_seg(&self, w: usize, g: &GdnL, stride: usize, nseg: usize, commit: u32) {
         let v = self.stage_view(w);
         // Wide windows (one segment, always committed): a warp per state column.
-        if self.in_wide.get() && commit == GDN_COMMIT && nseg == 1 && !env_is("TANG_CODER_GDNW", "0") {
+        if self.in_wide.get()
+            && commit == GDN_COMMIT
+            && nseg == 1
+            && !env_is("TANG_CODER_GDNW", "0")
+        {
             let (stab, htab, p, sd, dt, sa, nw, y, seg, eps, wc) = (
                 v.dev.buffer_addr(&g.stab),
                 v.dev.buffer_addr(&g.htab),
@@ -4121,7 +4182,10 @@ impl Coder {
             // The prep's rows (q, k, v, g, b a token) borrow the expert gate|up buffer, free
             // until this layer's MoE.
             let xrow = 2 * self.geo.gdn_hk * 128 + self.geo.gdn_hv * 128 + 2 * self.geo.gdn_hv;
-            assert!((self.hp.n_expert_used + 1) * 2 * self.hp.n_ff_exp >= xrow, "gdn prep rows fit egu");
+            assert!(
+                (self.hp.n_expert_used + 1) * 2 * self.hp.n_ff_exp >= xrow,
+                "gdn prep rows fit egu"
+            );
             let x = v.dev.buffer_addr(&v.s.egu);
             unsafe {
                 self.launch_on(
@@ -4310,10 +4374,16 @@ impl Coder {
         } else {
             (1, 8, 16, 2)
         };
-        let psst = if self.in_batch.get() { persist_shape().0 } else { 3 };
+        let psst = if self.in_batch.get() {
+            persist_shape().0
+        } else {
+            3
+        };
         let srp = if self.in_batch.get() { stream_srp() } else { 2 };
         // Tiles are the only device copy when present: batch windows must take the TCX kernels.
-        if layer.gate.t.ty >= 112 && (self.in_batch.get() || (self.var.tcx_narrow && !self.in_wide.get())) {
+        if layer.gate.t.ty >= 112
+            && (self.in_batch.get() || (self.var.tcx_narrow && !self.in_wide.get()))
+        {
             let pw = 4 + 2 * self.tw() * (hp.n_expert_used + 1);
             let plan = v.dev.buffer_addr(&s.plan) + if pbase > 0 { (pw * 4) as u64 } else { 0 };
             let ni = n as i32;
@@ -4340,9 +4410,20 @@ impl Coder {
                 );
                 // The routed call (pbase 0) quantizes x; the side stream's shared call reuses it.
                 let p32 = self.var.tcx32;
-                let (fgu, fdn) = if p32 { (v.k.moe_gu_t32, v.k.moe_down_t32) } else { (v.k.moe_gu_t, v.k.moe_down_t) };
+                let (fgu, fdn) = if p32 {
+                    (v.k.moe_gu_t32, v.k.moe_down_t32)
+                } else {
+                    (v.k.moe_gu_t, v.k.moe_down_t)
+                };
                 if pbase == 0 && !p32 {
-                    self.launch_on(stream, v.k.q8k, ((nh / 256) as u32, ti as u32, 1), 256, 0, tang_moe::args![x, xk]);
+                    self.launch_on(
+                        stream,
+                        v.k.q8k,
+                        ((nh / 256) as u32, ti as u32, 1),
+                        256,
+                        0,
+                        tang_moe::args![x, xk],
+                    );
                 }
                 self.launch_on(
                     stream,
@@ -4353,10 +4434,24 @@ impl Coder {
                     tang_moe::args![tg, tu, tsg, tsu, ids, xk, mxq, egu, ti, fastk, plan],
                 );
                 if !p32 {
-                    self.launch_on(stream, v.k.silu_q8k, ((ff / 256) as u32, np, 1), 256, 0, tang_moe::args![egu, hk, pb]);
+                    self.launch_on(
+                        stream,
+                        v.k.silu_q8k,
+                        ((ff / 256) as u32, np, 1),
+                        256,
+                        0,
+                        tang_moe::args![egu, hk, pb],
+                    );
                 }
                 if p32 || td.ty < 112 || tsd.ty < 112 {
-                    self.launch_on(stream, v.k.silu_q, ((ff / 32) as u32, np, 1), 32, 0, tang_moe::args![egu, hq, pb]);
+                    self.launch_on(
+                        stream,
+                        v.k.silu_q,
+                        ((ff / 32) as u32, np, 1),
+                        32,
+                        0,
+                        tang_moe::args![egu, hq, pb],
+                    );
                 }
                 self.launch_on(
                     stream,
@@ -4377,7 +4472,14 @@ impl Coder {
             let groups = n.min(hp.n_expert + 1 + n / BATCH_GCHUNK) as u32;
             let (sgu, sdn) = ck::tcx_split();
             unsafe {
-                self.launch_on(stream, v.k.moe_plan, (1, 1, 1), 1024, 0, tang_moe::args![ids, ti, pb, ni, plan]);
+                self.launch_on(
+                    stream,
+                    v.k.moe_plan,
+                    (1, 1, 1),
+                    1024,
+                    0,
+                    tang_moe::args![ids, ti, pb, ni, plan],
+                );
                 self.launch_on(
                     stream,
                     v.k.moe_gu_q,
@@ -4386,7 +4488,14 @@ impl Coder {
                     0,
                     tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, fastk, plan],
                 );
-                self.launch_on(stream, v.k.silu_q, ((ff / 32) as u32, np, 1), 32, 0, tang_moe::args![egu, hq, pb]);
+                self.launch_on(
+                    stream,
+                    v.k.silu_q,
+                    ((ff / 32) as u32, np, 1),
+                    32,
+                    0,
+                    tang_moe::args![egu, hq, pb],
+                );
                 self.launch_on(
                     stream,
                     v.k.moe_down_q,
@@ -4424,7 +4533,11 @@ impl Coder {
                 let gemm = (self.in_wide.get() || (self.in_batch.get() && self.var.bgemm))
                     && self.var.wgemm;
                 // Batch and wide modules' groups are at most 64 pairs: one tile.
-                let tiles = if self.in_batch.get() || self.in_wide.get() { 1 } else { t.div_ceil(64) as u32 };
+                let tiles = if self.in_batch.get() || self.in_wide.get() {
+                    1
+                } else {
+                    t.div_ceil(64) as u32
+                };
                 if gemm && self.var.wgemm_gu {
                     self.launch_on(
                         stream,
@@ -4470,7 +4583,9 @@ impl Coder {
                             b[wi]
                         );
                     }
-                } else if ((self.in_batch.get() && self.var.stream) || nstream) && self.var.persist_gu {
+                } else if ((self.in_batch.get() && self.var.stream) || nstream)
+                    && self.var.persist_gu
+                {
                     let ctr = plan + ((pw - 2) * 4) as u64;
                     self.launch_on(
                         stream,
@@ -4525,7 +4640,9 @@ impl Coder {
                         0,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, plan],
                     );
-                } else if ((self.in_batch.get() && self.var.stream) || nstream) && self.var.persist_down {
+                } else if ((self.in_batch.get() && self.var.stream) || nstream)
+                    && self.var.persist_down
+                {
                     let ctr = plan + ((pw - 2) * 4) as u64;
                     self.launch_on(
                         stream,
@@ -4552,7 +4669,8 @@ impl Coder {
                             v.k.moe_down_s,
                             ((nh / (8 * stream_shape().2)) as u32, groups, 1),
                             256,
-                            (8 * stream_sst_down() * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                            (8 * stream_sst_down() * 2 * 16 * r16d as usize
+                                + BATCH_GCHUNK * (ff + ff / 8)) as u32,
                             tang_moe::args![dw, sd, ids, hq, tp, ti, r16d, fastk, plan],
                         );
                         v.dev.sync();
@@ -4571,13 +4689,20 @@ impl Coder {
                                     bad += 1;
                                     if shown < 12 {
                                         shown += 1;
-                                        let ex = if p < t * hp.n_expert_used { ids_h[p].to_bits() as i64 } else { -1 };
+                                        let ex = if p < t * hp.n_expert_used {
+                                            ids_h[p].to_bits() as i64
+                                        } else {
+                                            -1
+                                        };
                                         eprintln!("  mma down pair {p} (expert {ex}) row {r}: mma {x} ref {y}");
                                     }
                                 }
                             }
                         }
-                        eprintln!("MMA check down: {bad} of {} differ >1%, worst rel {worst:.3e}", n * nh);
+                        eprintln!(
+                            "MMA check down: {bad} of {} differ >1%, worst rel {worst:.3e}",
+                            n * nh
+                        );
                     }
                 } else if (self.in_batch.get() && self.var.stream) || nstream {
                     self.launch_on(
@@ -4585,7 +4710,8 @@ impl Coder {
                         v.k.moe_down_s,
                         ((nh / (8 * snr_down)) as u32, groups, 1),
                         256,
-                        (8 * sst_down * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8)) as u32,
+                        (8 * sst_down * 2 * 16 * r16d as usize + BATCH_GCHUNK * (ff + ff / 8))
+                            as u32,
                         tang_moe::args![dw, sd, ids, hq, parts, ti, r16d, fastk, plan],
                     );
                 } else {
@@ -4731,7 +4857,12 @@ impl Coder {
                     t,
                 );
             }
-            self.kcopy_on(last, self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())), ids, t * 4);
+            self.kcopy_on(
+                last,
+                self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())),
+                ids,
+                t * 4,
+            );
             return;
         }
         unsafe {
@@ -4755,7 +4886,12 @@ impl Coder {
         if let Some(rs) = self.row_sampler.as_ref().filter(|_| !self.skip("argmax")) {
             rs.enqueue(v.dev, v.stream, &self.head_buf(last), &v.s.out_ids, t);
         }
-        self.kcopy_on(last, self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())), ids, t * 4);
+        self.kcopy_on(
+            last,
+            self.io_dev_on(last, Io::ids_at(self.hp.n_embd, self.tw())),
+            ids,
+            t * 4,
+        );
     }
 
     /// The head buffer of stage `w`'s device — the sampler needs it by reference.
@@ -4973,7 +5109,11 @@ impl Coder {
 
     /// [`mtp_pass`](Self::mtp_pass); `fill_only`: only the K/V of `rows` (no drafts, returns
     /// nothing), the MoE and head skipped.
-    fn mtp_pass_as(&mut self, rows: &[(usize, usize, u32)], fill_only: bool) -> Result<Vec<(u32, f32)>> {
+    fn mtp_pass_as(
+        &mut self,
+        rows: &[(usize, usize, u32)],
+        fill_only: bool,
+    ) -> Result<Vec<(u32, f32)>> {
         let (t, n) = (rows.len(), self.hp.n_embd);
         let end = rows.iter().map(|r| r.1 + 2).max().unwrap_or(0);
         ensure!((1..=MAX_T).contains(&t) && end <= self.max_ctx);
@@ -4997,7 +5137,11 @@ impl Coder {
             } else {
                 self.enqueue_mtp(t, nchunk, fill_only);
                 self.dev.sync();
-                let out = if fill_only { Vec::new() } else { self.mtp_read(t) };
+                let out = if fill_only {
+                    Vec::new()
+                } else {
+                    self.mtp_read(t)
+                };
                 let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
                 let me = self as *const Self;
                 let gr = Graph::capture(&stream, |_| {
@@ -5013,7 +5157,11 @@ impl Coder {
             self.enqueue_mtp(t, nchunk, fill_only);
         }
         self.dev.sync();
-        Ok(if fill_only { Vec::new() } else { self.mtp_read(t) })
+        Ok(if fill_only {
+            Vec::new()
+        } else {
+            self.mtp_read(t)
+        })
     }
 
     /// Copy rows `from[i]` of `src` (`n_embd` f32 each) to rows `i` of `m.mh`, through `m.cat`.
@@ -5068,7 +5216,11 @@ impl Coder {
             let mut o = 0;
             while o < g.3.len() {
                 let len = (g.3.len() - o).min(cap);
-                pieces.push((gi, (g.0, g.1 + o, g.2 + o, &g.3[o..o + len]), o + len == g.3.len()));
+                pieces.push((
+                    gi,
+                    (g.0, g.1 + o, g.2 + o, &g.3[o..o + len]),
+                    o + len == g.3.len(),
+                ));
                 o += len;
             }
         }
@@ -5105,7 +5257,12 @@ impl Coder {
             while j < from.len() && from[j] == from[j - 1] + 1 {
                 j += 1;
             }
-            self.kcopy_on(0, mh + (i * b) as u64, src + (from[i] * b) as u64, (j - i) * b);
+            self.kcopy_on(
+                0,
+                mh + (i * b) as u64,
+                src + (from[i] * b) as u64,
+                (j - i) * b,
+            );
             i = j;
         }
     }
@@ -5121,7 +5278,10 @@ impl Coder {
         let (t, n) = (rows.len(), self.hp.n_embd);
         let tw = self.batch_rows();
         let end = rows.iter().map(|r| r.1 + 2).max().unwrap_or(0);
-        ensure!(t > MAX_T && t <= tw && end <= self.max_ctx, "MTP batch pass of {t} rows");
+        ensure!(
+            t > MAX_T && t <= tw && end <= self.max_ctx,
+            "MTP batch pass of {t} rows"
+        );
         let emb_t = self.g.info("token_embd.weight")?.clone();
         {
             let io = &self.batch.as_ref().unwrap().io;
@@ -5143,7 +5303,12 @@ impl Coder {
         let m = self.mtp.as_ref().unwrap();
         let mw = self.mtp_w.as_ref().unwrap();
         let s = self.stage_view(0).s;
-        self.kcopy_on(0, self.a(&s.rows), self.io_dev_on(0, Io::rows(n, tw)), ROWS_PER_T * tw * 4);
+        self.kcopy_on(
+            0,
+            self.a(&s.rows),
+            self.io_dev_on(0, Io::rows(n, tw)),
+            ROWS_PER_T * tw * 4,
+        );
         self.kcopy_on(0, self.a(&mw.emb), self.io_dev_on(0, Io::EMB), t * n * 4);
         let (emb, mh, we, wh, eps, ni, cat) = (
             self.a(&mw.emb),
@@ -5170,7 +5335,16 @@ impl Coder {
         self.norm_q8(0, Some(self.a(&s.mix)), &m.layer.post_norm, t);
         self.enqueue_moe(0, MTP_L, t, &m.onorm, false);
         let v = self.hp.n_vocab;
-        self.gemv(0, "mtp_head", &self.head, self.a(&s.x), Some(self.a(&s.mxq)), self.a(&s.head), t, v);
+        self.gemv(
+            0,
+            "mtp_head",
+            &self.head,
+            self.a(&s.x),
+            Some(self.a(&s.mxq)),
+            self.a(&s.head),
+            t,
+            v,
+        );
         let (lg, vi, ids, prob) = (self.a(&s.head), v as i32, self.a(&mw.ids), self.a(&mw.prob));
         unsafe {
             self.launch_on(
@@ -5187,7 +5361,9 @@ impl Coder {
         let ids = self.dev.download(&mw.ids);
         let prob = self.dev.download(&mw.prob);
         let pick = |o: usize| -> Vec<(u32, f32)> {
-            (0..t).map(|i| (ids[o + i].to_bits(), prob[o + i])).collect()
+            (0..t)
+                .map(|i| (ids[o + i].to_bits(), prob[o + i]))
+                .collect()
         };
         Ok((pick(0), pick(tw)))
     }
@@ -5509,7 +5685,10 @@ impl Coder {
                 // First use: run eagerly (loads every kernel), then capture.
                 self.enqueue_window(t, verify, nchunk, nseg, None)?;
                 self.dev.sync();
-                let ids = self.iox().u32s(Io::ids_at(self.hp.n_embd, self.tw()), t).to_vec();
+                let ids = self
+                    .iox()
+                    .u32s(Io::ids_at(self.hp.n_embd, self.tw()), t)
+                    .to_vec();
                 // Undo nothing: the eager run *was* this window. Capture for next time without
                 // running it (capture records, it doesn't execute).
                 let stream = ManuallyDrop::new(Stream(self.dev.cu_stream()));
@@ -5532,7 +5711,10 @@ impl Coder {
                     self.enqueue_window(t, verify, nchunk, nseg, None)?;
                     self.sync_all();
                     self.collect_out(t, false);
-                    let ids = self.iox().u32s(Io::ids_at(self.hp.n_embd, self.tw()), t).to_vec();
+                    let ids = self
+                        .iox()
+                        .u32s(Io::ids_at(self.hp.n_embd, self.tw()), t)
+                        .to_vec();
                     self.capture_stages(t, verify, nchunk, nseg)?;
                     return Ok(self.finish(st, w0, ids));
                 }
@@ -5556,7 +5738,10 @@ impl Coder {
         self.sync_all();
         self.collect_out(t, false);
         self.prof_collect();
-        let ids = self.iox().u32s(Io::ids_at(self.hp.n_embd, self.tw()), t).to_vec();
+        let ids = self
+            .iox()
+            .u32s(Io::ids_at(self.hp.n_embd, self.tw()), t)
+            .to_vec();
         if let Some(p) = probe {
             let n = self.hp.n_embd;
             let last = self.stage_view(self.n_stages() - 1);
@@ -6521,10 +6706,19 @@ fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<E
         let tw = ExW {
             base: dev.buffer_addr(&tb),
             estride: ((rows / 16) * (k / 256) * tile) as u64,
-            ty: if q5 { super::tcx::TY_Q5 } else { super::tcx::TY_Q4 },
+            ty: if q5 {
+                super::tcx::TY_Q5
+            } else {
+                super::tcx::TY_Q4
+            },
             row_bytes: ((k / 256) * tile) as i32,
         };
-        return Ok(Experts { w: tw, _w: tb, _t: None, t: tw });
+        return Ok(Experts {
+            w: tw,
+            _w: tb,
+            _t: None,
+            t: tw,
+        });
     }
     bytes.extend_from_slice(&[0u8; 16]);
     let w = dev.upload_bytes(&bytes);
@@ -6538,7 +6732,12 @@ fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<E
         ty: ty as i32,
         row_bytes: rb as i32,
     };
-    Ok(Experts { w: w0, _w: w, _t: None, t: w0 })
+    Ok(Experts {
+        w: w0,
+        _w: w,
+        _t: None,
+        t: w0,
+    })
 }
 
 /// Is the GGUF at `path` a `qwen3next` model (this engine) rather than Flash-Next?
@@ -6916,7 +7115,10 @@ impl Coder {
     /// settings; greedy rows keep the argmax bit for bit. One GPU. Window graphs are recaptured.
     pub fn enable_row_sampling(&mut self) -> Result<()> {
         ensure!(self.peer.is_none(), "per-row sampling needs one GPU");
-        ensure!(self.sampler.is_none(), "per-row sampling replaces the engine sampler");
+        ensure!(
+            self.sampler.is_none(),
+            "per-row sampling replaces the engine sampler"
+        );
         if self.row_sampler.is_none() {
             let rows = MAX_T.max(256);
             self.row_sampler = Some(Box::new(super::sampler::RowSampler::new(
