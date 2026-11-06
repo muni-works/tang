@@ -18,7 +18,9 @@ fn main() {
     let out = std::path::PathBuf::from(args.get(1).cloned().unwrap_or("attn_out".into()));
     std::fs::create_dir_all(&out).unwrap();
     let list = |i: usize, def: &[usize]| -> Vec<usize> {
-        args.get(i).map_or(def.to_vec(), |s| s.split(',').map(|x| x.parse().unwrap()).collect())
+        args.get(i).map_or(def.to_vec(), |s| {
+            s.split(',').map(|x| x.parse().unwrap()).collect()
+        })
     };
     let ns = list(2, &[1024, 2048, 4096, 8192]);
     let ds = list(3, &[64, 128]);
@@ -43,7 +45,10 @@ fn main() {
     for &d in &ds {
         for &n in &ns {
             for (name, score, mask) in presets {
-                if only.as_deref().is_some_and(|o| !o.split(',').any(|x| x == name)) {
+                if only
+                    .as_deref()
+                    .is_some_and(|o| !o.split(',').any(|x| x == name))
+                {
                     continue;
                 }
                 for &bwd in &passes {
@@ -51,8 +56,9 @@ fn main() {
                     let tag = format!("{name}_d{d}_n{n}_{pass}");
                     let mut rng = tang_bench::Rng::new(1234);
                     let k = if bwd { 4 } else { 3 };
-                    let ins: Vec<Vec<f32>> =
-                        (0..k).map(|_| (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect()).collect();
+                    let ins: Vec<Vec<f32>> = (0..k)
+                        .map(|_| (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect())
+                        .collect();
                     let v = parse_variant(score, mask).unwrap();
                     let (g, outs) = naive_graph(&v, n, d, bwd).unwrap();
                     let (dg, douts) = derive_graph(&g, &outs);
@@ -62,7 +68,12 @@ fn main() {
                         exe.run(&rt);
                         let ms = exe.time(&rt, if n >= 4096 { 10 } else { 30 });
                         let res: Vec<f32> = douts.iter().flat_map(|&t| exe.read(&rt, t)).collect();
-                        let nxn = exe.program.buffers.iter().filter(|b| b.input.is_none() && b.len >= n * n).count();
+                        let nxn = exe
+                            .program
+                            .buffers
+                            .iter()
+                            .filter(|b| b.input.is_none() && b.len >= n * n)
+                            .count();
                         (ms, exe.program.kernels.len(), nxn, rep, res)
                     }));
                     let Ok((ms, nk, nxn, rep, res)) = res else {
@@ -75,7 +86,10 @@ fn main() {
                     };
                     w(out.join(format!("{tag}.in.bin")), &ins.concat());
                     w(out.join(format!("{tag}.out.bin")), &res);
-                    println!("{name},{d},{n},{pass},{ms:.4},{nk},{nxn},{},{}", rep.native_kept, rep.native_total);
+                    println!(
+                        "{name},{d},{n},{pass},{ms:.4},{nk},{nxn},{},{}",
+                        rep.native_kept, rep.native_total
+                    );
                 }
             }
         }

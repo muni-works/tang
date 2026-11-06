@@ -485,9 +485,9 @@ impl FlashServe {
                 .map(|c| c.iter().map(|x| x.1).collect())
                 .collect();
             // A window of sampled streams only: no drafts, no MTP pass.
-            let greedy = group.iter().any(|&i| {
-                !lanes[i].stream.downcast_ref::<Stream>().unwrap().sampled
-            });
+            let greedy = group
+                .iter()
+                .any(|&i| !lanes[i].stream.downcast_ref::<Stream>().unwrap().sampled);
             let choice = if greedy {
                 self.spec.choose(&conf, width.saturating_sub(group.len()))
             } else {
@@ -504,7 +504,11 @@ impl FlashServe {
                 .zip(chains.iter().zip(&choice.drafts))
                 .map(|(&i, (c, &g))| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    (s.slot, s.pending.unwrap(), c[..g].iter().map(|x| x.0).collect())
+                    (
+                        s.slot,
+                        s.pending.unwrap(),
+                        c[..g].iter().map(|x| x.0).collect(),
+                    )
                 })
                 .collect();
             let extra: usize = choice.drafts.iter().sum();
@@ -593,9 +597,16 @@ impl FlashServe {
     /// windows run; every window with `TANG_SERVE_SPEC_LOG=1`).
     fn spec_note(&mut self, live: usize, extra: usize, accepted: usize, dt: f64) {
         let (c, at) = &mut self.spec_log;
-        for (k, v) in [1.0, extra as f64, extra as f64, accepted as f64, (live + accepted) as f64, dt * 1e3]
-            .into_iter()
-            .enumerate()
+        for (k, v) in [
+            1.0,
+            extra as f64,
+            extra as f64,
+            accepted as f64,
+            (live + accepted) as f64,
+            dt * 1e3,
+        ]
+        .into_iter()
+        .enumerate()
         {
             c[k] += v;
         }

@@ -204,7 +204,10 @@ mod tests {
         // Room to spare after the windows: unchanged, never above what the windows fit.
         let fin = super::clamp_batch(16, 128, after).min(super::clamp_batch(16, 128, before));
         assert_eq!(fin, 16);
-        assert_eq!(super::clamp_batch(128, 128, 40).min(provisional), provisional);
+        assert_eq!(
+            super::clamp_batch(128, 128, 40).min(provisional),
+            provisional
+        );
     }
 
     #[test]
@@ -227,7 +230,9 @@ mod tests {
         assert_eq!(super::window_width(8, 64, true), 8);
         // 64 streams in 8-row windows: 8 windows a step, each on the narrow module.
         let w = super::window_width(8, 64, true);
-        assert!((1..=64usize).step_by(w).all(|r| !super::batch_module(w.min(65 - r), 8, 64)));
+        assert!((1..=64usize)
+            .step_by(w)
+            .all(|r| !super::batch_module(w.min(65 - r), 8, 64)));
     }
 
     #[test]
