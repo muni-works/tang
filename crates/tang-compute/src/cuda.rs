@@ -571,6 +571,20 @@ impl CudaComputeDevice {
         self.stream.memcpy_htod(data, dst).unwrap();
     }
 
+    /// Upload f32 data into `buf` at element `offset`, leaving the rest alone (async,
+    /// ordered on this device's stream).
+    pub fn upload_into_f32_at(&self, buf: &mut CudaBuffer, offset: usize, data: &[f32]) {
+        assert!(
+            offset + data.len() <= buf.len,
+            "upload_into_f32_at out of bounds"
+        );
+        let mut view = buf
+            .f32_data_mut()
+            .try_slice_mut(offset..offset + data.len())
+            .unwrap();
+        self.stream.memcpy_htod(data, &mut view).unwrap();
+    }
+
     /// Upload u32 data into an existing f32 buffer (async, graph-capturable).
     /// Reinterprets u32 as f32 bits (for token IDs stored as f32 bit patterns).
     pub fn upload_into_u32(&self, buf: &mut CudaBuffer, data: &[u32]) {

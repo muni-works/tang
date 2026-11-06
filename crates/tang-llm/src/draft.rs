@@ -232,6 +232,26 @@ impl Sam {
         (tok != SEP).then_some((tok, to, c as f32 / total as f32))
     }
 
+    /// Every continuation of state `s` (not the separator), most frequent first (ties: lower
+    /// token id): (token, next state, share).
+    pub fn children(&self, s: u32) -> Vec<(u32, u32, f32)> {
+        let (mut total, mut out) = (0u64, Vec::new());
+        let mut e = self.first[s as usize];
+        while e != NONE {
+            let Edge { tok, to, next } = self.edges[e as usize];
+            let c = self.cnt[to as usize].max(1);
+            total += c as u64;
+            if tok != SEP {
+                out.push((tok, to, c));
+            }
+            e = next;
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        out.into_iter()
+            .map(|(t, to, c)| (t, to, c as f32 / total as f32))
+            .collect()
+    }
+
     /// Follow the most frequent continuation from `s` for up to `max` tokens: each token with
     /// its conditional share among the state's continuations.
     pub fn continuation(&self, mut s: u32, max: usize) -> Vec<(u32, f32)> {
@@ -794,6 +814,41 @@ impl Drafter {
         self.gm.feed(&global.sam, t, cfg.max_depth);
     }
 
+    /// Branches for a draft tree: up to `k` chains of at most `room` tokens, each starting
+    /// with a different token, from the local and global matches (most frequent first).
+    /// Each chain is the child token followed by that child's greedy continuation.
+    pub fn branches(&self, cfg: &DraftConfig, global: &Global, k: usize, room: usize) -> Vec<Draft> {
+        let (ls, ln) = self.local.self_match(cfg.max_depth);
+        let mut cands: Vec<(f32, Draft)> = Vec::new();
+        for (sam, s, n) in [(&self.local, ls, ln), (&global.sam, self.gm.s, self.gm.n)] {
+            if n == 0 || n < cfg.min_match || room == 0 {
+                continue;
+            }
+            let rate = self.calib.rate(n);
+            for (tok, to, share) in sam.children(s).into_iter().take(k) {
+                let mut d = Draft {
+                    tokens: vec![tok],
+                    shares: vec![share],
+                    match_len: n,
+                    from_model: false,
+                };
+                for (t, sh) in sam.continuation(to, room - 1) {
+                    d.tokens.push(t);
+                    d.shares.push(sh);
+                }
+                cands.push((rate * share, d));
+            }
+        }
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut out: Vec<Draft> = Vec::new();
+        for (_, d) in cands {
+            if out.len() < k && !out.iter().any(|o| o.tokens[0] == d.tokens[0]) {
+                out.push(d);
+            }
+        }
+        out
+    }
+
     /// The draft to verify next, at most `room` tokens: the best source's continuation, cut
     /// where expected tokens per verify cost peaks.
     pub fn propose(&self, cfg: &DraftConfig, global: &Global, room: usize) -> Draft {
@@ -886,6 +941,15 @@ mod tests {
         assert_eq!(s.continuation(m.s, 5)[0].0, 8);
         m.feed(&s, 3, 64);
         assert_eq!(m.n, 0);
+    }
+
+    #[test]
+    fn children_are_every_branch_by_frequency() {
+        let mut s = Sam::new();
+        s.extend(&[9, 7, 8, 1, 5, 7, 8, 2, 6, 7, 8, 1, 3, 7, 8]);
+        let (st, _) = s.self_match(64);
+        let c: Vec<u32> = s.children(st).iter().map(|c| c.0).collect();
+        assert_eq!(c, vec![1, 2]);
     }
 
     #[test]

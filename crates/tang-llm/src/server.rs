@@ -99,6 +99,9 @@ struct NodeState {
     loading: Option<(String, Instant)>,
     /// Requests running, oldest first (several when the backend batches).
     running: Vec<Running>,
+    /// Why the engine can't run anything more (a device fault mid-step); `/health` reports
+    /// it and new requests fail instead of joining a broken engine.
+    unhealthy: Option<String>,
 }
 
 struct Loaded {
@@ -152,6 +155,14 @@ impl Node {
 #[derive(Clone)]
 struct App {
     node: Arc<Node>,
+}
+
+/// `ok`, or 503 with why the engine stopped (see [`NodeState::unhealthy`]).
+async fn health(State(app): State<App>) -> Response {
+    match app.node.state().unhealthy.clone() {
+        None => "ok".into_response(),
+        Some(why) => (StatusCode::SERVICE_UNAVAILABLE, format!("unhealthy: {why}")).into_response(),
+    }
 }
 
 /// A model owned by the server's worker thread. Backends may keep prompt rendering on
@@ -246,6 +257,69 @@ pub trait Backend {
 
 /// A batching backend's stream, opaque to the worker.
 pub type Inflight = Box<dyn std::any::Any>;
+
+/// A failed [`Backend::step`] that knows which lanes it hurt: the worker retires only those
+/// (indices into the step's `lanes`) and the rest keep decoding. `fatal`: the engine itself
+/// is broken (a device fault), so every stream ends and the node reports unhealthy.
+/// A step error that isn't one of these ends every stream (see [`step_verdict`]).
+#[derive(Debug)]
+pub struct StepFailure {
+    pub lanes: Vec<usize>,
+    pub fatal: bool,
+    pub error: String,
+}
+
+impl std::fmt::Display for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for StepFailure {}
+
+impl StepFailure {
+    /// `e` for `lanes`, fatal when it reads as a device fault.
+    pub fn lanes(lanes: Vec<usize>, e: anyhow::Error) -> anyhow::Error {
+        let error = format!("{e:#}");
+        anyhow::Error::new(StepFailure {
+            lanes,
+            fatal: device_fault(&error),
+            error,
+        })
+    }
+}
+
+/// The message reads as a GPU fault: after one the device context is unusable.
+pub fn device_fault(msg: &str) -> bool {
+    msg.contains("CUDA_ERROR") || msg.contains("CUDA error") || msg.contains("cudaError")
+}
+
+/// Which streams a step's outcome ends.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Ok,
+    /// These lanes, with this error; the others go on.
+    Lanes(Vec<usize>, String),
+    /// Every stream, with this error; `true`: the engine is broken too.
+    All(String, bool),
+}
+
+/// A step's result (`Err(None)`: it panicked) as what to retire.
+fn step_verdict(result: Result<anyhow::Result<()>, String>) -> Verdict {
+    match result {
+        Ok(Ok(())) => Verdict::Ok,
+        Err(panic) => Verdict::All(format!("the engine failed: {panic}"), true),
+        Ok(Err(e)) => match e.downcast_ref::<StepFailure>() {
+            Some(f) if f.fatal => Verdict::All(f.error.clone(), true),
+            Some(f) => Verdict::Lanes(f.lanes.clone(), f.error.clone()),
+            None => {
+                let msg = format!("{e:#}");
+                let fatal = device_fault(&msg);
+                Verdict::All(msg, fatal)
+            }
+        },
+    }
+}
 
 /// A stream in a [`Backend::step`], with where its pieces go and who controls it.
 pub struct DynLane<'a> {
@@ -434,6 +508,7 @@ where
     ready_rx.recv()??;
 
     let app = App { node };
+    let health_app = app.clone();
     let mut api = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/prefill", post(prefill))
@@ -454,7 +529,7 @@ where
         None => api,
     };
     let router = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health).with_state(health_app))
         .merge(api);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -588,7 +663,7 @@ where
         let Some((name, e)) = &self.engine else {
             return true;
         };
-        if name != model || tx.is_closed() {
+        if name != model || tx.is_closed() || self.node.state().unhealthy.is_some() {
             // It fails (or is dropped) without running.
             return true;
         }
@@ -657,6 +732,13 @@ where
             // The client went away while it waited.
             log_usage(rid, &model, &Usage::default(), "cancelled");
             trace.finish(&Usage::default(), End::Cancelled, ticket.yields, None);
+            return;
+        }
+        if let Some(why) = self.node.state().unhealthy.clone() {
+            let msg = format!("the engine is unhealthy ({why}); restart the server");
+            log_usage(rid, &model, &Usage::default(), "error");
+            trace.finish(&Usage::default(), End::Error, ticket.yields, Some(&msg));
+            let _ = tx.send(Out::Error(msg));
             return;
         }
         let engine = match &mut self.engine {
@@ -781,26 +863,55 @@ where
                 ctl,
             })
             .collect();
-        let result = engine.step(&mut lanes);
+        // A device fault surfaces as a panic in the compute layer: catch it so the
+        // streams get an error and the node reports itself unhealthy.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.step(&mut lanes)))
+                .map_err(|p| {
+                    p.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "panic".into())
+                });
         crate::telemetry::queue_depth(|| node.queue.len());
         drop(lanes);
         drop(ctls);
         drop(picked);
         drop(batch);
-        let failed = result.err().map(|e| format!("{e:#}"));
-        // Retire what's done (everything, if the step failed), oldest first.
+        // Each batch entry's error, if the step failed it (lanes are in `order`).
+        let mut failed: Vec<Option<String>> = vec![None; self.batch.len()];
+        match step_verdict(result) {
+            Verdict::Ok => {}
+            Verdict::Lanes(lanes, e) => {
+                eprintln!("tang-llm: a step failed {} stream(s): {e}", lanes.len());
+                for j in lanes {
+                    if let Some(&i) = order.get(j) {
+                        failed[i] = Some(e.clone());
+                    }
+                }
+            }
+            Verdict::All(e, fatal) => {
+                if fatal {
+                    eprintln!("tang-llm: the engine is unhealthy: {e}");
+                    self.node.state().unhealthy = Some(e.clone());
+                }
+                failed.iter_mut().for_each(|f| *f = Some(e.clone()));
+            }
+        }
+        // Retire what's done (and what the step failed), oldest first.
         let mut i = 0;
         while i < self.batch.len() {
             let engine = &self.engine.as_ref().expect("the engine that ran it").1;
-            let done = failed.is_some() || engine.stream_state(&self.batch[i].stream).0;
+            let done = failed[i].is_some() || engine.stream_state(&self.batch[i].stream).0;
             if !done {
                 i += 1;
                 continue;
             }
             let a = self.batch.remove(i);
+            let err = failed.remove(i);
             let engine = &mut self.engine.as_mut().expect("the engine that ran it").1;
             let result = match engine.retire(a.stream) {
-                Ok(o) => match &failed {
+                Ok(o) => match err {
                     Some(e) => Err(anyhow::anyhow!("{e}")),
                     None => Ok(o),
                 },
@@ -2146,6 +2257,345 @@ mod tests {
         let n = steps.load(Ordering::SeqCst);
         assert!(n < 2_000, "ran {n} steps after the client left");
         assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    }
+}
+
+/// A failed step ends only the streams it names; a device fault ends all and marks the
+/// node unhealthy.
+#[cfg(test)]
+mod step_failures {
+    use super::{Backend, DynLane, Inflight, Out, Outcome, Request, StepFailure, Verdict};
+    use crate::chat::Piece;
+    use crate::engine::{Finish, Usage};
+    use crate::telemetry::Trace;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    /// Streams that never finish on their own; `fail` picks what a step does.
+    struct Lanes {
+        fail: fn(&[usize]) -> anyhow::Result<()>,
+    }
+    impl Backend for Lanes {
+        fn context_window(&self) -> usize {
+            1024
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            _: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            unreachable!()
+        }
+        fn max_batch(&self) -> usize {
+            4
+        }
+        fn can_admit(&self, _: Option<&str>) -> bool {
+            true
+        }
+        fn admit(
+            &mut self,
+            req: &Request,
+            _: Option<(String, Vec<u32>)>,
+        ) -> anyhow::Result<Inflight> {
+            Ok(Box::new(req.max_tokens.unwrap_or(0)))
+        }
+        fn step(&mut self, lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
+            let ids: Vec<usize> = lanes
+                .iter()
+                .map(|l| *l.stream.downcast_ref::<usize>().unwrap())
+                .collect();
+            (self.fail)(&ids)
+        }
+        fn retire(&mut self, _: Inflight) -> anyhow::Result<Outcome> {
+            Ok(Outcome::Done(Finish::Length, Usage::default()))
+        }
+        fn stream_state(&self, _: &Inflight) -> (bool, bool) {
+            (false, false)
+        }
+    }
+
+    type W = super::Worker<Lanes, fn(&str) -> anyhow::Result<Lanes>>;
+
+    fn worker(fail: fn(&[usize]) -> anyhow::Result<()>) -> W {
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        fn load(_: &str) -> anyhow::Result<Lanes> {
+            unreachable!()
+        }
+        super::Worker {
+            node,
+            engine: Some(("m".into(), Lanes { fail })),
+            load,
+            batch: Vec::new(),
+        }
+    }
+
+    /// Admit stream `id` (its `max_tokens`); returns its reply channel.
+    fn start(w: &mut W, id: usize) -> mpsc::UnboundedReceiver<Out> {
+        let req = Box::new(super::parse(&json!({"messages": [], "max_tokens": id})).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ticket = crate::queue::Ticket {
+            id: id as u64,
+            priority: crate::queue::Priority::Interactive,
+            prompt_tokens: None,
+            since: std::time::Instant::now(),
+            yields: 0,
+        };
+        w.complete(ticket, req, None, tx, "m".into(), None, None, Trace::none());
+        rx
+    }
+
+    fn errored(rx: &mut mpsc::UnboundedReceiver<Out>) -> bool {
+        let mut e = false;
+        while let Ok(o) = rx.try_recv() {
+            e |= matches!(o, Out::Error(_));
+        }
+        e
+    }
+
+    /// Stream 2's slot overflowed: only it ends.
+    fn overflow(ids: &[usize]) -> anyhow::Result<()> {
+        match ids.iter().position(|&i| i == 2) {
+            Some(j) => Err(StepFailure::lanes(
+                vec![j],
+                anyhow::anyhow!("slot 2 is full"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn an_attributable_failure_ends_only_its_streams() {
+        let mut w = worker(overflow);
+        let mut rx: Vec<_> = (1..=3).map(|i| start(&mut w, i)).collect();
+        assert_eq!(w.batch.len(), 3);
+        w.step_batch();
+        assert_eq!(w.batch.len(), 2);
+        let errs: Vec<bool> = rx.iter_mut().map(errored).collect();
+        assert_eq!(errs, [false, true, false]);
+        assert!(w.node.state().unhealthy.is_none());
+        // The others go on stepping.
+        w.step_batch();
+        assert_eq!(w.batch.len(), 2);
+    }
+
+    fn fault(_: &[usize]) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access\")"
+        ))
+    }
+
+    fn panics(_: &[usize]) -> anyhow::Result<()> {
+        panic!("called `Result::unwrap()` on an `Err` value: CUDA_ERROR_ILLEGAL_ADDRESS")
+    }
+
+    #[test]
+    fn a_device_fault_ends_everything_and_marks_the_node_unhealthy() {
+        for f in [fault as fn(&[usize]) -> anyhow::Result<()>, panics] {
+            let mut w = worker(f);
+            let mut rx: Vec<_> = (1..=3).map(|i| start(&mut w, i)).collect();
+            w.step_batch();
+            assert!(w.batch.is_empty());
+            assert!(rx.iter_mut().all(errored));
+            assert!(w.node.state().unhealthy.is_some());
+            // A new request fails instead of joining the broken engine.
+            let mut late = start(&mut w, 4);
+            assert!(w.batch.is_empty());
+            assert!(errored(&mut late));
+        }
+    }
+
+    #[test]
+    fn verdicts() {
+        assert_eq!(super::step_verdict(Ok(Ok(()))), Verdict::Ok);
+        let v = super::step_verdict(Ok(Err(StepFailure::lanes(vec![1], anyhow::anyhow!("x")))));
+        assert_eq!(v, Verdict::Lanes(vec![1], "x".into()));
+        // Attributed, but a device fault: everything, and unhealthy.
+        let v = super::step_verdict(Ok(Err(StepFailure::lanes(
+            vec![1],
+            anyhow::anyhow!("CUDA_ERROR_ILLEGAL_ADDRESS"),
+        ))));
+        assert!(matches!(v, Verdict::All(_, true)));
+        // Unattributed, not a device fault: everything, still healthy.
+        let v = super::step_verdict(Ok(Err(anyhow::anyhow!("parse error"))));
+        assert_eq!(v, Verdict::All("parse error".into(), false));
+        assert!(matches!(
+            super::step_verdict(Err("boom".into())),
+            Verdict::All(_, true)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod context_limits {
+    use super::{Backend, DynLane, Inflight, Out, Outcome, Request};
+    use crate::chat::Piece;
+    use crate::engine::{Finish, Usage};
+    use crate::telemetry::Trace;
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    const CTX: usize = 1000;
+
+    /// A batching engine like `flash serve --batch`: a request's prompt is its first message's
+    /// length in characters, admission goes through `batch::token_limit`, and every step
+    /// generates one token for each stream until its limit.
+    struct Window;
+    /// (prompt, generated, limit)
+    type S = (usize, usize, usize);
+    impl Backend for Window {
+        fn context_window(&self) -> usize {
+            CTX
+        }
+        fn complete(
+            &mut self,
+            _: &Request,
+            _: &mut dyn FnMut(Piece) -> bool,
+        ) -> anyhow::Result<(Finish, Usage)> {
+            unreachable!()
+        }
+        fn max_batch(&self) -> usize {
+            4
+        }
+        fn can_admit(&self, _: Option<&str>) -> bool {
+            true
+        }
+        fn admit(
+            &mut self,
+            req: &Request,
+            _: Option<(String, Vec<u32>)>,
+        ) -> anyhow::Result<Inflight> {
+            let prompt = req.messages[0]["content"].as_str().unwrap().len();
+            let limit = crate::batch::token_limit(prompt, CTX, req.max_tokens)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Box::new((prompt, 0usize, limit)))
+        }
+        fn step(&mut self, lanes: &mut [DynLane<'_>]) -> anyhow::Result<()> {
+            for l in lanes {
+                let s = l.stream.downcast_mut::<S>().unwrap();
+                assert!(s.0 + s.1 < CTX, "a stream ran past the context");
+                s.1 += 1;
+                (l.on)(Piece::Text("x".into()));
+            }
+            Ok(())
+        }
+        fn retire(&mut self, s: Inflight) -> anyhow::Result<Outcome> {
+            let s = s.downcast::<S>().unwrap();
+            let usage = Usage {
+                prompt_tokens: s.0,
+                completion_tokens: s.1,
+                ..Default::default()
+            };
+            Ok(Outcome::Done(Finish::Length, usage))
+        }
+        fn stream_state(&self, s: &Inflight) -> (bool, bool) {
+            let s = s.downcast_ref::<S>().unwrap();
+            (s.1 >= s.2, false)
+        }
+    }
+
+    type W = super::Worker<Window, fn(&str) -> anyhow::Result<Window>>;
+
+    fn worker() -> W {
+        let node = std::sync::Arc::new(super::Node {
+            id: "test".into(),
+            queue: crate::queue::Queue::new(),
+            state: std::sync::Mutex::new(super::NodeState::default()),
+            hardware: std::sync::Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::F32,
+            resources: Default::default(),
+            image: None,
+        });
+        fn load(_: &str) -> anyhow::Result<Window> {
+            unreachable!()
+        }
+        super::Worker {
+            node,
+            engine: Some(("m".into(), Window)),
+            load,
+            batch: Vec::new(),
+        }
+    }
+
+    fn start(w: &mut W, id: u64, prompt: usize, max: usize) -> mpsc::UnboundedReceiver<Out> {
+        let body = json!({
+            "messages": [{"role": "user", "content": "p".repeat(prompt)}],
+            "max_tokens": max,
+        });
+        let req = Box::new(super::parse(&body).unwrap());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ticket = crate::queue::Ticket {
+            id,
+            priority: crate::queue::Priority::Interactive,
+            prompt_tokens: None,
+            since: std::time::Instant::now(),
+            yields: 0,
+        };
+        w.complete(ticket, req, None, tx, "m".into(), None, None, Trace::none());
+        rx
+    }
+
+    /// Drain a reply: (pieces, finish and usage, or the error).
+    fn reply(rx: &mut mpsc::UnboundedReceiver<Out>) -> (usize, Option<Result<(Finish, Usage), String>>) {
+        let (mut n, mut end) = (0, None);
+        while let Ok(o) = rx.try_recv() {
+            match o {
+                Out::Piece(_) => n += 1,
+                Out::Done(f, u) => end = Some(Ok((f, u))),
+                Out::Error(e) => end = Some(Err(e)),
+            }
+        }
+        (n, end)
+    }
+
+    #[test]
+    fn a_prompt_past_the_context_is_refused_at_admission() {
+        let mut w = worker();
+        let mut rx = start(&mut w, 1, CTX + 5, 10);
+        assert!(w.batch.is_empty(), "it never joined the batch");
+        let (n, end) = reply(&mut rx);
+        assert_eq!(n, 0);
+        let e = end.unwrap().unwrap_err();
+        assert!(e.contains("context_length_exceeded") && e.contains("1005"), "{e}");
+    }
+
+    #[test]
+    fn a_stream_reaching_the_context_stops_with_length_and_others_go_on() {
+        let mut w = worker();
+        // 990 + max 50 > 1000: it gets 9 tokens. The other wants 30.
+        let mut long = start(&mut w, 1, 990, 50);
+        let mut other = start(&mut w, 2, 10, 30);
+        assert_eq!(w.batch.len(), 2);
+        for _ in 0..40 {
+            w.step_batch();
+        }
+        assert!(w.batch.is_empty());
+        let (n, end) = reply(&mut long);
+        let (f, u) = end.unwrap().unwrap();
+        assert_eq!((n, f, u.completion_tokens), (9, Finish::Length, 9));
+        assert_eq!(super::finish_reason(f), "length");
+        let (n, end) = reply(&mut other);
+        let (_, u) = end.unwrap().unwrap();
+        assert_eq!((n, u.completion_tokens), (30, 30));
+    }
+
+    #[tokio::test]
+    async fn an_admission_error_answers_400() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Out::Error(
+            crate::batch::token_limit(5000, CTX, None).unwrap_err(),
+        ))
+        .unwrap();
+        let r = super::collect_response("m".into(), "id".into(), 0, rx).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 }
 
