@@ -3155,19 +3155,27 @@ impl TensorGraph {
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
-                std::thread::scope(|sc| {
-                    for (t, chunk) in buf.chunks_mut(per * w).enumerate() {
-                        let pts = &pts;
-                        sc.spawn(move || {
-                            let start = t * per;
-                            for (p, idx) in
-                                indices(pts).skip(start).take(chunk.len() / w).enumerate()
-                            {
-                                ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w]);
-                            }
-                        });
+                if threads == 1 {
+                    // one chunk: run it here. This is also the only path on targets that
+                    // cannot spawn threads (wasm32), where available_parallelism errs to 1.
+                    for (p, idx) in indices(&pts).enumerate() {
+                        ev_ref.point(i, &idx, &mut buf[p * w..(p + 1) * w]);
                     }
-                });
+                } else {
+                    std::thread::scope(|sc| {
+                        for (t, chunk) in buf.chunks_mut(per * w).enumerate() {
+                            let pts = &pts;
+                            sc.spawn(move || {
+                                let start = t * per;
+                                for (p, idx) in
+                                    indices(pts).skip(start).take(chunk.len() / w).enumerate()
+                                {
+                                    ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w]);
+                                }
+                            });
+                        }
+                    });
+                }
                 if emulate {
                     let f = self.nodes[i].precision.storage;
                     buf.iter_mut().for_each(|v| *v = f.round(*v));
