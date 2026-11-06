@@ -325,6 +325,9 @@ enum Storage {
         functions: Vec<cudarc::driver::CudaFunction>,
         /// One captured run ([`Program::capture`]).
         graph: Option<cudarc::driver::CudaGraph>,
+        /// The program as launches of kernels and persistent segments
+        /// ([`Program::megakernel`]): `run` launches these instead.
+        fused: Option<Vec<Item>>,
     },
     #[cfg(feature = "opencl")]
     OpenCl {
@@ -333,6 +336,26 @@ enum Storage {
         /// One kernel object per kernel, arguments bound at construction.
         kernels: ClKernels,
     },
+}
+
+/// One launch of a fused program ([`Program::megakernel`]).
+#[cfg(feature = "cuda")]
+enum Item {
+    Kernel(usize),
+    Mega(MegaRun),
+}
+
+/// A run of kernels fused into one persistent kernel.
+#[cfg(feature = "cuda")]
+struct MegaRun {
+    function: cudarc::driver::CudaFunction,
+    /// Device pointer per slot.
+    table: cudarc::driver::CudaSlice<u64>,
+    /// Grid barrier state (two words, left zero by every launch).
+    sync: cudarc::driver::CudaSlice<u32>,
+    grid: u32,
+    threads: u32,
+    smem: u32,
 }
 
 /// A lowered program with its buffers on one backend; reusable across runs.
@@ -457,6 +480,7 @@ impl Program {
                     slots,
                     functions,
                     graph: None,
+                    fused: None,
                 };
                 Self::assemble(program, storage, plan)
             }
@@ -732,6 +756,29 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn launch_all(&self, d: &CudaDevice) {
+        if let Storage::Cuda {
+            fused: Some(items), ..
+        } = &self.storage
+        {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            for it in items {
+                match it {
+                    Item::Kernel(i) => self.run_cuda(d, *i),
+                    Item::Mega(m) => {
+                        let cfg = LaunchConfig {
+                            grid_dim: (m.grid, 1, 1),
+                            block_dim: (m.threads, 1, 1),
+                            shared_mem_bytes: m.smem,
+                        };
+                        let mut launch = d.stream.launch_builder(&m.function);
+                        launch.arg(&m.table);
+                        launch.arg(&m.sync);
+                        unsafe { launch.launch(cfg) }.expect("megakernel launch");
+                    }
+                }
+            }
+            return;
+        }
         for &i in &self.order {
             self.run_cuda(d, i);
         }
@@ -753,6 +800,172 @@ impl Program {
     /// [`run_kernel`](Self::run_kernel) on a bare wgpu device.
     pub fn dispatch_kernel(&self, device: &GpuDevice, cache: &mut KernelCache, i: usize) {
         self.run_wgpu(device, cache, i);
+    }
+
+    /// Fuse the whole program into one persistent kernel
+    /// (`tang_compile::tensor::cuda_mega`): every kernel a stage over its
+    /// own grid, independent kernels sharing a phase, a grid barrier
+    /// between phases (knobs: `MegaOpts`; slot sizes are filled in here),
+    /// `per_sm` blocks per SM (0: as many as fit). With `max_blocks > 0`
+    /// only kernels of at most that many blocks fuse, in maximal runs
+    /// between the bigger ones (which keep their own launch and
+    /// occupancy): a kernel boundary is then a per-edge choice, launch or
+    /// grid barrier. Returns `(launches, phases, largest grid)`. Later [`run`](Self::run)s (and a
+    /// [`capture`](Self::capture) after this) launch it instead of the
+    /// kernels. CUDA only.
+    #[cfg(feature = "cuda")]
+    pub fn megakernel(
+        &mut self,
+        rt: &Runtime,
+        opts: &tang_compile::tensor::cuda_mega::MegaOpts,
+        per_sm: u32,
+        max_blocks: u32,
+    ) -> (usize, usize, u32) {
+        use cudarc::driver::DevicePtr;
+        use tang_compile::tensor::cuda_mega::{megakernel, Mega, MegaStage};
+        let mut opts = opts.clone();
+        if opts.threads == 0 {
+            opts.threads = 256;
+        }
+        let threads = opts.threads;
+        let Runtime::Cuda(d) = rt else {
+            panic!("megakernel needs the CUDA runtime")
+        };
+        let Storage::Cuda { slots, .. } = &self.storage else {
+            unreachable!()
+        };
+        opts.slot_bytes = slots.iter().map(|s| 4 * s.len()).collect();
+        let stage = |i: usize| {
+            let k = &self.program.kernels[i];
+            MegaStage {
+                source: &k.source,
+                threads: k.workgroup_size,
+                blocks: k.count.div_ceil(k.workgroup_size),
+                count: k.points,
+                args: self.args[i].clone(),
+            }
+        };
+        // segments: maximal runs of fusible kernels (at most `max_blocks`
+        // blocks, a block size dividing `threads`, no dynamic smem); a run
+        // of one stays a launch
+        let fusible = |i: usize| {
+            let k = &self.program.kernels[i];
+            let blocks = k.count.div_ceil(k.workgroup_size);
+            (max_blocks == 0 || blocks <= max_blocks)
+                && threads.is_multiple_of(k.workgroup_size)
+                && threads / k.workgroup_size <= 15
+                && crate::cuda::dynamic_smem(&k.source) == 0
+        };
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        for &i in &self.order {
+            match runs.last_mut() {
+                Some(r) if fusible(i) && fusible(*r.last().unwrap()) => r.push(i),
+                _ => runs.push(vec![i]),
+            }
+        }
+        let megas: Vec<Option<Mega>> = runs
+            .iter()
+            .map(|r| {
+                (r.len() > 1)
+                    .then(|| megakernel(&r.iter().map(|&i| stage(i)).collect::<Vec<_>>(), &opts))
+            })
+            .collect();
+        if let Ok(p) = std::env::var("TANG_MEGA_DUMP") {
+            if let Some(m) = megas.iter().flatten().max_by_key(|m| m.phases.len()) {
+                std::fs::write(p, &m.source).ok();
+            }
+        }
+        crate::cuda::precompile(megas.iter().flatten().map(|m| m.source.as_str()), d.arch);
+        let sms = d
+            .ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("SM count") as u32;
+        let Storage::Cuda {
+            slots,
+            fused,
+            graph,
+            ..
+        } = &mut self.storage
+        else {
+            unreachable!()
+        };
+        let mut items = Vec::new();
+        let (mut phases, mut grid) = (0, 0);
+        for (r, m) in runs.iter().zip(megas) {
+            let Some(mega) = m else {
+                items.push(Item::Kernel(r[0]));
+                continue;
+            };
+            let function = d.function(&mega.source);
+            let fit = function
+                .occupancy_max_active_blocks_per_multiprocessor(threads, mega.smem as usize, None)
+                .expect("occupancy");
+            assert!(fit > 0, "megakernel does not fit on an SM");
+            let g = sms * if per_sm == 0 { fit } else { per_sm.min(fit) };
+            let ptrs: Vec<u64> = mega
+                .table
+                .iter()
+                .map(|&s| {
+                    let (p, _sync) = slots[s].device_ptr(&d.stream);
+                    p
+                })
+                .collect();
+            let table = d.stream.memcpy_stod(&ptrs).expect("pointer table");
+            let sync = d
+                .stream
+                .alloc_zeros::<u32>(2 + 2 * (mega.phases.len() + 1))
+                .expect("barrier state");
+            phases += mega.phases.len();
+            grid = grid.max(g);
+            items.push(Item::Mega(MegaRun {
+                function,
+                table,
+                sync,
+                grid: g,
+                threads,
+                smem: mega.smem,
+            }));
+        }
+        let launches = items.len();
+        *graph = None;
+        *fused = Some(items);
+        (launches, phases, grid)
+    }
+
+    /// Kernel indices in launch order.
+    pub fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// With `MegaOpts::trace`: nanoseconds of each phase of the last run
+    /// (block 0's view).
+    #[cfg(feature = "cuda")]
+    pub fn mega_trace(&self, rt: &Runtime) -> Vec<f64> {
+        let (
+            Runtime::Cuda(d),
+            Storage::Cuda {
+                fused: Some(items), ..
+            },
+        ) = (rt, &self.storage)
+        else {
+            return Vec::new();
+        };
+        let Some(m) = items.iter().find_map(|it| match it {
+            Item::Mega(m) => Some(m),
+            Item::Kernel(_) => None,
+        }) else {
+            return Vec::new();
+        };
+        let words = d.stream.memcpy_dtov(&m.sync).expect("read trace");
+        let t: Vec<u64> = words[2..]
+            .chunks(2)
+            .map(|c| c[0] as u64 | (c[1] as u64) << 32)
+            .collect();
+        t.windows(2)
+            .map(|w| w[1].wrapping_sub(w[0]) as f64)
+            .collect()
     }
 
     /// Record one run as a CUDA graph; later [`run`](Self::run)s replay
@@ -1634,6 +1847,61 @@ mod tests {
         q.copy(&rt, q.input(0), &p, p.input(0));
         q.run(&rt);
         assert_eq!(q.read(&rt, c), first);
+    }
+
+    /// CUDA: a chain of kernels fused into persistent segments
+    /// (`Program::megakernel`), whole and split at big kernels, gives the
+    /// same bits as launching them one by one, and stays correct across
+    /// runs (the barrier state resets itself).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_megakernel_matches_launches() {
+        use tang_compile::tensor::cuda_mega::MegaOpts;
+        let Some(rt) = Runtime::cuda() else { return };
+        let mut g = TensorGraph::new();
+        let a = g.input(&[64, 32]);
+        let b = g.input(&[32, 48]);
+        let c = g.input(&[48, 40]);
+        let ab = g.matmul(a, b).unwrap();
+        let abc = g.matmul(ab, c).unwrap();
+        let ct = g.transpose(c, &[1, 0]).unwrap();
+        let out = g.matmul(abc, ct).unwrap();
+        let (g, outs) = g.substitute_maps(&[out]);
+        let fill = |n: usize, k: f32| {
+            (0..n)
+                .map(|i| (i as f32 * k).sin() * 0.5)
+                .collect::<Vec<f32>>()
+        };
+        let (va, vb, vc) = (
+            fill(64 * 32, 0.37),
+            fill(32 * 48, 0.11),
+            fill(48 * 40, 0.73),
+        );
+        // the decode lowering: warp kernels, the kind a megakernel fuses
+        let lower = || {
+            let dp = g.to_cuda_decode(
+                &outs,
+                &tang_compile::tensor::cuda_gemv::DecodeOpts::default(),
+            );
+            Program::new(&rt, dp.program, &[&va, &vb, &vc])
+        };
+        let want = {
+            let p = lower();
+            p.run(&rt);
+            p.read(&rt, outs[0])
+        };
+        // all fused; then only the 640-block kernel is small enough, so
+        // nothing fuses (a run of one stays a launch)
+        for (max_blocks, fused) in [(0, 1), (700, 3)] {
+            let mut p = lower();
+            let (launches, phases, _) = p.megakernel(&rt, &MegaOpts::default(), 0, max_blocks);
+            assert_eq!(launches, fused, "max_blocks {max_blocks}");
+            assert_eq!(phases > 0, fused == 1);
+            for _ in 0..3 {
+                p.run(&rt);
+                assert_eq!(p.read(&rt, outs[0]), want, "max_blocks {max_blocks}");
+            }
+        }
     }
 
     /// CUDA: f16 and bf16 storage (inputs, an intermediate and the
