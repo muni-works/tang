@@ -91,6 +91,10 @@ impl TensorGraph {
     /// The graph must be bound.
     pub fn to_c(&self, outputs: &[TensorId]) -> CProgram {
         assert!(self.is_bound(), "to_c needs a bound graph");
+        assert!(
+            (0..self.nodes.len()).all(|i| self.comp_at(i).is_none_or(|c| !c.has_gather())),
+            "to_c: gather views are not lowered to C yet (WGSL, CUDA, MSL, OpenCL are)"
+        );
         // An inlined reduction is recomputed at every read. GPU tiles
         // stage it per chunk; a CPU loop nest would redo the whole sum per
         // point (per reduce step, inside another reduction), so every

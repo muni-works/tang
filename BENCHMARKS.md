@@ -2459,3 +2459,58 @@ wgpu (Metal) on the M4: 0.93–1.50× vs #150. It is slower at n = 512 and faste
 | bidirectional | 4096 | 9.927 | 36.448 | 28.801 | 1.27× | 2.462 | 1.767 |
 
 The structure now matches FA2, but the per-element scalar dot inside the nested tiles still dominates. It is 0.25–0.34× the materialized schedule on the 3090 and about 12× behind SDPA there. Closing that needs the nested S/dP computed as a register-blocked GEMM per chunk (mma / simdgroup matrices), which this change makes a single site per tile.
+
+## MoE through gather views (M4 Max and RTX 3090, kernel-only)
+
+**Date:** 2026-11-06. **Branch:** `claude/focused-elgamal-3af3c7` (gather views, `docs/tensor-ir.md`
+"Gather views"). **Run:** `cargo run --release -p tang-bench [--features cuda] --example moe_gather`
+(`MOE_DIMS=T,D,E,K,F` for other sizes). Times are per kernel, mean of 50 dispatches
+(`Program::time_kernel`); f32 storage everywhere.
+
+- **M4 Max** (Metal via wgpu), on AC power (battery charging at 11%), desktop session otherwise idle.
+  Absolute M4 times drift up to ~2× with power state; compare columns within a run.
+- **RTX 3090** (`ssh mew`, CUDA sm_86 via `to_cuda`), shared host: 1% GPU utilization and 16.1 of
+  24 GB in use by other processes (a resident `tang-llm`, ffmpeg) before and after the run.
+
+**What runs.** A top-k MoE FFN layer as one IR graph: router GEMM, top-k as k rounds of argmax over
+the logits with earlier picks masked, softmax over the selected logits, SwiGLU experts reading
+`W1/W3[sel[t,k], f, d]` and `W2[sel[t,k], d, f]` through gather views, weighted combine. Token-major
+(decode-style); the host does no routing. `substitute_maps` + `schedule_auto`: 16 comps → 11 kernels
+(small config), 17 kernels at k = 10. The down projection is inlined into the combine (one kernel).
+
+**Correctness.** Small config (T 4, D 64, E 16, K 4, F 32): interpreter vs a plain-Rust f64
+reference 1.1e-13, interpreter before vs after the passes 0; GPU vs reference 4.3e-7 (M4),
+1.4e-4 (3090: the router GEMM is a TF32 `mma.sync` tile). Top-k indices match the reference
+exactly on both chips at both sizes.
+
+**Timed config:** T 8, D 2048, E 128, K 10, F 512 (Qwen3-Next-80B-A3B's hidden size, expert FFN
+width and top-k, with 128 of its 512 experts to fit the 3090's free memory). The expert half reads
+3 matrices × 80 (token, slot) pairs = 1007 MB of weights per layer.
+The baseline is the same expert math over weights the host gathered into contiguous `[T, K, …]`
+buffers (affine views): same FLOPs, same bytes, no data-dependent address. It runs under its own
+`schedule_auto` choice (a 16×16 tile) and again with every node forced to one thread per point
+(the gathered kernels' schedule).
+
+| expert GEMMs + combine | M4 Max | RTX 3090 |
+|---|---|---|
+| **gathered (`W[sel[t,k]]`)** | **2.17 ms** (464 GB/s) | **2.66 ms** (378 GB/s) |
+| pre-gathered, `schedule_auto` (tile) | 2.89 ms (348 GB/s) | 3.55 ms (283 GB/s) |
+| pre-gathered, one thread per point | 2.91 ms (346 GB/s) | 3.77 ms (267 GB/s) |
+| whole layer (router, top-k, experts) | 2.95 ms | 2.82 ms |
+
+Per kernel (gathered layer): gate 0.55 / 0.80 ms, up 0.62 / 0.77 ms, combine with the inlined
+down projection 0.95 / 1.09 ms (M4 / 3090). On the 3090 router + top-k are 0.07 ms in all (12
+kernels of 3–12 µs); on the M4 they are ~1.2 ms, ~0.08 ms per dispatch — launch overhead.
+
+M4 at T 32 (4.0 GB of weight reads): gathered 9.53 ms (423 GB/s), pre-gathered 11.67 ms tiled /
+11.55 ms per point.
+
+**Reading.** The data-dependent address costs nothing measurable: the gathered layer is *faster*
+than the affine baseline on both chips, under either baseline schedule. Not explained yet — the
+inner loop and the bytes are the same; the gathered kernels index 3 matrices of 64 MB per expert
+instead of 1 GB of per-(token, slot) copies, which may treat the TLB and page mapping better. As an
+absolute number, 378 GB/s is 40% of the 3090's 936 GB/s: one thread per output point walks its
+8 KB weight row alone, so adjacent threads' reads are 8 KB apart (uncoalesced). The gathered comp
+gets no tile (tiles stage affine regions) and no split at this size (40960 points); a
+warp-per-row GEMV schedule for gathered contractions is the obvious next step before comparing
+against tang-llm's hand-written int8 MoE kernel.
