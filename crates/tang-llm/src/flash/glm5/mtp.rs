@@ -102,7 +102,8 @@ impl Mtp {
             eh.rows,
             eh.cols
         );
-        Ok(Self {
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut me = Self {
             layer: l,
             n: hp.n_embd,
             eps: hp.eps,
@@ -120,7 +121,10 @@ impl Mtp {
             idx_g: Vec::new(),
             #[cfg(feature = "cuda")]
             dev: None,
-        })
+        };
+        #[cfg(feature = "cuda")]
+        me.load_dev(e)?;
+        Ok(me)
     }
 
     /// Put the block on the engine's GPU 0 (no-op without one, or `TANG_GLM5_MTP_DEV=0`).

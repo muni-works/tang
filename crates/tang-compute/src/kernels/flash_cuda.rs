@@ -1084,18 +1084,81 @@ extern "C" __global__ void fl_gdn_conv_commit(float* __restrict__ H0, const floa
     for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];
 }
 
+// GDN recurrent state storage (GDN_S16: bf16, round-to-nearest-even on store, GDN_SR
+// stochastic; GDN_H16: f16, nearest-even; else f32).
+// The recurrence always runs in f32 registers: only the window-boundary load/store change.
+#if defined(GDN_H16)
+// f16 (11-bit significand: 8x bf16's precision, range ample for the decayed state).
+typedef unsigned short gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) {
+    float x;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(x) : "h"(*p));
+    return x;
+}
+__device__ __forceinline__ void gst_st(gst_t* p, float x) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
+    *p = h;
+}
+#elif defined(GDN_S16)
+typedef unsigned short gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) { return __uint_as_float(((unsigned int)*p) << 16); }
+__device__ __forceinline__ void gst_st(gst_t* p, float x) {
+    unsigned int u = __float_as_uint(x);
+#ifdef GDN_SR
+    // Stochastic rounding: add 16 hashed bits of the value and truncate (deterministic, and
+    // independent of the slot, so batch and lone runs still agree).
+    unsigned int h = u * 0x85ebca6bu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12;
+    u += h & 0xffffu;
+#else
+    u += 0x7fffu + ((u >> 16) & 1u);
+#endif
+    *p = (unsigned short)(u >> 16);
+}
+#elif defined(GDN_RBITS)
+// Diagnostic: f32 storage with the low GDN_RBITS significand bits rounded off (nearest-even).
+typedef float gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) { return *p; }
+__device__ __forceinline__ void gst_st(gst_t* p, float x) {
+    unsigned int u = __float_as_uint(x);
+    const unsigned int h = 1u << (GDN_RBITS - 1);
+    u += (h - 1) + ((u >> GDN_RBITS) & 1u);
+    *p = __uint_as_float(u & ~((1u << GDN_RBITS) - 1));
+}
+#else
+typedef float gst_t;
+__device__ __forceinline__ float gst_ld(const gst_t* p) { return *p; }
+__device__ __forceinline__ void gst_st(gst_t* p, float x) { *p = x; }
+#endif
+// The value a state element has after a store and load: the recurrence rounds every token's
+// new state to it in registers, so a token's arithmetic is the same whether its window holds
+// one token (state stored between tokens) or eight (state in registers): window independence
+// and spec-decode equivalence hold bitwise in every storage mode. Identity for f32.
+__device__ __forceinline__ float gst_rt(float x) {
+    gst_t t;
+    gst_st(&t, x);
+    return gst_ld(&t);
+}
+
 // The recurrence + gated norm. Grid GDN_HV (a block per v head), block 512 = 4 row groups of 32
 // state rows × 128 columns; each thread holds its 32 state values in registers for the window.
 // `commit`: run min(win[1], T) tokens and write the state; else run T, state untouched. Same
 // code path either way, so commit's outputs are bitwise verify's.
 template <bool FUSED>
 __device__ __forceinline__ void gdn_step_body(
-    float* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
+    gst_t* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
     const unsigned int* __restrict__ win, unsigned int commit, float eps,
     unsigned int* __restrict__ YQ, unsigned int quant, const float* __restrict__ H0,
-    const float* __restrict__ Wc) {
+    const float* __restrict__ Wc, unsigned int pr0 = 0, unsigned int plen = 0, unsigned int r0 = 0) {
+    // Path rows (tree windows): path index i is window row i < plen ? pr0 + i : r0 + i - plen
+    // (identity when plen = r0 = 0). The first plen rows are a parent chain's prefix: they
+    // advance the state but their outputs belong to that chain's segment and aren't written.
+    // commit & 2: state only (a commit replay), no outputs; the state arithmetic is unchanged.
+    #define GDN_ROW(i) ((i) < plen ? pr0 + (i) : r0 + (i) - plen)
+    const bool outs = !(commit & 2);
     __shared__ float sq[8][128], sk[8][128], sv[8][128], sz[8][128];
     __shared__ float sg[8], sb[8];
     __shared__ float red[4][128];
@@ -1104,7 +1167,7 @@ __device__ __forceinline__ void gdn_step_body(
     unsigned int n = commit ? min(win[1], T) : T;
     float st[32];
     #pragma unroll
-    for (int r = 0; r < 32; r++) st[r] = S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j];
+    for (int r = 0; r < 32; r++) st[r] = gst_ld(&S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j]);
     // Tokens in chunks of 8 (one chunk up to MAX_T; wider windows are prefill), the state in
     // registers throughout: each token's arithmetic is the same at any width.
     for (unsigned int t0 = 0; t0 < n; t0 += 8) {
@@ -1117,7 +1180,7 @@ __device__ __forceinline__ void gdn_step_body(
         #pragma unroll
         for (unsigned int i = 0; i < 11; i++) {
             unsigned int p = t0 + i;
-            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)(p - 3) * stride + ch] : 0.0f));
+            e[i] = rg >= 3 ? 0.0f : (p < 3 ? H0[p * GDN_CONV + ch] : (p - 3 < n ? P[(u64)GDN_ROW(p - 3) * stride + ch] : 0.0f));
         }
         #pragma unroll
         for (unsigned int t = 0; t < 8; t++) {
@@ -1138,23 +1201,23 @@ __device__ __forceinline__ void gdn_step_body(
             if (rg == 0) sq[t][j] = v;
             else if (rg == 1) sk[t][j] = v;
             else if (rg == 2) sv[t][j] = v;
-            else sz[t][j] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + j];
+            else if (outs) sz[t][j] = P[(u64)GDN_ROW(t0 + t) * stride + GDN_Z + hv * 128 + j];
         }
     } else {
         for (unsigned int i = tid; i < nn * 128; i += 512) {
             unsigned int t = i >> 7, jj = i & 127;
-            const float* hh = Hc + (u64)(t0 + t) * GDN_CONV;
+            const float* hh = Hc + (u64)GDN_ROW(t0 + t) * GDN_CONV;
             sq[t][jj] = hh[hk * 128 + jj];
             sk[t][jj] = hh[GDN_HK * 128 + hk * 128 + jj];
             sv[t][jj] = hh[2 * GDN_HK * 128 + hv * 128 + jj];
-            sz[t][jj] = P[(u64)(t0 + t) * stride + GDN_Z + hv * 128 + jj];
+            sz[t][jj] = P[(u64)GDN_ROW(t0 + t) * stride + GDN_Z + hv * 128 + jj];
         }
     }
     if (tid < nn) {
-        float a = P[(u64)(t0 + tid) * stride + GDN_A + hv] + DT[hv];
+        float a = P[(u64)GDN_ROW(t0 + tid) * stride + GDN_A + hv] + DT[hv];
         float sp = a > 20.0f ? a : log1pf(expf(a));
         sg[tid] = expf(sp * SA[hv]);
-        sb[tid] = sigm(P[(u64)(t0 + tid) * stride + GDN_B + hv]);
+        sb[tid] = sigm(P[(u64)GDN_ROW(t0 + tid) * stride + GDN_B + hv]);
     }
     __syncthreads();
     for (unsigned int t = 0; t < nn; t++) {
@@ -1169,11 +1232,19 @@ __device__ __forceinline__ void gdn_step_body(
         __syncthreads();
         float skj = ((red[0][j] + red[1][j]) + red[2][j]) + red[3][j];
         float d = (sv[t][j] - skj) * sb[t];
+        if (!outs || t0 + t < plen) {
+            // No output for this row: the state update alone (the same fmas as below).
+            #pragma unroll
+            for (int r = 0; r < 32; r++) st[r] = gst_rt(__fmaf_rn(sk[t][rg * 32 + r], d, st[r]));
+            __syncthreads();
+            continue;
+        }
         p = 0.0f;
         #pragma unroll
         for (int r = 0; r < 32; r++) {
-            st[r] = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
-            p = __fmaf_rn(st[r], sq[t][rg * 32 + r], p);
+            const float sn = __fmaf_rn(sk[t][rg * 32 + r], d, st[r]);
+            p = __fmaf_rn(sn, sq[t][rg * 32 + r], p);
+            st[r] = gst_rt(sn);
         }
         __syncthreads();
         red[rg][j] = p;
@@ -1188,7 +1259,7 @@ __device__ __forceinline__ void gdn_step_body(
             float ss = ((red2[0] + red2[1]) + red2[2]) + red2[3];
             float rs = 1.0f / sqrtf(ss / 128.0f + eps);
             float y = o * rs * NW[j] * GDN_GATE(sz[t][j]);
-            Y[(u64)(t0 + t) * GDN_V + hv * 128 + j] = y;
+            Y[(u64)GDN_ROW(t0 + t) * GDN_V + hv * 128 + j] = y;
             if (quant) quant_chunk(y, YQ, T, GDN_V, t0 + t, hv * 4 + (j >> 5), j & 31);
         }
         __syncthreads();
@@ -1196,12 +1267,13 @@ __device__ __forceinline__ void gdn_step_body(
     }
     if (commit) {
         #pragma unroll
-        for (int r = 0; r < 32; r++) S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j] = st[r];
+        for (int r = 0; r < 32; r++) gst_st(&S[((u64)(rg * 32 + r) * GDN_HV + hv) * 128 + j], st[r]);
     }
+    #undef GDN_ROW
 }
 
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
-    float* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
+    gst_t* __restrict__ S, const float* __restrict__ Hc, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
     const unsigned int* __restrict__ win, unsigned int commit, float eps,
@@ -1212,7 +1284,7 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_step(
 // The conv (history read-only) and the recurrence in one launch: Hc unused, conv inputs from
 // P's qkv columns, the history H0 and the conv weights Wc.
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step(
-    float* __restrict__ S, const float* __restrict__ P,
+    gst_t* __restrict__ S, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, unsigned int T,
     const unsigned int* __restrict__ win, unsigned int commit, float eps,
@@ -1226,16 +1298,219 @@ extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step(
 // SEG[b][0] .. + SEG[b][1] of the window, all of sequence slot SEG[b][2], keeping SEG[b][3] of
 // them on commit. Its recurrent state and conv history are at Stab[slot] / Htab[slot]. Each
 // segment runs exactly as a lone window of its rows would (the same body). Grid (GDN_HV, nseg).
+//
+// Tree windows (chain-decomposed): SEG[b][3] with bit 31 set packs keep | pr0 << 8 | plen << 16
+// (otherwise it is a plain keep, any size). A chain that
+// branches off another after its first plen rows (window rows pr0 ..) runs those rows first,
+// in its own registers, as the prefix of its path: shared rows are computed once in the
+// window's GEMVs and MoE, and only the cheap recurrence is redone, with no state in HBM.
+// keep counts path rows (prefix included). plen = 0 is the plain segment.
+#define SEG_KEEP(w) ((w) >> 31 ? (w) & 0xffu : (w))
+#define SEG_PR0(w) ((w) >> 31 ? ((w) >> 8) & 0xffu : 0u)
+#define SEG_PLEN(w) ((w) >> 31 ? ((w) >> 16) & 0xffu : 0u)
 extern "C" __global__ void __launch_bounds__(512) fl_gdn_conv_step_seg(
     const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
     unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
     const float* __restrict__ NW, float* __restrict__ Y, const unsigned int* __restrict__ SEG,
     unsigned int commit, float eps, const float* __restrict__ Wc) {
     const unsigned int* sg = SEG + blockIdx.y * 4;
-    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2];
-    gdn_step_body<true>((float*)Stab[slot], nullptr, P + (u64)r0 * stride, stride, DT, SA, NW,
-                        Y + (u64)r0 * GDN_V, len, sg + 2, commit, eps, nullptr, 0,
-                        (const float*)Htab[slot], Wc);
+    const unsigned int r0 = sg[0], len = sg[1], slot = sg[2], pk = sg[3];
+    const unsigned int plen = SEG_PLEN(pk), win[2] = {0u, SEG_KEEP(pk)};
+    gdn_step_body<true>((gst_t*)Stab[slot], nullptr, P, stride, DT, SA, NW, Y, plen + len, win,
+                        commit, eps, nullptr, 0, (const float*)Htab[slot], Wc, SEG_PR0(pk), plen,
+                        r0);
+}
+
+// Wide prefill (the Coder engine's wide windows, one segment): the recurrence with 8 lanes per
+// value column. A state column S[:, j] evolves on its own given the token's k, q, g, b and
+// v_j, so 8 lanes hold column j (16 state rows a lane) and its dot products are 3-step shuffle
+// reductions: no block barrier per token, a short dependency chain. Block = 64 columns of head
+// blockIdx.x; the block stages a chunk of tokens' conv + SiLU (+ l2 norm for q, k), g and b in
+// shared memory. Writes the raw output o (before the gated norm) to Y; fl_gdn_wide_norm
+// finishes it. Commits the state for all `len` rows (prefill). Not the narrow kernel's
+// summation order (gated by flash-wide-check's KL bar). Grid (GDN_HV, 2), block 512.
+#define GW_C 32
+__device__ __forceinline__ float sum8(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    return v;
+}
+// fl_gdn_wide's per-token inputs, every token in parallel (they don't depend on the state):
+// conv + SiLU of q, k, v, l2 norm of q and k, the decay g and beta b. X row t (GW_XROW floats):
+// q [GDN_HK][128], k [GDN_HK][128], v [GDN_HV][128], g [GDN_HV], b [GDN_HV]. The same
+// arithmetic as the recurrence kernel staged itself (bitwise). Grid n, block 256.
+#define GW_XROW (2 * GDN_HK * 128 + GDN_HV * 128 + 2 * GDN_HV)
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide_prep(
+    const u64* __restrict__ Htab, const float* __restrict__ P, unsigned int stride,
+    const float* __restrict__ DT, const float* __restrict__ SA, const unsigned int* __restrict__ SEG,
+    float eps, const float* __restrict__ Wc, float* __restrict__ X) {
+    __shared__ float xs[2 * GDN_HK * 128];
+    const unsigned int r0 = SEG[0], slot = SEG[2], t = blockIdx.x;
+    const float* H0 = (const float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    float* Xr = X + (u64)t * GW_XROW;
+    const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (unsigned int ch = tid; ch < GDN_CONV; ch += 256) {
+        const float4 w = ((const float4*)Wc)[ch];
+        float e[4];
+        #pragma unroll
+        for (unsigned int q = 0; q < 4; q++) {
+            const unsigned int p = t + q;
+            e[q] = p < 3 ? H0[p * GDN_CONV + ch] : Pr[(u64)(p - 3) * stride + ch];
+        }
+        float acc = e[0] * w.x;
+        acc = __fmaf_rn(e[1], w.y, acc);
+        acc = __fmaf_rn(e[2], w.z, acc);
+        acc = __fmaf_rn(e[3], w.w, acc);
+        const float v = silu(acc);
+        if (ch < 2 * GDN_HK * 128) xs[ch] = v;
+        else Xr[ch] = v;
+    }
+    if (tid < GDN_HV) {
+        const float a = Pr[(u64)t * stride + GDN_A + tid] + DT[tid];
+        const float sp = a > 20.0f ? a : log1pf(expf(a));
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + tid] = expf(sp * SA[tid]);
+        Xr[2 * GDN_HK * 128 + GDN_HV * 128 + GDN_HV + tid] = sigm(Pr[(u64)t * stride + GDN_B + tid]);
+    }
+    __syncthreads();
+    for (unsigned int h = warp; h < 2 * GDN_HK; h += 8) {
+        const float* r = xs + h * 128;
+        const float x0 = r[lane], x1 = r[lane + 32], x2 = r[lane + 64], x3 = r[lane + 96];
+        const float ss = warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
+        const float rs = 1.0f / sqrtf(ss + eps);
+        float* o = Xr + h * 128;
+        o[lane] = x0 * rs; o[lane + 32] = x1 * rs; o[lane + 64] = x2 * rs; o[lane + 96] = x3 * rs;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) fl_gdn_wide(
+    const u64* __restrict__ Stab, const u64* __restrict__ Htab, const float* __restrict__ P,
+    unsigned int stride, const float* __restrict__ DT, const float* __restrict__ SA,
+    float* __restrict__ Y, const unsigned int* __restrict__ SEG, float eps, const float* __restrict__ Wc,
+    const float* __restrict__ X) {
+    __shared__ __align__(16) float sq[GW_C][128];
+    __shared__ __align__(16) float sk[GW_C][128];
+    __shared__ __align__(16) float sv[GW_C][64];
+    __shared__ float sg[GW_C], sb[GW_C];
+    const unsigned int r0 = SEG[0], n = SEG[1], slot = SEG[2];
+    gst_t* S = (gst_t*)Stab[slot];
+    const float* H0 = (const float*)Htab[slot];
+    const float* Pr = P + (u64)r0 * stride;
+    float* Yr = Y + (u64)r0 * GDN_V;
+    const unsigned int hv = blockIdx.x, hk = GDN_KH(hv), tid = threadIdx.x;
+    const unsigned int warp = tid >> 5, lane = tid & 31, sub = lane & 7;
+    const unsigned int jl = (warp * 4 + (lane >> 3)) * 2, j = blockIdx.y * 64 + jl;
+    float st0[16], st1[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
+        st0[i] = gst_ld(&S[o]);
+        st1[i] = gst_ld(&S[o + 1]);
+    }
+    for (unsigned int t0 = 0; t0 < n; t0 += GW_C) {
+        const unsigned int nn = min(n - t0, (unsigned int)GW_C);
+        __syncthreads();
+        // This chunk's inputs from fl_gdn_wide_prep: q, k of head hk, this block's 64 v
+        // columns, g and b of head hv.
+        for (unsigned int i = tid; i < GW_C * 80; i += 256) {
+            const unsigned int t = i / 80, c = i % 80;
+            if (t >= nn) continue;
+            const float* xr = X + (u64)(t0 + t) * GW_XROW;
+            float4 v4;
+            // q, k permuted: row R = sub + 8 i (i = 4 q4 + r) at 32 q4 + 4 sub + r, so a lane's
+            // float4 reads give rows sub + 8 i in i order (afa748e7's rows and sums, bitwise).
+            if (c < 64) {
+                float* dst = c < 32 ? sq[t] : sk[t];
+                const int c4 = c & 31;
+                v4 = ((const float4*)(xr + (c < 32 ? 0 : GDN_HK * 128) + hk * 128))[c4];
+                const float e4[4] = {v4.x, v4.y, v4.z, v4.w};
+                #pragma unroll
+                for (int u = 0; u < 4; u++) {
+                    const int R = 4 * c4 + u, i8 = R >> 3;
+                    dst[32 * (i8 >> 2) + 4 * (R & 7) + (i8 & 3)] = e4[u];
+                }
+            }
+            else { v4 = ((const float4*)(xr + 2 * GDN_HK * 128 + hv * 128 + blockIdx.y * 64))[c - 64]; *(float4*)&sv[t][4 * (c - 64)] = v4; }
+        }
+        if (tid < nn) {
+            const float* xr = X + (u64)(t0 + tid) * GW_XROW + 2 * GDN_HK * 128 + GDN_HV * 128;
+            sg[tid] = xr[hv];
+            sb[tid] = xr[GDN_HV + hv];
+        }
+        __syncthreads();
+        for (unsigned int t = 0; t < nn; t++) {
+            const float g = sg[t];
+            float kk[16];
+            #pragma unroll
+            for (int q4 = 0; q4 < 4; q4++) {
+                const float4 v4 = *(const float4*)&sk[t][32 * q4 + 4 * sub];
+                kk[4 * q4] = v4.x; kk[4 * q4 + 1] = v4.y; kk[4 * q4 + 2] = v4.z; kk[4 * q4 + 3] = v4.w;
+            }
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 2) {
+                st0[i] *= g; st0[i + 1] *= g; st1[i] *= g; st1[i + 1] *= g;
+                p0 = __fmaf_rn(st0[i], kk[i], p0);
+                p1 = __fmaf_rn(st0[i + 1], kk[i + 1], p1);
+                p2 = __fmaf_rn(st1[i], kk[i], p2);
+                p3 = __fmaf_rn(st1[i + 1], kk[i + 1], p3);
+            }
+            const float pa = sum8(p0 + p1), pb = sum8(p2 + p3);
+            const float2 vv = *(const float2*)&sv[t][jl];
+            const float bt = sb[t];
+            const float d0 = (vv.x - pa) * bt, d1 = (vv.y - pb) * bt;
+            float qq[16];
+            #pragma unroll
+            for (int q4 = 0; q4 < 4; q4++) {
+                const float4 v4 = *(const float4*)&sq[t][32 * q4 + 4 * sub];
+                qq[4 * q4] = v4.x; qq[4 * q4 + 1] = v4.y; qq[4 * q4 + 2] = v4.z; qq[4 * q4 + 3] = v4.w;
+            }
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 2) {
+                const float s00 = __fmaf_rn(kk[i], d0, st0[i]);
+                const float s01 = __fmaf_rn(kk[i + 1], d0, st0[i + 1]);
+                const float s10 = __fmaf_rn(kk[i], d1, st1[i]);
+                const float s11 = __fmaf_rn(kk[i + 1], d1, st1[i + 1]);
+                o0 = __fmaf_rn(s00, qq[i], o0);
+                o1 = __fmaf_rn(s01, qq[i + 1], o1);
+                o2 = __fmaf_rn(s10, qq[i], o2);
+                o3 = __fmaf_rn(s11, qq[i + 1], o3);
+                st0[i] = gst_rt(s00);
+                st0[i + 1] = gst_rt(s01);
+                st1[i] = gst_rt(s10);
+                st1[i + 1] = gst_rt(s11);
+            }
+            const float oa = sum8(o0 + o1), ob = sum8(o2 + o3);
+            if (sub == 0)
+                *(float2*)&Yr[(u64)(t0 + t) * GDN_V + hv * 128 + j] = make_float2(oa * INV_SQRT_D, ob * INV_SQRT_D);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const u64 o = ((u64)(sub + 8 * i) * GDN_HV + hv) * 128 + j;
+        gst_st(&S[o], st0[i]);
+        gst_st(&S[o + 1], st1[i]);
+    }
+}
+
+// fl_gdn_wide's gated norm, in place on Y: y = o · rms(o)⁻¹ · w · gate(z). Grid (len, GDN_HV),
+// block 128.
+extern "C" __global__ void fl_gdn_wide_norm(const float* __restrict__ P, unsigned int stride,
+                                            const float* __restrict__ NW, float* __restrict__ Y,
+                                            const unsigned int* __restrict__ SEG, float eps) {
+    __shared__ float red[4];
+    const unsigned int r0 = SEG[0], t = blockIdx.x, hv = blockIdx.y, j = threadIdx.x;
+    if (t >= SEG[1]) return;
+    float* y = Y + (u64)(r0 + t) * GDN_V + hv * 128;
+    const float o = y[j];
+    const float ss = warp_sum(o * o);
+    if ((j & 31) == 0) red[j >> 5] = ss;
+    __syncthreads();
+    const float tot = ((red[0] + red[1]) + red[2]) + red[3];
+    const float rs = 1.0f / sqrtf(tot / 128.0f + eps);
+    y[j] = o * rs * NW[j] * GDN_GATE(P[(u64)(r0 + t) * stride + GDN_Z + hv * 128 + j]);
 }
 
 // fl_gdn_conv_commit per segment (as above). Grid (ceil(GDN_CONV / 256), nseg), block 256.
@@ -1246,14 +1521,15 @@ extern "C" __global__ void fl_gdn_conv_commit_seg(const u64* __restrict__ Htab, 
     unsigned int ch = blockIdx.x * 256 + threadIdx.x;
     if (ch >= GDN_CONV) return;
     float* H0 = (float*)Htab[slot];
-    const float* Pr = P + (u64)r0 * stride;
-    unsigned int n = min(sg[3], len);
+    const unsigned int pk = sg[3], pr0 = SEG_PR0(pk), plen = SEG_PLEN(pk);
+    unsigned int n = min(SEG_KEEP(pk), plen + len);
     float old[3] = {H0[ch], H0[GDN_CONV + ch], H0[2 * GDN_CONV + ch]};
     float nw[3];
     #pragma unroll
     for (unsigned int s = 0; s < 3; s++) {
         unsigned int e = n + s;
-        nw[s] = e < 3 ? old[e] : Pr[(u64)(e - 3) * stride + ch];
+        unsigned int i = e - 3;
+        nw[s] = e < 3 ? old[e] : P[(u64)(i < plen ? pr0 + i : r0 + i - plen) * stride + ch];
     }
     #pragma unroll
     for (unsigned int s = 0; s < 3; s++) H0[s * GDN_CONV + ch] = nw[s];

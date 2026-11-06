@@ -11,6 +11,7 @@ pub mod cli;
 pub mod coder;
 #[cfg(feature = "cuda")]
 pub mod coder_kernels;
+pub mod coder_mtp;
 pub mod deepseek;
 #[cfg(feature = "cuda")]
 pub mod engine;
@@ -34,6 +35,8 @@ pub mod serve;
 #[cfg(feature = "cuda")]
 pub mod split;
 pub mod tokenize;
+pub mod tcx;
+pub mod tree;
 
 use crate::gguf::{Gguf, TensorInfo};
 use anyhow::Result;
