@@ -68,6 +68,7 @@ fn main() {
     let rank = shape.len() - 1; // [n, 1, dv]
     let pts: Vec<usize> = shape[..rank].iter().map(|x| x.n()).collect();
     let slot = |s: i64| View {
+        gather: None,
         guard: false,
         forms: (0..rank)
             .map(|dd| Form::unit(rank, dd))

@@ -1442,6 +1442,7 @@ impl TensorGraph {
         let inner = super::View {
             forms: inner,
             guard: ra.view.guard,
+            gather: None,
         };
         let comp = |a: &super::Arg| super::Arg {
             src: a.src,
