@@ -1022,6 +1022,7 @@ pub mod ir_gpu {
         let v = g.input(&[n]);
         let bc = g.input(&[2]);
         let bc_view = |k: i64| View {
+            gather: None,
             guard: false,
             forms: vec![Form {
                 coefs: vec![0],
@@ -1476,6 +1477,7 @@ pub mod ir_gpu {
             let x = g.input(&[ci, t]);
             let w = g.input(&[co, ci, k]);
             let xv = View {
+                gather: None,
                 forms: vec![
                     Form::unit(4, 2),
                     Form {
@@ -1803,7 +1805,11 @@ pub mod ir_gpu {
                         vec![
                             Arg {
                                 src: x,
-                                view: View { forms, guard: true },
+                                view: View {
+                                    gather: None,
+                                    forms,
+                                    guard: true,
+                                },
                             },
                             Arg {
                                 src: w,
@@ -1971,10 +1977,12 @@ pub mod ir_gpu {
                 f
             };
             let xv = View {
+                gather: None,
                 forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
                 guard: true,
             };
             let wv = View {
+                gather: None,
                 forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
                 guard: false,
             };
@@ -2234,6 +2242,7 @@ pub mod ir_block {
             Arg {
                 src: b,
                 view: View {
+                    gather: None,
                     guard: false,
                     forms: vec![unit(rank, 1)],
                 },
@@ -2278,10 +2287,12 @@ pub mod ir_block {
         // which is what makes the block differentiable through rope.
         let x = g.reshape(x, &[seq, heads, half, 2]).unwrap();
         let xv = |parity: i64| View {
+            gather: None,
             guard: false,
             forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
         };
         let tv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(3, 0), unit(3, 2)],
         };
@@ -2418,6 +2429,7 @@ pub mod ir_block {
                 let k4 = g.reshape(k_cache, &[kv_len, n_kv_heads, half, 2]).unwrap();
                 let halves = [0i64, 1].map(|parity| {
                     let view = View {
+                        gather: None,
                         guard: false,
                         forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
                     };
@@ -2447,10 +2459,12 @@ pub mod ir_block {
         let qe = g.reshape(qe, &[seq, groups, per_group, half]).unwrap();
         let qo = g.reshape(qo, &[seq, groups, per_group, half]).unwrap();
         let qv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(r5, 2), unit(r5, 0), unit(r5, 1), unit(r5, 4)],
         };
         let kv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
         };
@@ -2489,6 +2503,7 @@ pub mod ir_block {
                     Arg {
                         src: mask,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(r4, 2), unit(r4, 3)],
                         },
@@ -2513,6 +2528,7 @@ pub mod ir_block {
                     Arg {
                         src: p,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)],
                         },
@@ -2520,6 +2536,7 @@ pub mod ir_block {
                     Arg {
                         src: v3,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 4), unit(5, 0), unit(5, 3)],
                         },
@@ -2536,6 +2553,7 @@ pub mod ir_block {
                 vec![Arg {
                     src: l,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![
                             unit(4, 0),
@@ -2567,6 +2585,7 @@ pub mod ir_block {
                     Arg {
                         src: y,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 2), unit(5, 3), unit(5, 0), unit(5, 4)],
                         },
@@ -2574,6 +2593,7 @@ pub mod ir_block {
                     Arg {
                         src: wo4,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 1), unit(5, 2), unit(5, 3), unit(5, 4)],
                         },
@@ -2627,6 +2647,7 @@ pub mod ir_block {
                 Arg {
                     src: b,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![unit(2, 1)],
                     },
@@ -3396,6 +3417,62 @@ pub mod ir_block_gpu {
                     .fold(0.0f32, f32::max);
                 eprintln!("grad {k}: max err {err} (scale {scale})");
                 assert!(err < 2e-3 * scale.max(1.0), "grad {k} diverges");
+            }
+        }
+
+        /// The derived attention forward + backward with S = Q·Kᵀ and
+        /// dP = dO·Vᵀ nested in the dQ/dK/dV tiles (`to_wgsl`'s default)
+        /// writes no n×n buffer and matches the f64 interpreter.
+        #[test]
+        fn derived_attention_backward_nested_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (n, d) = (256, 32);
+            for (score, mask) in [
+                ("s", "j <= i"),
+                ("30*tanh(s/30)", "j <= i || j < 16"),
+                ("s", ""),
+            ] {
+                let v = tang_derive_wasm::parse_variant(score, mask).unwrap();
+                let (g, outs) = tang_derive_wasm::naive_graph(&v, n, d, true).unwrap();
+                let mut rng = crate::Rng::new(53);
+                let inputs: Vec<Vec<f32>> = (0..4)
+                    .map(|_| (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect())
+                    .collect();
+                let f64_inputs: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|x| *x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64_inputs, &outs);
+                let (dg, douts) = tang_derive_wasm::derive_graph(&g, &outs);
+                let program = dg.to_wgsl(&douts);
+                let nxn = program
+                    .buffers
+                    .iter()
+                    .filter(|b| b.input.is_none() && b.len >= n * n)
+                    .count();
+                assert_eq!(nxn, 0, "{score} / {mask}: backward writes n×n");
+                let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+                let exe = Executable::new(&device, program, &ins);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                for (k, (o, w)) in douts.iter().zip(&want).enumerate() {
+                    let got = exe.read(&device, *o);
+                    let scale = w.iter().fold(0.0f64, |m, v| m.max(v.abs())) as f32;
+                    let err = got
+                        .iter()
+                        .zip(w)
+                        .map(|(a, b)| (a - *b as f32).abs())
+                        .fold(0.0f32, f32::max);
+                    eprintln!("{score} / {mask}: grad {k} max err {err} (scale {scale})");
+                    assert!(
+                        err < 2e-3 * scale.max(1.0),
+                        "{score} / {mask}: grad {k} diverges"
+                    );
+                }
             }
         }
 

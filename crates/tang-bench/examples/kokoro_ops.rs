@@ -64,7 +64,11 @@ fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
 }
 
 fn view(forms: Vec<Form>, guard: bool) -> View {
-    View { forms, guard }
+    View {
+        gather: None,
+        forms,
+        guard,
+    }
 }
 
 fn arg(src: TensorId, view: View) -> Arg {

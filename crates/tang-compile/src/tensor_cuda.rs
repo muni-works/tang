@@ -1460,6 +1460,7 @@ impl TensorGraph {
             let pv = sa.view.compose(&outer.view, rank);
             let inner = super::View {
                 guard: false,
+                gather: None,
                 forms: pv
                     .forms
                     .iter()

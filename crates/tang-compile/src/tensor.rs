@@ -45,6 +45,9 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
+#[cfg(test)]
+#[path = "tensor_gather_tests.rs"]
+mod gather_tests;
 /// Vulkan decode lowering: the decode kernels as GLSL (SPIR-V passthrough).
 #[path = "tensor_glsl_gemv.rs"]
 pub mod glsl_gemv;
@@ -172,6 +175,22 @@ pub struct View {
     /// zero padding as a view. The guard travels with the leaf read through
     /// composition, and a gradient through it scatters only in range.
     pub guard: bool,
+    /// Data-dependent addressing: source coordinate `d` is
+    /// `forms[d] + gather.coefs[d] · round(args[gather.arg])`, the value of a
+    /// sibling arg of the same comp (an integer-valued index tensor read
+    /// through its own affine view). `None` for a plain affine view.
+    pub gather: Option<Gather>,
+}
+
+/// The data-dependent term of a [`View`]: the index is the value of arg
+/// `arg` of the comp that owns the view (at the same point), scaled per
+/// source dim by `coefs`. Referencing a sibling arg rather than a tensor
+/// keeps dependency tracking and node renumbering free: the index tensor is
+/// an ordinary arg. The index arg's own view must be affine (no nesting).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Gather {
+    pub arg: usize,
+    pub coefs: Vec<i64>,
 }
 
 impl View {
@@ -185,7 +204,22 @@ impl View {
         Self {
             forms,
             guard: false,
+            gather: None,
         }
+    }
+
+    /// Source dim `dim` (of `src_rank`) reads `scale · index + forms[dim]`
+    /// where the index is the value of arg `arg`; the other forms are kept.
+    pub fn gather(mut self, dim: usize, arg: usize, scale: i64) -> Self {
+        let mut coefs = vec![0; self.forms.len()];
+        coefs[dim] = scale;
+        self.gather = Some(Gather { arg, coefs });
+        self
+    }
+
+    /// Whether this view addresses its source through an index arg.
+    pub fn is_gather(&self) -> bool {
+        self.gather.is_some()
     }
 
     /// Identity over the first `src_rank` coordinates of a `rank`-dim space.
@@ -197,23 +231,31 @@ impl View {
         self.forms.first().map_or(0, |f| f.coefs.len())
     }
 
-    fn coords(&self, idx: &[usize]) -> Vec<usize> {
-        self.forms.iter().map(|f| f.eval(idx) as usize).collect()
+    /// Signed source coordinates; `index` is the gather arg's value (ignored
+    /// for an affine view).
+    fn coords_signed(&self, idx: &[usize], index: f64) -> Vec<i64> {
+        let g = index.round() as i64;
+        self.forms
+            .iter()
+            .enumerate()
+            .map(|(d, f)| f.eval(idx) + self.gather.as_ref().map_or(0, |ga| ga.coefs[d] * g))
+            .collect()
     }
 
     /// Coordinates in `shape`, or `None` when a guarded read falls outside.
-    fn coords_in(&self, idx: &[usize], shape: &[usize]) -> Option<Vec<usize>> {
-        if !self.guard {
-            return Some(self.coords(idx));
-        }
-        self.forms
+    /// An unguarded read outside the source is a caller bug (affine views
+    /// are range-checked at construction; gathered ones cannot be).
+    fn coords_in(&self, idx: &[usize], shape: &[usize], index: f64) -> Option<Vec<usize>> {
+        let cs = self.coords_signed(idx, index);
+        let inside = cs
             .iter()
             .zip(shape)
-            .map(|(f, &n)| {
-                let c = f.eval(idx);
-                (0..n as i64).contains(&c).then_some(c as usize)
-            })
-            .collect()
+            .all(|(&c, &n)| (0..n as i64).contains(&c));
+        if !inside {
+            assert!(self.guard, "unguarded read {cs:?} outside source {shape:?}");
+            return None;
+        }
+        Some(cs.into_iter().map(|c| c as usize).collect())
     }
 
     /// A view that may read outside its source; out-of-range reads are 0.
@@ -224,7 +266,27 @@ impl View {
 
     /// `self ∘ inner`: this view is over a space whose coordinates are
     /// given by `inner` over a `rank`-dim space.
+    ///
+    /// A gather on either side carries through, its `arg` still indexing
+    /// the args of the comp that owned it: the caller remaps it (see
+    /// [`splice_arg`]). An inner gather scales through `self`'s forms (a
+    /// data-dependent coordinate is still added linearly); both sides
+    /// gathering would nest one index read inside another and panics —
+    /// callers check [`View::is_gather`] first.
     fn compose(&self, inner: &View, rank: usize) -> View {
+        let gather = match (&self.gather, &inner.gather) {
+            (None, None) => None,
+            (Some(g), None) => Some(g.clone()),
+            (None, Some(gi)) => Some(Gather {
+                arg: gi.arg,
+                coefs: self
+                    .forms
+                    .iter()
+                    .map(|f| f.coefs.iter().zip(&gi.coefs).map(|(a, b)| a * b).sum())
+                    .collect(),
+            }),
+            (Some(_), Some(_)) => panic!("nested gather in view composition"),
+        };
         View {
             // one side is always a plain view: either a guarded leaf read
             // pushed through an unguarded consumer, or the reverse
@@ -234,6 +296,7 @@ impl View {
                 .iter()
                 .map(|f| f.compose(&inner.forms, rank))
                 .collect(),
+            gather,
         }
     }
 
@@ -244,8 +307,9 @@ impl View {
     /// `src`. A reshape that splits a source dim across destination dims
     /// (`[s, d] -> [s*d]`) is not affine (it needs `/` and `%`): `None`.
     pub fn through_reshape(&self, dst: &[Dim], src: &[Dim]) -> Option<View> {
-        // a guard bounds the reshape's coords, not the source's
-        if self.guard {
+        // a guard bounds the reshape's coords, not the source's; a gather
+        // would need its coefs re-strided too (not done)
+        if self.guard || self.is_gather() {
             return None;
         }
         let dst: Vec<usize> = dst.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
@@ -280,6 +344,7 @@ impl View {
         (d == dst.len()).then_some(View {
             forms,
             guard: false,
+            gather: None,
         })
     }
 
@@ -472,6 +537,20 @@ impl Comp {
 
     fn space(&self) -> Vec<Dim> {
         self.points().iter().chain(&self.red).copied().collect()
+    }
+
+    /// Whether any arg addresses its source through an index arg. Passes
+    /// that drop, reorder or split args leave such comps alone.
+    pub fn has_gather(&self) -> bool {
+        self.args.iter().any(|a| a.view.is_gather())
+    }
+
+    /// Args read as gather indices (by some other arg's view).
+    fn index_args(&self) -> Vec<usize> {
+        self.args
+            .iter()
+            .filter_map(|a| a.view.gather.as_ref().map(|g| g.arg))
+            .collect()
     }
 }
 
@@ -705,6 +784,12 @@ impl TensorGraph {
         if c.width() <= 8 {
             out.push((256, (0, 0, 0), (1, 1)));
         }
+        // tiles stage affine regions of their operands; a gathered read
+        // has no region to stage (one thread per point, or a split, only)
+        let root = self.comp_at(t.n()).unwrap();
+        if c.has_gather() || root.has_gather() {
+            return out;
+        }
         if tileable_red(&c.red) {
             let pts = fixed(c.points());
             let (ax, ay) = tile_axes(&pts);
@@ -882,9 +967,28 @@ impl TensorGraph {
                     a.view.rank()
                 ));
             }
+            if let Some(g) = &a.view.gather {
+                let ok = g.coefs.len() == src.len()
+                    && comp
+                        .args
+                        .get(g.arg)
+                        .is_some_and(|ia| ia.view.gather.is_none());
+                if !ok {
+                    return err(format!(
+                        "arg {i}: gather through arg {} must name an affine sibling, {} coefs",
+                        g.arg,
+                        src.len()
+                    ));
+                }
+            }
             let bound: Option<Vec<usize>> = space.iter().map(|d| d.fixed()).collect();
             if let (Some(space), false) = (bound, a.view.guard) {
-                for (f, &n) in a.view.forms.iter().zip(src) {
+                let gathered = |d: usize| a.view.gather.as_ref().is_some_and(|g| g.coefs[d] != 0);
+                for (d, (f, &n)) in a.view.forms.iter().zip(src).enumerate() {
+                    // a data-dependent coordinate cannot be range-checked
+                    if gathered(d) {
+                        continue;
+                    }
                     let (lo, hi) = f.range(&space);
                     if lo < 0 || n.fixed().is_some_and(|n| hi >= n as i64) {
                         return err(format!("arg {i}: view reaches {lo}..={hi}, dim is {n}"));
@@ -1044,6 +1148,48 @@ impl TensorGraph {
         })
     }
 
+    /// `out[i…, j…] = src[…, round(index[i…]), …]`: dim `dim` of `src`
+    /// addressed through `index` (an integer-valued tensor), the other
+    /// source dims kept in order after the index dims. An embedding
+    /// lookup is `gather(table, 0, ids)`. Sugar over a comp with a
+    /// gathered view; `guard` makes out-of-range indices (a `-1` pad) read
+    /// 0 instead of being undefined.
+    pub fn gather(
+        &mut self,
+        src: TensorId,
+        dim: usize,
+        index: TensorId,
+        guard: bool,
+    ) -> Result<TensorId, ShapeError> {
+        let s = self.shape(src).to_vec();
+        let ix = self.shape(index).to_vec();
+        if dim >= s.len() {
+            return err(format!("gather dim {dim} of {s:?}"));
+        }
+        let k = ix.len();
+        let rest: Vec<usize> = (0..s.len()).filter(|&d| d != dim).collect();
+        let out: Vec<Dim> = ix
+            .iter()
+            .copied()
+            .chain(rest.iter().map(|&d| s[d]))
+            .collect();
+        let rank = out.len();
+        let mut picks: Vec<Option<usize>> = vec![None; s.len()];
+        for (j, &d) in rest.iter().enumerate() {
+            picks[d] = Some(k + j);
+        }
+        let mut view = View::pick(rank, &picks).gather(dim, 1, 1);
+        view.guard = guard;
+        let args = vec![
+            Arg { src, view },
+            Arg {
+                src: index,
+                view: View::identity(rank, k),
+            },
+        ];
+        self.comp(&out, &[], args, None, |v| vec![v[0]])
+    }
+
     // -- analysis -----------------------------------------------------------
 
     pub fn comp_at(&self, i: usize) -> Option<&Comp> {
@@ -1098,8 +1244,9 @@ impl TensorGraph {
         let mut points: Vec<Option<Form>> = vec![None; pk];
         let mut fallback: Option<Vec<Form>> = None;
         for a in c.args.iter().filter(|a| a.src.n() == p) {
-            // a guarded read is 0 outside: not the accumulator
-            if a.view.guard {
+            // a guarded read is 0 outside: not the accumulator; a gathered
+            // one reads some other point's accumulator
+            if a.view.guard || a.view.is_gather() {
                 return None;
             }
             let (pt, state) = a.view.forms.split_at(pk);
@@ -1332,7 +1479,7 @@ impl TensorGraph {
                 }
             }
         }
-        let inline: Vec<bool> = (0..n)
+        let candidate: Vec<bool> = (0..n)
             .map(|i| {
                 self.comp_at(i).is_some_and(|c| {
                     c.red.is_empty()
@@ -1344,6 +1491,8 @@ impl TensorGraph {
                 })
             })
             .collect();
+        let pinned = self.gather_pins(&live, &candidate);
+        let inline: Vec<bool> = (0..n).map(|i| candidate[i] && !pinned[i]).collect();
 
         let mut ng = TensorGraph {
             nodes: Vec::new(),
@@ -1365,11 +1514,7 @@ impl TensorGraph {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
                     let mut args: Vec<Arg> = Vec::new();
-                    let vars: Vec<ExprId> = c
-                        .args
-                        .iter()
-                        .map(|a| self.splice(a, rank, &inline, &remap, &mut body, &mut args))
-                        .collect();
+                    let vars = self.splice_args(c, rank, &inline, &remap, &mut body, &mut args);
                     let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
                     Op::Comp(Comp {
                         out: c.out.clone(),
@@ -1408,7 +1553,7 @@ impl TensorGraph {
     fn effective(&self, i: usize) -> Option<Comp> {
         let c = self.comp_at(i)?;
         let n = self.nodes.len();
-        let inline: Vec<bool> = (0..n)
+        let candidate: Vec<bool> = (0..n)
             .map(|j| {
                 j != i
                     && self
@@ -1416,15 +1561,13 @@ impl TensorGraph {
                         .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
             })
             .collect();
+        let pinned = self.gather_pins(&vec![true; n], &candidate);
+        let inline: Vec<bool> = (0..n).map(|j| candidate[j] && !pinned[j]).collect();
         let remap: Vec<Option<usize>> = (0..n).map(Some).collect();
         let rank = c.rank();
         let mut body = ExprGraph::new();
         let mut args: Vec<Arg> = Vec::new();
-        let vars: Vec<ExprId> = c
-            .args
-            .iter()
-            .map(|a| self.splice(a, rank, &inline, &remap, &mut body, &mut args))
-            .collect();
+        let vars = self.splice_args(c, rank, &inline, &remap, &mut body, &mut args);
         let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
         Some(Comp {
             out: c.out.clone(),
@@ -1437,8 +1580,101 @@ impl TensorGraph {
         })
     }
 
+    /// Maps that must stay materialized because of gathers, given the
+    /// substitution candidates:
+    ///
+    /// - an index tensor (read as some gather's index) is a leaf: the
+    ///   address needs a value in memory, not an expression;
+    /// - a map that itself gathers, when it is read through a gathered
+    ///   view (directly, or through a chain of candidate maps): inlining it
+    ///   would make an index read data-dependent, a nested gather.
+    ///
+    /// Everything else fuses: an affine map read through a gather has the
+    /// gather pushed into its args, and a gathering map read affinely
+    /// carries its gather (and its index arg) into the reader.
+    fn gather_pins(&self, live: &[bool], candidate: &[bool]) -> Vec<bool> {
+        let n = self.nodes.len();
+        let mut pinned = vec![false; n];
+        let mut gathered_read = vec![false; n];
+        // readers sit after their producers: one descending sweep
+        for r in (0..n).rev().filter(|&r| live[r]) {
+            let Some(c) = self.comp_at(r) else { continue };
+            for &k in &c.index_args() {
+                pinned[c.args[k].src.n()] = true;
+            }
+            for a in &c.args {
+                if a.view.is_gather() || (candidate[r] && gathered_read[r]) {
+                    gathered_read[a.src.n()] = true;
+                }
+            }
+        }
+        for p in 0..n {
+            if gathered_read[p] && self.comp_at(p).is_some_and(Comp::has_gather) {
+                pinned[p] = true;
+            }
+        }
+        pinned
+    }
+
+    /// Splice every arg of `c` (see [`splice`](Self::splice)): index args
+    /// first, as leaves, so gathered args can name their new positions.
+    fn splice_args(
+        &self,
+        c: &Comp,
+        rank: usize,
+        inline: &[bool],
+        remap: &[Option<usize>],
+        body: &mut ExprGraph,
+        args: &mut Vec<Arg>,
+    ) -> Vec<ExprId> {
+        let resolved = self.resolve_gathers(&c.args, |a| a.clone(), inline, remap, args);
+        resolved
+            .iter()
+            .map(|a| self.splice(a, rank, inline, remap, body, args))
+            .collect()
+    }
+
+    /// `own` (one comp's args) with each view mapped by `view_of` and every
+    /// gather's `arg` renumbered into `args`, where the index args are
+    /// interned as leaves (they are pinned: never inlined).
+    fn resolve_gathers(
+        &self,
+        own: &[Arg],
+        view_of: impl Fn(&Arg) -> Arg,
+        inline: &[bool],
+        remap: &[Option<usize>],
+        args: &mut Vec<Arg>,
+    ) -> Vec<Arg> {
+        let mut leaf_of: HashMap<usize, usize> = HashMap::new();
+        for a in own {
+            let Some(g) = &a.view.gather else { continue };
+            if leaf_of.contains_key(&g.arg) {
+                continue;
+            }
+            let ia = view_of(&own[g.arg]);
+            assert!(!inline[ia.src.n()], "gather index tensors are pinned");
+            let leaf = Arg {
+                src: TensorId(remap[ia.src.n()].unwrap() as u32),
+                view: ia.view,
+            };
+            leaf_of.insert(g.arg, intern_arg(args, leaf));
+        }
+        own.iter()
+            .map(|a| {
+                let mut m = view_of(a);
+                // only `a`'s own gather is renumbered here; one inherited
+                // through `view_of` (the reader's) is already resolved
+                if let (Some(g), Some(own_g)) = (&mut m.view.gather, &a.view.gather) {
+                    g.arg = leaf_of[&own_g.arg];
+                }
+                m
+            })
+            .collect()
+    }
+
     /// Expression for `arg` inside a consumer of iteration rank `rank`:
-    /// either a leaf var or the producer map's body, recursively.
+    /// either a leaf var or the producer map's body, recursively. A gather
+    /// in `arg`'s view already names its index arg's position in `args`.
     fn splice(
         &self,
         arg: &Arg,
@@ -1471,16 +1707,22 @@ impl TensorGraph {
             return body.var(intern_arg(args, leaf) as u16);
         }
         let c = self.comp_at(p).unwrap();
-        let vars: Vec<ExprId> = c
-            .args
+        // the reader's view pushed into each of the map's args; the map's
+        // own gathers (only when the read is affine: see `gather_pins`)
+        // renumbered onto its index args, interned as leaves
+        let composed = self.resolve_gathers(
+            &c.args,
+            |a| Arg {
+                src: a.src,
+                view: a.view.compose(&arg.view, rank),
+            },
+            inline,
+            remap,
+            args,
+        );
+        let vars: Vec<ExprId> = composed
             .iter()
-            .map(|a| {
-                let composed = Arg {
-                    src: a.src,
-                    view: a.view.compose(&arg.view, rank),
-                };
-                self.splice(&composed, rank, inline, remap, body, args)
-            })
+            .map(|a| self.splice(a, rank, inline, remap, body, args))
             .collect();
         replay(&c.body, &c.body_outs, &vars, body)[0]
     }
@@ -1516,6 +1758,11 @@ impl TensorGraph {
     /// exactly the expression `s` of `c`'s body? Returns `s`'s canonical form.
     fn is_row_max_of(&self, c: &Comp, s: ExprId, m_arg: &Arg) -> Option<Canon> {
         let mc = &self.effective(m_arg.src.n())?;
+        // gathers name arg positions, which differ between `c` and `mc`;
+        // the softmax rewrite (which re-interns args) leaves them alone
+        if mc.has_gather() || c.has_gather() || m_arg.view.is_gather() {
+            return None;
+        }
         let n_out = c.points().len();
         let structural = mc.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Max)
             && mc.tuple == 0
@@ -1637,6 +1884,7 @@ impl TensorGraph {
             // slot 0: s, from the max's own body, re-indexed into the fused space
             let m_ext = View {
                 guard: false,
+                gather: None,
                 forms: (0..=m_out)
                     .map(|d| Form::unit(fused_rank, if d == m_out { m_out + e } else { d }))
                     .collect(),
@@ -1661,6 +1909,7 @@ impl TensorGraph {
                 let slot = outs.len() as i64;
                 let inv = View {
                     guard: false,
+                    gather: None,
                     forms: (0..c.rank())
                         .map(|d| match reads.get(d) {
                             Some(Some(j)) => Form::unit(fused_rank, *j),
@@ -1716,6 +1965,7 @@ impl TensorGraph {
                     mem.node,
                     View {
                         guard: false,
+                        gather: None,
                         forms: proj,
                     },
                 ));
@@ -1746,6 +1996,7 @@ impl TensorGraph {
             if !is_output(m_node) {
                 let proj = View {
                     guard: false,
+                    gather: None,
                     forms: (0..m_out)
                         .map(|d| Form::unit(m_out, d))
                         .chain((0..=e).map(|_| Form::zero(m_out)))
@@ -2053,6 +2304,14 @@ impl TensorGraph {
         for i in reductions {
             // schedule by the reduction's shape, even when `i` is its epilogue
             let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
+            // tiles stage affine operand regions: a gathered read gets the
+            // split (or one thread per point), never a tile
+            if c.has_gather() || self.comp_at(i).unwrap().has_gather() {
+                if numel(c.points()) < MANY_POINTS && c.width() <= 8 {
+                    self.nodes[i].split = 256;
+                }
+                continue;
+            }
             let pts = fixed(c.points());
             let (lane_dim, row_dim) = tile_axes(&pts);
             let lanes = lane_dim.map_or(1, |d| pts[d]);
@@ -2115,10 +2374,25 @@ impl TensorGraph {
     /// over the head dim, `dP = dO·Vᵀ`) whose every reader is a tile, or
     /// a map recomputed in tiles, is inlined: a tile lowering that can
     /// run it as a small GEMM per staged block (CUDA `mma`) recomputes it
-    /// instead of reading it back. For lowerings without nested GEMMs
-    /// this is a scalar loop per element, so only targets with one call
-    /// it (after [`schedule_auto`](Self::schedule_auto)).
+    /// instead of reading it back. The scalar tiled lowering (WGSL, MSL)
+    /// computes it as a dot per element of the shared comp it feeds, once
+    /// per chunk into workgroup memory; see
+    /// [`schedule_nested_contractions_scalar`](Self::schedule_nested_contractions_scalar).
+    /// Applied by the GPU lowerings, after [`schedule_auto`](Self::schedule_auto).
     pub fn schedule_nested_contractions(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, false);
+    }
+
+    /// [`schedule_nested_contractions`](Self::schedule_nested_contractions)
+    /// for the scalar tiled lowering (WGSL, MSL): also nests through a
+    /// tile's epilogue-inlined reduction, and reshapes each tile that
+    /// recomputes a nested contraction to more rows per workgroup.
+    pub fn schedule_nested_contractions_scalar(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, true);
+    }
+
+    fn nest_contractions(&mut self, outputs: &[TensorId], scalar: bool) {
+        let mut nested: Vec<usize> = Vec::new();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
@@ -2128,6 +2402,15 @@ impl TensorGraph {
                 readers[d].push(j);
             }
         }
+        // The scalar lowering also reads through a tile's own reduction,
+        // inlined under its epilogue map (flash backward's dK = (Σ dS·Q)·c).
+        let mut tile = vec![false; n];
+        for j in (0..n).filter(|&j| live[j] && self.nodes[j].tile.0 > 0) {
+            tile[j] = true;
+            if let Some(r) = self.tiled_reduction(j).filter(|_| scalar) {
+                tile[r] = true;
+            }
+        }
         // a map that is inline and read only by tiles (or such maps)
         let mut tiled_map = vec![false; n];
         for j in (0..n).rev().filter(|&j| live[j]) {
@@ -2135,9 +2418,7 @@ impl TensorGraph {
             tiled_map[j] = map
                 && self.nodes[j].inline
                 && !readers[j].is_empty()
-                && readers[j]
-                    .iter()
-                    .all(|&r| self.nodes[r].tile.0 > 0 || tiled_map[r]);
+                && readers[j].iter().all(|&r| tile[r] || tiled_map[r]);
         }
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
@@ -2146,7 +2427,7 @@ impl TensorGraph {
             if !sum || !short || c.tuple != 0 || c.width() != 1 || readers[i].is_empty() {
                 continue;
             }
-            let direct = |r: usize| self.nodes[r].tile.0 > 0;
+            let direct = |r: usize| tile[r];
             if !readers[i].iter().all(|&r| tiled_map[r] || direct(r)) {
                 continue;
             }
@@ -2162,6 +2443,30 @@ impl TensorGraph {
             self.nodes[i].inline = true;
             self.nodes[i].tile = (0, 0, 0);
             self.nodes[i].split = 0;
+            nested.push(i);
+        }
+        if !scalar {
+            return;
+        }
+        // A tile that recomputes a nested contraction computes it per
+        // chunk for each of its rows: give it rows enough to fill the
+        // workgroup (16 rows × 16 threads of 4 lanes) rather than 4 rows
+        // of 64 lanes, where most threads would idle through the dots.
+        let tiles: Vec<usize> = (0..n)
+            .filter(|&t| live[t] && self.nodes[t].tile.0 > 0)
+            .collect();
+        for t in tiles {
+            let (bx, by, _) = self.nodes[t].tile;
+            let (rx, ry) = self.nodes[t].reg;
+            let (lanes, rows) = (bx * rx.max(1), by * ry.max(1));
+            if rows >= 16 || lanes < 64 || lanes % 4 != 0 {
+                continue;
+            }
+            if !self.inline_closure(t).iter().any(|j| nested.contains(j)) {
+                continue;
+            }
+            self.nodes[t].tile = (lanes / 4, 256 / (lanes / 4), 16);
+            self.nodes[t].reg = (4, 1);
         }
     }
 
@@ -2230,7 +2535,9 @@ impl TensorGraph {
                             .forms
                             .iter()
                             .map(|f| (f.coefs.clone(), f.offset))
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>(),
+                        a.view.guard,
+                        &a.view.gather,
                     ))
                     .collect::<Vec<_>>(),
                 c.body.nodes_slice(),
@@ -2287,6 +2594,11 @@ impl TensorGraph {
         // which consumer dim each producer point dim is picked from, when
         // the view is a pick
         let picks_of = |view: &View, kp: usize| -> Option<Vec<Option<usize>>> {
+            // a gathered read addresses the producer by data: its layout
+            // is pinned (the gather's coefs name source dims)
+            if view.is_gather() {
+                return None;
+            }
             view.forms[..kp]
                 .iter()
                 .map(|f| {
@@ -2369,6 +2681,7 @@ impl TensorGraph {
                 cm.args[k].view = View {
                     forms,
                     guard: cm.args[k].view.guard,
+                    gather: None,
                 };
             }
         }
@@ -2430,6 +2743,7 @@ impl TensorGraph {
                             })
                             .collect(),
                         guard: a.view.guard,
+                        gather: a.view.gather.clone(),
                     },
                 })
                 .collect();
@@ -2476,6 +2790,7 @@ impl TensorGraph {
                             view: View {
                                 forms,
                                 guard: false,
+                                gather: None,
                             },
                         }
                     })
@@ -2525,6 +2840,9 @@ impl TensorGraph {
         // are reads all the same for a kernel: drop them
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
             let Some(c) = self.comp_at(i) else { continue };
+            if c.has_gather() {
+                continue;
+            }
             let mut used = vec![false; c.args.len()];
             for &o in &c.body_outs {
                 for v in vars_reachable(&c.body, o) {
@@ -2561,7 +2879,7 @@ impl TensorGraph {
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
             let Some(c) = pruned.comp_at(i) else { continue };
             let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
-            if !sum || c.tuple != 0 || c.width() != 1 || c.red.is_empty() {
+            if !sum || c.tuple != 0 || c.width() != 1 || c.red.is_empty() || c.has_gather() {
                 continue;
             }
             let k = c.points().len();
@@ -2570,6 +2888,7 @@ impl TensorGraph {
             // they do not read them)
             let point_view = |v: &View| View {
                 guard: v.guard,
+                gather: v.gather.clone(),
                 forms: v
                     .forms
                     .iter()
@@ -2709,7 +3028,7 @@ impl TensorGraph {
                         .map(|a| {
                             // a guarded read's bounds are per source dim
                             let reads = a.view.depends_on(outer) || a.view.depends_on(inner);
-                            if a.view.guard && reads {
+                            if (a.view.guard || a.view.is_gather()) && reads {
                                 return None;
                             }
                             // a map over a contraction just as big (P̃ =
@@ -2752,6 +3071,7 @@ impl TensorGraph {
                         view: View {
                             forms,
                             guard: a.view.guard,
+                            gather: a.view.gather.clone(),
                         },
                     });
                 }
@@ -2868,6 +3188,7 @@ impl TensorGraph {
             let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
             if c.tuple != 0
                 || c.width() != 1
+                || c.has_gather()
                 || readers.is_empty()
                 || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
             {
@@ -3031,6 +3352,7 @@ impl TensorGraph {
                         src: a.src,
                         view: View {
                             guard: false,
+                            gather: a.view.gather.clone(),
                             forms: a
                                 .view
                                 .forms
@@ -3089,6 +3411,7 @@ impl TensorGraph {
         let rank = shape.len() - 1;
         let slot_view = |s: usize| View {
             guard: false,
+            gather: None,
             forms: (0..rank)
                 .map(|d| Form::unit(rank, d))
                 .chain([Form::constant(rank, s as i64)])
@@ -3327,12 +3650,19 @@ impl Evaluator<'_> {
         let base = idx.len();
         idx.extend(std::iter::repeat_n(0, c.red.len()));
         let mut body_at = |idx: &[usize], elem: &mut [f64]| {
-            for (j, a) in c.args.iter().enumerate() {
-                let shape = fixed(&self.g.nodes[a.src.n()].shape);
-                arg_vals[j] = match a.view.coords_in(idx, &shape) {
-                    Some(at) => self.read(a.src, &at),
-                    None => 0.0,
-                };
+            // affine args first: gathered args read their index from them
+            for gathered in [false, true] {
+                for (j, a) in c.args.iter().enumerate() {
+                    if a.view.is_gather() != gathered {
+                        continue;
+                    }
+                    let index = a.view.gather.as_ref().map_or(0.0, |g| arg_vals[g.arg]);
+                    let shape = fixed(&self.g.nodes[a.src.n()].shape);
+                    arg_vals[j] = match a.view.coords_in(idx, &shape, index) {
+                        Some(at) => self.read(a.src, &at),
+                        None => 0.0,
+                    };
+                }
             }
             (k.body)(&arg_vals, elem);
         };
@@ -3860,6 +4190,7 @@ mod tests {
                     src: r,
                     view: View {
                         guard: false,
+                        gather: None,
                         forms: vec![
                             Form::unit(2, 0),
                             Form {
@@ -4104,6 +4435,7 @@ mod tests {
         let (co, k) = (g.shape(w)[0].n(), g.shape(w)[2].n());
         // space: (o, t, c, k)
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(4, 2),
                 Form {
@@ -4292,6 +4624,7 @@ mod tests {
         let mut g = TensorGraph::new();
         let x = g.input(&[t]);
         let pv = View {
+            gather: None,
             forms: vec![Form {
                 coefs: vec![1],
                 offset: -2,
