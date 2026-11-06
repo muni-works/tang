@@ -3016,3 +3016,36 @@ flock ~/tang-gpu.lock ./target/release/examples/split_k matmul 4096 32768 131072
 TANG_LOAD_LANES=1 flock ~/tang-gpu.lock ./target/release/examples/split_k prefill 1024 2048 4096
 flock ~/tang-gpu.lock python3 bench/split_k_sdpa.py
 ```
+
+### Follow-up: where the 10 ms went, and llama.cpp on the same 3090
+
+Per-kernel times showed the four big GEMVs per layer at ~222 µs (8 of the 10 ms, ~46% of 936
+GB/s); launches and small kernels are ~1 ms. So the lever was GEMV bandwidth, not boundaries:
+
+| change (CUDA graph, no megakernel) | len 64 | len 1024 | len 4096 | correctness (31 forced rows vs CPU f32) |
+|---|---|---|---|---|
+| main (rows 2) | 10.05 ms (99.5 tok/s) | 10.45 ms | 11.38 ms (87.9) | max err 3.18e-2, 31/31 |
+| **rows 4** (now the CUDA default) | 8.02 ms (124.6) | 8.31 ms | 9.27 ms (107.9) | 3.18e-2, 31/31 |
+| rows 4 + split-K the down projection ×4 (`TANG_SPLIT_GEMV=4`) | **7.80 ms (128.1)** | 8.11 ms | 9.09 ms (110.1) | 3.46e-2, 31/31 |
+| rows 4 + split-K down and attention ×4 (`TANG_SPLIT_MIN_K=4352`) | 7.95 ms | 8.28 ms | **8.89 ms (112.5)** | — |
+| + small-kernel segments (`TANG_MEGA_MAX_BLOCKS=64`) | 8.06 ms | 8.38 ms | 9.31 ms | 31/31 |
+
+Rows 4 amortizes each lane's activation (and recomputed RMSNorm) loads over 4 weight rows instead
+of 2: gate/up 98 → 77 µs, qkv 50 → 35 µs. Rows 8/16, 8 warps or unroll 2 are slower. `split_reduction`
+now cuts the outermost of several reduce axes (the 4-bit GEMV's groups × 64), so the down
+projection (K = 12288, 512 blocks) splits. Fusing the small kernels on top no longer helps.
+
+llama.cpp (`ggml` CUDA, built on mew, `llama-bench -n 128 -fa on -ngl 99`), GGUF converted from
+the same MLX checkpoint (dequantized to f16, then `llama-quantize`; no downloads):
+
+| | tg128 | @ d1024 | @ d4096 |
+|---|---|---|---|
+| llama.cpp Q4_0 (4.44 GiB) | **148.9 tok/s** | 144.8 | 134.4 |
+| llama.cpp Q4_K_M (4.68 GiB) | 140.5 | 136.6 | 127.4 |
+| tang IR, best (device step) | 128.1 | 123.3 | 112.5 |
+
+tang is at 86% of llama.cpp Q4_0 at short context and 84% at 4k (was 67% / 65%). The remaining
+gap is the GEMV inner loop: llama.cpp's MMVQ quantizes the activation to q8_1 once and runs dp4a
+int8 dot products; tang dequantizes every nibble to f32 and FMAs, and recomputes the norm per
+element. That is the next schedule to derive (an int8 activation-quantization map before the
+GEMV, then a dp4a body), along with per-kernel rows/split choices through the autotuner.

@@ -121,6 +121,12 @@ impl Step {
         let options = |outs: &[TensorId]| {
             let mut opts = decode_opts(&dg, outs);
             opts.rows = env("TANG_DECODE_ROWS");
+            // CUDA decode: 4 GEMV rows per warp amortize the activation
+            // (and recomputed norm) loads over more weight words: 10.0 ->
+            // 8.0 ms per Qwen3-8B step on the 3090 (BENCHMARKS.md)
+            if opts.rows == 0 && seq == 1 && rt.kind() == BackendKind::Cuda {
+                opts.rows = 4;
+            }
             opts.warps = env("TANG_DECODE_WARPS");
             opts.unroll = env("TANG_DECODE_UNROLL");
             opts.mma_shape = env("TANG_MMA_SHAPE");

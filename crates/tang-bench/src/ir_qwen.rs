@@ -989,11 +989,62 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         g.merge_siblings(&outs)
     };
-    let (mut g, outs) = if dg.seq > 1 {
+    let (mut g, mut outs) = if dg.seq > 1 {
         g.merge_reduce_dims(&outs)
     } else {
         (g, outs)
     };
+    // TANG_SPLIT_GEMV=P: decode reductions over at least TANG_SPLIT_MIN_K
+    // keys (default 8192: the down projection) split-K into P chunks
+    let parts: usize = std::env::var("TANG_SPLIT_GEMV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if dg.seq == 1 && parts > 1 {
+        let min_k: usize = std::env::var("TANG_SPLIT_MIN_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        // (the graph is dead-code free here and after each split)
+        let live = |g: &TensorGraph, _outs: &[TensorId]| {
+            (0..g.nodes().len())
+                .filter(|&i| {
+                    g.comp_at(i).is_some_and(|c| {
+                        c.monoid.is_some()
+                            && c.tuple <= 1
+                            && c.red.iter().map(|d| d.n()).product::<usize>() >= min_k
+                            && c.red[0].n() % parts == 0
+                            && c.red[0].n() / parts >= 2
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if std::env::var_os("TANG_SPLIT_DEBUG").is_some() {
+            for i in 0..g.nodes().len() {
+                if let Some(c) = g.comp_at(i).filter(|c| c.monoid.is_some()) {
+                    let red: Vec<usize> = c.red.iter().map(|d| d.n()).collect();
+                    eprintln!(
+                        "red node {i}: shape {:?} red {red:?} tuple {}",
+                        g.nodes()[i].shape,
+                        c.tuple
+                    );
+                }
+            }
+        }
+        let todo = live(&g, &outs).len();
+        for _ in 0..todo {
+            let Some(&t) = live(&g, &outs).first() else {
+                break;
+            };
+            match g.split_reduction(&outs, TensorId::from_index(t), parts) {
+                Ok((g2, o2)) => {
+                    g = g2;
+                    outs = o2;
+                }
+                Err(_) => break,
+            }
+        }
+    }
     g.schedule_inline(&outs);
     g.schedule_epilogues(&outs);
     // the norms feeding a 4-bit GEMV and the roped key of a cache update
