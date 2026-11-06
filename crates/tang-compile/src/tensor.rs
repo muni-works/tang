@@ -1865,7 +1865,14 @@ impl TensorGraph {
                             .comp_at(p)
                             .is_some_and(|pc| pc.red.len() == 1 || tileable_red(&pc.red))
                         && self.epilogue_read(c, p).is_some();
-                    consumer_reduces[p] = c.monoid.is_some() || as_epilogue;
+                    // a fold of partial folds with the same monoid (a
+                    // split-K combine) inlined is the split undone
+                    let refold =
+                        match (&c.monoid, self.comp_at(p).and_then(|pc| pc.monoid.as_ref())) {
+                            (Some(a), Some(b)) => a.width == b.width && a.kind() == b.kind(),
+                            _ => false,
+                        };
+                    consumer_reduces[p] = (c.monoid.is_some() && !refold) || as_epilogue;
                 }
             }
         }
@@ -2969,6 +2976,212 @@ impl TensorGraph {
         g.eliminate_dead(outputs)
     }
 
+    /// Schedule (split-K): cut the single reduce axis of comp `t` (length
+    /// `K`) into `parts` contiguous chunks computed in parallel, then fold
+    /// the chunks' partial states with the monoid's own combine. `t` is
+    /// rewritten in place to the combine, so every reader is unchanged:
+    ///
+    /// - partial `[parts, points…, tuple…]`: the original body and monoid
+    ///   over `K / parts` keys, the chunk index a new (leading) point axis,
+    ///   so one launch has `parts`× the points — the parallelism a long
+    ///   reduction over few points (batch-1 decode attention, a long-K
+    ///   GEMV/GEMM) lacks;
+    /// - combine: a reduction over the chunk axis whose body reads one
+    ///   partial state and whose monoid is `t`'s. That is legal for any
+    ///   monoid because partial states and elements are the same width
+    ///   and the combine is associative: for a sum it adds, for online
+    ///   softmax it is the rescale-and-add of `(m, l, acc)`.
+    ///
+    /// Nothing here knows about attention. Returns the rewritten graph
+    /// (topologically ordered) and `outputs` in it.
+    pub fn split_reduction(
+        &self,
+        outputs: &[TensorId],
+        t: TensorId,
+        parts: usize,
+    ) -> Result<(TensorGraph, Vec<TensorId>), ShapeError> {
+        let mut g = self.clone();
+        g.split_reduction_in_place(t, parts)?;
+        Ok(g.eliminate_dead(outputs))
+    }
+
+    /// [`TensorGraph::split_reduction`] without the reordering: the
+    /// partial is pushed after `t`, which now reads it.
+    fn split_reduction_in_place(
+        &mut self,
+        t: TensorId,
+        parts: usize,
+    ) -> Result<TensorId, ShapeError> {
+        let Some(c) = self.comp_at(t.n()).cloned() else {
+            return err("split_reduction: not a comp");
+        };
+        let Some(m) = c.monoid.clone() else {
+            return err("split_reduction: not a reduction");
+        };
+        if c.red.len() != 1 || c.tuple > 1 {
+            return err("split_reduction: one reduce axis, at most one tuple dim");
+        }
+        let total = c.red[0].n();
+        if parts < 2 || total % parts != 0 {
+            return err(format!(
+                "split_reduction: {total} keys do not split into {parts}"
+            ));
+        }
+        let per = total / parts;
+        let k = c.points().len();
+        let w = c.width();
+        // partial space (p, points…, r): the original reduce coordinate is
+        // p·per + r
+        let args = c
+            .args
+            .iter()
+            .map(|a| Arg {
+                src: a.src,
+                view: View {
+                    forms: a
+                        .view
+                        .forms
+                        .iter()
+                        .map(|f| Form {
+                            coefs: std::iter::once(f.coefs[k] * per as i64)
+                                .chain(f.coefs.iter().copied())
+                                .collect(),
+                            offset: f.offset,
+                        })
+                        .collect(),
+                    guard: a.view.guard,
+                },
+            })
+            .collect();
+        let mut out: Vec<Dim> = vec![Dim::Fixed(parts)];
+        out.extend_from_slice(&c.out);
+        let partial = self.push_comp(Comp {
+            out,
+            tuple: c.tuple,
+            red: vec![Dim::Fixed(per)],
+            args,
+            body: c.body.clone(),
+            body_outs: c.body_outs.clone(),
+            monoid: Some(m.clone()),
+        })?;
+        self.nodes[partial.n()].precision = self.nodes[t.n()].precision;
+        // combine space (points…, p): read slot s of partial state p
+        let args = (0..w)
+            .map(|s| {
+                let mut forms = vec![Form::unit(k + 1, k)];
+                forms.extend((0..k).map(|d| Form::unit(k + 1, d)));
+                if c.tuple == 1 {
+                    forms.push(Form::constant(k + 1, s as i64));
+                }
+                Arg {
+                    src: partial,
+                    view: View {
+                        forms,
+                        guard: false,
+                    },
+                }
+            })
+            .collect();
+        let mut body = ExprGraph::new();
+        let body_outs: Vec<ExprId> = (0..w).map(|v| body.var(v as u16)).collect();
+        let node = &mut self.nodes[t.n()];
+        node.op = Op::Comp(Comp {
+            out: c.out.clone(),
+            tuple: c.tuple,
+            red: vec![Dim::Fixed(parts)],
+            args,
+            body,
+            body_outs,
+            monoid: Some(m),
+        });
+        node.inline = false;
+        node.split = 0;
+        node.tile = (0, 0, 0);
+        node.reg = (1, 1);
+        node.fragment = false;
+        Ok(partial)
+    }
+
+    /// Split-K factors worth trying for comp `t`: powers of two that
+    /// divide its reduce axis, leave at least `min_chunk` keys per chunk,
+    /// and do not take the grid past `max_points` (points × parts). `[]`
+    /// when `t` is not a single-axis reduction. An autotuner times each
+    /// (and the unsplit kernel) per sequence length.
+    pub fn split_k_candidates(
+        &self,
+        t: TensorId,
+        min_chunk: usize,
+        max_points: usize,
+    ) -> Vec<usize> {
+        let Some(c) = self.comp_at(t.n()) else {
+            return vec![];
+        };
+        if c.monoid.is_none() || c.red.len() != 1 || c.tuple > 1 {
+            return vec![];
+        }
+        let (Some(total), Some(pts)) = (
+            c.red[0].fixed(),
+            c.points()
+                .iter()
+                .map(|d| d.fixed())
+                .product::<Option<usize>>(),
+        ) else {
+            return vec![];
+        };
+        (1..)
+            .map(|e| 1usize << e)
+            .take_while(|&p| total / p >= min_chunk && pts * p <= max_points)
+            .filter(|&p| total % p == 0)
+            .collect()
+    }
+
+    /// Split-K by rule, for when nothing is tuned: every live single-axis
+    /// reduction of fewer than `target_points` points over a reduce axis of
+    /// at least 1024 is split into the smallest power of
+    /// two that brings points × parts to `target_points`, keeping at least
+    /// 64 keys per chunk. Decode attention and long-K GEMVs qualify; a
+    /// prefill or a square matmul has the points already. The autotuned
+    /// path times [`split_k_candidates`](Self::split_k_candidates) instead.
+    pub fn schedule_split_k(
+        &self,
+        outputs: &[TensorId],
+        target_points: usize,
+    ) -> (TensorGraph, Vec<TensorId>) {
+        let mut g = self.clone();
+        let live = self.live(outputs);
+        let mut any = false;
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let (Some(red), Some(pts)) = (
+                c.red.first().and_then(|d| d.fixed()),
+                c.points()
+                    .iter()
+                    .map(|d| d.fixed())
+                    .product::<Option<usize>>(),
+            ) else {
+                continue;
+            };
+            if c.red.len() != 1 || pts >= target_points || red < 1024 {
+                continue;
+            }
+            let pick = self
+                .split_k_candidates(TensorId(i as u32), 64, usize::MAX)
+                .into_iter()
+                .find(|&p| pts * p >= target_points)
+                .or_else(|| {
+                    self.split_k_candidates(TensorId(i as u32), 64, usize::MAX)
+                        .pop()
+                });
+            if let Some(p) = pick {
+                any |= g.split_reduction_in_place(TensorId(i as u32), p).is_ok();
+            }
+        }
+        if !any {
+            return (g, outputs.to_vec());
+        }
+        g.eliminate_dead(outputs)
+    }
+
     /// Placement: split the (single) reduce axis of comp `t` into `parts`
     /// partial reductions over contiguous slices — each a comp that can
     /// live on its own device — plus a combine that folds the partials
@@ -3572,6 +3785,90 @@ mod tests {
         );
     }
 
+    /// Split-K, one launch: decode attention (1 query row, 64 keys), a
+    /// long-K matmul and an argmax all split into 2…16 chunks and fold
+    /// back with their own monoid; readers of the split node are untouched.
+    #[test]
+    fn split_reduction_folds_partials_with_the_monoid() {
+        let (nk, d, dv) = (64, 4, 4);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[1, d]);
+        let k = g.input(&[nk, d]);
+        let v = g.input(&[nk, dv]);
+        let y = naive_attention(&mut g, q, k, v, false);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (g, outs) = g.substitute_maps(&outs);
+        let fused = (0..g.nodes().len())
+            .find(|&i| matches!(&g.nodes()[i].op, Op::Comp(c) if c.tuple == 1))
+            .map(TensorId::from_index)
+            .unwrap();
+        let inputs = [
+            ramp(d, 0.3, -1.0),
+            ramp(nk * d, 0.07, -2.0),
+            ramp(nk * dv, 0.1, -2.0),
+        ];
+        let want = g.eval(&inputs, &outs).remove(0);
+        assert_eq!(g.split_k_candidates(fused, 8, 1 << 20), vec![2, 4, 8]);
+        for p in [2, 4, 8, 16] {
+            let (sg, so) = g.split_reduction(&outs, fused, p).unwrap();
+            assert_eq!(sg.count_comps(&so), g.count_comps(&outs) + 1);
+            close(&sg.eval(&inputs, &so).remove(0), &want);
+        }
+        assert!(g.split_reduction(&outs, fused, 3).is_err());
+
+        // a long-K matmul: [2, 96] · [96, 3]
+        let mut g = TensorGraph::new();
+        let a = g.input(&[2, 96]);
+        let b = g.input(&[96, 3]);
+        let c = g.matmul(a, b).unwrap();
+        let data = [ramp(192, 0.01, -1.0), ramp(288, 0.02, -2.0)];
+        let want = g.eval(&data, &[c]).remove(0);
+        for p in [2, 3, 8, 32] {
+            let (sg, so) = g.split_reduction(&[c], c, p).unwrap();
+            close(&sg.eval(&data, &so).remove(0), &want);
+        }
+
+        // argmax: a tuple monoid whose tie rule must survive the split
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 16]);
+        let i = g.iota(&[2, 16], 1);
+        let rank = 2;
+        let am = g
+            .comp_tuple(
+                &[2, 2],
+                &[16],
+                vec![
+                    Arg {
+                        src: i,
+                        view: View::pick(rank, &[Some(0), Some(1)]),
+                    },
+                    Arg {
+                        src: x,
+                        view: View::pick(rank, &[Some(0), Some(1)]),
+                    },
+                ],
+                Some(Monoid::argmax()),
+                |v| vec![v[0], v[1]],
+            )
+            .unwrap();
+        let data = vec![(0..32).map(|j| ((j * 7) % 5) as f64).collect::<Vec<_>>()];
+        let want = g.eval(&data, &[am]).remove(0);
+        let (sg, so) = g.split_reduction(&[am], am, 4).unwrap();
+        close(&sg.eval(&data, &so).remove(0), &want);
+
+        // the rule: a 2-point, 4096-long sum splits to fill 64 points
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 4096]);
+        let s = g.reduce(x, 1, Monoid::sum()).unwrap();
+        let (sg, so) = g.schedule_split_k(&[s], 64);
+        assert_eq!(sg.count_comps(&so), 2);
+        let data = vec![ramp(8192, 0.001, -1.0)];
+        close(&sg.eval(&data, &so)[0], &g.eval(&data, &[s])[0]);
+        // ... and leaves a reduction with enough points alone
+        let (sg, so) = g.schedule_split_k(&[s], 2);
+        assert_eq!(sg.count_comps(&so), 1);
+    }
+
     #[test]
     fn maps_substitute_through_affine_reshapes() {
         // m = 2x read as [4, 2, 4] by a comp: the reshape is a merge seen
@@ -3897,6 +4194,7 @@ mod tests {
         causal: bool,
     ) -> TensorId {
         let n = g.shape(q)[0];
+        let nk = g.shape(k)[0];
         let dv = g.shape(v)[1];
         let kt = g.transpose(k, &[1, 0]).unwrap();
         let mut s = g.matmul(q, kt).unwrap(); // [n, n]
@@ -3905,7 +4203,7 @@ mod tests {
             s = g.map(&[s, mask], |v| v[0] + v[1]).unwrap();
         }
         let m = g.reduce(s, 1, Monoid::max()).unwrap(); // [n, 1]
-        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let mb = g.broadcast(m, &[n, nk]).unwrap();
         let p = g.map(&[s, mb], |v| (v[0] - v[1]).exp()).unwrap(); // [n, n]
         let l = g.reduce(p, 1, Monoid::sum()).unwrap(); // [n, 1]
         let o = g.matmul(p, v).unwrap(); // [n, dv]

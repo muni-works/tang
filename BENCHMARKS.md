@@ -2378,3 +2378,59 @@ pending)
 - Expected on the K1 (1.7B, estimates): 49 tokens 3451 ms → ~500–700 ms (maps, register block),
   ~250–400 ms (q4), ~150–250 ms (fp16). A 20-token turn ~100–250 ms. 512 tokens ~2–5 s. Decode is
   unchanged at ~55 ms/token.
+
+## Split-K for monoid reductions (RTX 3090 and M4 Max, kernel-only)
+
+Batch-1 decode attention has one query row per head, so the derived kernel launched a handful of workgroups (one per head pair × value-column tile) and left most SMs idle. `TensorGraph::split_reduction(outputs, t, P)` is split-K for **any** monoid reduction, in one launch:
+
+- the partial is the original comp over `K / P` keys, with the chunk index as a new leading point axis, so the grid is `P`× larger;
+- the combine is a reduction over the chunk axis. Its body reads one partial state, and its monoid is the original's. That is legal for every monoid because partial states and elements have the same width and the combine is associative. For online softmax it is the rescale-and-add of `(m, l, acc)`, for a sum it is `+`, for argmax it keeps the first maximum. Nothing in it mentions attention: the interpreter test splits online softmax, a matmul and an argmax.
+
+How `P` is chosen: `split_k_candidates(t, min_chunk, max_points)` lists the powers of two the autotuner times per sequence length (here crossed with the partial's tile shapes). `schedule_split_k(outputs, target_points)` is the untuned rule: the smallest `P` that brings the point count to the target. Two changes elsewhere were needed:
+
+- `schedule_inline` no longer inlines a reduction into a consumer with the same monoid, because that undoes the split.
+- The tile emitter now loads a staged producer that is itself a reduction (attention's `q·k`) cooperatively. Each staged value gets 8 lanes over its reduce axis, and their partials are folded with the producer's monoid. Before, 64 of 256 threads each ran a serial, uncoalesced 128-long dot. `TANG_LOAD_LANES=1` restores the old load.
+
+Harness: `crates/tang-bench/examples/split_k.rs` (`attn`, `matmul`, `prefill`, `show`), `bench/split_k_sdpa.py`. Shapes: Llama-3-8B decode, 8 kv heads × 4 query heads, head dim 128, f32, one query row. Errors are max abs error relative to the largest output, against an f64 host reference: every variant is ≤ 1.1e-5 (attention) and ≤ 3.3e-4 (TF32 matmul). GB/s counts K and V bytes once.
+
+**RTX 3090 (CUDA, `ssh mew`), µs per call:**
+
+| KV | unsplit, old load | unsplit | rule (P=16) | autotuned | autotuned GB/s | hand `cx_attn` (f32 port, best chunk) | SDPA f32 | SDPA bf16 |
+|---|---|---|---|---|---|---|---|---|
+| 1k | 361 | 160 | 36.5 | **28.6** (P=8) | 293 | 30.4 | 159 | 14.3 |
+| 4k | 1410 | 641 | 83.0 | **83.0** (P=16) | 404 | 50.7 | 584 | 37.7 |
+| 16k | 5601 | 2581 | 273 | **273** (P=16) | 491 | 168 | 2644 | 97.1 |
+| 32k | 11253 | 5160 | 523 | **523** (P=16) | 513 | 325 | 5270 | 181 |
+
+- Split-K is 5.6–9.9x over the unsplit kernel. With the cooperative load it is 12.6–21.5x over where decode stood before this change.
+- It beats PyTorch SDPA in f32 by 5.6–10x: f32 decode has no flash path and runs the math fallback.
+- It matches tang-llm's hand split-K decode kernel at 1k and trails it 1.6x at 4k–32k. The hand kernel is `cx_attn_part` + `cx_attn_merge` from `flash/coder_kernels.rs`, ported to f32 head-major caches with no gate or causal offsets.
+- SDPA bf16 moves half the bytes and is not a like-for-like comparison. It is listed as the bar for a bf16 storage schedule.
+
+**What the remaining 1.6x is:** GQA reuse. The hand kernel's block runs all 4 query heads of a kv group over one read of K/V. The derived tile's row axis is chosen as the largest other point dim, which is the chunk axis or the kv heads, never the 4 query heads that share K. So K/V are read once per query-head pair. A reuse-aware row-axis choice in `tile_axes` is the follow-up.
+
+**Causal prefill (3090, the cooperative load alone, `split_k prefill`):** n = 1024 / 2048 / 4096 takes 33.3 / 134 / 538 ms with `TANG_LOAD_LANES=1` and 19.4 / 77.8 / 311 ms with the default, 1.7x. Absolute prefill numbers are the portable f32 tile, not the tensor-core path.
+
+**Long-K matmul `[16, K] · [K, 256]` (3090):** split-K gives nothing on CUDA: 1.06 / 1.01 / 1.03x at K = 4k / 32k / 128k, 16 / 55 / 180 µs. The tensor-core lowering already splits K itself (`tensor_cuda::split_k`, 770 GB/s at 128k). P ≥ 32 drops off the MMA path, to 0.2x. The autotuner picks P ≤ 16, but the untuned rule picks P = 32 there, so `schedule_split_k` should not be applied to CUDA matmuls. PyTorch takes 11.3 / 52.9 / 175 µs.
+
+**M4 Max (wgpu → Metal), µs per call.** The machine was shared with other sessions' GPU jobs during the run, so single numbers move ±2x. The P=16 column and the rule (also P=16) disagree by up to 2x at 16k.
+
+| KV | unsplit | P=16 | autotuned | speedup |
+|---|---|---|---|---|
+| 1k | 470 | 141 | **108** (P=8) | 4.4x |
+| 4k | 1867 | 308 | **257** (P=128) | 7.3x |
+| 16k | 8855 | 1230 | **1059** (P=256) | 8.4x |
+| 32k | 20358 | 2960 (rule) | **2439** (P=128) | 8.3x |
+
+Long-K matmul `[16, K] · [K, 256]` on the M4 takes 812 / 5426 / 22453 µs unsplit and 128 / 526 / 3077 µs autotuned (P = 64 / 64 / 16, 16×16 tile with a 2×2 or 4×4 register tile), **6.4 / 10.3 / 7.3x**. There is no native split in the Metal path, so here it pays. Causal prefill on the M4 shows no change from the cooperative load (n = 2048: 666 ms with `TANG_LOAD_LANES=1`, 622 ms with the default, within noise). The hand `cx_attn` port is CUDA-only and SDPA was not run on MPS.
+
+**Reproduce:**
+
+```
+cargo run --release -p tang-bench --example split_k -- attn            # M4 (wgpu)
+cargo build --release -p tang-bench --features cuda --example split_k  # mew
+flock ~/tang-gpu.lock ./target/release/examples/split_k attn
+flock ~/tang-gpu.lock ./target/release/examples/split_k matmul 4096 32768 131072
+TANG_LOAD_LANES=1 flock ~/tang-gpu.lock ./target/release/examples/split_k prefill 1024 2048 4096
+flock ~/tang-gpu.lock python3 bench/split_k_sdpa.py
+```
