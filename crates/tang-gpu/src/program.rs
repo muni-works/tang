@@ -1073,11 +1073,18 @@ impl Program {
             }
             #[cfg(feature = "cuda")]
             Runtime::Cuda(_) => {
-                use tang_compile::tensor::cuda::MMA_SHAPES;
+                use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES};
                 // variant 0: every kernel transpiled; 1 + v: the
-                // tensor-core tiles in block shape MMA_SHAPES[v]
+                // tensor-core tiles in block shape MMA_SHAPES[v]; on
+                // Hopper, then the flash tiles in SM90_FLASH_SHAPES
+                let n = MMA_SHAPES.len()
+                    + if matches!(rt, Runtime::Cuda(d) if d.arch == "sm_90a") {
+                        SM90_FLASH_SHAPES.len()
+                    } else {
+                        0
+                    };
                 let variants: Vec<WgslProgram> = std::iter::once(None)
-                    .chain((0..MMA_SHAPES.len()).map(Some))
+                    .chain((0..n).map(Some))
                     .map(|v| g.to_cuda_variant(outputs, v))
                     .collect();
                 Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)

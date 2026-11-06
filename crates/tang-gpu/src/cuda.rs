@@ -167,7 +167,9 @@ impl CudaDevice {
         let minor = ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .ok()?;
-        let arch: &'static str = Box::leak(format!("sm_{major}{minor}").into_boxed_str());
+        // Hopper builds for sm_90a: wgmma and setmaxnreg are arch-specific
+        let suffix = if major == 9 { "a" } else { "" };
+        let arch: &'static str = Box::leak(format!("sm_{major}{minor}{suffix}").into_boxed_str());
         let name = format!("{} (CUDA {arch})", ctx.name().ok()?);
         let stream = ctx.default_stream();
         Some(Self {
