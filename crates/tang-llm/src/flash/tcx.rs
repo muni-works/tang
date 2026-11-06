@@ -71,7 +71,7 @@ pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<
     let bb = if q5 { 176 } else { 144 };
     let nsb = k / 256;
     ensure!(
-        rows % 16 == 0 && k % 256 == 0,
+        rows.is_multiple_of(16) && k.is_multiple_of(256),
         "tcx: {rows} x {k} isn't 16 x 256 tiled"
     );
     ensure!(
