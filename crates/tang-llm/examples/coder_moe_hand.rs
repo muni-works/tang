@@ -35,7 +35,11 @@ struct ExW {
 }
 
 fn read_f32(p: &Path) -> Vec<f32> {
-    std::fs::read(p).unwrap().chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    std::fs::read(p)
+        .unwrap()
+        .chunks(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 struct Dev {
@@ -47,7 +51,10 @@ impl Dev {
     fn up<T: cudarc::driver::DeviceRepr>(&self, v: &[T]) -> CudaSlice<T> {
         self.stream.memcpy_stod(v).unwrap()
     }
-    fn zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(&self, n: usize) -> CudaSlice<T> {
+    fn zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        &self,
+        n: usize,
+    ) -> CudaSlice<T> {
         self.stream.alloc_zeros::<T>(n.max(1)).unwrap()
     }
     fn ptr<T>(&self, s: &CudaSlice<T>) -> u64 {
@@ -75,7 +82,11 @@ fn a<T: Copy>(v: T) -> Vec<u8> {
 
 impl Launch {
     fn go(&self, s: &CudaStream) {
-        let mut ptrs: Vec<*mut c_void> = self.args.iter().map(|b| b.as_ptr() as *mut c_void).collect();
+        let mut ptrs: Vec<*mut c_void> = self
+            .args
+            .iter()
+            .map(|b| b.as_ptr() as *mut c_void)
+            .collect();
         let r = unsafe {
             sys::cuLaunchKernel(
                 self.f,
@@ -96,17 +107,39 @@ impl Launch {
 }
 
 fn max_rel(got: &[f32], want: &[f32]) -> f64 {
-    let scale = want.iter().fold(0f64, |m, &v| m.max(v.abs() as f64)).max(1e-30);
-    got.iter().zip(want).map(|(&g, &w)| (g as f64 - w as f64).abs() / scale).fold(0.0, f64::max)
+    let scale = want
+        .iter()
+        .fold(0f64, |m, &v| m.max(v.abs() as f64))
+        .max(1e-30);
+    got.iter()
+        .zip(want)
+        .map(|(&g, &w)| (g as f64 - w as f64).abs() / scale)
+        .fold(0.0, f64::max)
 }
 
 fn run(dev: &Dev, dir: &Path) {
     let meta = std::fs::read_to_string(dir.join("meta.txt")).unwrap();
-    let v: Vec<usize> = meta.split_whitespace().map(|x| x.parse().unwrap()).collect();
+    let v: Vec<usize> = meta
+        .split_whitespace()
+        .map(|x| x.parse().unwrap())
+        .collect();
     let (t, d, e, k, f) = (v[0], v[1], v[2], v[3], v[4]);
     let batch = t > 8;
-    let maxt = if batch { t.max(16) } else { tang_llm::flash::coder::MAX_T };
-    let sh = Shapes { hidden: d, n_head: 16, n_kv: 2, head_dim: 256, n_rot: 64, ff: f, topk: k, n_expert: e };
+    let maxt = if batch {
+        t.max(16)
+    } else {
+        tang_llm::flash::coder::MAX_T
+    };
+    let sh = Shapes {
+        hidden: d,
+        n_head: 16,
+        n_kv: 2,
+        head_dim: 256,
+        n_rot: 64,
+        ff: f,
+        topk: k,
+        n_expert: e,
+    };
     let src = format!(
         "{}{}{}{}",
         if batch { "#define CX_GCHUNK 8\n" } else { "" },
@@ -121,7 +154,11 @@ fn run(dev: &Dev, dir: &Path) {
 
     let x = read_f32(&dir.join("x.f32"));
     let logits = read_f32(&dir.join("logits.f32")); // [t][e + 1]
-    let ids: Vec<u32> = std::fs::read(dir.join("ids.u32")).unwrap().chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let ids: Vec<u32> = std::fs::read(dir.join("ids.u32"))
+        .unwrap()
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let wts = read_f32(&dir.join("wts.f32"));
     let wgu = std::fs::read(dir.join("wgu.q4k")).unwrap();
     let wd = std::fs::read(dir.join("wd.q5k")).unwrap();
@@ -133,7 +170,11 @@ fn run(dev: &Dev, dir: &Path) {
             let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
             let s = amax / 127.0;
             for (j, &v) in blk.iter().enumerate() {
-                let q = if s == 0.0 { 0 } else { (v / s).round().clamp(-127.0, 127.0) as i32 };
+                let q = if s == 0.0 {
+                    0
+                } else {
+                    (v / s).round().clamp(-127.0, 127.0) as i32
+                };
                 xq[ti * d + b * 32 + j] = q as i8 as u8;
             }
             xq[maxt * d + (ti * (d / 32) + b) * 4..][..4].copy_from_slice(&s.to_le_bytes());
@@ -144,12 +185,34 @@ fn run(dev: &Dev, dir: &Path) {
     let (pgu, pd) = (dev.ptr(&g_wgu), dev.ptr(&g_wd));
     let es_gu = (2 * f * rb_gu) as u64;
     let es_d = (d * rb_d) as u64;
-    let gw = ExW { base: pgu, estride: es_gu, ty: 12, row_bytes: rb_gu as i32 };
-    let uw = ExW { base: pgu + (f * rb_gu) as u64, ..gw };
-    let sg = ExW { base: pgu + e as u64 * es_gu, ..gw };
-    let su = ExW { base: sg.base + (f * rb_gu) as u64, ..gw };
-    let dw = ExW { base: pd, estride: es_d, ty: 13, row_bytes: rb_d as i32 };
-    let sdw = ExW { base: pd + e as u64 * es_d, ..dw };
+    let gw = ExW {
+        base: pgu,
+        estride: es_gu,
+        ty: 12,
+        row_bytes: rb_gu as i32,
+    };
+    let uw = ExW {
+        base: pgu + (f * rb_gu) as u64,
+        ..gw
+    };
+    let sg = ExW {
+        base: pgu + e as u64 * es_gu,
+        ..gw
+    };
+    let su = ExW {
+        base: sg.base + (f * rb_gu) as u64,
+        ..gw
+    };
+    let dw = ExW {
+        base: pd,
+        estride: es_d,
+        ty: 13,
+        row_bytes: rb_d as i32,
+    };
+    let sdw = ExW {
+        base: pd + e as u64 * es_d,
+        ..dw
+    };
 
     let g_ids = dev.up(&ids);
     let g_xq = dev.up(&xq);
@@ -165,45 +228,109 @@ fn run(dev: &Dev, dir: &Path) {
     let g_xo = dev.zeros::<f32>(t * d);
     let g_xq2 = dev.zeros::<u8>(maxt * d + maxt * d / 32 * 4);
     let p = |s: &CudaSlice<f32>| dev.ptr(s);
-    let (ids_p, xq_p, egu_p, hq_p, parts_p, plan_p) =
-        (dev.ptr(&g_ids), dev.ptr(&g_xq), p(&g_egu), dev.ptr(&g_hq), p(&g_parts), dev.ptr(&g_plan));
+    let (ids_p, xq_p, egu_p, hq_p, parts_p, plan_p) = (
+        dev.ptr(&g_ids),
+        dev.ptr(&g_xq),
+        p(&g_egu),
+        dev.ptr(&g_hq),
+        p(&g_parts),
+        dev.ptr(&g_plan),
+    );
     let (ti, fastk, pb, r16) = (t as i32, 2i32, 0i32, 0i32);
     let ls = (e + 1) as i32;
     let mut ls_: Vec<Launch> = Vec::new();
     if batch {
         let (sgu, sdn) = ck::tcx_split();
         let groups = n.min(e + 1 + n / 8) as u32;
-        ls_.push(Launch { name: "cx_moe_plan_w", f: func("cx_moe_plan_w"), grid: (1, 1, 1), block: 1024, args: vec![a(ids_p), a(ti), a(pb), a(n as i32), a(plan_p)] });
+        ls_.push(Launch {
+            name: "cx_moe_plan_w",
+            f: func("cx_moe_plan_w"),
+            grid: (1, 1, 1),
+            block: 1024,
+            args: vec![a(ids_p), a(ti), a(pb), a(n as i32), a(plan_p)],
+        });
         ls_.push(Launch {
             name: "cx_moe_gu_q",
             f: func("cx_moe_gu_q"),
             grid: ((2 * f * sgu / 128) as u32, groups, 1),
             block: 256,
-            args: vec![a(gw), a(uw), a(sg), a(su), a(ids_p), a(xq_p), a(egu_p), a(ti), a(fastk), a(plan_p)],
+            args: vec![
+                a(gw),
+                a(uw),
+                a(sg),
+                a(su),
+                a(ids_p),
+                a(xq_p),
+                a(egu_p),
+                a(ti),
+                a(fastk),
+                a(plan_p),
+            ],
         });
-        ls_.push(Launch { name: "cx_silu_q", f: func("cx_silu_q"), grid: ((f / 32) as u32, n as u32, 1), block: 32, args: vec![a(egu_p), a(hq_p), a(pb)] });
+        ls_.push(Launch {
+            name: "cx_silu_q",
+            f: func("cx_silu_q"),
+            grid: ((f / 32) as u32, n as u32, 1),
+            block: 32,
+            args: vec![a(egu_p), a(hq_p), a(pb)],
+        });
         ls_.push(Launch {
             name: "cx_moe_down_q",
             f: func("cx_moe_down_q"),
             grid: ((d * sdn / 128) as u32, groups, 1),
             block: 256,
-            args: vec![a(dw), a(sdw), a(ids_p), a(hq_p), a(parts_p), a(ti), a(fastk), a(plan_p)],
+            args: vec![
+                a(dw),
+                a(sdw),
+                a(ids_p),
+                a(hq_p),
+                a(parts_p),
+                a(ti),
+                a(fastk),
+                a(plan_p),
+            ],
         });
     } else {
-        let (gu_n, dn_n, rows) = if t <= 4 { ("cx_moe_gu_d2", "cx_moe_down_d2f", 16) } else { ("cx_moe_gu_d4", "cx_moe_down_d4f", 32) };
+        let (gu_n, dn_n, rows) = if t <= 4 {
+            ("cx_moe_gu_d2", "cx_moe_down_d2f", 16)
+        } else {
+            ("cx_moe_gu_d4", "cx_moe_down_d4f", 32)
+        };
         ls_.push(Launch {
             name: gu_n,
             f: func(gu_n),
             grid: ((2 * f / rows) as u32, n as u32, 1),
             block: 256,
-            args: vec![a(gw), a(uw), a(sg), a(su), a(ids_p), a(xq_p), a(egu_p), a(ti), a(r16), a(fastk), a(pb)],
+            args: vec![
+                a(gw),
+                a(uw),
+                a(sg),
+                a(su),
+                a(ids_p),
+                a(xq_p),
+                a(egu_p),
+                a(ti),
+                a(r16),
+                a(fastk),
+                a(pb),
+            ],
         });
         ls_.push(Launch {
             name: dn_n,
             f: func(dn_n),
             grid: ((d / rows) as u32, n as u32, 1),
             block: 256,
-            args: vec![a(dw), a(sdw), a(ids_p), a(egu_p), a(parts_p), a(ti), a(r16), a(fastk), a(pb)],
+            args: vec![
+                a(dw),
+                a(sdw),
+                a(ids_p),
+                a(egu_p),
+                a(parts_p),
+                a(ti),
+                a(r16),
+                a(fastk),
+                a(pb),
+            ],
         });
     }
     ls_.push(Launch {
@@ -211,7 +338,19 @@ fn run(dev: &Dev, dir: &Path) {
         f: func("cx_moe_add_norm"),
         grid: (t as u32, 1, 1),
         block: 1024,
-        args: vec![a(p(&g_r)), a(parts_p), a(dev.ptr(&g_wts)), a(p(&g_lg)), a(ls), a(ti), a(p(&g_y)), a(p(&g_wn)), a(p(&g_xo)), a(dev.ptr(&g_xq2)), a(1e-6f32)],
+        args: vec![
+            a(p(&g_r)),
+            a(parts_p),
+            a(dev.ptr(&g_wts)),
+            a(p(&g_lg)),
+            a(ls),
+            a(ti),
+            a(p(&g_y)),
+            a(p(&g_wn)),
+            a(p(&g_xo)),
+            a(dev.ptr(&g_xq2)),
+            a(1e-6f32),
+        ],
     });
     let s = &dev.stream;
     for l in &ls_ {
@@ -238,7 +377,10 @@ fn run(dev: &Dev, dir: &Path) {
     // timings
     let mut flush = dev.zeros::<u8>(256 << 20);
     let iters = 100;
-    let ev = |s: &CudaStream| s.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+    let ev = |s: &CudaStream| {
+        s.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap()
+    };
     let (mut tw, mut tc) = (0.0, 0.0);
     for l in &ls_ {
         for _ in 0..3 {
@@ -276,7 +418,11 @@ fn run(dev: &Dev, dir: &Path) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = Path::new(args.first().expect("usage: coder_moe_hand dir [B...]"));
-    let bs: Vec<String> = if args.len() > 1 { args[1..].to_vec() } else { vec!["1".into(), "8".into(), "64".into()] };
+    let bs: Vec<String> = if args.len() > 1 {
+        args[1..].to_vec()
+    } else {
+        vec!["1".into(), "8".into(), "64".into()]
+    };
     let gpu = Gpu::new().expect("cuda");
     let stream = gpu.ctx.default_stream();
     let dev = Dev { stream, gpu };

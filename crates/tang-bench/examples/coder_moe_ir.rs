@@ -24,8 +24,10 @@
 //! (`CODER_MOE_B=1,8,64`, `CODER_MOE_STAGE=mma` for the MMA k order,
 //! `CODER_MOE_KSPLIT=gu,dn`). Without CUDA it runs the interpreter check only.
 
-use tang_compile::tensor::{Arg, Form, Format, IntMma, Monoid, Precision, Stage, TensorGraph, TensorId, View};
 use tang::Scalar;
+use tang_compile::tensor::{
+    Arg, Form, Format, IntMma, Monoid, Precision, Stage, TensorGraph, TensorId, View,
+};
 use tang_expr::ExprId;
 
 #[derive(Clone, Copy, Debug)]
@@ -70,7 +72,13 @@ fn scale_min(j: usize, q: &[u8]) -> (u8, u8) {
 
 /// `rows × cols` weights as Q4_K (`five = false`) or Q5_K super-blocks with
 /// random codes, scales and mins; values about `±amp`.
-fn gen_kquant(rows: usize, cols: usize, five: bool, amp: f32, rng: &mut tang_bench::Rng) -> Vec<u8> {
+fn gen_kquant(
+    rows: usize,
+    cols: usize,
+    five: bool,
+    amp: f32,
+    rng: &mut tang_bench::Rng,
+) -> Vec<u8> {
     let bb = if five { 176 } else { 144 };
     let nb = rows * cols / 256;
     let mut out = vec![0u8; nb * bb];
@@ -96,7 +104,11 @@ fn dequant(bytes: &[u8], five: bool) -> Vec<f32> {
         let d = f16_val(u16::from_le_bytes([b[0], b[1]]));
         let dmin = f16_val(u16::from_le_bytes([b[2], b[3]]));
         let sc = &b[4..16];
-        let (qh, qs) = if five { (&b[16..48], &b[48..176]) } else { (&b[0..0], &b[16..144]) };
+        let (qh, qs) = if five {
+            (&b[16..48], &b[48..176])
+        } else {
+            (&b[0..0], &b[16..144])
+        };
         for j in 0..4 {
             let q = &qs[32 * j..32 * j + 32];
             for half in 0..2 {
@@ -123,7 +135,11 @@ fn q8x32(v: &[f32]) -> Vec<f32> {
         let amax = blk.iter().fold(0f32, |a, x| a.max(x.abs()));
         let d = amax / 127.0;
         for x in blk.iter_mut() {
-            *x = if d == 0.0 { 0.0 } else { (*x / d).round().clamp(-127.0, 127.0) * d };
+            *x = if d == 0.0 {
+                0.0
+            } else {
+                (*x / d).round().clamp(-127.0, 127.0) * d
+            };
         }
     }
     out
@@ -174,7 +190,10 @@ fn layer_graph(m: Dims) -> Layer {
         .comp(
             &[t, e + 1],
             &[d],
-            vec![arg(x, View::pick(3, &[Some(0), Some(2)])), arg(wr, View::pick(3, &[Some(1), Some(2)]))],
+            vec![
+                arg(x, View::pick(3, &[Some(0), Some(2)])),
+                arg(wr, View::pick(3, &[Some(1), Some(2)])),
+            ],
             sum(),
             |v| vec![v[0] * v[1]],
         )
@@ -188,7 +207,10 @@ fn layer_graph(m: Dims) -> Layer {
         gather: None,
     };
     for _ in 0..k {
-        let mut args = vec![arg(logits, View::identity(2, 2)), arg(iota_e, View::identity(2, 2))];
+        let mut args = vec![
+            arg(logits, View::identity(2, 2)),
+            arg(iota_e, View::identity(2, 2)),
+        ];
         args.extend(picks.iter().map(|&q| arg(q, slot(0))));
         let n_prev = picks.len();
         let masked = g
@@ -204,7 +226,10 @@ fn layer_graph(m: Dims) -> Layer {
             .comp_tuple(
                 &[t, 2],
                 &[e],
-                vec![arg(iota_e, View::identity(2, 2)), arg(masked, View::identity(2, 2))],
+                vec![
+                    arg(iota_e, View::identity(2, 2)),
+                    arg(masked, View::identity(2, 2)),
+                ],
                 Some(Monoid::argmax()),
                 |v| vec![v[0], v[1]],
             )
@@ -220,8 +245,15 @@ fn layer_graph(m: Dims) -> Layer {
         gather: None,
     };
     let stack = |g: &mut TensorGraph, weights: bool| {
-        let mut args = vec![arg(iota_k, View::identity(2, 2)), arg(logits, gate_view.clone())];
-        args.extend(picks.iter().map(|&q| arg(q, slot(if weights { 1 } else { 0 }))));
+        let mut args = vec![
+            arg(iota_k, View::identity(2, 2)),
+            arg(logits, gate_view.clone()),
+        ];
+        args.extend(
+            picks
+                .iter()
+                .map(|&q| arg(q, slot(if weights { 1 } else { 0 }))),
+        );
         g.comp(&[t, k1], &[], args, None, |v| {
             let mut acc = ExprId::ZERO;
             let mut norm = ExprId::ZERO;
@@ -270,7 +302,9 @@ fn layer_graph(m: Dims) -> Layer {
             sum(),
             |v| {
                 let diff = v[0] - v[1];
-                vec![tang_expr::with_graph(|eg| eg.select(diff, ExprId::ONE, ExprId::ZERO))]
+                vec![tang_expr::with_graph(|eg| {
+                    eg.select(diff, ExprId::ONE, ExprId::ZERO)
+                })]
             },
         )
         .unwrap();
@@ -298,7 +332,10 @@ fn layer_graph(m: Dims) -> Layer {
             &[p, 2 * f],
             &[d],
             vec![
-                arg(wgu, View::pick(3, &[None, Some(1), Some(2)]).gather(0, 2, 1)),
+                arg(
+                    wgu,
+                    View::pick(3, &[None, Some(1), Some(2)]).gather(0, 2, 1),
+                ),
                 arg(xq, View::pick(3, &[None, Some(2)]).gather(0, 3, 1)),
                 arg(skey, View::pick(3, &[Some(0)])),
                 arg(stok, View::pick(3, &[Some(0)])),
@@ -308,7 +345,13 @@ fn layer_graph(m: Dims) -> Layer {
         )
         .unwrap();
     let up = View {
-        forms: vec![Form::unit(2, 0), Form { coefs: vec![0, 1], offset: f as i64 }],
+        forms: vec![
+            Form::unit(2, 0),
+            Form {
+                coefs: vec![0, 1],
+                offset: f as i64,
+            },
+        ],
         guard: false,
         gather: None,
     };
@@ -347,7 +390,18 @@ fn layer_graph(m: Dims) -> Layer {
             |v| vec![v[0] * v[1]],
         )
         .unwrap();
-    Layer { g, y, sel, wts, logits, rank, gu, dn, xq, h }
+    Layer {
+        g,
+        y,
+        sel,
+        wts,
+        logits,
+        rank,
+        gu,
+        dn,
+        xq,
+        h,
+    }
 }
 
 /// The schedule: storage formats and the int8 MMA fields.
@@ -357,8 +411,20 @@ fn schedule(l: &mut Layer, stage: Stage, ksplit: (u32, u32)) {
     g.set_precision(TensorId::from_index(3), Precision::storage(Format::Q5K));
     g.set_precision(l.xq, Precision::storage(Format::Q8x32));
     g.set_precision(l.h, Precision::storage(Format::Q8x32));
-    g.set_int_mma(l.gu, Some(IntMma { stage, ksplit: ksplit.0 }));
-    g.set_int_mma(l.dn, Some(IntMma { stage, ksplit: ksplit.1 }));
+    g.set_int_mma(
+        l.gu,
+        Some(IntMma {
+            stage,
+            ksplit: ksplit.0,
+        }),
+    );
+    g.set_int_mma(
+        l.dn,
+        Some(IntMma {
+            stage,
+            ksplit: ksplit.1,
+        }),
+    );
     // the router: a 2048-long dot a point, split across a warp
     g.set_schedule(l.logits, 32, (0, 0, 0), (1, 1));
 }
@@ -384,7 +450,11 @@ fn reference(m: Dims, x: &[f32], wgu: &[f32], wd: &[f32], sel: &[usize], wts: &[
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let per = p.div_ceil(threads);
     std::thread::scope(|sc| {
-        for (c, (guc, dnc)) in gu.chunks_mut(per * 2 * f).zip(dn.chunks_mut(per * d)).enumerate() {
+        for (c, (guc, dnc)) in gu
+            .chunks_mut(per * 2 * f)
+            .zip(dn.chunks_mut(per * d))
+            .enumerate()
+        {
             let xq = &xq;
             sc.spawn(move || {
                 for (i, (gup, dnp)) in guc.chunks_mut(2 * f).zip(dnc.chunks_mut(d)).enumerate() {
@@ -426,7 +496,10 @@ fn route(m: Dims, logits: &[f64]) -> (Vec<usize>, Vec<f64>) {
         let l = &logits[ti * (e + 1)..(ti + 1) * (e + 1)];
         let mut order: Vec<usize> = (0..e).collect();
         order.sort_by(|&a, &b| l[b].total_cmp(&l[a]).then(a.cmp(&b)));
-        let ex: Vec<f64> = order[..k].iter().map(|&i| (l[i] - l[order[0]]).exp()).collect();
+        let ex: Vec<f64> = order[..k]
+            .iter()
+            .map(|&i| (l[i] - l[order[0]]).exp())
+            .collect();
         let norm: f64 = ex.iter().sum();
         for j in 0..k {
             sel.push(order[j]);
@@ -440,7 +513,9 @@ fn route(m: Dims, logits: &[f64]) -> (Vec<usize>, Vec<f64>) {
 
 fn max_rel(got: impl Iterator<Item = f64> + Clone, want: &[f64]) -> f64 {
     let scale = want.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-30);
-    got.zip(want).map(|(g, w)| (g - w).abs() / scale).fold(0.0, f64::max)
+    got.zip(want)
+        .map(|(g, w)| (g - w).abs() / scale)
+        .fold(0.0, f64::max)
 }
 
 struct Data {
@@ -456,21 +531,38 @@ fn data(m: Dims, seed: u64) -> Data {
     let Dims { t, d, e, f, .. } = m;
     let mut rng = tang_bench::Rng::new(seed);
     let x: Vec<f32> = (0..t * d).map(|_| rng.f32() * 2.0 - 1.0).collect();
-    let wr: Vec<f32> = (0..(e + 1) * d).map(|_| (rng.f32() * 2.0 - 1.0) / (d as f32).sqrt()).collect();
+    let wr: Vec<f32> = (0..(e + 1) * d)
+        .map(|_| (rng.f32() * 2.0 - 1.0) / (d as f32).sqrt())
+        .collect();
     let wgu_q = gen_kquant((e + 1) * 2 * f, d, false, 2.0 / (d as f32).sqrt(), &mut rng);
     let wd_q = gen_kquant((e + 1) * d, f, true, 2.0 / (f as f32).sqrt(), &mut rng);
     let wgu = dequant(&wgu_q, false);
     let wd = dequant(&wd_q, true);
-    Data { x, wr, wgu_q, wd_q, wgu, wd }
+    Data {
+        x,
+        wr,
+        wgu_q,
+        wd_q,
+        wgu,
+        wd,
+    }
 }
 
 fn words(b: &[u8]) -> Vec<f32> {
-    b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn interpreter_check() {
     // small: T 3, D 256, E 6 (+ shared), K 2, F 256
-    let m = Dims { t: 3, d: 256, e: 6, k: 2, f: 256 };
+    let m = Dims {
+        t: 3,
+        d: 256,
+        e: 6,
+        k: 2,
+        f: 256,
+    };
     let dt = data(m, 5);
     let mut l = layer_graph(m);
     schedule(&mut l, Stage::Fragment, (1, 1));
@@ -478,14 +570,17 @@ fn interpreter_check() {
         .iter()
         .map(|v| v.iter().map(|&a| a as f64).collect())
         .collect();
-    let ev = l.g.eval_emulated(&ins, &[l.y, l.sel, l.wts, l.logits, l.gu, l.rank]);
+    let ev =
+        l.g.eval_emulated(&ins, &[l.y, l.sel, l.wts, l.logits, l.gu, l.rank]);
     let (sel, wts) = route(m, &ev[3]);
     let sel_ok = ev[1].iter().map(|&s| s as usize).eq(sel.iter().copied());
     let r = reference(m, &dt.x, &dt.wgu, &dt.wd, &sel, &wts);
     // the interpreter's gu is in sorted order: back through rank
     let rank: Vec<usize> = ev[5].iter().map(|&v| v as usize).collect();
     let f2 = 2 * m.f;
-    let gu_pairs: Vec<f64> = (0..m.p()).flat_map(|q| ev[4][rank[q] * f2..][..f2].to_vec()).collect();
+    let gu_pairs: Vec<f64> = (0..m.p())
+        .flat_map(|q| ev[4][rank[q] * f2..][..f2].to_vec())
+        .collect();
     println!(
         "interpreter (emulated int8) vs reference, {m:?}: top-k match {sel_ok}, gu max rel {:.2e}, y max rel {:.2e}",
         max_rel(gu_pairs.iter().copied(), &r.gu),
@@ -510,8 +605,16 @@ mod gpu {
 
     /// Per launch of kernel `i`: (min of warm launches, median with L2
     /// flushed before each launch), ms.
-    fn time(rt: &Runtime, exe: &Program, i: usize, flush: &mut tang_gpu::cudarc::driver::CudaSlice<u8>, iters: usize) -> (f64, f64) {
-        let Runtime::Cuda(dev) = rt else { unreachable!() };
+    fn time(
+        rt: &Runtime,
+        exe: &Program,
+        i: usize,
+        flush: &mut tang_gpu::cudarc::driver::CudaSlice<u8>,
+        iters: usize,
+    ) -> (f64, f64) {
+        let Runtime::Cuda(dev) = rt else {
+            unreachable!()
+        };
         let warm = exe.time_kernel(rt, i, iters);
         let mut v: Vec<f64> = (0..iters)
             .map(|_| {
@@ -553,9 +656,23 @@ mod gpu {
         };
         let iters = 100;
         // one weight set (the largest B's routing reuses it)
-        let full = Dims { t: 1, d: 2048, e: 512, k: 10, f: 512 };
-        let dt = data(Dims { t: *bs.iter().max().unwrap(), ..full }, 7);
-        let dump = std::env::var("CODER_MOE_DUMP").ok().map(std::path::PathBuf::from);
+        let full = Dims {
+            t: 1,
+            d: 2048,
+            e: 512,
+            k: 10,
+            f: 512,
+        };
+        let dt = data(
+            Dims {
+                t: *bs.iter().max().unwrap(),
+                ..full
+            },
+            7,
+        );
+        let dump = std::env::var("CODER_MOE_DUMP")
+            .ok()
+            .map(std::path::PathBuf::from);
         for &b in &bs {
             let m = Dims { t: b, ..full };
             let ks: (u32, u32) = match std::env::var("CODER_MOE_KSPLIT") {
@@ -572,9 +689,17 @@ mod gpu {
             let (wgu_w, wd_w) = (words(&dt.wgu_q), words(&dt.wd_q));
             let exe = Program::compile(&rt, &l.g, &outs, &[x, &dt.wr, &wgu_w, &wd_w]);
             exe.run(&rt);
-            let rd = |t: TensorId| -> Vec<f64> { exe.read(&rt, t).iter().map(|&v| v as f64).collect() };
-            let (y, gsel, gwts, logits, gu, dn, rank) =
-                (rd(l.y), rd(l.sel), rd(l.wts), rd(l.logits), rd(l.gu), rd(l.dn), rd(l.rank));
+            let rd =
+                |t: TensorId| -> Vec<f64> { exe.read(&rt, t).iter().map(|&v| v as f64).collect() };
+            let (y, gsel, gwts, logits, gu, dn, rank) = (
+                rd(l.y),
+                rd(l.sel),
+                rd(l.wts),
+                rd(l.logits),
+                rd(l.gu),
+                rd(l.dn),
+                rd(l.rank),
+            );
             let (sel_r, _) = route(m, &logits);
             let sel: Vec<usize> = gsel.iter().map(|&s| s as usize).collect();
             let topk_ok = sel == sel_r;
@@ -582,7 +707,9 @@ mod gpu {
             let rank: Vec<usize> = rank.iter().map(|&v| v as usize).collect();
             let (f2, d) = (2 * m.f, m.d);
             let unsort = |v: &[f64], w: usize| -> Vec<f64> {
-                (0..m.p()).flat_map(|q| v[rank[q] * w..][..w].to_vec()).collect()
+                (0..m.p())
+                    .flat_map(|q| v[rank[q] * w..][..w].to_vec())
+                    .collect()
             };
             let (gu_p, dn_p) = (unsort(&gu, f2), unsort(&dn, d));
             println!(
@@ -631,22 +758,39 @@ mod gpu {
             if let Some(dir) = &dump {
                 let dir = dir.join(format!("b{b}"));
                 std::fs::create_dir_all(&dir).unwrap();
-                put(&dir, "meta.txt", format!("{} {} {} {} {}\n", m.t, m.d, m.e, m.k, m.f).as_bytes());
+                put(
+                    &dir,
+                    "meta.txt",
+                    format!("{} {} {} {} {}\n", m.t, m.d, m.e, m.k, m.f).as_bytes(),
+                );
                 put(&dir, "x.f32", &f32s(x.iter().copied()));
                 put(&dir, "logits.f32", &f32s(logits.iter().map(|&v| v as f32)));
                 // routed pairs only, the hand kernels' ids / wts layout [t][K]
                 let routed = |v: &[f64]| -> Vec<f64> {
-                    (0..m.p()).filter(|q| q % m.k1() < m.k).map(|q| v[q]).collect()
+                    (0..m.p())
+                        .filter(|q| q % m.k1() < m.k)
+                        .map(|q| v[q])
+                        .collect()
                 };
-                let ids: Vec<u8> = routed(&gsel).iter().flat_map(|&s| (s as u32).to_le_bytes()).collect();
+                let ids: Vec<u8> = routed(&gsel)
+                    .iter()
+                    .flat_map(|&s| (s as u32).to_le_bytes())
+                    .collect();
                 put(&dir, "ids.u32", &ids);
-                put(&dir, "wts.f32", &f32s(routed(&gwts).iter().map(|&v| v as f32)));
+                put(
+                    &dir,
+                    "wts.f32",
+                    &f32s(routed(&gwts).iter().map(|&v| v as f32)),
+                );
                 put(&dir, "wgu.q4k", &dt.wgu_q);
                 put(&dir, "wd.q5k", &dt.wd_q);
                 // derived outputs in the hand kernels' pair order: routed t·K + k, then shared T·K + t
                 let hand_order = |v: &[f64], w: usize| -> Vec<f32> {
                     let mut o = Vec::with_capacity(m.p() * w);
-                    for q in (0..m.p()).filter(|q| q % m.k1() < m.k).chain((0..m.t).map(|t| t * m.k1() + m.k)) {
+                    for q in (0..m.p())
+                        .filter(|q| q % m.k1() < m.k)
+                        .chain((0..m.t).map(|t| t * m.k1() + m.k))
+                    {
                         o.extend(v[q * w..][..w].iter().map(|&a| a as f32));
                     }
                     o

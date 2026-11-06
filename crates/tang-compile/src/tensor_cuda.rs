@@ -239,7 +239,9 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             }
         };
         let elem = |f: super::Format| {
@@ -808,7 +810,9 @@ impl TensorGraph {
                                 "tang_b2f(src[0])".to_string(),
                                 format!("tang_b2f(src[{ce}])"),
                             ),
-                            super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                            super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                                unreachable!("block formats lower only through the int8 MMA kernel")
+                            }
                         };
                         writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? {s0} : 0.0f), tang_tf32(ok ? {s1} : 0.0f)}};").unwrap();
                         writeln!(s, "            #pragma unroll").unwrap();
@@ -1289,7 +1293,9 @@ impl TensorGraph {
                 super::Format::F32 => v.clone(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             };
             writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
         }
@@ -2386,7 +2392,9 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             }
         };
         let elem = |f: super::Format| {
@@ -3332,7 +3340,9 @@ impl TensorGraph {
                 super::Format::F32 => v.to_string(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             };
             writeln!(s, "            out[g * {w_out}u + 0u] = {};", st_v("m_v")).unwrap();
             writeln!(s, "            out[g * {w_out}u + 1u] = {};", st_v("l_v")).unwrap();
@@ -3380,7 +3390,9 @@ impl TensorGraph {
                     super::Format::F32 => v.clone(),
                     super::Format::F16 => format!("tang_f2h({v})"),
                     super::Format::BF16 => format!("tang_f2b({v})"),
-                    super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => unreachable!("block formats lower only through the int8 MMA kernel"),
+                    super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                        unreachable!("block formats lower only through the int8 MMA kernel")
+                    }
                 };
                 writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }

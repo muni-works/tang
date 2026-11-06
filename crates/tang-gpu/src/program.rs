@@ -1294,7 +1294,9 @@ fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
         Format::Q8x32 => {
             let bytes: &[u8] = bytemuck::cast_slice(words);
             let sc: &[f32] = bytemuck::cast_slice(&bytes[n..n + n / 32 * 8]);
-            (0..n).map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2]).collect()
+            (0..n)
+                .map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2])
+                .collect()
         }
         Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
         Format::F16 => unpack_f16(words, n),

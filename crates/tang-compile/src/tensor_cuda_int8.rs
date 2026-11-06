@@ -102,7 +102,7 @@ __device__ __forceinline__ void tang_q8x32_store(float* out, unsigned g, float v
 /// Rewrite a transpiled one-thread-per-point kernel to store its node as
 /// Q8x32. `None` when the kernel is not of that shape.
 pub(super) fn q8x32_writer(src: &str, points: usize) -> Option<String> {
-    if points % 32 != 0 {
+    if !points.is_multiple_of(32) {
         return None;
     }
     let store = "out[g * 1u + 0u] = v[0];";
@@ -138,8 +138,10 @@ impl TensorGraph {
         let (rd, kd) = (np - 1, np); // row and reduce coordinates
         let rows = pts[rd];
         let k = c.red[0].n();
-        if rows % 16 != 0 || k % 256 != 0 {
-            return Err(format!("rows {rows} must be a multiple of 16, k {k} of 256"));
+        if !rows.is_multiple_of(16) || !k.is_multiple_of(256) {
+            return Err(format!(
+                "rows {rows} must be a multiple of 16, k {k} of 256"
+            ));
         }
         let storage = |t: TensorId| self.nodes[t.n()].precision.storage;
         let wi = (0..c.args.len())
@@ -163,9 +165,8 @@ impl TensorGraph {
         if (probe(3.0, 2.0) - 6.0).abs() > 1e-12 || (probe(-1.5, 5.0) + 7.5).abs() > 1e-12 {
             return Err("body is not W · X".into());
         }
-        let shape = |t: TensorId| -> Vec<usize> {
-            self.nodes[t.n()].shape.iter().map(|d| d.n()).collect()
-        };
+        let shape =
+            |t: TensorId| -> Vec<usize> { self.nodes[t.n()].shape.iter().map(|d| d.n()).collect() };
         let (wa, xa) = (&c.args[wi], &c.args[xi]);
         let (ws, xs) = (shape(wa.src), shape(xa.src));
         let unit = |f: &super::Form, d: usize| f.as_unit() == Some(d);
@@ -175,7 +176,9 @@ impl TensorGraph {
         if wl < 2
             || !unit(&wa.view.forms[wl - 1], kd)
             || !unit(&wa.view.forms[wl - 2], rd)
-            || wa.view.forms[..wl - 2].iter().any(|f| !free_of(f, kd) || !free_of(f, rd))
+            || wa.view.forms[..wl - 2]
+                .iter()
+                .any(|f| !free_of(f, kd) || !free_of(f, rd))
             || ws[wl - 1] != k
             || ws[wl - 2] != rows
             || wa.view.guard
@@ -231,7 +234,12 @@ impl TensorGraph {
             if ia.view.is_gather() {
                 return Err("an index read must be affine".into());
             }
-            if ia.view.forms.iter().any(|f| !free_of(f, kd) || !free_of(f, rd)) {
+            if ia
+                .view
+                .forms
+                .iter()
+                .any(|f| !free_of(f, kd) || !free_of(f, rd))
+            {
                 return Err("an index must depend on positions only".into());
             }
             let off = offset_expr(&ia.view, &shape(ia.src), &names, None);
@@ -257,8 +265,7 @@ impl TensorGraph {
         let row_blocks = rows.div_ceil(16 * tiles_per_block);
         let nsb = k / 256;
         let frag = s.stage == Stage::Fragment;
-        let (wp, xp, ip) = (param(wi)?, param(xi)?, ());
-        let _ = ip;
+        let (wp, xp) = (param(wi)?, param(xi)?);
         let params: Vec<String> = (0..reads.len())
             .map(|i| format!("const float* __restrict__ q{i}"))
             .collect();
@@ -431,7 +438,7 @@ impl TensorGraph {
         .unwrap();
         // a block where r0 >= rows returned before the barrier: only legal
         // when every warp of a block passes it together
-        if ksplit > 1 && rows % (16 * tiles_per_block) != 0 {
+        if ksplit > 1 && !rows.is_multiple_of(16 * tiles_per_block) {
             return Err("ksplit > 1 needs rows a multiple of a block's rows".into());
         }
         let _ = (wp, x_total);
