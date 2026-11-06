@@ -24,13 +24,19 @@ fn rel_err(got: &[Vec<f32>], want: &[Vec<f64>]) -> f64 {
         .zip(want)
         .map(|(g, w)| {
             let scale = w.iter().fold(1e-30f64, |m, v| m.max(v.abs()));
-            g.iter().zip(w).fold(0.0f64, |m, (&a, &b)| m.max((a as f64 - b).abs())) / scale
+            g.iter()
+                .zip(w)
+                .fold(0.0f64, |m, (&a, &b)| m.max((a as f64 - b).abs()))
+                / scale
         })
         .fold(0.0, f64::max)
 }
 
 fn nxn(p: &tang_compile::tensor::wgsl::WgslProgram, n: usize) -> usize {
-    p.buffers.iter().filter(|b| b.input.is_none() && b.len >= n * n).count()
+    p.buffers
+        .iter()
+        .filter(|b| b.input.is_none() && b.len >= n * n)
+        .count()
 }
 
 fn main() {
@@ -71,9 +77,9 @@ fn main() {
             };
             let (ms0, big0, got0) = wgpu(&dg, false, &mut cache);
             let (ms1, big1, got1) = wgpu(&dg, true, &mut cache);
-            let err = want
-                .as_ref()
-                .map_or("—".into(), |w| format!("{:.1e} / {:.1e}", rel_err(&got0, w), rel_err(&got1, w)));
+            let err = want.as_ref().map_or("—".into(), |w| {
+                format!("{:.1e} / {:.1e}", rel_err(&got0, w), rel_err(&got1, w))
+            });
             println!(
                 "| {name} | {n} | wgpu | {ms0:.3} ({big0}) | {ms1:.3} ({big1}) | {:.2}× | {err} |",
                 ms0 / ms1
@@ -84,7 +90,11 @@ fn main() {
                 use tang_compile::tensor::msl::FragmentTarget;
                 let run = |nested: bool| {
                     let p = dg.to_msl_with(&douts, &FragmentTarget::APPLE, nested);
-                    let big = p.buffers.iter().filter(|b| b.input.is_none() && b.len >= n * n).count();
+                    let big = p
+                        .buffers
+                        .iter()
+                        .filter(|b| b.input.is_none() && b.len >= n * n)
+                        .count();
                     let names: Vec<usize> = p.kernels.iter().map(|k| k.node.index()).collect();
                     let exe = MslExe::new(dev, p, &ins);
                     if std::env::var("PER_KERNEL").is_ok() {
@@ -93,7 +103,9 @@ fn main() {
                             eprintln!("  nested={nested} kernel {i} (node {node}): {ms:.3} ms");
                         }
                     }
-                    let ms = (0..3).map(|_| exe.time(dev, ITERS)).fold(f64::INFINITY, f64::min);
+                    let ms = (0..3)
+                        .map(|_| exe.time(dev, ITERS))
+                        .fold(f64::INFINITY, f64::min);
                     exe.run(dev);
                     let got: Vec<Vec<f32>> = douts.iter().map(|o| exe.read(*o)).collect();
                     (ms, big, got)

@@ -3256,7 +3256,11 @@ pub mod ir_block_gpu {
             };
             let mut cache = KernelCache::new();
             let (n, d) = (256, 32);
-            for (score, mask) in [("s", "j <= i"), ("30*tanh(s/30)", "j <= i || j < 16"), ("s", "")] {
+            for (score, mask) in [
+                ("s", "j <= i"),
+                ("30*tanh(s/30)", "j <= i || j < 16"),
+                ("s", ""),
+            ] {
                 let v = tang_derive_wasm::parse_variant(score, mask).unwrap();
                 let (g, outs) = tang_derive_wasm::naive_graph(&v, n, d, true).unwrap();
                 let mut rng = crate::Rng::new(53);
@@ -3289,7 +3293,10 @@ pub mod ir_block_gpu {
                         .map(|(a, b)| (a - *b as f32).abs())
                         .fold(0.0f32, f32::max);
                     eprintln!("{score} / {mask}: grad {k} max err {err} (scale {scale})");
-                    assert!(err < 2e-3 * scale.max(1.0), "{score} / {mask}: grad {k} diverges");
+                    assert!(
+                        err < 2e-3 * scale.max(1.0),
+                        "{score} / {mask}: grad {k} diverges"
+                    );
                 }
             }
         }

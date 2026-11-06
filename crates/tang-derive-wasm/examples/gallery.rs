@@ -21,7 +21,12 @@ fn main() {
             let a = naive_program(&g, &outs);
             let (dg, douts) = derive_graph(&g, &outs);
             let b = dg.to_wgsl(&douts);
-            let nxn = |p: &tang_compile::tensor::wgsl::WgslProgram| p.buffers.iter().filter(|x| x.input.is_none() && x.len >= n * n).count();
+            let nxn = |p: &tang_compile::tensor::wgsl::WgslProgram| {
+                p.buffers
+                    .iter()
+                    .filter(|x| x.input.is_none() && x.len >= n * n)
+                    .count()
+            };
             println!(
                 "{name},{score},{mask},{},{},{},{},{}",
                 if bwd { "fwd+bwd" } else { "fwd" },

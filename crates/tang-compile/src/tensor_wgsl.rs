@@ -204,7 +204,12 @@ impl TensorGraph {
     }
 
     /// [`to_program`](Self::to_program), nesting short contractions or not.
-    pub fn to_program_with(&self, outputs: &[TensorId], target: Target, nested: bool) -> WgslProgram {
+    pub fn to_program_with(
+        &self,
+        outputs: &[TensorId],
+        target: Target,
+        nested: bool,
+    ) -> WgslProgram {
         if !nested {
             return self.to_program_numbered(outputs, target).canonical();
         }

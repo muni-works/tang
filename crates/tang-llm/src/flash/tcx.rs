@@ -63,7 +63,7 @@ fn decode_sb(q5: bool, b: &[u8]) -> (u16, u16, [u8; 8], [u8; 8], [u8; 256]) {
 pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<Vec<u8>> {
     let bb = if q5 { 176 } else { 144 };
     let nsb = k / 256;
-    ensure!(rows % 16 == 0 && k % 256 == 0, "tcx: {rows} x {k} isn't 16 x 256 tiled");
+    ensure!(rows.is_multiple_of(16) && k.is_multiple_of(256), "tcx: {rows} x {k} isn't 16 x 256 tiled");
     ensure!(src.len() == ne * rows * nsb * bb, "tcx: {} bytes, want {}", src.len(), ne * rows * nsb * bb);
     let tb = tile_bytes(q5);
     let per = (rows / 16) * nsb * tb;

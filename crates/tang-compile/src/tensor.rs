@@ -2140,9 +2140,7 @@ impl TensorGraph {
             tiled_map[j] = map
                 && self.nodes[j].inline
                 && !readers[j].is_empty()
-                && readers[j]
-                    .iter()
-                    .all(|&r| tile[r] || tiled_map[r]);
+                && readers[j].iter().all(|&r| tile[r] || tiled_map[r]);
         }
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
@@ -2176,7 +2174,9 @@ impl TensorGraph {
         // chunk for each of its rows: give it rows enough to fill the
         // workgroup (16 rows × 16 threads of 4 lanes) rather than 4 rows
         // of 64 lanes, where most threads would idle through the dots.
-        let tiles: Vec<usize> = (0..n).filter(|&t| live[t] && self.nodes[t].tile.0 > 0).collect();
+        let tiles: Vec<usize> = (0..n)
+            .filter(|&t| live[t] && self.nodes[t].tile.0 > 0)
+            .collect();
         for t in tiles {
             let (bx, by, _) = self.nodes[t].tile;
             let (rx, ry) = self.nodes[t].reg;
