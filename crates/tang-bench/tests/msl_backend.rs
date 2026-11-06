@@ -167,6 +167,7 @@ fn conv_graph(ci: usize, co: usize, t: usize, k: usize, dil: i64) -> (TensorGrap
             },
         ],
         guard: true,
+        gather: None,
     };
     let y = g
         .comp(
@@ -542,6 +543,7 @@ fn conv_strided(
             },
         ],
         guard: true,
+        gather: None,
     };
     g.comp(
         &[co, tout],
@@ -618,10 +620,12 @@ fn fragment_window_upsample() {
         let xv = View {
             forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
             guard: true,
+            gather: None,
         };
         let wv = View {
             forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
             guard: false,
+            gather: None,
         };
         let y = g
             .comp(

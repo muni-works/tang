@@ -2836,6 +2836,61 @@ second MMA), groups cut at 8-position tiles with no plan kernel, and ksplit 1 on
 - Synthetic weights (random valid k-quant blocks, gate/up Q4_K, down Q5_K); the real UD-Q4_K_XL mixes
   types per layer. Kernel-only times; no CUDA graph, no end-to-end step.
 
+## Persistent megakernel: Qwen3-8B decode with no kernel boundaries (RTX 3090)
+
+`tang_compile::tensor::cuda_mega` lowers any CUDA program from the decode lowering (the
+510 kernels of a Qwen3-8B MLX-4-bit step, `to_cuda_decode`) to persistent kernels: each kernel
+becomes a stage over its own grid as virtual blocks, stages are levelled over buffer hazards into
+phases, and a grid barrier separates phases. `Program::megakernel` fuses the whole step (1 launch,
+437 phases) or only the runs of small kernels between the big GEMVs (`max_blocks`: the boundary is
+a per-edge choice, launch or grid barrier). Nothing in it is Qwen-specific.
+`qwen_decode model ... TANG_MEGA=1 [TANG_MEGA_MAX_BLOCKS=64 TANG_MEGA_PER_SM=1]`.
+
+Correctness, 31 teacher-forced positions vs the CPU f32 reference (`qwen_decode reference`):
+all three variants give **max |err| 3.18e-2, mean 1.50e-3, argmax 31/31**, the same as the
+510-kernel graph. `cuda_megakernel_matches_launches` checks bit equality over repeated runs.
+
+Device time per decode step (min of 3 × 20, shared 3090 with other tenants, so the baseline is
+~4% slower than the 9.6 ms quoted above; the rows in one block below ran back to back):
+
+| schedule | launches | phases | len 64 | len 1024 | len 4096 | % of 936 GB/s at 4k (4.86 GB/token) |
+|---|---|---|---|---|---|---|
+| 510-kernel CUDA graph (main) | 510 | — | 10.05 ms (99.5 tok/s) | 10.45 ms | 11.38 ms (87.9 tok/s) | 46% |
+| one megakernel, `__launch_bounds__(256,2)` | 1 | 437 | 12.00 ms (83.3 tok/s) | 12.42 ms | 13.69 ms (73.1 tok/s) | 38% |
+| segments of kernels ≤ 64 blocks, 1 block/SM | 364 | 146 | **10.02 ms (99.8 tok/s)** | 10.39 ms | **11.32 ms (88.3 tok/s)** | 46% |
+| segments of kernels ≤ 300 blocks, 1 block/SM | 328 | 182 | 10.14 ms | 10.65 ms | 12.13 ms | 43% |
+
+So: the persistent form is correct and generic, but on this graph it is **at parity at best**,
+not a win. What the per-phase trace (`TANG_MEGA_TRACE=1`, `%globaltimer` per phase) showed:
+
+- **A grid barrier costs what a launch costs.** 436 barriers over 164 blocks: 0.81 µs each
+  (0.67 at 82 blocks, 1.51 at 328); 436 empty kernels in a CUDA graph: 0.77 µs each. Inside the
+  megakernel the small stages do run in 1–3 µs instead of ~4 µs standalone, worth ~0.5 ms a step.
+- **One register budget for every stage loses more than that.** The standalone kernels use 19–128
+  registers; the megakernel uses the max (103–185), so it runs 2 blocks × 8 warps per SM.
+  Capping lower spills the 4-bit gate/up GEMV (3/SM: 390 µs vs 98; 4/SM: 782 µs). At 2/SM the qkv
+  GEMV matches standalone (51 vs 50 µs) but gate/up (116 vs 98), down (66 vs 53) and o_proj (24 vs
+  20) do not: down's 512 blocks fit one wave standalone at 52 registers (9 blocks/SM) and need two
+  rounds over the megakernel's 328 slots. Larger GEMV row tiles / unroll / 8 warps make both
+  paths slower (rows 1: 17–18 ms).
+- **Prefetching the next phase's weights into L2 during the barrier** (`TANG_MEGA_PREFETCH`, 1–4
+  MB) changes nothing: DRAM is not idle at the boundaries, the GEMVs themselves are at ~58% of
+  bandwidth.
+- **Replicating tiny stages in every block** instead of a barrier before their readers
+  (`TANG_MEGA_DUP=1`: 437 → 363 phases) is slower (12.99 ms): every block redoing a 4096-wide
+  norm costs more than the barrier it saves.
+
+Two correctness traps worth keeping: `__ldg`/`__restrict__` reads of a buffer another block wrote
+earlier in the launch are not coherent (weights keep `__ldg`, everything else is a plain load); and
+a named barrier with a register id makes ptxas reserve all 16 hardware barriers per block, which
+caps residency below what the occupancy API reports, so a grid barrier over "fitting" blocks
+deadlocks (seen at 3 blocks/SM; barrier ids are now immediates, 3 barriers used).
+
+Where a win would have to come from: work units sized for one register budget (split-K or row
+groups so every GEMV fills the persistent grid in whole rounds) and the GEMVs' own bandwidth, not
+the boundaries. llama.cpp and vLLM are not installed on mew (no GGUF either) and no Hopper host
+was available, so there are no H200 rows.
+
 ## WGSL/MSL lowering caps: subgroups, native f16, simdgroup fragments under wgpu
 
 `TensorGraph::to_wgsl_caps(outputs, WgslCaps { subgroups, f16 })` lets the
@@ -2961,3 +3016,135 @@ flock ~/tang-gpu.lock ./target/release/examples/split_k matmul 4096 32768 131072
 TANG_LOAD_LANES=1 flock ~/tang-gpu.lock ./target/release/examples/split_k prefill 1024 2048 4096
 flock ~/tang-gpu.lock python3 bench/split_k_sdpa.py
 ```
+
+## Flash attention and matmul on Hopper (H200 SXM, bf16, kernel-only)
+
+GPU: one H200 SXM (141 GB HBM3e, same GH100 die and SM count as the H100 SXM, so
+FA3's published H100 numbers are comparable — the H200 adds bandwidth, not
+tensor throughput). RunPod community pod, idle except for the benchmark, one
+process at a time. CUDA 12.x, PyTorch SDPA (cuDNN/flash backend), FlashAttention-3
+built from `flash-attention/hopper` (`flash_attn_interface`).
+
+Method: 16k tokens per config (batch = 16384/N), 2048 hidden (heads = 2048/d),
+q/k/v/dO ~ N(0,1) in bf16. Each library: best of 5 samples of 20 launches (CUDA
+events). Every output is checked against an f64 forward/backward of the same bf16
+inputs on two heads; all three libraries land at rel_err 1.6–5e-3. TFLOP/s:
+forward 4·N²·d per head (halved when causal), backward 2.5× that. tang's backward
+is the whole derived fwd+bwd program (9 kernels, includes the forward recompute
+of L) timed end to end, reported in the same backward-equivalent units, so it
+slightly flatters tang. Scripts: `examples/hopper_attention.rs`,
+`examples/hopper_matmul.rs`, `scripts/hopper_attention.py`. Raw logs:
+`docs/bench/hopper-h200-*.log`.
+
+### Forward (TFLOP/s)
+
+| d | causal | N | tang | SDPA | FA3 | tang / FA3 |
+|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 231 | 292 | 384 | 0.60 |
+| 64 | false | 2048 | 261 | 302 | 500 | 0.52 |
+| 64 | false | 4096 | 279 | 310 | 528 | 0.53 |
+| 64 | false | 8192 | 289 | 313 | 574 | 0.50 |
+| 64 | false | 16384 | 294 | 315 | 567 | 0.52 |
+| 64 | true | 1024 | 154 | 222 | 300 | 0.51 |
+| 64 | true | 2048 | 191 | 263 | 427 | 0.45 |
+| 64 | true | 4096 | 216 | 283 | 488 | 0.44 |
+| 64 | true | 8192 | 231 | 297 | 550 | 0.42 |
+| 64 | true | 16384 | 246 | 303 | 574 | 0.43 |
+| 128 | false | 1024 | 308 | 334 | 636 | 0.48 |
+| 128 | false | 2048 | 361 | 347 | 692 | 0.52 |
+| 128 | false | 4096 | 392 | 355 | 718 | 0.55 |
+| 128 | false | 8192 | 408 | 358 | 737 | 0.55 |
+| 128 | false | 16384 | 416 | 359 | 729 | 0.57 |
+| 128 | true | 1024 | 212 | 251 | 489 | 0.43 |
+| 128 | true | 2048 | 272 | 284 | 612 | 0.45 |
+| 128 | true | 4096 | 315 | 306 | 692 | 0.46 |
+| 128 | true | 8192 | 346 | 321 | 735 | 0.47 |
+| 128 | true | 16384 | 378 | 327 | 750 | 0.50 |
+
+### Backward (TFLOP/s)
+
+| d | causal | N | tang | SDPA | FA3 | tang / FA3 |
+|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 22 | 215 | 426 | 0.05 |
+| 64 | false | 2048 | 22 | 247 | 488 | 0.05 |
+| 64 | false | 4096 | 25 | 269 | 527 | 0.05 |
+| 64 | false | 8192 | 24 | 280 | 538 | 0.05 |
+| 64 | false | 16384 | – | 286 | 541 | – |
+| 64 | true | 1024 | 17 | 154 | 299 | 0.06 |
+| 64 | true | 2048 | 20 | 199 | 410 | 0.05 |
+| 64 | true | 4096 | 22 | 233 | 502 | 0.04 |
+| 64 | true | 8192 | 23 | 256 | 535 | 0.04 |
+| 64 | true | 16384 | – | 274 | 556 | – |
+| 128 | false | 1024 | 16 | 227 | 491 | 0.03 |
+| 128 | false | 2048 | 17 | 264 | 574 | 0.03 |
+| 128 | false | 4096 | 18 | 286 | 597 | 0.03 |
+| 128 | false | 8192 | 18 | 297 | 611 | 0.03 |
+| 128 | false | 16384 | – | 303 | 615 | – |
+| 128 | true | 1024 | 13 | 168 | 356 | 0.04 |
+| 128 | true | 2048 | 16 | 216 | 483 | 0.03 |
+| 128 | true | 4096 | 19 | 253 | 548 | 0.03 |
+| 128 | true | 8192 | 20 | 279 | 596 | 0.03 |
+| 128 | true | 16384 | – | 307 | 607 | – |
+
+16k backward was not run for tang (the 9-kernel program at 8k already takes 60–150 ms).
+FA3's FP8 forward (in the logs) reaches 300–930 TFLOP/s at rel_err 3–11e-2.
+
+### bf16 matmul vs cuBLAS (TFLOP/s, best variant per family, rel_err 3–4e-3)
+
+| M×K×N | B layout | tang mma.sync | tang wgmma | cuBLAS | wgmma / cuBLAS |
+|---|---|---|---|---|---|
+| 1k³ | [k,n] | 112 | 148 | 223 | 0.66 |
+| 2k³ | [k,n] | 212 | 332 | 696 | 0.48 |
+| 4k³ | [k,n] | 230 | 401 | 803 | 0.50 |
+| 8k³ | [k,n] | 240 | 434 | 760 | 0.57 |
+| 16k×2k×2k | [n,k] | 234 | 416 | 675 | 0.62 |
+| 16k×2k×8k | [n,k] | 237 | 403 | 686 | 0.59 |
+| 16k×8k×2k | [n,k] | 247 | 500 | 723 | 0.69 |
+
+### Where the gap is
+
+- **Forward**: the derived flash kernel (wgmma, warp-specialized producer) is at
+  0.42–0.60× FA3; it beats SDPA at d=128 from 2k up (416 vs 359 at 16k). Missing vs FA3:
+  intra-warpgroup softmax/GEMM ping-pong and TMA loads.
+- **Backward**: 13–25 TFLOP/s, 20–30× behind FA3. The derived backward is 9
+  kernels (two flash-style tiles, two plain contraction tiles, five elementwise),
+  re-materializing P/dS through global memory; per-kernel at 1k d64 causal the
+  three contraction tiles are 1.7, 2.7 and 3.7 ms. `TANG_WG_SYNC` makes no
+  difference (9.98 ms both). Fix: fuse dK/dV (and atomic dQ) into one kernel,
+  FA3-style — a recognizer for the backward pattern, not a tile tweak.
+- **Matmul**: wgmma doubled mma.sync but sits at 0.5–0.69× cuBLAS. Next: TMA
+  (multicast across a cluster) instead of cp.async, two consumer warpgroups
+  ping-ponging with a producer, and a persistent tile scheduler.
+
+### Follow-up: where the 10 ms went, and llama.cpp on the same 3090
+
+Per-kernel times showed the four big GEMVs per layer at ~222 µs (8 of the 10 ms, ~46% of 936
+GB/s); launches and small kernels are ~1 ms. So the lever was GEMV bandwidth, not boundaries:
+
+| change (CUDA graph, no megakernel) | len 64 | len 1024 | len 4096 | correctness (31 forced rows vs CPU f32) |
+|---|---|---|---|---|
+| main (rows 2) | 10.05 ms (99.5 tok/s) | 10.45 ms | 11.38 ms (87.9) | max err 3.18e-2, 31/31 |
+| **rows 4** (now the CUDA default) | 8.02 ms (124.6) | 8.31 ms | 9.27 ms (107.9) | 3.18e-2, 31/31 |
+| rows 4 + split-K the down projection ×4 (`TANG_SPLIT_GEMV=4`) | **7.80 ms (128.1)** | 8.11 ms | 9.09 ms (110.1) | 3.46e-2, 31/31 |
+| rows 4 + split-K down and attention ×4 (`TANG_SPLIT_MIN_K=4352`) | 7.95 ms | 8.28 ms | **8.89 ms (112.5)** | — |
+| + small-kernel segments (`TANG_MEGA_MAX_BLOCKS=64`) | 8.06 ms | 8.38 ms | 9.31 ms | 31/31 |
+
+Rows 4 amortizes each lane's activation (and recomputed RMSNorm) loads over 4 weight rows instead
+of 2: gate/up 98 → 77 µs, qkv 50 → 35 µs. Rows 8/16, 8 warps or unroll 2 are slower. `split_reduction`
+now cuts the outermost of several reduce axes (the 4-bit GEMV's groups × 64), so the down
+projection (K = 12288, 512 blocks) splits. Fusing the small kernels on top no longer helps.
+
+llama.cpp (`ggml` CUDA, built on mew, `llama-bench -n 128 -fa on -ngl 99`), GGUF converted from
+the same MLX checkpoint (dequantized to f16, then `llama-quantize`; no downloads):
+
+| | tg128 | @ d1024 | @ d4096 |
+|---|---|---|---|
+| llama.cpp Q4_0 (4.44 GiB) | **148.9 tok/s** | 144.8 | 134.4 |
+| llama.cpp Q4_K_M (4.68 GiB) | 140.5 | 136.6 | 127.4 |
+| tang IR, best (device step) | 128.1 | 123.3 | 112.5 |
+
+tang is at 86% of llama.cpp Q4_0 at short context and 84% at 4k (was 67% / 65%). The remaining
+gap is the GEMV inner loop: llama.cpp's MMVQ quantizes the activation to q8_1 once and runs dp4a
+int8 dot products; tang dequantizes every nibble to f32 and FMAs, and recomputes the norm per
+element. That is the next schedule to derive (an int8 activation-quantization map before the
+GEMV, then a dp4a body), along with per-kernel rows/split choices through the autotuner.

@@ -797,7 +797,12 @@ impl TensorGraph {
         if !matches!(self.nodes[f.red_node].precision.operand, Format::E4M3(_)) {
             return None;
         }
-        if kd != 128 || bj != 128 || d % 64 != 0 || d > 256 || f.n_keys % 16 != 0 {
+        if kd != 128
+            || bj != 128
+            || !d.is_multiple_of(64)
+            || d > 256
+            || !f.n_keys.is_multiple_of(16)
+        {
             return None;
         }
         let (qb, qa, kb, ka) = &f.terms[0];
