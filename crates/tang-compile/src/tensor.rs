@@ -45,6 +45,9 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
+/// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
+#[path = "tensor_cuda_int8.rs"]
+mod cuda_int8;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
@@ -589,10 +592,44 @@ pub struct TNode {
     /// for an f16 × f16 → f32 contraction; see
     /// [`TensorGraph::fragment_plan`]. Backends without fragments ignore it.
     pub fragment: bool,
+    /// Schedule: lower this contraction onto integer tensor-core fragments
+    /// (CUDA `mma.sync` m16n8k32 s8) with its weight operand dequantized
+    /// in registers from a block format. See [`IntMma`]. Backends without
+    /// the lowering ignore it (and then reject the block formats).
+    pub int_mma: Option<IntMma>,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
     pub precision: Precision,
+}
+
+/// The integer-MMA schedule of one contraction
+/// `out[p…, r] = Σ_k W[idx(p), r, k] · X[p…, k]`: `W` a graph input stored
+/// Q4_K / Q5_K (its first dim optionally gathered by a per-point index), `X`
+/// a buffer stored [`Format::Q8x32`]. A warp owns 16 rows `r` (the MMA's M)
+/// and 8 consecutive points `p` (its N); consecutive points that gather the
+/// same `W` slice share each A fragment, so a point dim sorted by the index
+/// reads every slice once a tile. The integer dot of a 32-column step is
+/// scaled once in float (weight `d · scale − dmin · min`, activation `d`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntMma {
+    /// How the activation operand reaches the B fragment.
+    pub stage: Stage,
+    /// Warps that split a 16-row tile's reduction (1, 2, 4 or 8), their
+    /// partial sums added through shared memory.
+    pub ksplit: u32,
+}
+
+/// Activation staging for [`IntMma`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Fragment order: each lane's B fragment is 8 consecutive columns, one
+    /// 8-byte load from global, no shared memory; the A fragment takes the
+    /// same permutation of the 32 columns (a dot product does not care).
+    Fragment,
+    /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
+    /// and `16 + 4·tig..`), on both operands.
+    Mma,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)
@@ -755,6 +792,13 @@ impl TensorGraph {
         self.nodes[t.n()].precision = p;
     }
 
+    /// Schedule: run contraction `t` on integer MMA fragments
+    /// ([`IntMma`]); `None` clears it. The CUDA lowering checks the pattern
+    /// and the operand formats and panics when they do not fit.
+    pub fn set_int_mma(&mut self, t: TensorId, s: Option<IntMma>) {
+        self.nodes[t.n()].int_mma = s;
+    }
+
     pub fn precision(&self, t: TensorId) -> Precision {
         self.nodes[t.n()].precision
     }
@@ -815,6 +859,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -831,6 +876,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -862,6 +908,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1005,6 +1052,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1519,6 +1567,7 @@ impl TensorGraph {
                 tile: node.tile,
                 reg: node.reg,
                 fragment: node.fragment,
+                int_mma: node.int_mma,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -2705,6 +2754,7 @@ impl TensorGraph {
                 tile: (0, 0, 0),
                 reg: (1, 1),
                 fragment: false,
+                int_mma: None,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3182,6 +3232,7 @@ impl TensorGraph {
                     // siblings group by precision: all members share it
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
+                    int_mma: None,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
@@ -3448,6 +3499,7 @@ impl TensorGraph {
                 if emulate {
                     let f = self.nodes[i].precision.storage;
                     buf.iter_mut().for_each(|v| *v = f.round(*v));
+                    f.round_blocks(&mut buf);
                 }
                 ev.bufs[i] = buf;
             }

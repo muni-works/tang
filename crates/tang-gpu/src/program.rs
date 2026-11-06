@@ -256,12 +256,20 @@ impl From<&MemoryPlan> for BufferPlan {
 /// f32 words a buffer needs (f16 and bf16 pack two per word, element
 /// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
 /// buffers share the layout).
+///
+/// Block formats (Q4K, Q5K, Q8x32) are passed in and read back as their
+/// raw device words, except that reading a Q8x32 buffer dequantizes it.
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
-    match b.format {
-        Format::F16 | Format::BF16 => b.len.div_ceil(2),
-        _ => b.len,
+    b.format.words(b.len).max(1)
+}
+
+/// Host length of an input: elements, or raw words for a block format.
+fn host_len(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
+    if b.format.is_block() {
+        words(b)
+    } else {
+        b.len
     }
-    .max(1)
 }
 
 fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, shared: &[usize]) {
@@ -276,7 +284,7 @@ fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, share
         assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
         if let Some(k) = b.input.filter(|k| !shared.contains(k)) {
             assert!(
-                inputs[k].is_empty() || inputs[k].len() == b.len,
+                inputs[k].is_empty() || inputs[k].len() == host_len(b),
                 "input {k} has wrong length"
             );
         }
@@ -536,6 +544,9 @@ impl Program {
                 Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
                 Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
                 Format::BF16 => unreachable!("bf16 is interpreter-only"),
+                Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                    panic!("block formats run only on the CUDA int8 lowering")
+                }
             };
             if fresh.len() == plan.slot_len[s] {
                 slots[s] = fresh;
@@ -1267,6 +1278,7 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
     };
     match format {
         Format::F32 => std::borrow::Cow::Borrowed(data),
+        f if f.is_block() => std::borrow::Cow::Borrowed(data),
         _ => data
             .chunks(2)
             .map(|p| f32::from_bits(bits(p[0]) | p.get(1).map_or(0, |&x| bits(x) << 16)))
@@ -1279,6 +1291,12 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
 fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),
+        Format::Q8x32 => {
+            let bytes: &[u8] = bytemuck::cast_slice(words);
+            let sc: &[f32] = bytemuck::cast_slice(&bytes[n..n + n / 32 * 8]);
+            (0..n).map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2]).collect()
+        }
+        Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
         Format::F16 => unpack_f16(words, n),
         Format::BF16 => words
             .iter()

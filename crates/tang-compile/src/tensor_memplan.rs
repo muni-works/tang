@@ -27,10 +27,7 @@ use super::{Format, TensorGraph, TensorId};
 
 /// Bytes per element word: every slot is a run of 32-bit words.
 fn words(len: usize, format: Format) -> usize {
-    match format {
-        Format::F32 => len.max(1),
-        Format::F16 | Format::BF16 => len.div_ceil(2).max(1),
-    }
+    format.words(len).max(1)
 }
 
 /// Byte counts of a plan. Persistent: graph inputs (weights, optimizer
