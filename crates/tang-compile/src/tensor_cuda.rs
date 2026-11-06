@@ -21,6 +21,10 @@ use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
 
+#[path = "tensor_cuda_fp8.rs"]
+mod fp8;
+pub use fp8::SM90_FP8_SHAPES;
+
 /// A tensor-core tile's block shape: a `bm × bn` output block per thread
 /// block of `warps_m × warps_n` warps (each a `bm/warps_m × bn/warps_n`
 /// warp tile of 16×8 `mma` fragments), the reduction staged `chunk` at a
@@ -400,12 +404,17 @@ impl TensorGraph {
             return None;
         }
         let fmt = |j: usize| self.nodes[j].precision.storage;
+        // fp8 operands have their own tile (tensor_cuda_fp8)
+        if reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
+            return None;
+        }
         // buffer j's element at `idx`, as f32
         let ld = |j: usize, idx: &str| -> String {
             match fmt(j) {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
+                _ => unreachable!("fp8 has its own tile"),
             }
         };
         let elem = |f: super::Format| {
@@ -1074,6 +1083,7 @@ impl TensorGraph {
                                 "tang_b2f(src[0])".to_string(),
                                 format!("tang_b2f(src[{ce}])"),
                             ),
+                            _ => unreachable!("fp8 has its own tile"),
                         };
                         writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? {s0} : 0.0f), tang_tf32(ok ? {s1} : 0.0f)}};").unwrap();
                         writeln!(s, "            #pragma unroll").unwrap();
@@ -1652,6 +1662,7 @@ impl TensorGraph {
                 super::Format::F32 => v.clone(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
+                _ => unreachable!("fp8 has its own tile"),
             };
             writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
         }
@@ -1943,7 +1954,23 @@ impl TensorGraph {
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            // FP8 operands: only the sm90 FP8 tile reads them (variant v
+            // picks its shape)
+            let fp8 = reads.iter().any(|&j| self.nodes[j].precision.storage.is_fp8());
             let native = match variant {
+                _ if fp8 => {
+                    let sh = SM90_FP8_SHAPES[variant.unwrap_or(0) % SM90_FP8_SHAPES.len()];
+                    Some(
+                        self.cuda_fp8_kernel_shaped(root, &reads, sh)
+                            .or_else(|| self.cuda_fp8_kernel_shaped(root, &reads, SM90_FP8_SHAPES[0]))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "kernel {root} reads FP8 storage but is not an FP8 tile \
+                                     (a contraction of two FP8 operands contiguous along k)"
+                                )
+                            }),
+                    )
+                }
                 Some(v) if self.nodes[root].tile.0 > 0 => v
                     .checked_sub(MMA_SHAPES.len())
                     .and_then(|h| {
@@ -2756,11 +2783,16 @@ impl TensorGraph {
             return None;
         }
         let fmt = |j: usize| self.nodes[j].precision.storage;
+        // fp8 operands have their own tile (tensor_cuda_fp8)
+        if reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
+            return None;
+        }
         let ld = |j: usize, idx: &str| -> String {
             match fmt(j) {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
+                _ => unreachable!("fp8 has its own tile"),
             }
         };
         let elem = |f: super::Format| {
@@ -4054,6 +4086,7 @@ impl TensorGraph {
                 super::Format::F32 => v.to_string(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
+                _ => unreachable!("fp8 has its own tile"),
             };
             writeln!(s, "            out[g * {w_out}u + 0u] = {};", st_v("m_v")).unwrap();
             writeln!(s, "            out[g * {w_out}u + 1u] = {};", st_v("l_v")).unwrap();
@@ -4101,6 +4134,7 @@ impl TensorGraph {
                     super::Format::F32 => v.clone(),
                     super::Format::F16 => format!("tang_f2h({v})"),
                     super::Format::BF16 => format!("tang_f2b({v})"),
+                    _ => unreachable!("fp8 has its own tile"),
                 };
                 writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }

@@ -23,7 +23,31 @@ pub enum Format {
     /// Interpreter-only for now: WGSL has no bf16 type, and the lowering
     /// rejects it.
     BF16,
+    /// OCP FP8 E4M3 (3 mantissa bits, max 448, no ∞) with one f32 scale
+    /// per `block` consecutive elements (0: one scale for the tensor).
+    /// The scale is part of the type: a block's scale is its largest
+    /// magnitude over 448, the stored byte is `x / scale` rounded, and
+    /// the scales live in the same buffer after the bytes (see
+    /// [`Format::buffer_bytes`]), so a kernel reads the scale map like
+    /// any other view of the operand.
+    E4M3(u32),
+    /// OCP FP8 E5M2 (2 mantissa bits, max 57344), block-scaled like
+    /// [`Format::E4M3`].
+    E5M2(u32),
+    /// An accumulation format only: Hopper's FP8 tensor-core accumulator
+    /// without promotion ("fast accumulation"): f32 range, but each
+    /// addition keeps about [`FP8_ACCUM_BITS`] mantissa bits, truncated.
+    /// A reduction with this `accum` lets an FP8 tile accumulate the
+    /// whole reduction in the tensor cores; with `F32` the tile promotes
+    /// its partial sum into an f32 register every 128 elements.
+    Fp8Accum,
 }
+
+/// Explicit mantissa bits [`Format::Fp8Accum`] keeps (calibrated on H100:
+/// truncation to 14 bits matches the GPU to 4e-4 relative, 13 or 15 bits
+/// are off by 1e-2 and 4e-3;
+/// see `examples/hopper_fp8.rs`).
+pub const FP8_ACCUM_BITS: i32 = 14;
 
 impl Format {
     /// Bytes per element in a buffer.
@@ -31,6 +55,80 @@ impl Format {
         match self {
             Format::F32 => 4,
             Format::F16 | Format::BF16 => 2,
+            Format::E4M3(_) | Format::E5M2(_) => 1,
+            Format::Fp8Accum => 4,
+        }
+    }
+
+    /// An 8-bit block-scaled format.
+    pub fn is_fp8(self) -> bool {
+        matches!(self, Format::E4M3(_) | Format::E5M2(_))
+    }
+
+    /// Elements per scale of a block-scaled format (`n` for a per-tensor
+    /// scale of an `n`-element buffer); `None` for unscaled formats.
+    pub fn block(self, n: usize) -> Option<usize> {
+        match self {
+            Format::E4M3(b) | Format::E5M2(b) => Some(if b == 0 { n.max(1) } else { b as usize }),
+            _ => None,
+        }
+    }
+
+    /// Largest finite value (of the unscaled format).
+    pub fn max_finite(self) -> f64 {
+        match self {
+            Format::F32 | Format::Fp8Accum => f32::MAX as f64,
+            Format::F16 => 65504.0,
+            Format::BF16 => f32::from_bits(0x7f7f_0000) as f64,
+            Format::E4M3(_) => 448.0,
+            Format::E5M2(_) => 57344.0,
+        }
+    }
+
+    /// Bytes of an `n`-element buffer: block-scaled formats store the
+    /// bytes, padded to 16, then one f32 scale per block.
+    pub fn buffer_bytes(self, n: usize) -> usize {
+        match self.block(n) {
+            Some(b) => n.next_multiple_of(16) + 4 * n.div_ceil(b),
+            None => n * self.bytes(),
+        }
+    }
+
+    /// Byte offset of the scales in a block-scaled `n`-element buffer.
+    pub fn scale_offset(n: usize) -> usize {
+        n.next_multiple_of(16)
+    }
+
+    /// Per-block scales of `x` under a block-scaled format (f32 values):
+    /// the block's largest magnitude over the format's largest finite
+    /// value, 1 for an all-zero block.
+    pub fn scales(self, x: &[f64]) -> Vec<f64> {
+        let b = self.block(x.len()).expect("block-scaled format");
+        let max = self.max_finite();
+        x.chunks(b)
+            .map(|c| {
+                let a = c.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                if a > 0.0 && a.is_finite() {
+                    (a / max) as f32 as f64
+                } else {
+                    1.0
+                }
+            })
+            .collect()
+    }
+
+    /// A whole stored buffer rounded to this format: element-wise
+    /// [`Format::round`], or for a block-scaled format `round(x/s)·s`
+    /// with each block's scale `s` ([`Format::scales`]).
+    pub fn round_buf(self, x: &mut [f64]) {
+        match self.block(x.len()) {
+            None => x.iter_mut().for_each(|v| *v = self.round(*v)),
+            Some(b) => {
+                let s = self.scales(x);
+                for (c, s) in x.chunks_mut(b).zip(s) {
+                    c.iter_mut().for_each(|v| *v = self.round(*v / s) * s);
+                }
+            }
         }
     }
 
@@ -42,6 +140,10 @@ impl Format {
             Format::F32 => x as f32 as f64,
             Format::F16 => round_to(x, 10, -14, 65504.0),
             Format::BF16 => round_to(x, 7, -126, f32::from_bits(0x7f7f_0000) as f64),
+            // saturating (cvt.rn.satfinite): fp8 has no ∞ to overflow to
+            Format::E4M3(_) => sat(round_to(x, 3, -6, f64::INFINITY), 448.0),
+            Format::E5M2(_) => sat(round_to(x, 2, -14, f64::INFINITY), 57344.0),
+            Format::Fp8Accum => truncate_to(x as f32 as f64, FP8_ACCUM_BITS),
         }
     }
 }
@@ -61,6 +163,98 @@ fn round_to(x: f64, mant: i32, emin: i32, max: f64) -> f64 {
     } else {
         r
     }
+}
+
+/// `x` truncated (toward zero) to `mant` explicit mantissa bits.
+fn truncate_to(x: f64, mant: i32) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    let e = ((x.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    let quantum = 2f64.powi(e - mant);
+    (x / quantum).trunc() * quantum
+}
+
+fn sat(x: f64, max: f64) -> f64 {
+    if x.is_nan() {
+        x
+    } else {
+        x.clamp(-max, max)
+    }
+}
+
+/// FP8 bits of `x` (already scaled) in `f` (E4M3 or E5M2), round to
+/// nearest even, saturating.
+pub fn fp8_bits(f: Format, x: f64) -> u8 {
+    let (mant, bias) = match f {
+        Format::E4M3(_) => (3, 7),
+        Format::E5M2(_) => (2, 15),
+        _ => panic!("not fp8"),
+    };
+    if x.is_nan() {
+        return 0x7f;
+    }
+    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+    let r = f.round(x).abs();
+    let emin = 1 - bias;
+    if r < 2f64.powi(emin) {
+        return sign | (r * 2f64.powi(mant - emin)) as u8;
+    }
+    let e = ((r.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    let m = (r * 2f64.powi(mant - e)) as u32 - (1 << mant);
+    sign | (((e + bias) as u8) << mant) | m as u8
+}
+
+/// Value of FP8 bits in `f`.
+pub fn fp8_from_bits(f: Format, b: u8) -> f64 {
+    let (mant, bias) = match f {
+        Format::E4M3(_) => (3, 7),
+        Format::E5M2(_) => (2, 15),
+        _ => panic!("not fp8"),
+    };
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = ((b & 0x7f) >> mant) as i32;
+    let m = (b & ((1 << mant) - 1)) as f64;
+    let one = (1u32 << mant) as f64;
+    sign * if e == 0 {
+        m / one * 2f64.powi(1 - bias)
+    } else {
+        (1.0 + m / one) * 2f64.powi(e - bias)
+    }
+}
+
+/// A buffer in its block-scaled device layout: the FP8 bytes (padded to
+/// 16), then the f32 scales, as little-endian 32-bit words.
+pub fn pack_fp8(f: Format, x: &[f64]) -> Vec<u32> {
+    let n = x.len();
+    let b = f.block(n).expect("fp8");
+    let s = f.scales(x);
+    let mut bytes = vec![0u8; f.buffer_bytes(n).next_multiple_of(4)];
+    for (i, v) in x.iter().enumerate() {
+        bytes[i] = fp8_bits(f, v / s[i / b]);
+    }
+    let off = Format::scale_offset(n);
+    for (j, sc) in s.iter().enumerate() {
+        bytes[off + 4 * j..off + 4 * j + 4].copy_from_slice(&(*sc as f32).to_le_bytes());
+    }
+    bytes
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Inverse of [`pack_fp8`]: the `n` dequantized values.
+pub fn unpack_fp8(f: Format, words: &[u32], n: usize) -> Vec<f64> {
+    let b = f.block(n).expect("fp8");
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let off = Format::scale_offset(n);
+    (0..n)
+        .map(|i| {
+            let j = off + 4 * (i / b);
+            let s = f32::from_le_bytes([bytes[j], bytes[j + 1], bytes[j + 2], bytes[j + 3]]);
+            fp8_from_bits(f, bytes[i]) * s as f64
+        })
+        .collect()
 }
 
 /// IEEE binary16 bits of `x` (rounded to nearest even).
@@ -208,7 +402,7 @@ impl TensorGraph {
             Op::Comp(c) if !n.inline => numel(c.points()) * c.width(),
             _ => 0,
         };
-        elems * n.precision.storage.bytes()
+        n.precision.storage.buffer_bytes(elems)
     }
 }
 
@@ -217,6 +411,47 @@ mod tests {
     use super::*;
     use crate::tensor::{Monoid, TensorGraph};
     use tang::Scalar;
+
+    #[test]
+    fn fp8_round_trips_and_scales() {
+        for f in [Format::E4M3(0), Format::E5M2(0)] {
+            for b in 0u8..=255 {
+                let v = fp8_from_bits(f, b);
+                // E4M3 0x7f / 0xff are NaN; E5M2's top exponent is ∞/NaN
+                let special = match f {
+                    Format::E4M3(_) => b & 0x7f == 0x7f,
+                    _ => (b >> 2) & 0x1f == 0x1f,
+                };
+                if special {
+                    continue;
+                }
+                assert_eq!(f.round(v), v, "{f:?} {b:#x}");
+                if v != 0.0 {
+                    assert_eq!(fp8_bits(f, v), b, "{f:?} {b:#x} = {v}");
+                }
+            }
+        }
+        assert_eq!(Format::E4M3(0).round(1000.0), 448.0);
+        assert_eq!(Format::E4M3(0).round(1.0 + 1.0 / 16.0), 1.0); // tie → even
+        assert_eq!(Format::E4M3(0).round(2f64.powi(-9)), 2f64.powi(-9)); // min subnormal
+        assert_eq!(Format::E5M2(0).round(1.0 + 1.0 / 8.0), 1.0);
+        // block scales: each block's largest magnitude maps to 448
+        let x: Vec<f64> = (0..256).map(|i| ((i * 37 % 101) as f64 - 50.0) * if i < 128 { 1e-3 } else { 10.0 }).collect();
+        let mut r = x.clone();
+        Format::E4M3(128).round_buf(&mut r);
+        for (blk, (a, b)) in x.chunks(128).zip(r.chunks(128)).enumerate() {
+            let amax = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            for (u, v) in a.iter().zip(b) {
+                assert!((u - v).abs() <= amax / 448.0 * 16.0 + 1e-12, "block {blk}");
+            }
+        }
+        let words = pack_fp8(Format::E4M3(128), &x);
+        assert_eq!(words.len() * 4, Format::E4M3(128).buffer_bytes(256));
+        let back = unpack_fp8(Format::E4M3(128), &words, 256);
+        for (u, v) in back.iter().zip(&r) {
+            assert!((u - v).abs() <= v.abs() * 1e-6, "{u} vs {v}");
+        }
+    }
 
     #[test]
     fn f16_known_bit_patterns() {

@@ -3133,6 +3133,24 @@ impl TensorGraph {
 
     fn eval_with(&self, inputs: &[Vec<f64>], outputs: &[TensorId], emulate: bool) -> Vec<Vec<f64>> {
         let live = self.live(outputs);
+        // block-scaled inputs: the scales depend on the whole buffer
+        let scaled: Vec<Vec<f64>>;
+        let inputs = if emulate
+            && self.nodes.iter().any(|n| matches!(n.op, Op::Input(_)) && n.precision.storage.is_fp8())
+        {
+            let mut v = inputs.to_vec();
+            for n in &self.nodes {
+                if let Op::Input(k) = n.op {
+                    if n.precision.storage.is_fp8() {
+                        n.precision.storage.round_buf(&mut v[k]);
+                    }
+                }
+            }
+            scaled = v;
+            &scaled[..]
+        } else {
+            inputs
+        };
         let mut ev = Evaluator {
             g: self,
             emulate,
@@ -3178,8 +3196,7 @@ impl TensorGraph {
                     }
                 });
                 if emulate {
-                    let f = self.nodes[i].precision.storage;
-                    buf.iter_mut().for_each(|v| *v = f.round(*v));
+                    self.nodes[i].precision.storage.round_buf(&mut buf);
                 }
                 ev.bufs[i] = buf;
             }
@@ -3266,7 +3283,8 @@ impl Evaluator<'_> {
         match &node.op {
             Op::Input(k) => {
                 let v = self.inputs[*k][flat_index(&fixed(&node.shape), idx)];
-                if self.emulate {
+                // block-scaled inputs are rounded whole up front
+                if self.emulate && !node.precision.storage.is_fp8() {
                     node.precision.storage.round(v)
                 } else {
                     v

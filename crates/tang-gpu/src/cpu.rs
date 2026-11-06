@@ -133,6 +133,7 @@ impl CpuProgram {
                     let h: Vec<u16> = data.iter().map(|x| bf16(*x)).collect();
                     std::ptr::copy_nonoverlapping(h.as_ptr(), p as *mut u16, len)
                 }
+                _ => panic!("fp8 storage lowers only on sm90 CUDA"),
             }
         }
     }
@@ -159,6 +160,7 @@ impl CpuProgram {
                     .iter()
                     .map(|h| f32::from_bits((*h as u32) << 16))
                     .collect(),
+                _ => panic!("fp8 storage lowers only on sm90 CUDA"),
             }
         }
     }

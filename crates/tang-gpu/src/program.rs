@@ -259,6 +259,7 @@ impl From<&MemoryPlan> for BufferPlan {
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     match b.format {
         Format::F16 | Format::BF16 => b.len.div_ceil(2),
+        f if f.is_fp8() => f.buffer_bytes(b.len).div_ceil(4),
         _ => b.len,
     }
     .max(1)
@@ -535,7 +536,7 @@ impl Program {
             let fresh = match b.format {
                 Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
                 Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
-                Format::BF16 => unreachable!("bf16 is interpreter-only"),
+                _ => unreachable!("bf16 and fp8 are not wgpu formats"),
             };
             if fresh.len() == plan.slot_len[s] {
                 slots[s] = fresh;
@@ -1273,6 +1274,13 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
         Format::BF16 => bf16_bits(x as f64) as u32,
         _ => f16_bits(x as f64) as u32,
     };
+    if format.is_fp8() {
+        let x: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+        return tang_compile::tensor::precision::pack_fp8(format, &x)
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+    }
     match format {
         Format::F32 => std::borrow::Cow::Borrowed(data),
         _ => data
@@ -1288,7 +1296,14 @@ fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),
         Format::F16 => unpack_f16(words, n),
-        Format::BF16 => words
+        f if f.is_fp8() => {
+            let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();
+            tang_compile::tensor::precision::unpack_fp8(f, &w, n)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        }
+        _ => words
             .iter()
             .flat_map(|w| {
                 let b = w.to_bits();

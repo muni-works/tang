@@ -2371,6 +2371,7 @@ fn msl_ty(f: Format) -> &'static str {
         Format::F32 => "float",
         Format::F16 => "half",
         Format::BF16 => "bfloat",
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     }
 }
 

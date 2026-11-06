@@ -816,6 +816,7 @@ fn elem_ty(f: Format) -> &'static str {
         Format::F32 => "float",
         Format::F16 => "tang_f16",
         Format::BF16 => "uint16_t",
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     }
 }
 
@@ -824,6 +825,7 @@ fn load(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(float){e}"),
         Format::BF16 => format!("tang_b2f({e})"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     }
 }
 
@@ -832,6 +834,7 @@ fn store(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(tang_f16)({e})"),
         Format::BF16 => format!("tang_f2b({e})"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     }
 }
 
@@ -985,6 +988,7 @@ fn c_unit(
         Format::F32 => 0,
         Format::F16 => 1,
         Format::BF16 => 2,
+        _ => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     };
     let mut inputs: Vec<(usize, usize)> = prog
         .buffers

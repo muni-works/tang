@@ -30,6 +30,7 @@ fn words(len: usize, format: Format) -> usize {
     match format {
         Format::F32 => len.max(1),
         Format::F16 | Format::BF16 => len.div_ceil(2).max(1),
+        f => f.buffer_bytes(len).div_ceil(4).max(1),
     }
 }
 

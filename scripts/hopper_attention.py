@@ -5,6 +5,7 @@ FlashAttention-3 and PyTorch SDPA.
     python scripts/hopper_attention.py gen DIR N D CAUSAL   # inputs + reference
     python scripts/hopper_attention.py bench DIR            # FA3 and SDPA
     python scripts/hopper_attention.py matmul [MxKxN,...]   # cuBLAS bf16
+    python scripts/hopper_attention.py fp8mm [MxKxN,...]    # cuBLASLt FP8
 
 16k tokens per config (batch = 16384 / N) and 2048 hidden (heads = 2048 / D),
 FlashAttention's benchmark convention. q, k, v, dO ~ N(0, 1) in bf16, layout
@@ -161,6 +162,31 @@ def matmul(cases):
             print(f"cublas matmul {m}x{k}x{n} b={lay}: {t:.4f} ms {2 * m * k * n / t / 1e9:.1f} TFLOP/s")
 
 
+def fp8mm(cases):
+    """cuBLASLt FP8 (`torch._scaled_mm`, e4m3 × e4m3, fp32 accumulation,
+    bf16 out) on the shapes of `examples/hopper_fp8.rs`: A [m, k] and B
+    [n, k], per-tensor and per-row/column ("rowwise") scales. cuBLASLt on
+    sm_90 has no 1×128 block scaling; tang's tiles do (DeepSeek-style)."""
+    for m, k, n in cases:
+        a = torch.randn(m, k, device="cuda")
+        b = torch.randn(n, k, device="cuda")
+        fa = a.to(torch.float8_e4m3fn)
+        fb = b.to(torch.float8_e4m3fn)
+        one = torch.ones((), device="cuda")
+        f = lambda: torch._scaled_mm(fa, fb.t(), scale_a=one, scale_b=one, out_dtype=torch.bfloat16)
+        t = best_ms(f)
+        line = f"cublaslt fp8 {m}x{k}x{n}: tensor {t:.4f} ms {2 * m * k * n / t / 1e9:.1f} TFLOP/s"
+        try:
+            sa = torch.ones(m, 1, device="cuda")
+            sb = torch.ones(1, n, device="cuda")
+            g = lambda: torch._scaled_mm(fa, fb.t(), scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            t2 = best_ms(g)
+            line += f"  rowwise {t2:.4f} ms {2 * m * k * n / t2 / 1e9:.1f} TFLOP/s"
+        except Exception as e:  # noqa: BLE001
+            line += f"  rowwise n/a ({type(e).__name__})"
+        print(line)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "gen":
@@ -170,5 +196,8 @@ if __name__ == "__main__":
     elif cmd == "matmul":
         spec = sys.argv[2] if len(sys.argv) > 2 else "1024x1024x1024,2048x2048x2048,4096x4096x4096,8192x8192x8192,16384x2048x2048,16384x2048x8192,16384x8192x2048"
         matmul([tuple(map(int, c.split("x"))) for c in spec.split(",")])
+    elif cmd == "fp8mm":
+        spec = sys.argv[2] if len(sys.argv) > 2 else "1024x1024x1024,2048x2048x2048,4096x4096x4096,8192x8192x8192,16384x2048x8192,16384x8192x2048"
+        fp8mm([tuple(map(int, c.split("x"))) for c in spec.split(",")])
     else:
         sys.exit(__doc__)
