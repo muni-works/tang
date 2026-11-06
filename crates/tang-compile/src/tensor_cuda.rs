@@ -353,6 +353,7 @@ impl TensorGraph {
             n,
             k_total,
             kdim,
+            scales,
             ..
         } = self.bilinear_tile(root, reads)?;
         let (bm, bn, chunk) = (sh.bm, sh.bn, sh.chunk);
@@ -509,7 +510,12 @@ impl TensorGraph {
                 nested.push(plan);
             }
         }
-        if nest_regs > 96 {
+        if nest_regs
+            > std::env::var("TANG_NEST_REGS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(192)
+        {
             return None;
         }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
@@ -1371,6 +1377,9 @@ impl TensorGraph {
                 writeln!(s, "            for (unsigned sp = 0u; sp < {splits}u; sp++) red{w} += __ldcg(tang_partial + (sp * {n_base}u + tile) * {}u + {}u + lr * {bn}u + lc);", n_outs * bb, w * bb).unwrap();
             } else {
                 writeln!(s, "            float red{w} = acc[{w}][i][j][r];").unwrap();
+            }
+            if scales[w] != 1.0 {
+                writeln!(s, "            red{w} *= {}f;", f32_lit(scales[w])).unwrap();
             }
         }
         let vals: Vec<String> = if epilogue {

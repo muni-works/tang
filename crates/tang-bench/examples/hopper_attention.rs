@@ -56,6 +56,7 @@ fn passes(g: TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
     let (g, outs) = g.merge_reduce_dims(&outs);
     let (mut g, outs) = g.split_reduce_dims(&outs);
     g.schedule_auto(&outs);
+    tile_reductions(&mut g);
     (g, outs)
 }
 
@@ -174,5 +175,53 @@ fn main() {
             errs.join(" "),
             p.program.kernels.len()
         );
+    }
+}
+
+/// Every reduction `schedule_auto` left untiled (the attention backward's,
+/// whose score has two readers) gets the 16×16 tile, so the CUDA lowering
+/// can try its tensor-core tiles on it (`TANG_NO_TILE_ALL` skips this).
+fn tile_reductions(g: &mut tang_compile::tensor::TensorGraph) {
+    if std::env::var_os("TANG_NO_TILE_ALL").is_some() {
+        return;
+    }
+    for i in 0..g.nodes().len() {
+        let n = &g.nodes()[i];
+        let Some(c) = g.comp_at(i) else { continue };
+        let red: usize = c.red.iter().map(|r| r.n()).product();
+        if !n.inline && !c.red.is_empty() && red >= 16 && n.tile.0 == 0 && n.split == 0 {
+            g.set_schedule(
+                tang_compile::tensor::TensorId::from_index(i),
+                0,
+                (16, 16, 32),
+                (1, 1),
+            );
+        }
+    }
+    // a tiled epilogue that only copies its reduction into another layout
+    // (`[1, h, n, d]` -> `[h, n, d]`): the reduction becomes its own tile,
+    // written in its own layout, and the copy a separate map
+    use tang_compile::tensor::TensorId;
+    for m in 0..g.nodes().len() {
+        if g.nodes()[m].tile.0 == 0 {
+            continue;
+        }
+        let Some(r) = g.tiled_reduction(m).filter(|&r| r != m) else {
+            continue;
+        };
+        let copy = g.comp_at(m).is_some_and(|c| {
+            c.args.len() == 1
+                && c.body_outs.len() == 1
+                && matches!(
+                    c.body.nodes_slice()[c.body_outs[0].index() as usize],
+                    tang_expr::Node::Var(0)
+                )
+                && g.nodes()[m].shape.len() != g.nodes()[r].shape.len()
+        });
+        if copy {
+            g.set_inline(TensorId::from_index(r), false);
+            g.set_schedule(TensorId::from_index(r), 0, (16, 16, 32), (1, 1));
+            g.set_schedule(TensorId::from_index(m), 0, (0, 0, 0), (1, 1));
+        }
     }
 }

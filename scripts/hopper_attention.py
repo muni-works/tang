@@ -79,7 +79,7 @@ def load_fa3():
     except ImportError:
         from kernels import get_kernel
 
-        k = get_kernel("kernels-community/flash-attn3")
+        k = get_kernel("kernels-community/flash-attn3", version=1)
         return k.flash_attn_func, "kernels-community/flash-attn3"
 
 

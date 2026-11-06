@@ -2109,6 +2109,17 @@ impl TensorGraph {
                 readers[d].push(j);
             }
         }
+        // a tile: a node with a tile schedule, or an inline reduction
+        // under a tiled epilogue map (`tiled_reduction` of that map)
+        let mut tiled = vec![false; n];
+        for j in (0..n).filter(|&j| live[j]) {
+            if self.nodes[j].tile.0 > 0 {
+                tiled[j] = true;
+                if let Some(r) = self.tiled_reduction(j) {
+                    tiled[r] = true;
+                }
+            }
+        }
         // a map that is inline and read only by tiles (or such maps)
         let mut tiled_map = vec![false; n];
         for j in (0..n).rev().filter(|&j| live[j]) {
@@ -2116,9 +2127,7 @@ impl TensorGraph {
             tiled_map[j] = map
                 && self.nodes[j].inline
                 && !readers[j].is_empty()
-                && readers[j]
-                    .iter()
-                    .all(|&r| self.nodes[r].tile.0 > 0 || tiled_map[r]);
+                && readers[j].iter().all(|&r| tiled[r] || tiled_map[r]);
         }
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
@@ -2127,7 +2136,7 @@ impl TensorGraph {
             if !sum || !short || c.tuple != 0 || c.width() != 1 || readers[i].is_empty() {
                 continue;
             }
-            let direct = |r: usize| self.nodes[r].tile.0 > 0;
+            let direct = |r: usize| tiled[r];
             if !readers[i].iter().all(|&r| tiled_map[r] || direct(r)) {
                 continue;
             }
