@@ -267,7 +267,7 @@ top-k MoE FFN as one graph — router GEMM, top-k as k rounds of argmax
 with the earlier picks masked, softmax over the selected logits, SwiGLU
 experts reading `W[sel[t, k]]` through gather views, weighted combine —
 checks it against the f64 interpreter and a plain-Rust reference (top-k
-indices exact, f32 output within 3e-6), and times it against the same
+indices exact; output within 4e-6 on Metal, 4e-5 on CUDA, whose router GEMM is a TF32 tile), and times it against the same
 expert math over host-pre-gathered (affine) weights. The data-dependent
 address costs nothing measurable on either chip (BENCHMARKS.md, "MoE
 through gather views"). The token-major form is the decode shape; an

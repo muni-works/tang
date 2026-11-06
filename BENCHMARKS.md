@@ -2431,5 +2431,5 @@ instead of 1 GB of per-(token, slot) copies, which may treat the TLB and page ma
 absolute number, 378 GB/s is 40% of the 3090's 936 GB/s: one thread per output point walks its
 8 KB weight row alone, so adjacent threads' reads are 8 KB apart (uncoalesced). The gathered comp
 gets no tile (tiles stage affine regions) and no split at this size (40960 points); a
-warp-per-row GEMV schedule for gathered contractions is the obvious next step, and is what the
-hand-written int8 MoE kernel in tang-llm does.
+warp-per-row GEMV schedule for gathered contractions is the obvious next step before comparing
+against tang-llm's hand-written int8 MoE kernel.
