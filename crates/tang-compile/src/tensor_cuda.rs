@@ -434,7 +434,7 @@ impl TensorGraph {
         };
         if wg
             && (n_wg == 0
-                || (sh.warps_m * sh.warps_n) % 4 != 0
+                || !(sh.warps_m * sh.warps_n).is_multiple_of(4)
                 || bm % (64 * n_wg) != 0
                 || bn % 8 != 0
                 || bn > 256)
