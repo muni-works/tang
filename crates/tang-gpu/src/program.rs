@@ -180,15 +180,21 @@ impl Runtime {
         }
     }
 
-    /// `g`'s program for this backend. wgpu: WGSL, or native MSL tiles
-    /// with `TANG_NATIVE=1` on Metal. CUDA: `to_cuda` (tensor cores on).
+    /// `g`'s program for this backend. wgpu: WGSL with the device's caps
+    /// (subgroups, native f16), `fragment` nodes as Metal simdgroup-matrix
+    /// kernels under MSL passthrough, or native MSL tiles for everything
+    /// with `TANG_NATIVE=1`. CUDA: `to_cuda` (tensor cores on).
     pub fn lower(&self, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         match self {
             Self::Wgpu { device, .. } => {
+                let caps = device.wgsl_caps();
                 if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-                    g.to_msl_mma(outputs)
+                    g.to_msl_mma_caps(outputs, caps)
+                } else if device.msl_passthrough {
+                    // `fragment` nodes run their simdgroup-matrix kernel
+                    g.to_wgsl_fragments(outputs, caps)
                 } else {
-                    g.to_wgsl(outputs)
+                    g.to_wgsl_caps(outputs, caps)
                 }
             }
             #[cfg(feature = "cuda")]

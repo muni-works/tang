@@ -1654,9 +1654,15 @@ impl TensorGraph {
         let (dr, dc) = (plan.dr, plan.dc);
         let (nq, nc, nk, dk) = (pts[dr], pts[dc], plan.nk, plan.dk);
         let others: Vec<usize> = (0..pk).filter(|&d| d != dr && d != dc).collect();
-        let rf = ATT_RF;
-        let (bq, bk) = (32 * rf, ATT_BK);
-        let bc = nc.next_multiple_of(8).min(ATT_BC);
+        // geometry: the node's `frag_cfg` where set, else the defaults
+        let cfg = self.nodes[root].frag_cfg;
+        let pick = |v: u8, d: usize| if v == 0 { d } else { v as usize };
+        let rf = pick(cfg[0], ATT_RF);
+        let bk = 8 * pick(cfg[1], ATT_BK / 8);
+        let nsg = pick(cfg[3], 4);
+        let threads = 32 * nsg;
+        let bq = 8 * rf * nsg;
+        let bc = nc.next_multiple_of(8).min(8 * pick(cfg[2], ATT_BC / 8));
         let d8 = dk.next_multiple_of(8);
         let (ldq, ldk, ldv) = (d8 + 8, d8 + 8, bc + 8);
         // halves: Q staging, then K|V tiles
@@ -1761,11 +1767,12 @@ impl TensorGraph {
                 "smem",
                 ldq,
                 "    ",
+                threads,
             );
         if !q_direct {
             writeln!(
                 s,
-                "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                "    for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                 bq * d8
             )
             .unwrap();
@@ -1881,11 +1888,12 @@ impl TensorGraph {
                     "Ks",
                     ldk,
                     "        ",
+                    threads,
                 );
             if !k_direct {
                 writeln!(
                     s,
-                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                     bk * d8
                 )
                 .unwrap();
@@ -1921,11 +1929,12 @@ impl TensorGraph {
                 "Vs",
                 ldv,
                 "        ",
+                threads,
             );
             if !v_direct {
                 writeln!(
                     s,
-                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                     bk * bc
                 )
                 .unwrap();
@@ -2227,7 +2236,7 @@ impl TensorGraph {
             reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
             points: points as u32,
             groups: grid(n_tiles),
-            threads: 128,
+            threads: threads as u32,
             fragment: true,
         }
     }
@@ -2248,6 +2257,7 @@ fn stage_direct(
     dst: &str,
     ld: usize,
     pad: &str,
+    threads: usize,
 ) -> bool {
     let Some((buf, flat)) = direct else {
         return false;
@@ -2277,7 +2287,7 @@ fn stage_direct(
     writeln!(s, "{pad}    const int base = {base};").unwrap();
     writeln!(
         s,
-        "{pad}    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+        "{pad}    for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
         rows * c4
     )
     .unwrap();

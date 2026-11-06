@@ -117,10 +117,7 @@ static REGISTRY: Mutex<Vec<(Knob, Vec<Arc<ConstraintFn>>)>> = Mutex::new(Vec::ne
 /// Add a knob (and constraints involving it) to every [`Space::standard`]
 /// built from now on, process-wide: how a new schedule field joins the
 /// search. Registering a name twice replaces the earlier knob.
-pub fn register_knob(
-    knob: Knob,
-    constraints: Vec<Constraint>,
-) {
+pub fn register_knob(knob: Knob, constraints: Vec<Constraint>) {
     let mut r = REGISTRY.lock().unwrap();
     r.retain(|(k, _)| k.name != knob.name);
     r.push((knob, constraints.into_iter().map(Arc::from).collect()));
@@ -146,11 +143,7 @@ impl Space {
     }
 
     /// This space with one more knob (replacing one of the same name).
-    pub fn with(
-        mut self,
-        knob: Knob,
-        constraint: Option<Constraint>,
-    ) -> Self {
+    pub fn with(mut self, knob: Knob, constraint: Option<Constraint>) -> Self {
         self.knobs.retain(|x| x.name != knob.name);
         self.knobs.push(knob);
         self.constraints.extend(constraint.map(Arc::from));
@@ -273,7 +266,7 @@ impl Space {
             "fragment",
             |g, t| {
                 let mut v = vec![vec![0]];
-                if g.fragment_plan(t).is_some() {
+                if g.fragment_plan(t).is_some() || g.attention_plan(t).is_some() {
                     v.push(vec![1]);
                 }
                 v
@@ -281,9 +274,67 @@ impl Space {
             |g, t, v| g.set_fragment(t, v[0] != 0),
             |g, t| vec![g.nodes[t.n()].fragment as u32],
         );
+        let subgroup = Knob::new(
+            "subgroup",
+            |g, t| {
+                let splittable = g
+                    .tiled_reduction(t.n())
+                    .and_then(|r| g.comp_at(r))
+                    .is_some_and(|c| numel(&c.red) >= 16);
+                if splittable {
+                    vec![vec![0], vec![1]]
+                } else {
+                    vec![vec![0]]
+                }
+            },
+            |g, t, v| g.set_subgroup(t, v[0] != 0),
+            |g, t| vec![g.nodes[t.n()].subgroup as u32],
+        );
+        // attention-on-fragments geometry: [rows/SIMD group /8, keys per
+        // tile /8, value cols /8, SIMD groups]; all 0 = backend default
+        let frag_cfg = Knob::new(
+            "frag_cfg",
+            |g, t| {
+                let mut v = vec![vec![0, 0, 0, 0]];
+                if g.attention_plan(t).is_some() {
+                    for rf in [1, 2] {
+                        for bk in [4, 8] {
+                            for bc in [2, 4, 8] {
+                                for nsg in [1, 2, 4] {
+                                    v.push(vec![rf, bk, bc, nsg]);
+                                }
+                            }
+                        }
+                    }
+                }
+                v
+            },
+            |g, t, v| g.nodes[t.n()].frag_cfg = [v[0] as u8, v[1] as u8, v[2] as u8, v[3] as u8],
+            |g, t| g.nodes[t.n()].frag_cfg.iter().map(|&x| x as u32).collect(),
+        );
         Self {
-            knobs: vec![split, tile, reg, fragment],
+            knobs: vec![split, tile, reg, fragment, subgroup, frag_cfg],
             constraints: vec![
+                // subgroup combine: power-of-two splits of at least 128
+                Arc::new(|s: &Space, c: &Candidate| {
+                    let sg = c.get(s, "subgroup").map_or(0, |v| v[0]);
+                    let split = c.get(s, "split").map_or(0, |v| v[0]);
+                    sg == 0 || (split >= 128 && split.is_power_of_two())
+                }),
+                // fragment geometry only for fragment-lowered nodes
+                Arc::new(|s: &Space, c: &Candidate| {
+                    let f = c.get(s, "fragment").map_or(0, |v| v[0]);
+                    let cfg = c.get(s, "frag_cfg").unwrap_or(&[0, 0, 0, 0]);
+                    f == 1 || cfg.iter().all(|&x| x == 0)
+                }),
+                // a fragment kernel ignores the thread mapping: keep one
+                Arc::new(|s: &Space, c: &Candidate| {
+                    let f = c.get(s, "fragment").map_or(0, |v| v[0]);
+                    let split = c.get(s, "split").map_or(0, |v| v[0]);
+                    let tile = c.get(s, "tile").map_or(0, |v| v[0]);
+                    let reg = c.get(s, "reg").unwrap_or(&[1, 1]);
+                    f == 0 || (split == 0 && tile == 0 && reg == [1, 1])
+                }),
                 // one thread mapping at a time
                 Arc::new(|s: &Space, c: &Candidate| {
                     let split = c.get(s, "split").map_or(0, |v| v[0]);
@@ -635,6 +686,8 @@ mod tests {
                 vec![tile.0, tile.1, tile.2],
                 vec![reg.0, reg.1],
                 vec![0],
+                vec![0],
+                vec![0, 0, 0, 0],
             ]);
             assert!(cands.contains(&want), "missing {want:?}");
         }
