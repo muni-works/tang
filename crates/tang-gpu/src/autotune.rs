@@ -760,7 +760,6 @@ fn tune_kernel(
         }
         (pick, rejected_noisy, near) = decide(&ratios);
     }
-    drop(round);
     for (i, s) in &pool {
         measured[*i].stats = Some(Stats::of(s));
     }
