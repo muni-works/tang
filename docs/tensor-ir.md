@@ -41,6 +41,14 @@ not be 0. The gradient of a guarded read eliminates a coordinate rather
 than scattering: for `x[c, t + 3k − 9]`, `dx[c, τ]` reads `dy[o, τ − 3k + 9]`
 through a guard, so padding contributions never reach `x`.
 
+A view can also *gather*: one source coordinate is data. `View::gather`
+adds `coef · round(index)` to a source dim's form, the index being the
+value of a sibling arg of the same comprehension (an integer-valued tensor
+read through its own affine view). An embedding lookup is
+`table[ids[t], j]`, a paged KV read `cache[table[s, blk], off, c]`, an MoE
+expert read `W[sel[t, k], f, d]`. See [Gather views](#gather-views) for
+what the passes do with them.
+
 **Comprehensions.** The only compute op:
 
 ```
@@ -186,6 +194,85 @@ hand-written kernel is as an intrinsic: "this comprehension shape has a
 fast implementation on this chip". The compiler picks it when it wins and
 derives one when it doesn't. The existing kernels keep their speed and stop
 being forks.
+
+## Gather views
+
+Affine views cover every layout, but not data-dependent addressing: MoE
+token→expert routing, paged KV caches and token embeddings read a source
+at a coordinate held in another tensor. A gather view makes that a
+comprehension read rather than a special op:
+
+```
+out[t, k, f] = Σ_d x[t, d] · W[sel[t, k], f, d]
+             = Σ_d x[view₀] · W[forms + 1·round(arg₂)] ,  arg₂ = sel[t, k]
+```
+
+**Representation.** `View.gather: Option<Gather { arg, coefs }>`: source
+coordinate `d` is `forms[d] + coefs[d] · round(args[arg])`. The index is
+named by *arg position*, not by tensor: it is an ordinary arg of the
+comprehension, so dependency tracking, liveness and every pass that
+renumbers nodes (`eliminate_dead`, `substitute_maps`, …) handle it with
+no new code. The index arg must itself be affine (`push_comp` rejects a
+gathered index: one level, no pointer chasing). `coefs` per source dim
+allow a scaled, offset address: a paged read iterates `(blk, off)` and
+reads row `bs · table[blk] + off`. A gathered dim cannot be range-checked
+at construction; with `guard` set, an out-of-range index (a `-1` pad)
+reads 0, otherwise it is a caller bug (the interpreter panics). Index
+tensors are f32 like everything else: exact below 2²⁴.
+
+**Interpreter.** Affine args are read first, then gathered args read
+their index from them (`eval` and `eval_emulated` alike).
+
+**Backward.** A gathered dim of the differentiated arg is a scatter dim:
+the gradient comprehension iterates the source coordinate as an out dim
+and gates the body by `[coord == form + coef · index]`, the index read
+through the renamed index arg. That is a scatter-add — `dtable[v, :] =
+Σ_t [ids[t] == v] · dy[t, :]`, repeated ids summed, guarded pads
+dropped — written as a dense gated sum: it costs `|source dim| ×
+|iteration space|`, a one-hot matmul. Correct (tests check it against
+hand scatter-adds), fine for small vocabularies, not for a 150k-entry
+embedding; a segmented-sum or atomic lowering of the same comprehension
+is the follow-up. The gradient with respect to the index is 0 (it only
+addresses).
+
+**Fusion.** Composition carries a gather linearly: an affine map read
+through a gather has the gather pushed into its own args (`2·table` read
+at `ids[t]` becomes `2·table[ids[t]]`), and a gathering map read through
+an affine view brings its gather and its index arg into the reader. So
+`x[tok]`, an activation and the GEMM that consumes them are one kernel.
+What `substitute_maps` keeps materialized, and why:
+
+- *Index tensors* are pinned leaves: an address needs a value in memory,
+  not an expression to recompute per read.
+- *Nested gathers*: a gathering map read through a gather (directly or
+  through a chain of substituted maps) stays a buffer — inlining it would
+  make an index read data-dependent.
+
+Everything else fuses. Passes that drop, reorder, or split a comp's args
+(`hoist_invariant_factors`, `merge_siblings`, the softmax rewrite) skip
+gathered comps; `relayout`, `merge_reduce_dims` and `through_reshape`
+leave a gathered source's layout alone (its `coefs` name source dims);
+iteration-space rewrites (`split_reduce_dims`, `shard_reduction`) carry
+the gather through unchanged; CSE keys on it.
+
+**Schedules and lowering.** Tiles stage affine regions of their operands
+and a gathered read has none, so `schedule_auto` gives gathered comps a
+workgroup split (few points) or one thread per point, never a tile or a
+tensor-core fragment. Every backend that emits through the WGSL arg read
+(WGSL; CUDA's generic path, which transpiles it; MSL; OpenCL) reads the
+index inline as `i32(round(read_idx(…)))`. The C backend rejects gathers.
+
+**Worked example.** `crates/tang-bench/examples/moe_gather.rs` builds a
+top-k MoE FFN as one graph — router GEMM, top-k as k rounds of argmax
+with the earlier picks masked, softmax over the selected logits, SwiGLU
+experts reading `W[sel[t, k]]` through gather views, weighted combine —
+checks it against the f64 interpreter and a plain-Rust reference (top-k
+indices exact, f32 output within 3e-6), and times it against the same
+expert math over host-pre-gathered (affine) weights. The data-dependent
+address costs nothing measurable on either chip (BENCHMARKS.md, "MoE
+through gather views"). The token-major form is the decode shape; an
+expert-major dispatch (tokens grouped per expert, then grouped GEMMs)
+needs a compaction — a scan — which is not a comprehension.
 
 ## Precision is a schedule
 
@@ -538,8 +625,10 @@ schedule space; the compiler searches it.
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
-- Non-affine indexing — KV-cache paging, MoE routing — needs a `Gather`
-  view that reads an index tensor, which blocks some fusion.
+- Gathers ([above](#gather-views)): the backward is a dense gated sum
+  (a segmented-sum or atomic lowering is the follow-up); gathered reads
+  never tile, so a prefill-sized MoE GEMM runs one thread per point;
+  expert-major dispatch needs a scan; the C backend rejects them.
 - Placement is a transform now (`shard_reduction` + `fold_partials`:
   partial reductions over slices, the all-reduce as a comprehension over
   the monoid's combine; `examples/shard_attention.rs` runs flash

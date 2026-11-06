@@ -368,7 +368,12 @@ fn main() {
     let gpu_sel_ok = gsel.iter().map(|&s| s as usize).eq(want_sel.iter().copied());
     let e_gpu = max_rel(&got, &want);
     println!("  gpu vs reference: max rel err {e_gpu:.2e}, top-k match {gpu_sel_ok}");
-    assert!(gpu_sel_ok && e_gpu < 1e-4);
+    // CUDA runs the router GEMM as a TF32 `mma.sync` tile (10-bit mantissa)
+    let tol = match rt.kind() {
+        tang_gpu::program::BackendKind::Cuda => 2e-3,
+        _ => 1e-4,
+    };
+    assert!(gpu_sel_ok && e_gpu < tol);
 
     // 2. timed config
     let m = match std::env::var("MOE_DIMS") {
