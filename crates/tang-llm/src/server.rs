@@ -2544,7 +2544,9 @@ mod context_limits {
     }
 
     /// Drain a reply: (pieces, finish and usage, or the error).
-    fn reply(rx: &mut mpsc::UnboundedReceiver<Out>) -> (usize, Option<Result<(Finish, Usage), String>>) {
+    fn reply(
+        rx: &mut mpsc::UnboundedReceiver<Out>,
+    ) -> (usize, Option<Result<(Finish, Usage), String>>) {
         let (mut n, mut end) = (0, None);
         while let Ok(o) = rx.try_recv() {
             match o {
@@ -2564,7 +2566,10 @@ mod context_limits {
         let (n, end) = reply(&mut rx);
         assert_eq!(n, 0);
         let e = end.unwrap().unwrap_err();
-        assert!(e.contains("context_length_exceeded") && e.contains("1005"), "{e}");
+        assert!(
+            e.contains("context_length_exceeded") && e.contains("1005"),
+            "{e}"
+        );
     }
 
     #[test]
