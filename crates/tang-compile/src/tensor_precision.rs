@@ -43,6 +43,24 @@ pub enum Format {
     Fp8Accum,
 }
 
+/// Softmax weights rounded to an 8-bit operand format are first scaled by
+/// `2^FP8_SOFTMAX_SHIFT`: `exp(s − m) ∈ (0, 1]` would sit mostly in
+/// E4M3's subnormals (below 2⁻⁶), `2⁸·exp(s − m) ∈ (0, 256]` keeps three
+/// mantissa bits down to `2⁻⁶·2⁻⁸` (FlashAttention-3's max offset). The
+/// row sum is scaled alike, so the normalized result is not.
+pub const FP8_SOFTMAX_SHIFT: i32 = 8;
+
+/// The softmax weight `w = exp(s − m)` as an `operand`-format tile feeds it
+/// to the tensor cores (scaled into range first when 8-bit).
+pub fn round_weight(operand: Format, w: f64) -> f64 {
+    if operand.is_fp8() {
+        let k = 2f64.powi(FP8_SOFTMAX_SHIFT);
+        operand.round(w * k) / k
+    } else {
+        operand.round(w)
+    }
+}
+
 /// Explicit mantissa bits [`Format::Fp8Accum`] keeps (calibrated on H100:
 /// truncation to 14 bits matches the GPU to 4e-4 relative, 13 or 15 bits
 /// are off by 1e-2 and 4e-3;

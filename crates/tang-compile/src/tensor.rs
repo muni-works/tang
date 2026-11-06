@@ -3358,7 +3358,7 @@ impl Evaluator<'_> {
                     continue;
                 }
                 let sa = if vals[0] == f64::NEG_INFINITY { 0.0 } else { (vals[0] - mx).exp() };
-                let se = operand.round((elem[0] - mx).exp());
+                let se = precision::round_weight(operand, (elem[0] - mx).exp());
                 vals[0] = mx;
                 for t in 1..w {
                     vals[t] = vals[t] * sa + elem[t] * se;

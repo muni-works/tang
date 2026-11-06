@@ -515,7 +515,7 @@ impl TensorGraph {
 pub(super) const FP8_FLASH_PRELUDE: &str = r#"static __device__ __forceinline__ unsigned short tang_f2e4x2(float lo, float hi) { unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo)); return r; }
 static __device__ __forceinline__ float2 tang_e4x2f(unsigned short v) {
     unsigned h; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
-    float2 f; asm("{ .reg .f16 a, b; mov.b32 {a, b}, %2; cvt.f32.f16 %0, a; cvt.f32.f16 %1, b; }" : "=f"(f.x), "=f"(f.y) : "r"(h));
+    float2 f; asm("{ .reg .f16 a, b; mov." "b" "32 {a, b}, %2; cvt.f32.f16 %0, a; cvt.f32.f16 %1, b; }" : "=f"(f.x), "=f"(f.y) : "r"(h));
     return f;
 }
 static __device__ __forceinline__ void tang_cp4s(unsigned d, const void* src, bool ok) {
@@ -752,7 +752,11 @@ impl TensorGraph {
         w(s, "    unsigned wrow = cwi * 64u + (warp % 4u) * 16u;".into());
         w(s, format!("    unsigned qaddr = sbase + cwi * {}u;", 64 * 128));
         w(s, format!("    unsigned pbase = sbase + {}u + cwi * {}u;", pl.p_off, 64 * bj));
-        w(s, format!("    float o[{nof}][4], ot[{nof}][4];"));
+        if pl.blk[2].is_none() {
+            w(s, format!("    float o[{nof}][4];"));
+        } else {
+            w(s, format!("    float o[{nof}][4], ot[{nof}][4];"));
+        }
         w(s, "    #pragma unroll".into());
         w(s, format!("    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"));
         w(s, "    float m_row[2] = {-1.0e30f, -1.0e30f};".into());
@@ -803,7 +807,10 @@ impl TensorGraph {
         w(s, "            #pragma unroll".into());
         w(s, format!("            for (int j = 0; j < {nsf}; j++) {{"));
         // the weights rounded to e4m3; the sum adds the rounded values
-        w(s, "                float2 pr = tang_e4x2f(tang_f2e4x2(exp2f(sc[j][2 * h] - m_new), exp2f(sc[j][2 * h + 1] - m_new)));".into());
+        // scaled by 2^FP8_SOFTMAX_SHIFT into e4m3's normal range (O and l
+        // carry the same factor, which the normalization cancels)
+        let sh = super::super::precision::FP8_SOFTMAX_SHIFT;
+        w(s, format!("                float2 pr = tang_e4x2f(tang_f2e4x2(exp2f(sc[j][2 * h] - m_new + {sh}.0f), exp2f(sc[j][2 * h + 1] - m_new + {sh}.0f)));"));
         w(s, "                sc[j][2 * h] = pr.x; sc[j][2 * h + 1] = pr.y; lsum += pr.x + pr.y;".into());
         w(s, "            }".into());
         w(s, "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;".into());
@@ -826,15 +833,85 @@ impl TensorGraph {
         w(s, "        tang_wg_fence();".into());
         w(s, "        #pragma unroll".into());
         w(s, format!("        for (int kk = 0; kk < {}; kk++)", bj / 32));
-        w(s, "            tang_wgo(&ot[0][0], tang_desc(pbase + kk * 32u, 16u, 1024u), tang_desc(vaddr + kk * 32u, 16u, 1024u), kk > 0);".into());
-        w(s, "        tang_wg_commit(); tang_wg_wait<0>();".into());
-        w(s, "        #pragma unroll".into());
-        w(s, format!("        for (int j = 0; j < {nof}; j++) {{"));
-        w(s, "            float2 sv = *(const float2*)(svp + 8u * j + 2u * tq);".into());
-        w(s, "            o[j][0] += ot[j][0] * sv.x; o[j][1] += ot[j][1] * sv.y; o[j][2] += ot[j][2] * sv.x; o[j][3] += ot[j][3] * sv.y;".into());
-        w(s, "        }".into());
+        if pl.blk[2].is_none() {
+            // one V scale: P·V accumulates into O, scaled at the end
+            w(s, "            tang_wgo(&o[0][0], tang_desc(pbase + kk * 32u, 16u, 1024u), tang_desc(vaddr + kk * 32u, 16u, 1024u), 1);".into());
+            w(s, "        tang_wg_commit(); tang_wg_wait<0>();".into());
+            w(s, "        (void)svp;".into());
+        } else {
+            w(s, "            tang_wgo(&ot[0][0], tang_desc(pbase + kk * 32u, 16u, 1024u), tang_desc(vaddr + kk * 32u, 16u, 1024u), kk > 0);".into());
+            w(s, "        tang_wg_commit(); tang_wg_wait<0>();".into());
+            w(s, "        #pragma unroll".into());
+            w(s, format!("        for (int j = 0; j < {nof}; j++) {{"));
+            w(s, "            float2 sv = *(const float2*)(svp + 8u * j + 2u * tq);".into());
+            w(s, "            o[j][0] += ot[j][0] * sv.x; o[j][1] += ot[j][1] * sv.y; o[j][2] += ot[j][2] * sv.x; o[j][3] += ot[j][3] * sv.y;".into());
+            w(s, "        }".into());
+        }
         w(s, "        tang_bar_arrive(bar_e + 8u * q);".into());
         w(s, "    }".into());
-        w(s, "    m_row[0] *= 0.6931471805599453f; m_row[1] *= 0.6931471805599453f;".into());
+        if pl.blk[2].is_none() {
+            w(s, "    { float sv0 = sv_g[0];".into());
+            w(s, "    #pragma unroll".into());
+            w(s, format!("    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] *= sv0; }}"));
+        }
+        // the weights were scaled by 2^shift: the state's max moves with them
+        let sh = super::super::precision::FP8_SOFTMAX_SHIFT;
+        w(s, format!("    m_row[0] = (m_row[0] - {sh}.0f) * 0.6931471805599453f; m_row[1] = (m_row[1] - {sh}.0f) * 0.6931471805599453f;"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tensor::{Format, Precision, TensorGraph, TensorId};
+
+    fn matmul(m: usize, k: usize, n: usize, weight: bool, f: Format) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let a = g.input(&[m, k]);
+        let b = g.input(&if weight { [n, k] } else { [k, n] });
+        let bt = if weight { g.transpose(b, &[1, 0]).unwrap() } else { b };
+        let c = g.matmul(a, bt).unwrap();
+        let (mut g, outs) = g.substitute_maps(&[c]);
+        g.schedule_auto(&outs);
+        g.set_precision(a, Precision::storage(f));
+        g.set_precision(b, Precision::storage(f));
+        (g, outs[0])
+    }
+
+    #[test]
+    fn fp8_matmul_lowers_k_major_only() {
+        let (g, c) = matmul(256, 512, 384, true, Format::E4M3(128));
+        assert!(g.cuda_fp8_lowers(&[c]));
+        let src = &g.to_cuda_variant(&[c], Some(0)).kernels[0].source;
+        assert!(src.contains("mma (FP8 e4m3xe4m3 wgmma) tile"), "{src}");
+        assert!(src.contains("m64n256k32.f32.e4m3.e4m3"));
+        // B [k, n] is contiguous along n: FP8 wgmma cannot read it
+        let (g, c) = matmul(256, 512, 384, false, Format::E4M3(128));
+        assert!(!g.cuda_fp8_lowers(&[c]));
+        // a block that straddles k chunks
+        let (g, c) = matmul(256, 512, 384, true, Format::E4M3(64));
+        assert!(!g.cuda_fp8_lowers(&[c]));
+    }
+
+    #[test]
+    fn fp8_emulation_is_block_quantization() {
+        // eval_emulated of an FP8 matmul = the f64 product of the
+        // block-quantized inputs (f32 accumulation is below its noise)
+        let (m, k, n) = (8, 256, 4);
+        let (g, c) = matmul(m, k, n, true, Format::E4M3(128));
+        let a: Vec<f64> = (0..m * k).map(|i| ((i * 37 % 101) as f64 - 50.0) / 7.0).collect();
+        let b: Vec<f64> = (0..n * k).map(|i| ((i * 53 % 89) as f64 - 44.0) / 3.0).collect();
+        let got = g.eval_emulated(&[a.clone(), b.clone()], &[c]);
+        let (mut aq, mut bq) = (a, b);
+        Format::E4M3(128).round_buf(&mut aq);
+        Format::E4M3(128).round_buf(&mut bq);
+        for i in 0..m {
+            for j in 0..n {
+                let want: f64 = (0..k).map(|kk| aq[i * k + kk] * bq[j * k + kk]).sum();
+                let e = got[0][i * n + j];
+                assert!((e - want).abs() <= want.abs() * 1e-5 + 1e-5, "{e} vs {want}");
+            }
+        }
+        // and differs from the exact product by the quantization error
+        assert!(g.precision_error(&[aq.clone(), bq.clone()], &[c]).max_rel < 1e-5);
     }
 }

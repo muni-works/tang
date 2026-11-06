@@ -63,6 +63,59 @@ fn main() {
         ],
     };
     let mut rng = tang_bench::Rng::new(5);
+    // MM_TUNE=MxKxN: the precision search (`ir_precision::tune_precision`)
+    // on an f32 matmul with bf16 and E4M3(128) candidates, at the budget
+    // `TANG_BUDGET`: FP8 is taken when the emulator predicts it within
+    // budget and it is fastest, never run when predicted over
+    if let Ok(spec) = std::env::var("MM_TUNE") {
+        let d: Vec<usize> = spec.split('x').map(|x| x.parse().unwrap()).collect();
+        let (m, k, n) = (d[0], d[1], d[2]);
+        let mut g = TensorGraph::new();
+        let a = g.input(&[m, k]);
+        let b = g.input(&[n, k]);
+        let bt = g.transpose(b, &[1, 0]).unwrap();
+        let c = g.matmul(a, bt).unwrap();
+        let (mut g, outs) = g.substitute_maps(&[c]);
+        g.schedule_auto(&outs);
+        let av: Vec<f32> = (0..m * k).map(|_| rng.f32()).collect();
+        let bv: Vec<f32> = (0..n * k).map(|_| rng.f32()).collect();
+        let ins64 = [
+            av.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            bv.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        ];
+        let want = g.eval(&ins64, &outs);
+        let rt = rt.as_ref().unwrap();
+        let r = tang_bench::ir_precision::tune_precision(
+            rt,
+            g,
+            &outs,
+            &[&av, &bv],
+            &want,
+            budget,
+            &[],
+            &[Format::BF16, Format::E4M3(128)],
+            0.01,
+            20,
+        );
+        for t in &r.trials {
+            println!(
+                "  trial {:<40} err {:.2e} {} {}",
+                t.what,
+                t.error.max_rel,
+                t.ms.map_or("—".to_string(), |x| format!("{x:.4} ms")),
+                if t.kept { "kept" } else { "" }
+            );
+        }
+        println!(
+            "tune {m}x{k}x{n} budget {:.0e}: f32 {:.4} ms -> {:.4} ms, err {:.2e}, assignment {:?}",
+            budget.max_rel,
+            r.base_ms,
+            r.ms,
+            r.error.max_rel,
+            r.assignment.iter().map(|(t, p)| (t.index(), p.storage)).collect::<Vec<_>>()
+        );
+        return;
+    }
     for (ci, &(m, k, n)) in cases.iter().enumerate() {
         let build = |f: Format| {
             let mut g = TensorGraph::new();
@@ -98,14 +151,17 @@ fn main() {
             return;
         }
         let rt = rt.as_ref().unwrap();
-        // N(0,1)-ish entries with a per-row magnitude spread of 2^±4, so the
-        // block scales matter
+        // zero-mean, unit-variance entries (Rng::f32 is uniform on [-1, 1])
+        // with a per-row magnitude spread of 2^±4, so the block scales matter
         let mut gen = |rows: usize| -> Vec<f32> {
             let mut v = Vec::with_capacity(rows * k);
             for _ in 0..rows {
-                let mag = 2f32.powi((rng.f32() * 8.0) as i32 - 4);
+                let mag = 2f32.powi(((rng.f32() + 1.0) * 4.0) as i32 - 4);
                 for _ in 0..k {
-                    v.push((rng.f32() + rng.f32() + rng.f32() - 1.5) * 2.0 * mag);
+                    // MM_BIAS=1: all-positive-mean entries (accumulations
+                    // grow linearly in k)
+                    let bias = if std::env::var("MM_BIAS").is_ok() { 1.5 } else { 0.0 };
+                    v.push((rng.f32() + rng.f32() + rng.f32() + bias) * mag);
                 }
             }
             v
@@ -179,7 +235,7 @@ fn main() {
             let eemu = ErrorStats::compare(&[gs.clone()], &[emu.clone()]);
             if acc_f == Format::Fp8Accum && v == 0 {
                 // calibration: which truncation width matches the GPU
-                for bits in [10, 11, 12, 13, 14, 15, 23] {
+                for bits in [9, 10, 11, 12, 13, 14, 15, 16, 18, 23] {
                     let tr = |x: f64| {
                         let x = x as f32 as f64;
                         if x == 0.0 {
@@ -192,9 +248,21 @@ fn main() {
                     let e: Vec<f64> = samples.iter().map(|&(i, j)| emu_dot(i, j, &tr)).collect();
                     let vs_gpu = ErrorStats::compare(&[gs.clone()], &[e.clone()]);
                     let vs_64 = ErrorStats::compare(&[e], &[exact.clone()]);
+                    // per k32 instruction: the 32 products summed, then
+                    // added to the truncated running sum
+                    let eg: Vec<f64> = samples
+                        .iter()
+                        .map(|&(i, j)| {
+                            (0..k).step_by(32).fold(0.0, |s, k0| {
+                                let part: f64 = (k0..(k0 + 32).min(k)).map(|kk| aq[i * k + kk] * bq[j * k + kk]).sum();
+                                tr(s + part)
+                            })
+                        })
+                        .collect();
+                    let g_gpu = ErrorStats::compare(&[gs.clone()], &[eg]);
                     println!(
-                        "    truncate to {bits} bits: emulated vs f64 {:.2e} (mean {:.2e}), GPU vs emulated {:.2e} (mean {:.2e})",
-                        vs_64.max_rel, vs_64.mean_rel, vs_gpu.max_rel, vs_gpu.mean_rel
+                        "    truncate to {bits} bits: per add: emulated vs f64 {:.2e} (mean {:.2e}), GPU vs emulated {:.2e} (mean {:.2e}); per k32: GPU vs emulated {:.2e} (mean {:.2e})",
+                        vs_64.max_rel, vs_64.mean_rel, vs_gpu.max_rel, vs_gpu.mean_rel, g_gpu.max_rel, g_gpu.mean_rel
                     );
                 }
             }

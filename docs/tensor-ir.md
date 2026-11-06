@@ -561,9 +561,7 @@ nested-GEMM register budget is 192 (`TANG_NEST_REGS`; the tuner still
 times each variant, so a tile that spills loses).
 
 Not done, and what it costs (BENCHMARKS.md, "Flash attention on Hopper"):
-- TMA copies and FP8 (e4m3) storage. FP8 needs a `Format` variant, `wgmma`
-  k32 fragments and V transposed in shared memory (`wgmma` has no
-  transpose for 8-bit operands).
+- TMA copies. (FP8 storage: see [FP8](#fp8-the-scale-is-part-of-the-type).)
 - `wgmma` for the GEMM tiles, so the backward's dQ/dK/dV tiles (with S
   and dP nested) still run on `mma.sync`.
 - Intra-warpgroup overlap (issuing the next S before this softmax) and
@@ -574,6 +572,69 @@ Not done, and what it costs (BENCHMARKS.md, "Flash attention on Hopper"):
   dK and dV in one pass over queries and dQ with atomics. Deriving that
   needs a merge of sibling reductions that read the same nested
   contractions but reduce over different axes.
+
+## FP8: the scale is part of the type
+
+`Format::E4M3(block)` and `Format::E5M2(block)` are 8-bit storage formats
+with one f32 scale per `block` consecutive elements (`0`: one scale for
+the tensor). The scale is not a separate tensor the graph threads through
+every consumer; it is part of the format, the same way the MLX 4-bit
+dequantization map is part of a quantized weight's view. A block's scale is
+its largest magnitude over the format's largest finite value (448, 57344);
+the stored byte is `x / scale` rounded to nearest even, saturating. The
+buffer holds the bytes (padded to 16), then the scales
+(`Format::buffer_bytes`, `scale_offset`), so element `a` is byte `a` and
+scale `a / block`: the scale map is one more affine view of the operand,
+and a kernel reads it as such. `tang_gpu::program` packs and unpacks the
+layout (`precision::pack_fp8` / `unpack_fp8`), so a program's inputs stay
+f32 slices.
+
+- **Emulation.** `eval_emulated` rounds an FP8 input as a whole buffer
+  (`Format::round_buf`: the scales depend on the block), so
+  `precision_error` predicts the cost of a schedule before it runs. Two
+  more things the tensor cores do had to become types to be predicted:
+  - `Precision::operand`: the format a reduction rounds a multiplicand it
+    computes itself to — the softmax weights `exp(s − m)` of an
+    online-softmax reduction, which an FP8 attention tile feeds to the
+    tensor cores as P. The emulator rounds each weight (scaled by
+    `2^FP8_SOFTMAX_SHIFT` into E4M3's normal range, as FlashAttention-3
+    does) before it scales v and joins the row sum.
+  - `Format::Fp8Accum`, an accumulation format: Hopper's FP8 `wgmma`
+    accumulator without promotion keeps about 14 mantissa bits,
+    truncated. Calibrated on an H100 (`examples/hopper_fp8.rs`,
+    `MM_ACC=fast`): truncation to 14 bits matches the GPU to 4e-4, 13 and
+    15 bits are off by 1e-2 and 4e-3. A reduction with `accum: F32` gets
+    f32 accumulation: the tile promotes every 128 elements.
+- **Matmul** (`tensor_cuda_fp8.rs`, `SM90_FP8_SHAPES`). Any single-term
+  contraction `bilinear_tile` recognizes, with both operands FP8 and
+  contiguous along k (FP8 `wgmma` reads K-major operands only), lowers to
+  a warp-specialized tile: a producer warpgroup copies 128-byte k chunks
+  of A and B (one 128-byte swizzle row each) plus the chunk's scales
+  (`cp.async` with `cp.async.mbarrier.arrive.noinc`: the ring stays full);
+  consumer warpgroups of 64 rows issue `wgmma.m64nNk32` into a scratch
+  accumulator and fold it into the f32 sum times `sa[row] · sb[col]` —
+  the block scale is constant over a chunk when the block is a multiple
+  of 128. With per-tensor scales and `accum: Fp8Accum` the fold is
+  skipped (the whole reduction in the tensor cores, scales applied once).
+  Rows, columns and the reduction may be ragged; other point dims,
+  epilogue maps and a literal factor work as on the half tiles.
+- **Attention** (the Hopper flash schedule, `SM90_FP8_FLASH_SHAPES`). FP8
+  Q, K and V (each with its own blocks) and an E4M3 `operand` on the
+  online-softmax reduction: S = Q·Kᵀ on FP8 `wgmma` scaled by
+  `sq[row] · sk[key]`, P rounded to e4m3 and staged through shared memory
+  (K-major, swizzled), O += P·V on FP8 `wgmma` with V's scales folded in
+  per 128 keys. P·V reduces over keys, so V must be contiguous along keys:
+  the graph stores V as `[d, n]` (FlashAttention-3 transposes V in its
+  kernel instead). Head dim 128.
+- **Search.** `ir_precision::tune_precision` takes FP8 formats like f16 /
+  bf16: a move that covers an attention kernel's Q, K, V also sets its
+  `operand` (`apply_for`); an FP8 candidate never reaches the GPU when no
+  FP8 tile lowers it (`cuda_fp8_lowers`: a B stored `[k, n]`, a block that
+  straddles chunks, FP8 on a computed buffer) or when the emulator
+  predicts it over budget. `Program::tuned` sweeps the FP8 tile and flash
+  shapes through the same variant indices as the other tiles.
+
+Numbers (H200): `docs/bench/fp8-hopper.md`.
 
 ## Not yet
 

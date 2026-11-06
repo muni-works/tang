@@ -2042,6 +2042,68 @@ impl TensorGraph {
 }
 
 impl TensorGraph {
+    /// Whether every kernel of the CUDA program for `outputs` that reads
+    /// an FP8 buffer lowers to an FP8 tile (a contraction of two FP8
+    /// operands contiguous along k, or FP8 attention). A precision search
+    /// skips FP8 candidates that do not: no other kernel reads FP8.
+    pub fn cuda_fp8_lowers(&self, outputs: &[TensorId]) -> bool {
+        // FP8 is an operand format: inputs only (no kernel writes it)
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.precision.storage.is_fp8() && !matches!(n.op, Op::Input(_)))
+        {
+            return false;
+        }
+        let mut g = self.clone();
+        g.schedule_nested_contractions(outputs);
+        let program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
+            g.to_program_numbered(outputs, Target::Wgsl)
+        });
+        program.kernels.iter().all(|k| {
+            let root = k.node.index();
+            let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            !reads.iter().any(|&j| g.nodes[j].precision.storage.is_fp8())
+                || g.cuda_fp8_kernel_shaped(root, &reads, SM90_FP8_SHAPES[0]).is_some()
+                || g.cuda_flash_kernel_shaped(root, &reads, SM90_FP8_FLASH_SHAPES[0]).is_some()
+        })
+    }
+
+    /// The online-softmax reductions of the attention kernels in the CUDA
+    /// program for `outputs`, with the buffers each stages as plain
+    /// operands (Q, K, V): where an FP8 precision move sets the
+    /// reduction's `operand` format.
+    pub fn cuda_flash_reductions(&self, outputs: &[TensorId]) -> Vec<(TensorId, Vec<TensorId>)> {
+        let mut g = self.clone();
+        g.schedule_nested_contractions(outputs);
+        let program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
+            g.to_program_numbered(outputs, Target::Wgsl)
+        });
+        program
+            .kernels
+            .iter()
+            .filter_map(|k| {
+                let root = k.node.index();
+                if g.nodes[root].tile.0 == 0 {
+                    return None;
+                }
+                let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                let f = g.flash_tile(root, &reads)?;
+                let rc = g.comp_at(f.red_node)?;
+                let mut bufs: Vec<TensorId> = f
+                    .terms
+                    .iter()
+                    .flat_map(|(qb, _, kb, _)| [*qb, *kb])
+                    .map(|b| TensorId(b as u32))
+                    .collect();
+                if let ENode::Var(v) = rc.body.nodes_slice()[rc.body_outs[2].index() as usize] {
+                    bufs.push(TensorId(g.storage(rc.args[v as usize].src).n() as u32));
+                }
+                Some((TensorId(f.red_node as u32), bufs))
+            })
+            .collect()
+    }
+
     /// The tensor-core kernels of [`to_cuda`](Self::to_cuda) and, for
     /// each, the buffers its tiles stage as plain operands (a matmul's two
     /// factors, attention's Q, K and V): stored in f16 (bf16) together,

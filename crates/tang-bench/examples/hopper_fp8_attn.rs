@@ -151,7 +151,7 @@ fn head(q: &[f64], k: &[f64], vt: &[f64], n: usize, d: usize, causal: bool, roun
             let sa = if m == f64::NEG_INFINITY { 0.0 } else { (m - mx).exp() };
             let mut se = (sv - mx).exp();
             if let Some(f) = round_p {
-                se = f.round(se);
+                se = tang_compile::tensor::precision::round_weight(f, se);
             }
             l = l * sa + se;
             for c in 0..d {
@@ -183,6 +183,34 @@ fn main() {
         }
         return;
     }
+    // ATT_EMU=1: where the error comes from, on the emulator only (no GPU)
+    if std::env::var("ATT_EMU").is_ok() {
+        let (bh, n, d) = (2, 512, 128);
+        let mut rng = tang_bench::Rng::new(11);
+        let ins: Vec<Vec<f64>> = (0..3)
+            .map(|_| (0..bh * n * d).map(|_| ((rng.f32() + rng.f32() + rng.f32() + rng.f32()) * 0.866) as f64).collect())
+            .collect();
+        for (name, inp, op) in [
+            ("inputs only", fmt, Format::F32),
+            ("P only", Format::F32, Format::E4M3(0)),
+            ("inputs + P", fmt, Format::E4M3(0)),
+        ] {
+            let (g, y) = attention_vt(bh, n, d, causal);
+            let (mut g, outs) = passes(g, &[y]);
+            fp8_schedule(&mut g, &outs, inp, Format::F32);
+            for i in 0..g.nodes().len() {
+                let t = TensorId::from_index(i);
+                if g.precision(t).operand != Format::F32 {
+                    let mut p = g.precision(t);
+                    p.operand = op;
+                    g.set_precision(t, p);
+                }
+            }
+            let e = g.precision_error(&ins, &outs);
+            println!("{name:12}: max_rel {:.2e} mean_rel {:.2e}", e.max_rel, e.mean_rel);
+        }
+        return;
+    }
     let rt = Runtime::select().expect("gpu");
     let budget = ErrorBudget::rel(
         std::env::var("TANG_BUDGET")
@@ -203,7 +231,8 @@ fn main() {
     let mut rng = tang_bench::Rng::new(11);
     let mut gauss = |len: usize| -> Vec<f32> {
         (0..len)
-            .map(|_| (rng.f32() + rng.f32() + rng.f32() + rng.f32() - 2.0) * 1.7)
+            // Rng::f32 is uniform on [-1, 1]: four of them, unit variance
+            .map(|_| (rng.f32() + rng.f32() + rng.f32() + rng.f32()) * 0.866)
             .collect()
     };
 
@@ -256,6 +285,19 @@ fn main() {
             emu.push(head(&sl(&qq, h), &sl(&kq, h), &sl(&vq, h), n, d, causal, Some(Format::E4M3(0))));
         }
         let predicted = ErrorStats::compare(&emu, &exact);
+        if std::env::var("ATT_DECOMP").is_ok() {
+            let h = heads[0];
+            let inp = head(&sl(&qq, h), &sl(&kq, h), &sl(&vq, h), n, d, causal, None);
+            let pon = head(&sl(&q64, h), &sl(&k64, h), &sl(&v64, h), n, d, causal, Some(Format::E4M3(0)));
+            let ex = &exact[0];
+            let e_in = ErrorStats::compare(&[inp], std::slice::from_ref(ex));
+            let e_p = ErrorStats::compare(&[pon], std::slice::from_ref(ex));
+            let qe = ErrorStats::compare(&[sl(&qq, h)], &[sl(&q64, h)]);
+            println!(
+                "  decomposition (head {h}): inputs only max {:.2e} mean {:.2e}; P only max {:.2e} mean {:.2e}; q quantization max {:.2e} mean {:.2e}",
+                e_in.max_rel, e_in.mean_rel, e_p.max_rel, e_p.mean_rel, qe.max_rel, qe.mean_rel
+            );
+        }
         let frac = if causal { 0.5 } else { 1.0 };
         let flop = 4.0 * (bh * n * n * d) as f64 * frac;
         println!(
