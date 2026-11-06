@@ -207,8 +207,7 @@ impl TensorGraph {
                         && readers[i]
                             .iter()
                             .all(|&r| g.comp_at(r).is_some_and(|rc| rc.monoid.is_some()));
-                    g.nodes[i].inline =
-                        map && s.pointwise == Place::Recompute && reduced_by_all;
+                    g.nodes[i].inline = map && s.pointwise == Place::Recompute && reduced_by_all;
                 }
             }
         }
@@ -262,7 +261,11 @@ impl TensorGraph {
         self.placements(outputs)
             .into_iter()
             .map(|(t, p)| {
-                let flip = if p == Place::Hbm { Place::Recompute } else { Place::Hbm };
+                let flip = if p == Place::Hbm {
+                    Place::Recompute
+                } else {
+                    Place::Hbm
+                };
                 (t, flip)
             })
             .collect()
@@ -328,7 +331,9 @@ mod tests {
         let (g, outs) = attention(n, d);
         let mut rng = 1u64;
         let mut r = || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
         };
         let inputs: Vec<Vec<f64>> = (0..3).map(|_| (0..n * d).map(|_| r()).collect()).collect();

@@ -127,12 +127,22 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map_or(16e9 as u64, |g| (g * 1e9) as u64);
-    let ns: Vec<usize> = env_list("N", "1024,4096").iter().map(|s| s.parse().unwrap()).collect();
-    let ds: Vec<usize> = env_list("D", "64").iter().map(|s| s.parse().unwrap()).collect();
+    let ns: Vec<usize> = env_list("N", "1024,4096")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let ds: Vec<usize> = env_list("D", "64")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
     let ops = env_list("OPS", "fwd,fwdbwd");
     let tune = std::env::var("NO_TUNE").is_err();
     let v = parse_variant("s", "j <= i").unwrap();
-    let emit = |point: &str, op: &str, n: usize, d: usize, r: Result<(&Run, Option<bool>, &str), String>| {
+    let emit = |point: &str,
+                op: &str,
+                n: usize,
+                d: usize,
+                r: Result<(&Run, Option<bool>, &str), String>| {
         match r {
             Ok((r, ok, check)) => println!(
                 "{{\"point\":\"{point}\",\"device\":\"{dev_name}\",\"op\":\"{op}\",\"n\":{n},\"d\":{d},\"ms\":{:.4},\"hbm_bytes\":{},\"kernels\":{},\"nxn_buffers\":{},\"correct\":{},\"check\":\"{check}\",\"note\":null}}",
@@ -149,7 +159,13 @@ fn main() {
         for &n in &ns {
             for op in &ops {
                 let bwd = op == "fwdbwd";
-                let iters = if n >= 16384 { 3 } else if n >= 4096 { 5 } else { 20 };
+                let iters = if n >= 16384 {
+                    3
+                } else if n >= 4096 {
+                    5
+                } else {
+                    20
+                };
                 let (g, outs) = naive_graph(&v, n, d, bwd).unwrap();
                 let nin = if bwd { 4 } else { 3 };
                 let inputs: Vec<Vec<f32>> = (0..nin).map(|k| rand(n * d, 7 + k as u64)).collect();
@@ -165,20 +181,39 @@ fn main() {
                 let tol = 2e-3;
                 // flash first: it is the cross-check above n = 1024
                 let fl = g.place(&outs, &MemorySchedule::flash());
-                let flash = run(&device, &mut cache, &fl.graph, &fl.outputs, fl.nest, &ins, n, iters, budget);
+                let flash = run(
+                    &device,
+                    &mut cache,
+                    &fl.graph,
+                    &fl.outputs,
+                    fl.nest,
+                    &ins,
+                    n,
+                    iters,
+                    budget,
+                );
                 let reference: Option<Vec<Vec<f64>>> = want.clone().or_else(|| {
                     flash.as_ref().ok().map(|r| {
-                        r.out.iter().map(|o| o.iter().map(|&x| x as f64).collect()).collect()
+                        r.out
+                            .iter()
+                            .map(|o| o.iter().map(|&x| x as f64).collect())
+                            .collect()
                     })
                 });
                 let check = if want.is_some() { "f64" } else { "vs-flash" };
                 let verdict = |r: &Run| reference.as_ref().map(|w| max_rel(&r.out, w) < tol);
                 for (name, s) in MemorySchedule::named() {
                     let r = if name == "flash" {
-                        flash.as_ref().map_err(|e| e.clone()).map(|r| (r, if want.is_some() { verdict(r) } else { None }))
+                        flash
+                            .as_ref()
+                            .map_err(|e| e.clone())
+                            .map(|r| (r, if want.is_some() { verdict(r) } else { None }))
                     } else {
                         let p = g.place(&outs, &s);
-                        match run(&device, &mut cache, &p.graph, &p.outputs, p.nest, &ins, n, iters, budget) {
+                        match run(
+                            &device, &mut cache, &p.graph, &p.outputs, p.nest, &ins, n, iters,
+                            budget,
+                        ) {
                             Ok(r) => {
                                 let ok = verdict(&r);
                                 emit(name, op, n, d, Ok((&r, ok, check)));
@@ -187,7 +222,11 @@ fn main() {
                             Err(e) => Err(e),
                         }
                     };
-                    let chk = if name == "flash" && want.is_none() { "self (reference)" } else { check };
+                    let chk = if name == "flash" && want.is_none() {
+                        "self (reference)"
+                    } else {
+                        check
+                    };
                     emit(name, op, n, d, r.map(|(r, ok)| (r, ok, chk)));
                 }
                 emit("fa3", op, n, d, Err("FA3 = FA2 placement + async TMA/wgmma staging; needs Hopper (sm_90). Not this device; tang's wgmma lowering is on an unmerged branch".into()));
@@ -197,11 +236,14 @@ fn main() {
                 }
                 // autotune: every role-level placement, then each kernel's
                 // thread mappings on the winner (one kernel at a time)
-                let mut best: Option<(f64, TensorGraph, Vec<TensorId>, bool, MemorySchedule)> = None;
+                let mut best: Option<(f64, TensorGraph, Vec<TensorId>, bool, MemorySchedule)> =
+                    None;
                 let titers = iters.min(5);
                 for s in MemorySchedule::candidates() {
                     let p = g.place(&outs, &s);
-                    if let Ok(r) = run(&device, &mut cache, &p.graph, &p.outputs, p.nest, &ins, n, titers, budget) {
+                    if let Ok(r) = run(
+                        &device, &mut cache, &p.graph, &p.outputs, p.nest, &ins, n, titers, budget,
+                    ) {
                         if verdict(&r) != Some(false) && best.as_ref().is_none_or(|b| r.ms < b.0) {
                             best = Some((r.ms, p.graph, p.outputs, p.nest, s));
                         }
@@ -220,7 +262,9 @@ fn main() {
                     for (split, tile, reg) in bg.schedule_candidates(t) {
                         let mut c = bg.clone();
                         c.set_schedule(t, split, tile, reg);
-                        if let Ok(r) = run(&device, &mut cache, &c, &bo, nest, &ins, n, titers, budget) {
+                        if let Ok(r) =
+                            run(&device, &mut cache, &c, &bo, nest, &ins, n, titers, budget)
+                        {
                             if verdict(&r) != Some(false) && r.ms < bms {
                                 bms = r.ms;
                                 bg = c;
@@ -234,7 +278,15 @@ fn main() {
                     "autotune:{:?}/{:?}/{:?}/{:?}",
                     bs.contraction, bs.pointwise, bs.normalizer, bs.boundary
                 );
-                emit(&tag, op, n, d, r.as_ref().map_err(|e| e.clone()).map(|r| (r, verdict(r), check)));
+                emit(
+                    &tag,
+                    op,
+                    n,
+                    d,
+                    r.as_ref()
+                        .map_err(|e| e.clone())
+                        .map(|r| (r, verdict(r), check)),
+                );
             }
         }
     }
