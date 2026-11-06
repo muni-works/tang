@@ -1642,16 +1642,23 @@ mod tests {
             fill(32 * 48, 0.11),
             fill(48 * 40, 0.73),
         );
+        // the decode lowering: warp kernels, the kind a megakernel fuses
+        let lower = || {
+            let dp = g.to_cuda_decode(&outs, &tang_compile::tensor::cuda_gemv::DecodeOpts::default());
+            Program::new(&rt, dp.program, &[&va, &vb, &vc])
+        };
         let want = {
-            let p = Program::compile(&rt, &g, &outs, &[&va, &vb, &vc]);
+            let p = lower();
             p.run(&rt);
             p.read(&rt, outs[0])
         };
-        for max_blocks in [0, 4] {
-            let mut p = Program::compile(&rt, &g, &outs, &[&va, &vb, &vc]);
+        // all fused; then only the 640-block kernel is small enough, so
+        // nothing fuses (a run of one stays a launch)
+        for (max_blocks, fused) in [(0, 1), (700, 3)] {
+            let mut p = lower();
             let (launches, phases, _) = p.megakernel(&rt, &MegaOpts::default(), 0, max_blocks);
-            assert!(launches < p.program.kernels.len() || p.program.kernels.len() == 1);
-            assert!(phases >= 1);
+            assert_eq!(launches, fused, "max_blocks {max_blocks}");
+            assert_eq!(phases > 0, fused == 1);
             for _ in 0..3 {
                 p.run(&rt);
                 assert_eq!(p.read(&rt, outs[0]), want, "max_blocks {max_blocks}");

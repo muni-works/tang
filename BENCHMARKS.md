@@ -2835,3 +2835,58 @@ second MMA), groups cut at 8-position tiles with no plan kernel, and ksplit 1 on
 - *B=1.* A narrow-window schedule (one pair over more warps, dp4a instead of MMA) is not expressible yet.
 - Synthetic weights (random valid k-quant blocks, gate/up Q4_K, down Q5_K); the real UD-Q4_K_XL mixes
   types per layer. Kernel-only times; no CUDA graph, no end-to-end step.
+
+## Persistent megakernel: Qwen3-8B decode with no kernel boundaries (RTX 3090)
+
+`tang_compile::tensor::cuda_mega` lowers any CUDA program from the decode lowering (the
+510 kernels of a Qwen3-8B MLX-4-bit step, `to_cuda_decode`) to persistent kernels: each kernel
+becomes a stage over its own grid as virtual blocks, stages are levelled over buffer hazards into
+phases, and a grid barrier separates phases. `Program::megakernel` fuses the whole step (1 launch,
+437 phases) or only the runs of small kernels between the big GEMVs (`max_blocks`: the boundary is
+a per-edge choice, launch or grid barrier). Nothing in it is Qwen-specific.
+`qwen_decode model ... TANG_MEGA=1 [TANG_MEGA_MAX_BLOCKS=64 TANG_MEGA_PER_SM=1]`.
+
+Correctness, 31 teacher-forced positions vs the CPU f32 reference (`qwen_decode reference`):
+all three variants give **max |err| 3.18e-2, mean 1.50e-3, argmax 31/31**, the same as the
+510-kernel graph. `cuda_megakernel_matches_launches` checks bit equality over repeated runs.
+
+Device time per decode step (min of 3 × 20, shared 3090 with other tenants, so the baseline is
+~4% slower than the 9.6 ms quoted above; the rows in one block below ran back to back):
+
+| schedule | launches | phases | len 64 | len 1024 | len 4096 | % of 936 GB/s at 4k (4.86 GB/token) |
+|---|---|---|---|---|---|---|
+| 510-kernel CUDA graph (main) | 510 | — | 10.05 ms (99.5 tok/s) | 10.45 ms | 11.38 ms (87.9 tok/s) | 46% |
+| one megakernel, `__launch_bounds__(256,2)` | 1 | 437 | 12.00 ms (83.3 tok/s) | 12.42 ms | 13.69 ms (73.1 tok/s) | 38% |
+| segments of kernels ≤ 64 blocks, 1 block/SM | 364 | 146 | **10.02 ms (99.8 tok/s)** | 10.39 ms | **11.32 ms (88.3 tok/s)** | 46% |
+| segments of kernels ≤ 300 blocks, 1 block/SM | 328 | 182 | 10.14 ms | 10.65 ms | 12.13 ms | 43% |
+
+So: the persistent form is correct and generic, but on this graph it is **at parity at best**,
+not a win. What the per-phase trace (`TANG_MEGA_TRACE=1`, `%globaltimer` per phase) showed:
+
+- **A grid barrier costs what a launch costs.** 436 barriers over 164 blocks: 0.81 µs each
+  (0.67 at 82 blocks, 1.51 at 328); 436 empty kernels in a CUDA graph: 0.77 µs each. Inside the
+  megakernel the small stages do run in 1–3 µs instead of ~4 µs standalone, worth ~0.5 ms a step.
+- **One register budget for every stage loses more than that.** The standalone kernels use 19–128
+  registers; the megakernel uses the max (103–185), so it runs 2 blocks × 8 warps per SM.
+  Capping lower spills the 4-bit gate/up GEMV (3/SM: 390 µs vs 98; 4/SM: 782 µs). At 2/SM the qkv
+  GEMV matches standalone (51 vs 50 µs) but gate/up (116 vs 98), down (66 vs 53) and o_proj (24 vs
+  20) do not: down's 512 blocks fit one wave standalone at 52 registers (9 blocks/SM) and need two
+  rounds over the megakernel's 328 slots. Larger GEMV row tiles / unroll / 8 warps make both
+  paths slower (rows 1: 17–18 ms).
+- **Prefetching the next phase's weights into L2 during the barrier** (`TANG_MEGA_PREFETCH`, 1–4
+  MB) changes nothing: DRAM is not idle at the boundaries, the GEMVs themselves are at ~58% of
+  bandwidth.
+- **Replicating tiny stages in every block** instead of a barrier before their readers
+  (`TANG_MEGA_DUP=1`: 437 → 363 phases) is slower (12.99 ms): every block redoing a 4096-wide
+  norm costs more than the barrier it saves.
+
+Two correctness traps worth keeping: `__ldg`/`__restrict__` reads of a buffer another block wrote
+earlier in the launch are not coherent (weights keep `__ldg`, everything else is a plain load); and
+a named barrier with a register id makes ptxas reserve all 16 hardware barriers per block, which
+caps residency below what the occupancy API reports, so a grid barrier over "fitting" blocks
+deadlocks (seen at 3 blocks/SM; barrier ids are now immediates, 3 barriers used).
+
+Where a win would have to come from: work units sized for one register budget (split-K or row
+groups so every GEMV fills the persistent grid in whole rounds) and the GEMVs' own bandwidth, not
+the boundaries. llama.cpp and vLLM are not installed on mew (no GGUF either) and no Hopper host
+was available, so there are no H200 rows.
