@@ -293,6 +293,29 @@ through gather views"). The token-major form is the decode shape; an
 expert-major dispatch (tokens grouped per expert, then grouped GEMMs)
 needs a compaction — a scan — which is not a comprehension.
 
+## Integer MMA and block formats (schedule fields)
+
+Quantized expert GEMMs need no new op. Three storage formats join `Precision`:
+
+- `Format::Q4K`, `Format::Q5K`: GGUF k-quant super-blocks (256 along the last dim), input storage
+  only. The graph's values are the dequantized weights; the buffer holds the GGUF bytes as they are.
+- `Format::Q8x32`: int8 codes with one f32 scale a 32 (`d = amax / 127`) and `d · Σcodes` beside it.
+  The writer quantizes (any one-thread-per-point kernel: its store becomes a warp-level quantize);
+  `eval_emulated` rounds the same way, so the interpreter predicts the int8 error.
+
+and one field on the node, `TNode::int_mma: Option<IntMma { stage, ksplit }>`, for a contraction
+`out[p…, r] = Σ_k W[idx(p), r, k] · X[p…, k]` with `W` Q4K/Q5K (first dim optionally gathered) and
+`X` Q8x32 (rows optionally gathered). The CUDA lowering (`tensor_cuda_int8.rs`) generates the kernel
+from the comp's views: a warp owns 16 rows × 8 consecutive positions (`mma.sync.m16n8k32.s8`), the
+4/5-bit codes are the A fragment after one shift and mask, scales/mins are unpacked once a
+super-block, and `acc += dₓ·(d·sc)·dot − (dmin·m)·(dₓ·Σc)` (the mins need no second MMA because
+`Σc` is stored with the activation). Consecutive positions with the same gather index share A
+fragments, so a position dim *sorted by the index* reads each expert once a tile; the sort is
+ordinary IR (a rank comp and its inverse permutation). `stage: Fragment` loads each lane's B as 8
+consecutive bytes (A takes the same column permutation); `Stage::Mma` uses the MMA's own k order.
+`ksplit` warps split a tile's reduction. `crates/tang-bench/examples/coder_moe_ir.rs` builds a whole
+Coder-Next MoE layer this way; BENCHMARKS.md has it against the hand kernels.
+
 ## Precision is a schedule
 
 f16 is not a different program; it is a different way to run the same

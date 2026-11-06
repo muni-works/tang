@@ -45,6 +45,9 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
+/// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
+#[path = "tensor_cuda_int8.rs"]
+mod cuda_int8;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
@@ -590,6 +593,11 @@ pub struct TNode {
     /// for an f16 × f16 → f32 contraction; see
     /// [`TensorGraph::fragment_plan`]. Backends without fragments ignore it.
     pub fragment: bool,
+    /// Schedule: lower this contraction onto integer tensor-core fragments
+    /// (CUDA `mma.sync` m16n8k32 s8) with its weight operand dequantized
+    /// in registers from a block format. See [`IntMma`]. Backends without
+    /// the lowering ignore it (and then reject the block formats).
+    pub int_mma: Option<IntMma>,
     /// Schedule: combine a `split` reduction's per-thread partials with
     /// subgroup operations (WGSL `subgroupAdd`/`subgroupShuffleXor`, MSL
     /// `simd_sum`/`simd_shuffle_xor`) instead of a workgroup-memory tree:
@@ -601,6 +609,35 @@ pub struct TNode {
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
     pub precision: Precision,
+}
+
+/// The integer-MMA schedule of one contraction
+/// `out[p…, r] = Σ_k W[idx(p), r, k] · X[p…, k]`: `W` a graph input stored
+/// Q4_K / Q5_K (its first dim optionally gathered by a per-point index), `X`
+/// a buffer stored [`Format::Q8x32`]. A warp owns 16 rows `r` (the MMA's M)
+/// and 8 consecutive points `p` (its N); consecutive points that gather the
+/// same `W` slice share each A fragment, so a point dim sorted by the index
+/// reads every slice once a tile. The integer dot of a 32-column step is
+/// scaled once in float (weight `d · scale − dmin · min`, activation `d`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntMma {
+    /// How the activation operand reaches the B fragment.
+    pub stage: Stage,
+    /// Warps that split a 16-row tile's reduction (1, 2, 4 or 8), their
+    /// partial sums added through shared memory.
+    pub ksplit: u32,
+}
+
+/// Activation staging for [`IntMma`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Fragment order: each lane's B fragment is 8 consecutive columns, one
+    /// 8-byte load from global, no shared memory; the A fragment takes the
+    /// same permutation of the 32 columns (a dot product does not care).
+    Fragment,
+    /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
+    /// and `16 + 4·tig..`), on both operands.
+    Mma,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)
@@ -767,6 +804,13 @@ impl TensorGraph {
         self.nodes[t.n()].precision = p;
     }
 
+    /// Schedule: run contraction `t` on integer MMA fragments
+    /// ([`IntMma`]); `None` clears it. The CUDA lowering checks the pattern
+    /// and the operand formats and panics when they do not fit.
+    pub fn set_int_mma(&mut self, t: TensorId, s: Option<IntMma>) {
+        self.nodes[t.n()].int_mma = s;
+    }
+
     pub fn precision(&self, t: TensorId) -> Precision {
         self.nodes[t.n()].precision
     }
@@ -827,6 +871,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             subgroup: false,
             precision: Precision::default(),
         });
@@ -844,6 +889,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             subgroup: false,
             precision: Precision::default(),
         });
@@ -876,6 +922,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             subgroup: false,
             precision: Precision::default(),
         });
@@ -1020,6 +1067,7 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
             subgroup: false,
             precision: Precision::default(),
             op: Op::Comp(comp),
@@ -1535,6 +1583,7 @@ impl TensorGraph {
                 tile: node.tile,
                 reg: node.reg,
                 fragment: node.fragment,
+                int_mma: node.int_mma,
                 subgroup: node.subgroup,
                 precision: node.precision,
             });
@@ -2770,6 +2819,7 @@ impl TensorGraph {
                 tile: (0, 0, 0),
                 reg: (1, 1),
                 fragment: false,
+                int_mma: None,
                 subgroup: false,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
@@ -3141,6 +3191,56 @@ impl TensorGraph {
         Some(Some((d0, merged)))
     }
 
+    /// Whether node `a` reads `b`, directly or transitively.
+    fn depends_on(&self, a: usize, b: usize) -> bool {
+        let mut seen = vec![false; self.nodes.len()];
+        let mut stack = self.deps(a);
+        while let Some(i) = stack.pop() {
+            if i == b {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[i], true) {
+                stack.extend(self.deps(i));
+            }
+        }
+        false
+    }
+
+    /// Reads of comp `i` that it recomputes per element: through its
+    /// map args (not outputs, so `schedule_auto` may inline them), the
+    /// `(source, view over i's space)` of every comp read that is larger
+    /// than `i`'s points — an n×n score tile read by an n×d gradient.
+    fn recomputed_reads(&self, i: usize, is_output: &dyn Fn(usize) -> bool) -> Vec<(usize, View)> {
+        let Some(c) = self.comp_at(i) else {
+            return Vec::new();
+        };
+        let rank = c.rank();
+        let pts = numel(c.points());
+        let mut out: Vec<(usize, View)> = Vec::new();
+        // (source, view, reached through a recomputed map)
+        let mut stack: Vec<(usize, View, bool)> = c
+            .args
+            .iter()
+            .map(|a| (a.src.n(), a.view.clone(), false))
+            .collect();
+        while let Some((p, v, via)) = stack.pop() {
+            let Some(pc) = self.comp_at(p) else { continue };
+            if numel(&self.nodes[p].shape) <= pts {
+                continue;
+            }
+            let map = pc.monoid.is_none() && pc.red.is_empty() && pc.tuple == 0 && !is_output(p);
+            if map {
+                for a in &pc.args {
+                    stack.push((a.src.n(), a.view.compose(&v, rank), true));
+                }
+            }
+            if (map || via) && !out.contains(&(p, v.clone())) {
+                out.push((p, v));
+            }
+        }
+        out
+    }
+
     /// Sibling reductions — the same points, reduce dims and monoid,
     /// each one value per point, read by exactly the same consumers —
     /// become one comp producing all of them (the product monoid, one
@@ -3178,30 +3278,38 @@ impl TensorGraph {
         };
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
-        for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
+        // members that fit neither rule above, by shape key: they may
+        // still share a recomputed read (see `recomputed_reads`)
+        let mut loose: Vec<(String, usize)> = Vec::new();
+        for i in (0..n).filter(|&i| live[i]) {
             let Some(c) = self.comp_at(i) else { continue };
             let Some(m) = &c.monoid else { continue };
-            let readers = &consumers[i];
-            // the same readers, or a shared recomputed operand (then a
-            // reader that is not a comp, a reshape, reads the member's
-            // slot of the merged reduction through a copy)
-            let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
-            if c.tuple != 0
-                || c.width() != 1
-                || c.has_gather()
-                || readers.is_empty()
-                || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
-            {
+            if c.tuple != 0 || c.width() != 1 || c.has_gather() {
                 continue;
             }
-            let key = format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+            let readers = &consumers[i];
+            let base = format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                 self.nodes[i].precision,
                 c.out,
                 c.red,
                 m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 m.combine.nodes_slice(),
                 m.outs,
+            );
+            // the same readers, or a shared recomputed operand (then a
+            // reader that is not a comp, a reshape, reads the member's
+            // slot of the merged reduction through a copy)
+            let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
+            if is_output(i)
+                || readers.is_empty()
+                || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
+            {
+                loose.push((base, i));
+                continue;
+            }
+            let key = format!(
+                "{base}|{}",
                 match shared {
                     Some(p) => format!("via {p}"),
                     None => format!("{readers:?}"),
@@ -3212,6 +3320,66 @@ impl TensorGraph {
                 Vec::new()
             });
             g.push(i);
+        }
+        // Groups of one may still merge with a loose member, and loose
+        // members with each other, when they recompute a common read: the
+        // flash backward's dV = Σᵢ P̃ᵀ·dO and dK = Σᵢ dSᵀ·Q both evaluate
+        // S = Q·Kᵀ (and exp(S − m)) at the same (j, i). Merged, one tile
+        // recomputes that tile once for both.
+        for key in &order {
+            if let [i] = groups[key][..] {
+                let c = self.comp_at(i).unwrap();
+                let m = c.monoid.as_ref().unwrap();
+                let base = format!(
+                    "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    self.nodes[i].precision,
+                    c.out,
+                    c.red,
+                    m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    m.combine.nodes_slice(),
+                    m.outs,
+                );
+                loose.push((base, i));
+            }
+        }
+        loose.sort_by_key(|&(_, i)| i);
+        let reads: HashMap<usize, Vec<(usize, View)>> = loose
+            .iter()
+            .map(|&(_, i)| (i, self.recomputed_reads(i, &is_output)))
+            .collect();
+        let mut taken: Vec<bool> = vec![false; loose.len()];
+        for a in 0..loose.len() {
+            if taken[a] || reads[&loose[a].1].is_empty() {
+                continue;
+            }
+            let mut members = vec![loose[a].1];
+            for b in a + 1..loose.len() {
+                if taken[b] || loose[b].0 != loose[a].0 || members.len() == MAX_GROUP {
+                    continue;
+                }
+                let rb = &reads[&loose[b].1];
+                let independent = members
+                    .iter()
+                    .all(|&m| !self.depends_on(m, loose[b].1) && !self.depends_on(loose[b].1, m));
+                if independent && reads[&loose[a].1].iter().any(|r| rb.contains(r)) {
+                    taken[b] = true;
+                    members.push(loose[b].1);
+                }
+            }
+            if members.len() < 2 {
+                continue;
+            }
+            taken[a] = true;
+            // drop the singleton groups these came from
+            for key in &order {
+                let g = groups.get_mut(key).unwrap();
+                if g.len() == 1 && members.contains(&g[0]) {
+                    g.clear();
+                }
+            }
+            let key = format!("shared {members:?}");
+            order.push(key.clone());
+            groups.insert(key, members);
         }
         let mut g = self.clone();
         // member -> (merged node, slot)
@@ -3248,6 +3416,7 @@ impl TensorGraph {
                     // siblings group by precision: all members share it
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
+                    int_mma: None,
                     subgroup: false,
                     inline: false,
                     split: 0,
@@ -3270,7 +3439,7 @@ impl TensorGraph {
                 });
                 for (j, &i) in members.iter().enumerate() {
                     slot_of[i] = Some((merged, j));
-                    if consumers[i].iter().all(|&r| self.comp_at(r).is_some()) {
+                    if !is_output(i) && consumers[i].iter().all(|&r| self.comp_at(r).is_some()) {
                         continue;
                     }
                     let c = self.comp_at(i).unwrap();
@@ -3523,6 +3692,7 @@ impl TensorGraph {
                 if emulate {
                     let f = self.nodes[i].precision.storage;
                     buf.iter_mut().for_each(|v| *v = f.round(*v));
+                    f.round_blocks(&mut buf);
                 }
                 ev.bufs[i] = buf;
             }

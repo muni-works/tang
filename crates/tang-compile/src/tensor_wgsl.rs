@@ -1085,6 +1085,9 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
             Format::F32 => "f32",
             Format::F16 => "f16",
             Format::BF16 => "bf16",
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
@@ -1092,6 +1095,9 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
         Format::F16 if native_f16() => "f16",
         Format::F16 => "u32",
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -1118,6 +1124,9 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
             Format::F32 => format!("{buf}[{idx}]"),
             Format::F16 => format!("tang_h2f({buf}[{idx}])"),
             Format::BF16 => format!("tang_b2f({buf}[{idx}])"),
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
@@ -1125,6 +1134,9 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
         Format::F16 if native_f16() => format!("f32({buf}[{idx}])"),
         Format::F16 => format!("unpack2x16float({buf}[({idx}) >> 1u])[({idx}) & 1u]"),
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -1137,6 +1149,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             Format::F32 => format!("out[{idx}] = {v};"),
             Format::F16 => format!("out[{idx}] = half({v});"),
             Format::BF16 => format!("out[{idx}] = bfloat({v});"),
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     if dialect() == Dialect::Cuda {
@@ -1144,6 +1159,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             Format::F32 => format!("out[{idx}] = {v};"),
             Format::F16 => format!("out[{idx}] = tang_f2h({v});"),
             Format::BF16 => format!("out[{idx}] = tang_f2b({v});"),
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
@@ -1155,6 +1173,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
              atomicOr(&out[i_ >> 1u], (pack2x16float(vec2<f32>({v}, 0.0)) & 0xffffu) << sh_); }}"
         ),
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -1168,6 +1189,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             Format::F32 => e.to_string(),
             Format::F16 => format!("f32(half({e}))"),
             Format::BF16 => format!("f32(bfloat({e}))"),
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     if dialect() == Dialect::Cuda {
@@ -1175,6 +1199,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             Format::F32 => e.to_string(),
             Format::F16 => format!("tang_h2f(tang_f2h({e}))"),
             Format::BF16 => format!("tang_b2f(tang_f2b({e}))"),
+            Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
@@ -1182,6 +1209,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
         Format::F16 if native_f16() => format!("f32(f16({e}))"),
         Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),
         Format::BF16 => panic!("bf16 accumulation is interpreter-only"),
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 

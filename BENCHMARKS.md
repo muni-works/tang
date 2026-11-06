@@ -2685,6 +2685,44 @@ Three things were tried and dropped:
 
 Matching the materialized time needs the nested dots register-blocked (k-chunked) as a small GEMM, as `cuda_mma_kernel` does on `mma`, or on simdgroup matrices on Metal.
 
+### Flash backward: dK and dV in one tile, S recomputed once
+
+`merge_siblings` now also merges same-shape reductions that recompute a common read through their inlinable map operands, even when their readers differ or one is a program output. The read is a `(source, view)` larger than the reduction's points. Outputs read their slot through a copy. In the derived attention backward, dV = Σᵢ P̃ᵀ·dO and dK = Σᵢ dSᵀ·Q both evaluate S = Q·Kᵀ at (j, i). They become one tile. The tiled emitter runs the cooperative loads of its shared comps (P̃, dS) in one loop and memoizes nested producers by (node, coords), so S is a single dot per element (plus dP). This is the structure of FA2's dK/dV kernel. dQ stays its own tile.
+
+Gallery fwd+bwd: 8 kernels, 0 n×n. Heavy (n²) kernels go from 4 to 3: fwd, dK+dV, dQ. Two kernels are 32K-element slot copies (dK·scale and dV, ~0.01 ms each), and 3 are O(n·d) preprocess. Nested dots per (i, j) go from 5 to 4. Gradients still match the f64 interpreter (`derived_attention_backward_nested_on_gpu`, 3 variants).
+
+Whole fwd+bwd, d = 64, best of 3 (M4) or 2 (3090) interleaved A/B rounds. "#150" is that PR's nested schedule. "Materialized" is #150's `nested = false`.
+
+**Apple M4 Max, MSL**, 2026-11-06 ~13:00 EST. Load average 30–440 from other sessions, so treat these as rough.
+
+| preset | n | materialized | #150 nested | this | vs #150 |
+|---|---|---|---|---|---|
+| causal | 512 | 0.480 | 0.662 | 0.603 | 1.10× |
+| bidirectional | 512 | 0.359 | 0.540 | 0.465 | 1.16× |
+| causal | 1024 | 1.116 | 1.446 | 1.311 | 1.10× |
+| bidirectional | 1024 | 0.926 | 1.205 | 1.045 | 1.15× |
+| causal | 2048 | 3.117 | 4.668 | 4.299 | 1.09× |
+| bidirectional | 2048 | 2.694 | 4.177 | 3.952 | 1.06× |
+| causal | 4096 | 12.937 | 19.895 | 13.863 | 1.44× |
+| bidirectional | 4096 | 10.671 | 15.932 | 12.935 | 1.23× |
+
+wgpu (Metal) on the M4: 0.93–1.50× vs #150. It is slower at n = 512 and faster from n = 2048 up (4096: 44.9 → 29.9 ms causal).
+
+**RTX 3090, Vulkan through wgpu** (`mew`, under `flock`). PyTorch 2.10 SDPA fwd+bwd is f32, one head, TF32 off, on the same GPU.
+
+| preset | n | materialized | #150 nested | this | vs #150 | SDPA efficient | SDPA math |
+|---|---|---|---|---|---|---|---|
+| causal | 512 | 0.587 | 2.822 | 2.253 | 1.25× | 0.294 | 0.228 |
+| bidirectional | 512 | 0.590 | 2.853 | 2.334 | 1.22× | 0.303 | 0.194 |
+| causal | 1024 | 1.318 | 5.207 | 4.319 | 1.21× | 0.573 | 0.228 |
+| bidirectional | 1024 | 1.336 | 5.232 | 4.374 | 1.20× | 0.588 | 0.197 |
+| causal | 2048 | 3.332 | 12.523 | 10.265 | 1.22× | 1.138 | 0.646 |
+| bidirectional | 2048 | 3.374 | 12.625 | 10.375 | 1.22× | 1.167 | 0.513 |
+| causal | 4096 | 9.811 | 36.171 | 28.729 | 1.26× | 2.322 | 2.203 |
+| bidirectional | 4096 | 9.927 | 36.448 | 28.801 | 1.27× | 2.462 | 1.767 |
+
+The structure now matches FA2, but the per-element scalar dot inside the nested tiles still dominates. It is 0.25–0.34× the materialized schedule on the 3090 and about 12× behind SDPA there. Closing that needs the nested S/dP computed as a register-blocked GEMM per chunk (mma / simdgroup matrices), which this change makes a single site per tile.
+
 ## MoE through gather views (M4 Max and RTX 3090, kernel-only)
 
 **Date:** 2026-11-06. **Branch:** `claude/focused-elgamal-3af3c7` (gather views, `docs/tensor-ir.md`
@@ -2739,6 +2777,64 @@ absolute number, 378 GB/s is 40% of the 3090's 936 GB/s: one thread per output p
 gets no tile (tiles stage affine regions) and no split at this size (40960 points); a
 warp-per-row GEMV schedule for gathered contractions is the obvious next step before comparing
 against tang-llm's hand-written int8 MoE kernel.
+
+## Coder-Next MoE layer derived from the IR vs the hand kernels (H200, kernel-only)
+
+**Date:** 2026-11-06. **Branch:** `claude/moe-ir-derive` (on `claude/focused-elgamal-3af3c7`, gather views).
+**GPU:** 1× H200 SXM, RunPod secure (pod `29rjl4y2rn3fyk`, US-NC-1), idle: 0 MiB / 0% before the runs.
+**Run:** `cargo run --release -p tang-bench --features cuda --example coder_moe_ir` with
+`CODER_MOE_DUMP=dir`, then `cargo run --release -p tang-llm --features cuda --example coder_moe_hand -- dir`
+(the engine's own kernels from `coder_kernels.rs`, compiled and launched as `coder.rs` does, on the same bytes).
+
+**Layer.** Qwen3-Coder-Next 80B-A3B shapes: hidden 2048, 512 routed experts + 1 shared, top-10, expert
+FFN 512. Gate|up stored GGUF Q4_K, down Q5_K (random valid super-blocks; ~975 MB a layer), router f32.
+One IR graph: router GEMM → top-k (10 argmax rounds) → softmax weights + sigmoid shared gate → pairs
+sorted by expert (rank + inverse permutation, ordinary comps) → `gu[i] = Wgu[key[i]] · xq[tok[i]]` →
+SwiGLU → `dn[i] = Wd[key[i]] · h[i]` → combine reading `dn[rank[t, j]]`. No new op: the int8 path is
+schedule fields — `Format::Q4K/Q5K` (input storage), `Format::Q8x32` (int8 a 32, quantized by the
+writer) on `xq` and `h`, `IntMma { stage: Fragment, ksplit: (2, 1) }` on the two expert GEMMs
+(`docs/tensor-ir.md`, "Integer MMA and block formats").
+
+**Correctness.** Interpreter (`eval_emulated`, same int8 rounding) vs plain-Rust reference (small
+config): y 2.7e-7. GPU vs reference at B = 1/8/64: ≤ 2.8e-7 (gu, dn, y; top-k exact). Hand kernels vs
+derived on the same bytes: gate|up ≤ 2.7e-7, down ≤ 3.0e-7, combine ≤ 2.9e-7 (max abs / max |ref|).
+
+**Times** (ms a launch; median of 100 with the L2 flushed by a 256 MB memset before each — weights cold,
+as in the engine's 48-layer cycle. Warm minima within ~10% and in the same order.)
+
+| B | | derived (IR) | hand (engine) |
+|---|---|---|---|
+| 1 | gate\|up | 0.0174 (int8 MMA) | 0.0145 `cx_moe_gu_d2` (per pair, dp4a) |
+| | down | 0.0129 + SwiGLU→Q8 0.0062 | 0.0189 `cx_moe_down_d2f` (SiLU fused) |
+| | x→Q8 / combine | 0.0055 / 0.0063 | — (fused in norm) / 0.0113 `cx_moe_add_norm` |
+| | **expert half** | **0.0484** | **0.0447** |
+| 8 | gate\|up | 0.0481 | 0.0535 `cx_moe_gu_d4` |
+| | down | 0.0312 + 0.0065 | 0.0607 `cx_moe_down_d4f` |
+| | **expert half** | **0.0981** | **0.1256** |
+| 64 | gate\|up | **0.158** | 0.180 `cx_moe_gu_q` (the §8 int8 MMA) |
+| | down | **0.0885** + 0.0085 | 0.124 `cx_moe_down_q` + 0.0126 `cx_silu_q` |
+| | plan / x→Q8 / combine | — (sort in routing) / 0.0060 / 0.0084 | 0.0064 / — / 0.0125 |
+| | **expert half** | **0.270** | **0.336** |
+
+Stage and split at B=64 (gate|up / down, cold): Fragment (2,1) 0.158 / 0.089; Fragment (1,1) 0.165 /
+0.088; (4,2) 0.165 / 0.101; (8,2) 0.177 / 0.101; MMA k order (2,1) 0.199 / 0.097 — fragment-order
+staging is worth ~20% on gate|up.
+
+**Reading.** The derived expert GEMMs match or beat the hand kernels at B = 8 and 64 (B=64 gate|up −12%,
+down −29%) and trail at B = 1 (+20% gate|up: one pair a tile, where the hand per-pair dp4a GEMV with
+more warps a pair wins). Likely sources of the B=64 win: mins folded through the stored `dₓ·Σc` (no
+second MMA), groups cut at 8-position tiles with no plan kernel, and ksplit 1 on down.
+
+**What is missing (the gap that remains).**
+- *Routing.* The derived router + top-k + sort is 27 small kernels (0.35 ms at B=1, 0.6 ms at B=64);
+  the engine's is one router GEMV + `cx_route` (not timed here). Top-k as k argmax rounds, one kernel
+  each, is the cost; a warp-level top-k schedule (or a fused reduction) is the next field.
+- *Fusion.* The engine fuses x's int8 into the previous RMSnorm, SiLU into the B≤8 down kernel, and the
+  combine into residual + next norm; the derived layer keeps SwiGLU→Q8 and x→Q8 as their own kernels
+  (~0.012 ms a layer).
+- *B=1.* A narrow-window schedule (one pair over more warps, dp4a instead of MMA) is not expressible yet.
+- Synthetic weights (random valid k-quant blocks, gate/up Q4_K, down Q5_K); the real UD-Q4_K_XL mixes
+  types per layer. Kernel-only times; no CUDA graph, no end-to-end step.
 
 ## WGSL/MSL lowering caps: subgroups, native f16, simdgroup fragments under wgpu
 
