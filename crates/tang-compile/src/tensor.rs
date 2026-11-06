@@ -78,6 +78,9 @@ pub mod place;
 pub use place::{Boundary, MemorySchedule, Place, Placed};
 #[path = "tensor_precision.rs"]
 pub mod precision;
+/// The declarative schedule search space and the autotuner's cost model.
+#[path = "tensor_space.rs"]
+pub mod space;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
@@ -608,6 +611,12 @@ pub struct TNode {
     /// subgroups ([`WgslCaps::subgroups`](crate::tensor::WgslCaps); always
     /// on Metal), ignored elsewhere.
     pub subgroup: bool,
+    /// Schedule: geometry of a fragment-lowered attention kernel —
+    /// `[query rows per SIMD group / 8, keys per tile / 8, value columns
+    /// per threadgroup / 8, SIMD groups per threadgroup]`; 0 = the
+    /// backend's default. Ignored unless `fragment` is set and the node
+    /// has an attention plan.
+    pub frag_cfg: [u8; 4],
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -876,6 +885,7 @@ impl TensorGraph {
             fragment: false,
             int_mma: None,
             subgroup: false,
+            frag_cfg: [0; 4],
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -894,6 +904,7 @@ impl TensorGraph {
             fragment: false,
             int_mma: None,
             subgroup: false,
+            frag_cfg: [0; 4],
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -927,6 +938,7 @@ impl TensorGraph {
             fragment: false,
             int_mma: None,
             subgroup: false,
+            frag_cfg: [0; 4],
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1072,6 +1084,7 @@ impl TensorGraph {
             fragment: false,
             int_mma: None,
             subgroup: false,
+            frag_cfg: [0; 4],
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1588,6 +1601,7 @@ impl TensorGraph {
                 fragment: node.fragment,
                 int_mma: node.int_mma,
                 subgroup: node.subgroup,
+                frag_cfg: node.frag_cfg,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -2831,6 +2845,7 @@ impl TensorGraph {
                 fragment: false,
                 int_mma: None,
                 subgroup: false,
+                frag_cfg: [0; 4],
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3428,6 +3443,7 @@ impl TensorGraph {
                     fragment: false,
                     int_mma: None,
                     subgroup: false,
+                    frag_cfg: [0; 4],
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
