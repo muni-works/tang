@@ -2096,10 +2096,25 @@ impl TensorGraph {
     /// over the head dim, `dP = dO·Vᵀ`) whose every reader is a tile, or
     /// a map recomputed in tiles, is inlined: a tile lowering that can
     /// run it as a small GEMM per staged block (CUDA `mma`) recomputes it
-    /// instead of reading it back. For lowerings without nested GEMMs
-    /// this is a scalar loop per element, so only targets with one call
-    /// it (after [`schedule_auto`](Self::schedule_auto)).
+    /// instead of reading it back. The scalar tiled lowering (WGSL, MSL)
+    /// computes it as a dot per element of the shared comp it feeds, once
+    /// per chunk into workgroup memory; see
+    /// [`schedule_nested_contractions_scalar`](Self::schedule_nested_contractions_scalar).
+    /// Applied by the GPU lowerings, after [`schedule_auto`](Self::schedule_auto).
     pub fn schedule_nested_contractions(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, false);
+    }
+
+    /// [`schedule_nested_contractions`](Self::schedule_nested_contractions)
+    /// for the scalar tiled lowering (WGSL, MSL): also nests through a
+    /// tile's epilogue-inlined reduction, and reshapes each tile that
+    /// recomputes a nested contraction to more rows per workgroup.
+    pub fn schedule_nested_contractions_scalar(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, true);
+    }
+
+    fn nest_contractions(&mut self, outputs: &[TensorId], scalar: bool) {
+        let mut nested: Vec<usize> = Vec::new();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
@@ -2107,6 +2122,15 @@ impl TensorGraph {
         for j in (0..n).filter(|&j| live[j]) {
             for d in self.deps(j) {
                 readers[d].push(j);
+            }
+        }
+        // The scalar lowering also reads through a tile's own reduction,
+        // inlined under its epilogue map (flash backward's dK = (Σ dS·Q)·c).
+        let mut tile = vec![false; n];
+        for j in (0..n).filter(|&j| live[j] && self.nodes[j].tile.0 > 0) {
+            tile[j] = true;
+            if let Some(r) = self.tiled_reduction(j).filter(|_| scalar) {
+                tile[r] = true;
             }
         }
         // a map that is inline and read only by tiles (or such maps)
@@ -2118,7 +2142,7 @@ impl TensorGraph {
                 && !readers[j].is_empty()
                 && readers[j]
                     .iter()
-                    .all(|&r| self.nodes[r].tile.0 > 0 || tiled_map[r]);
+                    .all(|&r| tile[r] || tiled_map[r]);
         }
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
@@ -2127,7 +2151,7 @@ impl TensorGraph {
             if !sum || !short || c.tuple != 0 || c.width() != 1 || readers[i].is_empty() {
                 continue;
             }
-            let direct = |r: usize| self.nodes[r].tile.0 > 0;
+            let direct = |r: usize| tile[r];
             if !readers[i].iter().all(|&r| tiled_map[r] || direct(r)) {
                 continue;
             }
@@ -2143,6 +2167,28 @@ impl TensorGraph {
             self.nodes[i].inline = true;
             self.nodes[i].tile = (0, 0, 0);
             self.nodes[i].split = 0;
+            nested.push(i);
+        }
+        if !scalar {
+            return;
+        }
+        // A tile that recomputes a nested contraction computes it per
+        // chunk for each of its rows: give it rows enough to fill the
+        // workgroup (16 rows × 16 threads of 4 lanes) rather than 4 rows
+        // of 64 lanes, where most threads would idle through the dots.
+        let tiles: Vec<usize> = (0..n).filter(|&t| live[t] && self.nodes[t].tile.0 > 0).collect();
+        for t in tiles {
+            let (bx, by, _) = self.nodes[t].tile;
+            let (rx, ry) = self.nodes[t].reg;
+            let (lanes, rows) = (bx * rx.max(1), by * ry.max(1));
+            if rows >= 16 || lanes < 64 || lanes % 4 != 0 {
+                continue;
+            }
+            if !self.inline_closure(t).iter().any(|j| nested.contains(j)) {
+                continue;
+            }
+            self.nodes[t].tile = (lanes / 4, 256 / (lanes / 4), 16);
+            self.nodes[t].reg = (4, 1);
         }
     }
 

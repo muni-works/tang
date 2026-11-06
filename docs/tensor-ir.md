@@ -140,7 +140,8 @@ dropped, since a kernel would still bind them.
 
 **Flash backward is nesting.** A short contraction (one reduce dim, at most
 128) whose every reader is a tile, or a map recomputed in tiles, is inlined
-(`schedule_nested_contractions`, applied by `to_cuda`). The attention
+(`schedule_nested_contractions`, applied by `to_cuda`, `to_wgsl` and
+`to_msl`). The attention
 backward then reads `S = Q·Kᵀ` and `dP = dO·Vᵀ` only through `P̃` and `dS`,
 which the dQ, dK and dV tiles recompute, so nothing n×n is written.
 `cuda_mma_kernel` runs each nested contraction as `mma` per staged block:
@@ -155,6 +156,24 @@ the same sum the forward reduced. Chunks where a staged operand of every
 term is a masked exponential, zero by an affine condition (`map_zero_cond`),
 are left out of the k range. `merge_reduce_dims` leaves a map over a
 contraction this big unmerged, since a reshape would pin it to memory.
+
+The scalar tiled lowering (WGSL, and MSL translated from it) has no nested
+GEMM. It nests through `schedule_nested_contractions_scalar`. That version
+also reads through a tile's epilogue-inlined reduction (dK = (Σ dS·Q)·c),
+which is a reader `to_cuda` does not nest into. The tiled emitter already
+computes a shared comp once per chunk into workgroup memory: an inlined
+producer that varies along the reduce and row axes but not the lanes, here
+dS and P̃. So each dS element in the chunk evaluates S and dP as a 64-FMA
+dot, on one thread. A tile that recomputes a nested contraction is
+reshaped from 4 rows × 64 lanes to 16 rows × 16 threads of 4 lanes, so a
+chunk has one dS element per thread instead of 128 elements across 256
+threads. Nothing n×n is written on any backend. The cost is time: the
+scalar dots run 1.3× (MSL) to 4× (Vulkan on a 3090) slower than reading
+the materialized buffers (BENCHMARKS.md, "Flash backward without n×n on
+WGSL and MSL"). `to_wgsl_with(outputs, false)` and `to_msl_with(…, false)`
+lower the materialized schedule. Staging the chunk side (K, V rows) of the
+nested dots in workgroup memory was measured slower on both GPUs. It
+needs a second barrier, and the 16 KiB budget then halves the chunk.
 
 **Schedules are separate from algebra.** A comprehension says *what*. The
 schedule fields on a node say *how*, and can't change the answer:

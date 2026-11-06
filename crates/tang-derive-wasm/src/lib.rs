@@ -541,11 +541,8 @@ mod tests {
                 let j = derive(score, mask, 64, 16, bwd);
                 assert!(!j.contains("\"error\""), "{score} / {mask} / {bwd}: {j}");
                 let derived = &j[j.find("\"derived\"").unwrap()..j.find("\"candidates\"").unwrap()];
-                // the forward never writes n×n; the WGSL backward still materializes a few
-                // (nested contractions, which remove them, are lowered on CUDA only)
-                if !bwd {
-                    assert!(derived.contains("\"nxn_buffers\":0"), "{score} / {mask}: derived forward writes n×n");
-                }
+                // neither pass writes n×n: the backward nests S and dP in its tiles
+                assert!(derived.contains("\"nxn_buffers\":0"), "{score} / {mask} / {bwd}: derived writes n×n");
                 let nx = |p: &str| p.rsplit("\"nxn_buffers\":").next().unwrap().trim_end_matches(['}']).parse::<usize>().unwrap();
                 let naive = &j[..j.find("\"derived\"").unwrap()];
                 eprintln!("{score:>16} | {mask:<22} | bwd {bwd:<5} | n×n naive {} derived {}", nx(naive.trim_end_matches(',')), nx(derived.trim_end_matches(',')));

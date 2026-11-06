@@ -3245,6 +3245,55 @@ pub mod ir_block_gpu {
             }
         }
 
+        /// The derived attention forward + backward with S = Q·Kᵀ and
+        /// dP = dO·Vᵀ nested in the dQ/dK/dV tiles (`to_wgsl`'s default)
+        /// writes no n×n buffer and matches the f64 interpreter.
+        #[test]
+        fn derived_attention_backward_nested_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (n, d) = (256, 32);
+            for (score, mask) in [("s", "j <= i"), ("30*tanh(s/30)", "j <= i || j < 16"), ("s", "")] {
+                let v = tang_derive_wasm::parse_variant(score, mask).unwrap();
+                let (g, outs) = tang_derive_wasm::naive_graph(&v, n, d, true).unwrap();
+                let mut rng = crate::Rng::new(53);
+                let inputs: Vec<Vec<f32>> = (0..4)
+                    .map(|_| (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect())
+                    .collect();
+                let f64_inputs: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|x| *x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64_inputs, &outs);
+                let (dg, douts) = tang_derive_wasm::derive_graph(&g, &outs);
+                let program = dg.to_wgsl(&douts);
+                let nxn = program
+                    .buffers
+                    .iter()
+                    .filter(|b| b.input.is_none() && b.len >= n * n)
+                    .count();
+                assert_eq!(nxn, 0, "{score} / {mask}: backward writes n×n");
+                let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+                let exe = Executable::new(&device, program, &ins);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                for (k, (o, w)) in douts.iter().zip(&want).enumerate() {
+                    let got = exe.read(&device, *o);
+                    let scale = w.iter().fold(0.0f64, |m, v| m.max(v.abs())) as f32;
+                    let err = got
+                        .iter()
+                        .zip(w)
+                        .map(|(a, b)| (a - *b as f32).abs())
+                        .fold(0.0f32, f32::max);
+                    eprintln!("{score} / {mask}: grad {k} max err {err} (scale {scale})");
+                    assert!(err < 2e-3 * scale.max(1.0), "{score} / {mask}: grad {k} diverges");
+                }
+            }
+        }
+
         /// Hand-written trainable block (forward_train + backward) vs the
         /// derived forward + backward on identical weights.
         #[test]

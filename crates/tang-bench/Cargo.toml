@@ -93,6 +93,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
+tang-derive-wasm = { path = "../tang-derive-wasm" }
 
 [[example]]
 name = "algebraic_bits"

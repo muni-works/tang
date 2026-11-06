@@ -173,6 +173,14 @@ impl TensorGraph {
         self.to_program(outputs, Target::Wgsl)
     }
 
+    /// [`to_wgsl`](Self::to_wgsl) with short contractions nested in the
+    /// tiles that read them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions))
+    /// or, for `nested: false`, materialized as scheduled.
+    pub fn to_wgsl_with(&self, outputs: &[TensorId], nested: bool) -> WgslProgram {
+        self.to_program_with(outputs, Target::Wgsl, nested)
+    }
+
     /// Like [`to_wgsl`](Self::to_wgsl) with matmul-shaped f32 tiles
     /// lowered to Metal simdgroup matrices (`tensor_msl_mma.rs`, run
     /// through wgpu's MSL passthrough); everything else stays WGSL. The
@@ -184,8 +192,25 @@ impl TensorGraph {
     /// Lower to kernels. Sources are [canonical](canonical_source): the
     /// same kernel at different node numbers (say, in another layer) is
     /// the same string, so source-keyed caches compile it once.
+    ///
+    /// Short contractions read only by tiles are nested in them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions)):
+    /// the tiled emitter computes an inlined producer that varies along
+    /// the reduce and row axes once per chunk into workgroup memory, so
+    /// the flash backward recomputes `S` and `dP` there instead of
+    /// writing them.
     pub fn to_program(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
-        self.to_program_numbered(outputs, target).canonical()
+        self.to_program_with(outputs, target, true)
+    }
+
+    /// [`to_program`](Self::to_program), nesting short contractions or not.
+    pub fn to_program_with(&self, outputs: &[TensorId], target: Target, nested: bool) -> WgslProgram {
+        if !nested {
+            return self.to_program_numbered(outputs, target).canonical();
+        }
+        let mut g = self.clone();
+        g.schedule_nested_contractions_scalar(outputs);
+        g.to_program_numbered(outputs, target).canonical()
     }
 
     /// [`to_program`](Self::to_program) without

@@ -132,7 +132,29 @@ impl TensorGraph {
     /// Lower to MSL. Same kernels and buffers as [`to_wgsl`](Self::to_wgsl);
     /// nodes scheduled `fragment` (and eligible, see
     /// [`fragment_plan`](Self::fragment_plan)) run on matrix fragments.
+    ///
+    /// Short contractions read only by tiles are nested in them, as in
+    /// [`to_wgsl`](Self::to_wgsl).
     pub fn to_msl_for(&self, outputs: &[TensorId], target: &FragmentTarget) -> MslProgram {
+        self.to_msl_with(outputs, target, true)
+    }
+
+    /// [`to_msl_for`](Self::to_msl_for), nesting short contractions or not.
+    pub fn to_msl_with(
+        &self,
+        outputs: &[TensorId],
+        target: &FragmentTarget,
+        nested: bool,
+    ) -> MslProgram {
+        if !nested {
+            return self.to_msl_scheduled(outputs, target);
+        }
+        let mut g = self.clone();
+        g.schedule_nested_contractions_scalar(outputs);
+        g.to_msl_scheduled(outputs, target)
+    }
+
+    fn to_msl_scheduled(&self, outputs: &[TensorId], target: &FragmentTarget) -> MslProgram {
         with_dialect(Dialect::Msl, || {
             let w = self.to_program_numbered(outputs, super::wgsl::Target::Wgsl);
             let kernels: Vec<MslKernel> = w
