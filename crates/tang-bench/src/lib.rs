@@ -304,9 +304,9 @@ pub mod ir_gpu {
     /// default everywhere.
     pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-            g.to_msl_mma(outputs)
+            g.to_msl_mma_caps(outputs, device.wgsl_caps())
         } else {
-            g.to_wgsl(outputs)
+            g.to_wgsl_caps(outputs, device.wgsl_caps())
         }
     }
 
@@ -1187,6 +1187,160 @@ pub mod ir_gpu {
         use super::*;
         use tang_gpu::kv_attention_fused;
         use tang_gpu::GpuTensor;
+
+        /// Subgroup-combined splits (sum, max, argmax, online softmax) and
+        /// native f16 storage agree with the portable lowering and the
+        /// CPU evaluator, on whatever caps the device has.
+        #[test]
+        fn subgroup_and_f16_lowerings_match_eval() {
+            use tang_compile::tensor::{Format, Monoid, Precision, WgslCaps};
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let caps = device.wgsl_caps();
+            eprintln!("{} {caps:?}", device.name);
+            let mut cache = KernelCache::new();
+            let (rows, len) = (13, 1000);
+            let mut rng = crate::Rng::new(9);
+            let x: Vec<f32> = (0..rows * len).map(|_| rng.f32() * 4.0 - 2.0).collect();
+            let x64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            for (name, m) in [
+                ("sum", Monoid::sum()),
+                ("max", Monoid::max()),
+                ("argmax", Monoid::argmax()),
+                ("softmax", Monoid::online_softmax(1)),
+            ] {
+                for f16 in [false, true] {
+                    let mut g = tang_compile::tensor::TensorGraph::new();
+                    let xi = g.input(&[rows, len]);
+                    let w = m.width;
+                    use tang_compile::tensor::{Arg, View};
+                    let y = if w == 1 {
+                        g.comp(
+                            &[rows],
+                            &[len],
+                            vec![Arg {
+                                src: xi,
+                                view: View::identity(2, 2),
+                            }],
+                            Some(m.clone()),
+                            |v| vec![v[0]],
+                        )
+                    } else {
+                        g.comp_tuple(
+                            &[rows, w],
+                            &[len],
+                            vec![Arg {
+                                src: xi,
+                                view: View::identity(2, 2),
+                            }],
+                            Some(m.clone()),
+                            |v| {
+                                (0..w)
+                                    .map(|k| if k == 0 { v[0] } else { v[0] * v[0] })
+                                    .collect()
+                            },
+                        )
+                    }
+                    .unwrap();
+                    if f16 {
+                        g.set_precision(
+                            xi,
+                            Precision {
+                                storage: Format::F16,
+                                accum: Format::F32,
+                            },
+                        );
+                    }
+                    let want = g.eval(std::slice::from_ref(&x64), &[y]).remove(0);
+                    #[cfg(feature = "metal")]
+                    if let Some(dev) = crate::ir_msl::MslDevice::new() {
+                        for sg in [false, true] {
+                            let mut g = g.clone();
+                            g.set_schedule(y, 256, (0, 0, 0), (1, 1));
+                            g.set_subgroup(y, sg);
+                            let prog = g.to_msl(&[y]);
+                            assert_eq!(prog.kernels[0].source.contains("simd_"), sg);
+                            let exe = crate::ir_msl::Executable::new(&dev, prog, &[&x]);
+                            exe.run(&dev);
+                            let got = exe.read(y);
+                            let tol = if f16 { 0.05 } else { 1e-3 };
+                            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                                let scale = 1.0f64.max(b.abs());
+                                assert!(
+                                    ((*a as f64) - b).abs() / scale < tol,
+                                    "msl {name} f16={f16} sg={sg}[{i}]: {a} vs {b}"
+                                );
+                            }
+                        }
+                    }
+                    for (tag, sg, c) in [
+                        ("portable", false, WgslCaps::default()),
+                        ("caps", true, caps),
+                    ] {
+                        let mut g = g.clone();
+                        g.set_schedule(y, 256, (0, 0, 0), (1, 1));
+                        g.set_subgroup(y, sg);
+                        let exe = Executable::new(&device, g.to_wgsl_caps(&[y], c), &[&x]);
+                        exe.run(&device, &mut cache);
+                        cache.flush(&device);
+                        let got = exe.read(&device, y);
+                        assert_eq!(got.len(), want.len());
+                        let tol = if f16 { 0.05 } else { 1e-3 };
+                        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                            let scale = 1.0f64.max(b.abs());
+                            assert!(
+                                ((*a as f64) - b).abs() / scale < tol,
+                                "{name} f16={f16} {tag}[{i}]: {a} vs {b}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// wgpu on Metal: `fragment` attention runs the spliced native
+        /// simdgroup-matrix kernel and agrees with the f32 WGSL schedule.
+        #[test]
+        fn fragment_kernels_splice_into_wgpu_programs() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            if !device.msl_passthrough {
+                eprintln!("no MSL passthrough, skipping");
+                return;
+            }
+            let mut cache = KernelCache::new();
+            let (h, n, d) = (2, 256, 64);
+            let mut rng = crate::Rng::new(3);
+            let mut r = || {
+                (0..h * n * d)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>()
+            };
+            let (q, k, v) = (r(), r(), r());
+            for causal in [false, true] {
+                let (ga, y) = flash_attention_heads_auto(h, 1, n, d, d, causal);
+                let (gf, yf) = flash_attention_heads_fragment(h, 1, n, d, d, causal);
+                let pf = gf.to_msl_mma(&[yf]);
+                assert!(pf
+                    .kernels
+                    .iter()
+                    .any(|k| k.source.contains("simdgroup_half8x8")));
+                let ea = Executable::new(&device, ga.to_wgsl(&[y]), &[&q, &k, &v]);
+                let ef = Executable::new(&device, pf, &[&q, &k, &v]);
+                ea.run(&device, &mut cache);
+                ef.run(&device, &mut cache);
+                cache.flush(&device);
+                let (a, b) = (ea.read(&device, y), ef.read(&device, yf));
+                assert_eq!(a.len(), b.len());
+                for (i, (x, z)) in a.iter().zip(&b).enumerate() {
+                    assert!((x - z).abs() < 1e-2, "causal={causal} [{i}]: {x} vs {z}");
+                }
+            }
+        }
 
         #[test]
         fn derived_rmsnorm_and_swiglu_match_hand_kernels_on_gpu() {

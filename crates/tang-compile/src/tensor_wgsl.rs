@@ -54,6 +54,55 @@ pub(super) fn with_dialect<T>(d: Dialect, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Optional device features a WGSL lowering may use. The default (none)
+/// is portable WGSL that every adapter runs; [`TensorGraph::to_wgsl_caps`]
+/// opts in to what the device has (wgpu `SUBGROUP`, `SHADER_F16`). The
+/// MSL dialect has both natively and ignores this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WgslCaps {
+    /// `subgroupAdd`/`subgroupMax`/`subgroupShuffleXor` and the
+    /// `subgroup_size` builtins: `subgroup`-scheduled splits use them.
+    pub subgroups: bool,
+    /// `enable f16;`: f16 buffers are native `array<f16>` (same bytes as
+    /// the packed-u32 fallback) with plain stores instead of atomics, and
+    /// f16 accumulator rounding is an `f16` cast.
+    pub f16: bool,
+}
+
+thread_local! {
+    static CAPS: std::cell::Cell<WgslCaps> = const { std::cell::Cell::new(WgslCaps { subgroups: false, f16: false }) };
+}
+
+/// Caps in effect: the MSL dialect always has subgroups (simdgroups)
+/// and native half.
+pub(super) fn caps() -> WgslCaps {
+    match dialect() {
+        Dialect::Msl => WgslCaps {
+            subgroups: true,
+            f16: true,
+        },
+        Dialect::Cuda => WgslCaps::default(),
+        Dialect::Wgsl => CAPS.with(|c| c.get()),
+    }
+}
+
+/// Run `f` with the WGSL emitters allowed `c`.
+pub(super) fn with_caps<T>(c: WgslCaps, f: impl FnOnce() -> T) -> T {
+    let prev = CAPS.with(|x| x.replace(c));
+    struct Reset(WgslCaps);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAPS.with(|x| x.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
+fn native_f16() -> bool {
+    dialect() == Dialect::Wgsl && caps().f16
+}
+
 /// One dispatch.
 /// Which shading language a [`WgslProgram`]'s kernels are emitted in.
 /// `MslMma` lowers matmul-shaped f32 tiles to simdgroup matrices (see
@@ -173,6 +222,17 @@ impl TensorGraph {
         self.to_program(outputs, Target::Wgsl)
     }
 
+    /// [`to_wgsl`](Self::to_wgsl) using the device features in `caps`.
+    pub fn to_wgsl_caps(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || self.to_program(outputs, Target::Wgsl))
+    }
+
+    /// [`to_msl_mma`](Self::to_msl_mma) using the device features in `caps`
+    /// for its WGSL kernels.
+    pub fn to_msl_mma_caps(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || self.to_program(outputs, Target::MslMma))
+    }
+
     /// Like [`to_wgsl`](Self::to_wgsl) with matmul-shaped f32 tiles
     /// lowered to Metal simdgroup matrices (`tensor_msl_mma.rs`, run
     /// through wgpu's MSL passthrough); everything else stays WGSL. The
@@ -185,7 +245,41 @@ impl TensorGraph {
     /// same kernel at different node numbers (say, in another layer) is
     /// the same string, so source-keyed caches compile it once.
     pub fn to_program(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
-        self.to_program_numbered(outputs, target).canonical()
+        let mut p = self.to_program_numbered(outputs, target);
+        if target == Target::MslMma {
+            self.splice_fragment_kernels(outputs, &mut p);
+        }
+        p.canonical()
+    }
+
+    /// Under MSL passthrough, nodes scheduled `fragment` that have a
+    /// simdgroup-matrix plan (an f16 contraction, fused f16 attention)
+    /// run the native backend's fragment kernel instead of the WGSL one:
+    /// same buffers in the same `[[buffer(i)]]` order, static threadgroup
+    /// memory, the same `x + y·65535` grid. The kernels map one to one
+    /// (`to_msl_for` lowers this same program kernel by kernel).
+    fn splice_fragment_kernels(&self, outputs: &[TensorId], p: &mut WgslProgram) {
+        let live = self.live(outputs);
+        let any = (0..self.nodes.len()).any(|i| live[i] && self.nodes[i].fragment);
+        if !any {
+            return;
+        }
+        let msl = self.to_msl_for(outputs, &super::msl::FragmentTarget::APPLE);
+        assert_eq!(msl.kernels.len(), p.kernels.len());
+        for (k, m) in p.kernels.iter_mut().zip(msl.kernels) {
+            if !m.fragment {
+                continue;
+            }
+            debug_assert_eq!(k.node, m.node);
+            debug_assert_eq!(k.reads, m.reads);
+            k.source = m.source.replacen(
+                &format!("kernel void {}(", m.entry),
+                "kernel void main0(",
+                1,
+            );
+            k.workgroup_size = m.threads;
+            k.count = m.groups.0 * m.groups.1 * m.threads;
+        }
     }
 
     /// [`to_program`](Self::to_program) without
@@ -280,6 +374,13 @@ impl TensorGraph {
             .collect();
 
         let mut s = String::new();
+        let uses_f16 = order.iter().chain(std::iter::once(&root)).any(|&j| {
+            self.nodes[j].precision.storage == Format::F16
+                || self.nodes[j].precision.accum == Format::F16
+        });
+        if native_f16() && uses_f16 {
+            writeln!(s, "enable f16;").unwrap();
+        }
         writeln!(s, "// Auto-generated by tang-compile from a TensorGraph").unwrap();
         writeln!(
             s,
@@ -375,11 +476,24 @@ impl TensorGraph {
         let m = rc.monoid.as_ref().expect("split needs a reduction");
         let (w, w_out) = (rc.width(), c.width());
         let r_total = numel(&rc.red);
-        writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {split}>;").unwrap();
+        // needs whole subgroups: split a power of two ≥ 128 covers every
+        // subgroup size in use (4–128 lanes)
+        let sg = self.nodes[root].subgroup
+            && caps().subgroups
+            && split >= 128
+            && split.is_power_of_two();
+        // subgroup tree: one partial per subgroup (≥ 4 lanes everywhere)
+        let slots = if sg { split.div_ceil(4) } else { split };
+        writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {slots}>;").unwrap();
         writeln!(s, "@compute @workgroup_size({split})").unwrap();
+        let sg_args = if sg {
+            ", @builtin(subgroup_size) sg_size: u32, @builtin(subgroup_invocation_id) sg_lane: u32"
+        } else {
+            ""
+        };
         writeln!(
             s,
-            "fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{"
+            "fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>{sg_args}) {{"
         )
         .unwrap();
         writeln!(s, "    let g = wid.x + wid.y * 65535u;").unwrap();
@@ -409,23 +523,48 @@ impl TensorGraph {
             self.nodes[red_node].precision.accum,
         );
         writeln!(s, "    }}").unwrap();
-        writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
-        writeln!(s, "    workgroupBarrier();").unwrap();
-        writeln!(
-            s,
-            "    for (var stride: u32 = {split}u / 2u; stride > 0u; stride = stride / 2u) {{"
-        )
-        .unwrap();
-        writeln!(s, "        if (tid < stride) {{").unwrap();
-        writeln!(
-            s,
-            "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
-        )
-        .unwrap();
-        writeln!(s, "        }}").unwrap();
-        writeln!(s, "        workgroupBarrier();").unwrap();
-        writeln!(s, "    }}").unwrap();
-        writeln!(s, "    if (tid == 0u) {{").unwrap();
+        if sg {
+            emit_subgroup_reduce(&mut s, "    ", m, red_node);
+            writeln!(
+                s,
+                "    if (sg_lane == 0u) {{ wg_acc[tid / sg_size] = {}; }}",
+                acc_array(w)
+            )
+            .unwrap();
+            writeln!(s, "    workgroupBarrier();").unwrap();
+            // the subgroups' partials, folded by thread 0 (a handful:
+            // split / subgroup size)
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+            writeln!(
+                s,
+                "        for (var i: u32 = 1u; i < {split}u / sg_size; i = i + 1u) {{"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            wg_acc[0] = combine_{red_node}(wg_acc[0], wg_acc[i]);"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+        } else {
+            writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
+            writeln!(s, "    workgroupBarrier();").unwrap();
+            writeln!(
+                s,
+                "    for (var stride: u32 = {split}u / 2u; stride > 0u; stride = stride / 2u) {{"
+            )
+            .unwrap();
+            writeln!(s, "        if (tid < stride) {{").unwrap();
+            writeln!(
+                s,
+                "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        workgroupBarrier();").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+        }
         if red_node == root {
             for slot in 0..w {
                 let st = store(
@@ -582,6 +721,47 @@ impl TensorGraph {
         writeln!(s, "    return {};", acc_array(w)).unwrap();
         writeln!(s, "}}\n").unwrap();
     }
+}
+
+/// Reduce the scalar accumulators `acc0…` across the subgroup, leaving
+/// the total in every lane. Sum and max use the subgroup built-ins; any
+/// other monoid runs a butterfly of `subgroupShuffleXor`s through its
+/// combine (associative, so the pairing order is free; the combine
+/// may be non-commutative only if it is order-insensitive in value,
+/// which every monoid here is — the tree combine already assumes it).
+fn emit_subgroup_reduce(s: &mut String, indent: &str, m: &Monoid, j: usize) {
+    use super::MonoidKind;
+    match m.kind() {
+        MonoidKind::Sum => {
+            writeln!(s, "{indent}acc0 = subgroupAdd(acc0);").unwrap();
+            return;
+        }
+        MonoidKind::Max => {
+            writeln!(s, "{indent}acc0 = subgroupMax(acc0);").unwrap();
+            return;
+        }
+        _ => {}
+    }
+    let w = m.width;
+    writeln!(
+        s,
+        "{indent}for (var o: u32 = sg_size / 2u; o > 0u; o = o / 2u) {{"
+    )
+    .unwrap();
+    let others = (0..w)
+        .map(|i| format!("subgroupShuffleXor(acc{i}, o)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        s,
+        "{indent}    let sx = combine_{j}({}, array<f32, {w}>({others}));",
+        acc_array(w)
+    )
+    .unwrap();
+    for i in 0..w {
+        writeln!(s, "{indent}    acc{i} = sx[{i}];").unwrap();
+    }
+    writeln!(s, "{indent}}}").unwrap();
 }
 
 /// `var acc0: f32 = id0; …` — accumulator slots as scalars, so the
@@ -858,6 +1038,7 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
     }
     match f {
         Format::F32 => "f32",
+        Format::F16 if native_f16() => "f16",
         Format::F16 => "u32",
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
     }
@@ -867,7 +1048,7 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
 /// written by different threads, so the word is atomic.
 fn out_ty(f: Format) -> &'static str {
     match f {
-        Format::F16 if dialect() == Dialect::Wgsl => "atomic<u32>",
+        Format::F16 if dialect() == Dialect::Wgsl && !native_f16() => "atomic<u32>",
         f => elem_ty(f),
     }
 }
@@ -890,6 +1071,7 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
     }
     match f {
         Format::F32 => format!("{buf}[{idx}]"),
+        Format::F16 if native_f16() => format!("f32({buf}[{idx}])"),
         Format::F16 => format!("unpack2x16float({buf}[({idx}) >> 1u])[({idx}) & 1u]"),
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
     }
@@ -915,6 +1097,7 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
     }
     match f {
         Format::F32 => format!("out[{idx}] = {v};"),
+        Format::F16 if native_f16() => format!("out[{idx}] = f16({v});"),
         Format::F16 => format!(
             "{{ let i_ = {idx}; let sh_ = (i_ & 1u) * 16u; \
              atomicAnd(&out[i_ >> 1u], ~(0xffffu << sh_)); \
@@ -945,6 +1128,7 @@ pub(super) fn quant(f: Format, e: &str) -> String {
     }
     match f {
         Format::F32 => e.to_string(),
+        Format::F16 if native_f16() => format!("f32(f16({e}))"),
         Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),
         Format::BF16 => panic!("bf16 accumulation is interpreter-only"),
     }
