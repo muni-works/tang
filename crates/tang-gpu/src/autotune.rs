@@ -213,8 +213,8 @@ fn budgeted(
     let probe = Stats::of(&positive(f(warmup.max(1), 3)?))
         .median
         .clamp(1e-4, 1e3);
-    let w = ((WARM_MS / probe).ceil() as usize).clamp(warmup, 4000);
-    let m = ((SPAN_MS / probe).ceil() as usize).clamp(n, 1000);
+    let w = ((WARM_MS / probe).ceil() as usize).clamp(warmup, 400);
+    let m = ((SPAN_MS / probe).ceil() as usize).clamp(n, 400);
     f(w, m)
 }
 

@@ -1374,6 +1374,10 @@ fn wgpu_pass_times(
             record(&mut enc, None);
         }
         device.queue.submit(std::iter::once(enc.finish()));
+        // short waits: wgpu gives up on one long one
+        if device.device.poll(wgpu::PollType::Wait).is_err() {
+            return Vec::new();
+        }
     }
     let mut out = Vec::with_capacity(n);
     let mut left = n;
@@ -1418,10 +1422,19 @@ fn wgpu_pass_times(
                 enc.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
             }
             device.queue.submit(std::iter::once(enc.finish()));
+            if device.device.poll(wgpu::PollType::Wait).is_err() {
+                return Vec::new();
+            }
         }
         let slice = read.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.device.poll(wgpu::PollType::Wait).ok();
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.is_ok());
+        });
+        if device.device.poll(wgpu::PollType::Wait).is_err() || rx.try_recv() != Ok(true) {
+            // a kernel that faulted or hung: no times, so it never wins
+            return Vec::new();
+        }
         {
             let data = slice.get_mapped_range();
             let ticks: &[u64] = bytemuck::cast_slice(&data);
