@@ -3005,7 +3005,12 @@ pub fn state_kl(args: &[String]) -> Result<()> {
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
                 let (p, q) = (lsm(&r), lsm(&lg));
-                kls.push(p.iter().zip(&q).map(|(x, y)| x.exp() * (x - y)).sum::<f64>());
+                kls.push(
+                    p.iter()
+                        .zip(&q)
+                        .map(|(x, y)| x.exp() * (x - y))
+                        .sum::<f64>(),
+                );
                 for (x, y) in r.iter().zip(&lg) {
                     let d = (*x as f64 - *y as f64).abs();
                     dsum += d;
@@ -3024,7 +3029,11 @@ pub fn state_kl(args: &[String]) -> Result<()> {
         for x in &lgs {
             f.write_all(&x.to_le_bytes())?;
         }
-        println!("state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}", ids.len(), p.display());
+        println!(
+            "state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}",
+            ids.len(),
+            p.display()
+        );
         println!(
             "state-kl ids: {}",
             toks.iter()
