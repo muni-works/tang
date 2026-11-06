@@ -2890,3 +2890,73 @@ Where a win would have to come from: work units sized for one register budget (s
 groups so every GEMV fills the persistent grid in whole rounds) and the GEMVs' own bandwidth, not
 the boundaries. llama.cpp and vLLM are not installed on mew (no GGUF either) and no Hopper host
 was available, so there are no H200 rows.
+
+## WGSL/MSL lowering caps: subgroups, native f16, simdgroup fragments under wgpu
+
+`TensorGraph::to_wgsl_caps(outputs, WgslCaps { subgroups, f16 })` lets the
+WGSL lowering use what the device has (`GpuDevice::wgsl_caps()`; wgpu
+`SUBGROUP`, `SHADER_F16`; `TANG_NO_SUBGROUPS` / `TANG_NO_F16` turn them off).
+Plain `to_wgsl` is unchanged, portable WGSL.
+
+- **Subgroup split combine** (`subgroup` schedule field, set by
+  `schedule_auto` on its splits; `set_subgroup`): a split reduction folds
+  its per-thread partials with `subgroupAdd` / `subgroupMax` (sum, max) or a
+  `subgroupShuffleXor` butterfly through the monoid's combine (any monoid:
+  argmax, online softmax), then one barrier and a fold of the per-subgroup
+  partials, instead of a log₂(split) workgroup-memory tree. Splits that are
+  a power of two of at least 128 only. MSL always has it (`simd_sum`,
+  `simd_max`, `simd_shuffle_xor`), so the native backend uses it too.
+- **Native f16** (`enable f16;`): f16 buffers become `array<f16>` (same bytes
+  as the packed-u32 fallback), stores are plain instead of two atomics, and
+  f16 accumulator rounding is a cast. Works on Metal with wgpu 25. **Not on
+  the 3090:** wgpu 25's Vulkan adapter does not expose `SHADER_F16` there
+  (NVIDIA lacks `storageInputOutput16`, which, as far as I can tell, wgpu
+  requires for that feature), so the 3090 keeps the packed path. The
+  numbers are the same either way.
+- **Fragments under wgpu** (`to_msl_mma[_caps]`, Metal MSL passthrough): a
+  node scheduled `fragment` that has a simdgroup-matrix plan (f16
+  contraction, fused f16 attention) now runs the native backend's
+  `simdgroup_matrix` 8×8 kernel inside the wgpu program. Same buffers in the
+  same order, static threadgroup memory, same grid. Before this they only
+  ran on the separate `metal`-feature backend. WGSL has no matrix path:
+  wgpu 25 exposes no cooperative/subgroup-matrix feature.
+
+`cargo run --release -p tang-bench --example lowering_caps` (A/B interleaved,
+best of 5×30 launches, kernel-only, ms) and `scripts/torch_lowering_caps.py`
+(the same shapes; f32 matmul without TF32). The M4 was shared with other
+sessions during these runs, and its absolute times moved up to 2× between
+runs. Compare columns within one run.
+
+**Caps A/B (portable → caps).** M4 Max: within ±10% for split reductions
+(one 1.74× outlier on `sum [512,8192]` that a rerun did not reproduce),
+f16-input matmul and attention fwd and fwd+bwd. 3090 (subgroups only):
+0.97–1.04× everywhere. These kernels are not limited by the combine tree
+or by f16 unpacking. Both features are correct and validated, but they
+are not where the gap to PyTorch comes from.
+
+**Fragments under wgpu (M4, f16 q/k/v or a/b, f32 accumulate) vs the f32
+WGSL schedule, and vs PyTorch 2.15 MPS (separate run, same afternoon):**
+
+| workload | WGSL f32 auto | wgpu fragment | speedup | TFLOP/s | MPS f32 | MPS f16 |
+|---|---|---|---|---|---|---|
+| attn h1 n1024 | 0.943 | 0.122 | 7.7× | 2.2 | 0.096 | 0.117 |
+| attn h8 n1024 | 12.68 | 0.874 | 14.5× | 2.5 | 0.311 | 0.288 |
+| attn h8 n2048 | 34.86 | 1.648 | 21× | 5.2 | 1.062 | 0.946 |
+| attn h8 n2048 causal | 35.85 | 1.332 | 27× | 3.2 | 0.654 | 0.568 |
+| attn h8 n4096 | 105.6 | 3.768 | 28× | 9.1 | 4.092 | 3.783 |
+| matmul 1024³ | 0.750 | 0.291 | 2.6× | 7.4 | 0.245 | 0.230 |
+| matmul 2048³ | 5.237 | 2.066 | 2.5× | 8.3 | 1.564 | 1.409 |
+| matmul 512×576×1536 | 0.372 | 0.125 | 3.0× | 7.2 | 0.133 | 0.116 |
+
+(The WGSL f32 column was unusually slow in this run: the same schedule
+took 5.6–11 ms at h8 n1024 in other runs. The fragment column is the
+number that matters.) Through wgpu, Metal attention now ties MPS f16 at
+h8 × 4096 and trails it by 1.7–2.3× at n ≤ 2048. Matmul is 1.1–1.5× behind
+MPS f16. Max |fragment − f32| is 0.7–2.2e-3 for attention; for matmul it is
+0.09–0.16 on outputs of magnitude ~30–45, which is what rounding the
+inputs to f16 costs.
+
+**3090 vs PyTorch 2.10 cu128 (WGSL via Vulkan, caps on):** matmul 1024³
+0.350 vs 0.108 f32 / 0.041 f16; attention h8 n1024 4.31 vs 0.280 / 0.044;
+fwd+bwd h8 n1024 4.81 vs 1.19 / 0.164. The 3090's gap is tensor cores,
+which WGSL cannot reach in wgpu 25. That is the CUDA backend's job.

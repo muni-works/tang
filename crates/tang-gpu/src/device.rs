@@ -43,6 +43,22 @@ pub struct GpuDevice {
     /// WGSL kernels may use `f64` (wgpu `SHADER_F64`: Vulkan and DX12 on
     /// most desktop GPUs; not Metal).
     pub shader_f64: bool,
+    /// WGSL subgroup operations (wgpu `SUBGROUP`).
+    pub subgroups: bool,
+    /// WGSL `enable f16;` (wgpu `SHADER_F16`).
+    pub shader_f16: bool,
+}
+
+impl GpuDevice {
+    /// What generated WGSL may use on this device
+    /// ([`TensorGraph::to_wgsl_caps`](tang_compile::tensor::TensorGraph::to_wgsl_caps)).
+    /// `TANG_NO_SUBGROUPS` / `TANG_NO_F16` turn either off, for A/B runs.
+    pub fn wgsl_caps(&self) -> tang_compile::tensor::WgslCaps {
+        tang_compile::tensor::WgslCaps {
+            subgroups: self.subgroups && std::env::var_os("TANG_NO_SUBGROUPS").is_none(),
+            f16: self.shader_f16 && std::env::var_os("TANG_NO_F16").is_none(),
+        }
+    }
 }
 
 impl GpuDevice {
@@ -82,7 +98,9 @@ impl GpuDevice {
         let required_features = adapter.features()
             & (wgpu::Features::MSL_SHADER_PASSTHROUGH
                 | wgpu::Features::SPIRV_SHADER_PASSTHROUGH
-                | wgpu::Features::SHADER_F64);
+                | wgpu::Features::SHADER_F64
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::SHADER_F16);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tang-gpu"),
@@ -105,6 +123,8 @@ impl GpuDevice {
             msl_passthrough,
             spirv_passthrough,
             shader_f64: required_features.contains(wgpu::Features::SHADER_F64),
+            subgroups: required_features.contains(wgpu::Features::SUBGROUP),
+            shader_f16: required_features.contains(wgpu::Features::SHADER_F16),
         })
     }
 

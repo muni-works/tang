@@ -2476,7 +2476,7 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (Strin
         if t.starts_with("fn main(") {
             writeln!(
                 body,
-                "kernel void k_main({params}uint3 gid [[thread_position_in_grid]], uint3 wid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {{"
+                "kernel void k_main({params}uint3 gid [[thread_position_in_grid]], uint3 wid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]], uint sg_size [[threads_per_simdgroup]], uint sg_lane [[thread_index_in_simdgroup]]) {{"
             )
             .unwrap();
             for d in &shared {
@@ -2495,7 +2495,10 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (Strin
         }
         let line = line
             .replace("KERNEL_PARAMS ", &params)
-            .replace("BUFS_INIT", &bufs_init);
+            .replace("BUFS_INIT", &bufs_init)
+            .replace("subgroupAdd(", "simd_sum(")
+            .replace("subgroupMax(", "simd_max(")
+            .replace("subgroupShuffleXor(", "simd_shuffle_xor(");
         writeln!(body, "{}", statement(&line)).unwrap();
     }
     out.push_str(&body);

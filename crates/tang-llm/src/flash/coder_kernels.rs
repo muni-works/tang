@@ -32,7 +32,7 @@ pub fn prelude(c: &Shapes, maxt: usize) -> String {
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
          #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n\
-         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n{tiles}",
+         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n{tiles}{kv}",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -47,6 +47,14 @@ pub fn prelude(c: &Shapes, maxt: usize) -> String {
         np = maxt * (c.topk + 1),
         chunk = attn_chunk(),
         maxt = maxt,
+        kv = if kv8() {
+            format!(
+                "#define CX_KV8 1\n#define CX_KVROW {}\n",
+                kv_row_bytes(c.n_kv, c.head_dim)
+            )
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -58,7 +66,7 @@ pub fn attn_chunk() -> usize {
         .unwrap_or(64)
 }
 
-pub use super::fa2::{fa2_smem, fa2_splits, FA2_BM, FA2_BN};
+pub use super::fa2::{fa2_smem, fa2_splits, kv8, kv_row_bytes, FA2_BM, FA2_BN};
 
 /// The shapes the kernels are compiled for.
 #[derive(Clone, Debug)]
@@ -1724,7 +1732,6 @@ extern "C" __global__ void __launch_bounds__(256) cx_silu_q8k(const float* gu, u
     q8k_store(silu_f2(gv) * uv, hk, CX_NP, CX_FF, p, c);
 }
 
-
 // ---- GGUF-native batch experts: TCX32's kernel on the GGUF Q4_K / Q5_K rows themselves ----
 //
 // The m16n8k32 A register c of lane (g, tig) at step s is row g + 8 (c & 1)'s qs word at
@@ -3189,6 +3196,72 @@ GEMVKB_T(8, 8) GEMVKB_T(8, 16) GEMVKB_T(8, 32)
 // layout.
 #define CX_OFF(rows, t, p) ((p) > (int)(rows)[7 * CX_MAXT + (t)] ? (p) + (int)(rows)[6 * CX_MAXT + (t)] : (p))
 
+#ifdef CX_KV8
+// int8 K/V cache (`TANG_CODER_KV=int8`): position p of a layer's K (or V) cache is one CX_KVROW-byte
+// row, CX_NKV heads of CX_HD int8 codes, then an f16 scale (absmax / 127) for each group of KV8_G
+// dims of each head, zero padding to 16 bytes. Value = code * scale of its group.
+#define KV8_G 64
+#define KV8_NG (CX_HD / KV8_G)
+__device__ __forceinline__ float kv8_h2f(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ unsigned short kv8_f2h(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+#define KV8_Q(base, p, g) ((const signed char*)(base) + (size_t)(p) * CX_KVROW + (g) * CX_HD)
+// The scale of dim d of head g at position p.
+#define KV8_S(base, p, g, d) kv8_h2f(((const unsigned short*)((const unsigned char*)(base) + (size_t)(p) * CX_KVROW + CX_NKV * CX_HD))[(g) * KV8_NG + (d) / KV8_G])
+static_assert(CX_KVROW % 16 == 0 && CX_HD % KV8_G == 0 && KV8_G % 32 == 0, "int8 K/V rows stay 16-byte aligned");
+// Max over this thread's group of KV8_G threads (whole warps), of non-negative values.
+__device__ float kv8_gmax(float v, float* sh) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    const int w0 = (threadIdx.x / KV8_G) * (KV8_G / 32);
+    float m = 0.f;
+    for (int i = 0; i < KV8_G / 32; i++) m = fmaxf(m, sh[w0 + i]);
+    return m;
+}
+// Q, K and V heads are rotated before K/V are quantized: y = H D x / sqrt(CX_HD), D a fixed +-1
+// diagonal and H the Sylvester Hadamard matrix (QuaRot, arXiv 2404.00456). q.k is unchanged
+// (the rotation is orthogonal), and outlier channels are spread over the head, so a per-head
+// absmax scale wastes far fewer codes. Attention then produces H D o; cx_attn_merge undoes it
+// (o = D H y / sqrt(CX_HD)). Block = CX_HD threads, thread d owns dim d; s is CX_HD floats.
+static_assert((CX_HD & (CX_HD - 1)) == 0, "int8 K/V rotation: head dim a power of two");
+__device__ __forceinline__ float kv8_sign(int d) {
+    return ((0x5A3C96E1u >> (d & 31)) ^ (unsigned)(d >> 5) ^ (unsigned)(d >> 7)) & 1u ? -1.f : 1.f;
+}
+__device__ float kv8_wht(float x, int d, float* s) {
+    __syncthreads();
+    s[d] = x;
+    __syncthreads();
+    for (int h = 1; h < CX_HD; h <<= 1) {
+        const float a = s[d], b = s[d ^ h];
+        __syncthreads();
+        s[d] = (d & h) ? b - a : a + b;
+        __syncthreads();
+    }
+    return s[d] * rsqrtf((float)CX_HD);
+}
+__device__ __forceinline__ float kv8_rot(float x, int d, float* s) { return kv8_wht(x * kv8_sign(d), d, s); }
+__device__ __forceinline__ float kv8_unrot(float y, int d, float* s) { return kv8_wht(y, d, s) * kv8_sign(d); }
+// One head's value x (this thread's dim d) as an int8 code into the row at `row`, each group's
+// scale by its first thread.
+// Codes are rounded against the stored (f16) scale, so code * scale is what the readers see.
+__device__ __forceinline__ void kv8_put(unsigned char* row, int g, int d, float x, float* sh) {
+    const unsigned short sh16 = kv8_f2h(kv8_gmax(fabsf(x), sh) / 127.0f);
+    const float sc = kv8_h2f(sh16), inv = sc > 0.f ? 1.0f / sc : 0.f;
+    const int q = max(-127, min(127, __float2int_rn(x * inv)));
+    row[g * CX_HD + d] = (unsigned char)(signed char)q;
+    if (d % KV8_G == 0) ((unsigned short*)(row + CX_NKV * CX_HD))[g * KV8_NG + d / KV8_G] = sh16;
+}
+#endif
+
 // Gated attention prep: q heads (rmsnorm * qn, NeoX rope on CX_ROT dims) into q [t][NH][HD];
 // k heads (rmsnorm * kn, rope) and v into the row's slot caches at the row's position.
 // Grid (t, NH + NKV), block HD.
@@ -3216,11 +3289,20 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
         x = d < half ? sx[d] * c - sx[d + half] * s : sx[d - half] * s + sx[d] * c;
     }
     if (isq) {
+#ifdef CX_KV8
+        x = kv8_rot(x, d, sx);
+#endif
         q[((size_t)t * CX_NH + h) * CX_HD + d] = x;
     } else {
+#ifdef CX_KV8
+        const size_t pr = (size_t)CX_OFF(rows, t, (int)pos) * CX_KVROW;
+        kv8_put((unsigned char*)kc + pr, g, d, kv8_rot(x, d, sx), sh);
+        kv8_put((unsigned char*)vc + pr, g, d, kv8_rot(row[CX_QV + g * CX_HD + d], d, sx), sh);
+#else
         const size_t o = ((size_t)CX_OFF(rows, t, (int)pos) * CX_NKV + g) * CX_HD + d;
         kc[o] = f2bf(x);
         vc[o] = f2bf(row[CX_QV + g * CX_HD + d]);
+#endif
     }
 }
 
@@ -3228,6 +3310,9 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
 // CX_G query heads of group g over its chunk (4 warps; lane owns HD / 32 dims) and writes per
 // head (m, l, acc[HD]) to part[c][g][j][G][HD + 2]. Chunks past the token's position write l = 0.
 #define CX_DL (CX_HD / 32)
+#ifdef CX_KV8
+static_assert(CX_DL % 8 == 0 && KV8_G % CX_DL == 0, "int8 split-K: a lane's codes, whole 8-byte words in one scale group");
+#endif
 extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, const unsigned long long* ktab,
                                                                const unsigned long long* vtab, const unsigned* rows,
                                                                float* part, int nchunk) {
@@ -3258,11 +3343,28 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, c
     const int hi = min(pos + 1, lo + CX_CHUNK);
     for (int p = lo + warp; p < hi; p += 4) {
         const size_t pc = (size_t)CX_OFF(rows, c, p);
+        float kv[CX_DL], vv[CX_DL];
+#ifdef CX_KV8
+        // A lane's CX_DL codes are 8-byte aligned (rows and heads are 16-byte aligned).
+        const float ks = KV8_S(kc, pc, g, lane * CX_DL), vs = KV8_S(vc, pc, g, lane * CX_DL);
+        const uint2* kr = (const uint2*)(KV8_Q(kc, pc, g) + lane * CX_DL);
+        const uint2* vr = (const uint2*)(KV8_Q(vc, pc, g) + lane * CX_DL);
+        #pragma unroll
+        for (int c8 = 0; c8 < CX_DL / 8; c8++) {
+            const uint2 kq = kr[c8], vq = vr[c8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned kw = i < 4 ? kq.x : kq.y, vw = i < 4 ? vq.x : vq.y;
+                kv[c8 * 8 + i] = (float)(signed char)(kw >> (8 * (i & 3))) * ks;
+                vv[c8 * 8 + i] = (float)(signed char)(vw >> (8 * (i & 3))) * vs;
+            }
+        }
+#else
         const unsigned short* kr = kc + (pc * CX_NKV + g) * CX_HD + lane * CX_DL;
         const unsigned short* vr = vc + (pc * CX_NKV + g) * CX_HD + lane * CX_DL;
-        float kv[CX_DL], vv[CX_DL];
         #pragma unroll
         for (int i = 0; i < CX_DL; i++) { kv[i] = bf2f(kr[i]); vv[i] = bf2f(vr[i]); }
+#endif
         #pragma unroll
         for (int h = 0; h < CX_G; h++) {
             float sc = 0.f;
@@ -3316,7 +3418,12 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 #ifdef CX_JITTER
     o *= 1.f + CX_JITTER * (float)((c * 131 + h * 7 + d) % 17 - 8) / 8.f;
 #endif
+#ifdef CX_KV8
+    __shared__ float su[CX_HD];
+    out[((size_t)c * CX_NH + h) * CX_HD + d] = kv8_unrot(o / L, d, su) * sigm_f(gt);
+#else
     out[((size_t)c * CX_NH + h) * CX_HD + d] = (o / L) * sigm_f(gt);
+#endif
 }
 // ---- FA2-style tensor-core prefill attention (wide windows, `TANG_CODER_ATTN=fa2`) ----
 //
@@ -3339,7 +3446,13 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 #define FA_BM 64
 #define FA_BN 32
 #define FA_LD (CX_HD + 8)
+#ifdef CX_KV8
+// int8 K/V tiles land (cp.async) in a double-buffered staging area [2][K, V][FA_BN][CX_HD] after the
+// fp16 tiles, and the per-tile conversion pass dequantizes them into the fp16 tiles.
+#define FA_SMEM ((FA_BM + 4 * FA_BN) * FA_LD * 2 + 4 * FA_BN * CX_HD)
+#else
 #define FA_SMEM ((FA_BM + 4 * FA_BN) * FA_LD * 2)
+#endif
 static_assert(FA_BM % CX_G == 0, "FA2 tile: whole rows of G heads");
 static_assert(CX_HD % 16 == 0, "FA2 tile: head dim a multiple of 16");
 
@@ -3399,6 +3512,9 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
     unsigned short* sq = (unsigned short*)fa_sm;  // [FA_BM][FA_LD]
     unsigned short* sk = sq + FA_BM * FA_LD;     // [2][FA_BN][FA_LD]
     unsigned short* sv = sk + 2 * FA_BN * FA_LD; // [2][FA_BN][FA_LD]
+#ifdef CX_KV8
+    unsigned char* s8 = (unsigned char*)(sv + 2 * FA_BN * FA_LD); // [2][2][FA_BN][CX_HD]
+#endif
     const int g = blockIdx.y, j = blockIdx.z, tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t4 = lane & 3;
     const int nv = t * CX_G, v0 = blockIdx.x * FA_BM;
@@ -3418,6 +3534,22 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
     const unsigned slot = rows[CX_MAXT];
     const unsigned short* kc = (const unsigned short*)ktab[slot];
     const unsigned short* vc = (const unsigned short*)vtab[slot];
+#ifdef CX_KV8
+    auto load = [&](int kb, int b) {
+        for (int e = tid; e < FA_BN * (CX_HD / 16); e += 128) {
+            const int p = e / (CX_HD / 16), d = (e % (CX_HD / 16)) * 16, key = kb + p;
+            unsigned char* dk = s8 + ((2 * b) * FA_BN + p) * CX_HD + d;
+            unsigned char* dv = s8 + ((2 * b + 1) * FA_BN + p) * CX_HD + d;
+            if (key < k1) {
+                fa_cp16((unsigned short*)dk, (const unsigned short*)(KV8_Q(kc, key, g) + d));
+                fa_cp16((unsigned short*)dv, (const unsigned short*)(KV8_Q(vc, key, g) + d));
+            } else {
+                *(uint4*)dk = make_uint4(0, 0, 0, 0);
+                *(uint4*)dv = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+#else
     auto load = [&](int kb, int b) {
         for (int e = tid; e < FA_BN * (CX_HD / 8); e += 128) {
             const int p = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8, key = kb + p;
@@ -3434,6 +3566,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
             }
         }
     };
+#endif
     load(k0, 0);
     cx_async_commit();
     // Q tile, pre-scaled, as bf16 (overlaps the first K/V copy).
@@ -3459,7 +3592,21 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
         cx_async_commit();
         cx_async_wait<1>();
         __syncthreads();
-#ifndef FA_BF16
+#ifdef CX_KV8
+        // The landed int8 K/V tile, code * scale -> fp16 (bf16 under FA_BF16) into the tile. Keys past
+        // k1 are zero codes with scale 0.
+        for (int e = tid; e < 2 * FA_BN * (CX_HD / 8); e += 128) {
+            const int r = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8, isv = r >= FA_BN, p = r - isv * FA_BN;
+            const int key = kbase + p;
+            const float sc = key < k1 ? KV8_S(isv ? vc : kc, key, g, d) : 0.f;
+            const uint2 x = *(const uint2*)(s8 + ((2 * b + isv) * FA_BN + p) * CX_HD + d);
+            auto h2 = [&](unsigned w, int i) {
+                return fa_pack((float)(signed char)(w >> (8 * i)) * sc, (float)(signed char)(w >> (8 * i + 8)) * sc);
+            };
+            *(uint4*)((isv ? sv : sk) + (b * FA_BN + p) * FA_LD + d) = make_uint4(h2(x.x, 0), h2(x.x, 2), h2(x.y, 0), h2(x.y, 2));
+        }
+        __syncthreads();
+#elif !defined(FA_BF16)
         // The landed K/V tile, bf16 -> fp16 in place (once a block, not per warp fragment).
         for (int e = tid; e < 2 * FA_BN * (CX_HD / 8); e += 128) {
             const int r = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8;

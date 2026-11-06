@@ -1584,6 +1584,78 @@ pub fn wide_check(args: &[String]) -> Result<()> {
 /// Tokens and logits must be bitwise equal. Then decode speed at 1, 2, 4, … up to N sequences
 /// (tok/s aggregate and per stream). `TANG_BATCH_CTX=8192`: the speed runs first prefill
 /// every sequence to about that many tokens (the prompt repeated, wide prefill windows).
+/// Cross-process reference for [`batch_check`]'s batched outputs, to compare two engine
+/// configurations (e.g. `TANG_CODER_KV=int8` against the bf16 cache): `TANG_BATCH_REF_DUMP=F`
+/// writes every sequence's tokens and logits; `TANG_BATCH_REF=F` (same prompt, N and `-n`)
+/// compares this run's against them with batch-check's tolerance rule (logits while a
+/// sequence's tokens agree, greedy agreement given the same history; bar 99% and mean |dlogit|
+/// <= `TANG_BATCH_TOL`, default 0.2) and fails below it.
+fn batch_ref(got: &[(Vec<u32>, Vec<f32>)], v: usize, steps: usize) -> Result<()> {
+    use std::io::{Read, Write};
+    if let Ok(p) = std::env::var("TANG_BATCH_REF_DUMP") {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&p)?);
+        f.write_all(&(got.len() as u64).to_le_bytes())?;
+        f.write_all(&(steps as u64).to_le_bytes())?;
+        for (t, l) in got {
+            t.iter().try_for_each(|x| f.write_all(&x.to_le_bytes()))?;
+            l.iter().try_for_each(|x| f.write_all(&x.to_le_bytes()))?;
+        }
+        println!(
+            "batch-ref: wrote {} sequences x {steps} steps to {p}",
+            got.len()
+        );
+    }
+    let Ok(p) = std::env::var("TANG_BATCH_REF") else {
+        return Ok(());
+    };
+    let mut f = std::io::BufReader::new(std::fs::File::open(&p)?);
+    let mut w = [0u8; 8];
+    f.read_exact(&mut w)?;
+    let n = u64::from_le_bytes(w) as usize;
+    f.read_exact(&mut w)?;
+    ensure!(
+        n == got.len() && u64::from_le_bytes(w) as usize == steps,
+        "batch-ref {p}: another N or -n"
+    );
+    let (mut dmax, mut dsum, mut dn, mut tagree, mut ttot, mut prefix) =
+        (0f64, 0f64, 0usize, 0usize, 0usize, usize::MAX);
+    let mut tb = vec![0u8; 4 * steps];
+    let mut lb = vec![0u8; 4 * steps * v];
+    for (toks, lg) in got {
+        f.read_exact(&mut tb)?;
+        f.read_exact(&mut lb)?;
+        let rt: Vec<u32> = tb
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let first = (0..steps)
+            .find(|&k| rt[k] != toks[k])
+            .map_or(steps, |k| k + 1);
+        prefix = prefix.min((0..steps).find(|&k| rt[k] != toks[k]).unwrap_or(steps));
+        for (c, y) in lb[..4 * first * v].chunks(4).zip(&lg[..first * v]) {
+            let d = (f32::from_le_bytes(c.try_into().unwrap()) as f64 - *y as f64).abs();
+            dmax = dmax.max(d);
+            dsum += d;
+            dn += 1;
+        }
+        tagree += first - usize::from(first <= steps && rt[first - 1] != toks[first - 1]);
+        ttot += first;
+    }
+    let tol: f64 = std::env::var("TANG_BATCH_TOL")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0.2);
+    let (agree, mean) = (tagree as f64 / ttot.max(1) as f64, dsum / dn.max(1) as f64);
+    let ok = agree >= 0.99 && mean <= tol;
+    println!(
+        "batch-ref: tokens agree {:.2}% ({tagree}/{ttot}, same history), max |dlogit| {dmax:.4}, mean {mean:.2e}, every sequence equal for its first {prefix} tokens (bar: 99%, mean <= {tol}): {}",
+        100.0 * agree,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ensure!(ok, "batch-ref failed");
+    Ok(())
+}
+
 /// `tang-llm flash-spec-batch-check <gguf> --mtp M ...`: speculative decoding in batch windows.
 /// `TANG_BATCH_N` sequences (default 32) decode `-n` greedy tokens each, first with budget 0
 /// (one row a sequence, the plain batched path), then for each budget in `TANG_SPEC_BUDGETS`
@@ -1850,6 +1922,7 @@ pub fn batch_check(args: &[String]) -> Result<()> {
         for &s in &slots {
             e.free_slot(s);
         }
+        batch_ref(&got, v, steps)?;
         let mut ok = true;
         // Tolerance (batch windows past MAX_T may use tensor-core kernels): logits compared
         // while a sequence's tokens still agree, tokens position by position.
@@ -2914,6 +2987,7 @@ pub fn state_kl(args: &[String]) -> Result<()> {
     let mut forced = forced;
     let mut kls = Vec::new();
     let mut agree = Vec::new();
+    let (mut dsum, mut dmax) = (0f64, 0f64);
     let mut rl = vec![0u8; 4 * v];
     for i in 0..steps {
         let got = e.decode_batch(&[(s, next)])?[0];
@@ -2931,12 +3005,12 @@ pub fn state_kl(args: &[String]) -> Result<()> {
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
                 let (p, q) = (lsm(&r), lsm(&lg));
-                kls.push(
-                    p.iter()
-                        .zip(&q)
-                        .map(|(x, y)| x.exp() * (x - y))
-                        .sum::<f64>(),
-                );
+                kls.push(p.iter().zip(&q).map(|(x, y)| x.exp() * (x - y)).sum::<f64>());
+                for (x, y) in r.iter().zip(&lg) {
+                    let d = (*x as f64 - *y as f64).abs();
+                    dsum += d;
+                    dmax = dmax.max(d);
+                }
                 agree.push(got == ft[i]);
                 next = ft[i];
             }
@@ -2950,10 +3024,13 @@ pub fn state_kl(args: &[String]) -> Result<()> {
         for x in &lgs {
             f.write_all(&x.to_le_bytes())?;
         }
+        println!("state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}", ids.len(), p.display());
         println!(
-            "state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}",
-            ids.len(),
-            p.display()
+            "state-kl ids: {}",
+            toks.iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         return Ok(());
     }
@@ -2984,6 +3061,13 @@ pub fn state_kl(args: &[String]) -> Result<()> {
         kls.iter().sum::<f64>() / steps as f64,
         kls.iter().cloned().fold(0.0, f64::max),
         100.0 * ag as f64 / steps as f64
+    );
+    // Teacher-forced on the reference's greedy tokens, this run's first disagreeing argmax is
+    // where its own free-running greedy output would first leave the reference's.
+    let same = agree.iter().position(|&x| !x).unwrap_or(steps);
+    println!(
+        "state-kl greedy: equal to the reference for the first {same} of {steps} tokens; |dlogit| mean {:.3e} max {dmax:.3}",
+        dsum / (steps * v).max(1) as f64
     );
     Ok(())
 }
