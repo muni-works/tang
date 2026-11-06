@@ -607,3 +607,48 @@ Serve (`load_dec.py`, R = 4 after a warm-up run, `--batch 64 --mtp`, H200), aggr
 
 Prompt-heavy mix (`load.py` 64, R = 3): before off 486 / auto 491, after off 543 / auto 551,
 0 errors throughout. Hence `TANG_SERVE_SPEC` defaults to `auto`.
+
+## int8 K/V cache (2026-11-05, not yet measured on a GPU)
+
+`TANG_CODER_KV=bf16|int8` (default **bf16**; the switch off compiles the same PTX as before,
+byte for byte, so every existing gate is unchanged). What one slot holds at `--ctx 131072`:
+
+| part | bytes | share |
+|---|---|---|
+| attention K/V, 12 layers × 2 × 131072 × 2 kv heads × 256 × bf16 | 3.22 GB | 90% |
+| MTP layer K/V (same shape, one layer) | 0.27 GB | 7.5% |
+| GDN state, 36 layers × 32 × 128 × 128 f32 (+ 0.1 MB conv history a layer) | 0.08 GB | 2.2% |
+| **total** (`slot_bytes`) | **3.57 GB** | |
+
+K/V is what dominates, so it's what int8 compresses (the GDN state is 2%: `TANG_CODER_GDN_STATE=bf16`
+would save 38 MB a slot, under one slot in total, and stays f32). Under `int8` each position of a
+layer's K (or V) cache is one 528-byte row: 2 heads × 256 int8 codes, the two heads' f32 scales
+(absmax / 127, round-half-even codes, `fa2::kv8_quant`), zero padding to 16 bytes. That's 0.52 of
+a bf16 row, and rows stay contiguous a position, so positional save/restore, the tree-commit
+copies and `slot_bytes` / `fit_slots` / the `--batch` clamp only change their row size
+(`ck::kv_row_bytes`). The MTP layer's K/V use it too. Per slot at 131k: 1.88 GB; where 24 bf16
+slots fit on the production H200 (~86–89 GB free past the 4 GB headroom), 45–47 int8 slots fit,
+so `--batch 48` clamps to 44–46 (one slot stays spare) unless `TANG_SLOT_HEADROOM_GB` is lowered.
+
+Kernels (dequantize on load, no extra pass): `cx_attn_prep` quantizes each head as it writes
+(a block max over the head's 256 values); `cx_attn_part` (split-K decode) loads a lane's 8 codes
+as one 8-byte word and multiplies by the row's scale; `cx_attn_fa2` lands the int8 tiles with
+`cp.async` in a double-buffered staging area (`FA_SMEM` + 32 KB: 134,144 bytes) and its existing
+per-tile conversion pass writes code × scale into the fp16 tiles the MMAs read.
+
+CPU tests (`fa2::tests`): the quantization rule, the row/slot/smem arithmetic (24 bf16 slots →
+46+ int8 on the same memory), and the FA2 model on int8 K/V against exact f64 attention at head
+dim 256 with outlier K channels (int8 max 4.4e-2 / mean 4.7e-3 against bf16's 6.9e-3 / 7.2e-4 on
+that deliberately sharp synthetic softmax; the model gates below are the real bar).
+
+Gate tools added: `flash-batch-check` with `TANG_BATCH_REF_DUMP=F` / `TANG_BATCH_REF=F` compares
+one configuration's batched outputs against another process's (batch-check's tolerance rule:
+≥ 99% tokens agree given the same history, mean |dlogit| ≤ `TANG_BATCH_TOL`, default 0.2);
+`flash-state-kl --ref` now also prints the greedy prefix length (the first teacher-forced
+argmax that leaves the reference is where free-running greedy would diverge) and mean / max
+|dlogit|, and `--dump` prints the tokens. Pod gates: switch off bitwise against the base build
+(batch-check checksums at N = 1 and 8, a state-kl dump byte for byte); int8's own tcheck, spec,
+tree, batch8, spec-batch and wide-check 3000 / 8000 (same bars); int8 against bf16 on
+batch-check N = 64, state-kl explain / refactor / write / an 8k review (greedy ≥ 64 tokens), and
+a ~110k-token needle at depths 10% and 50%; then `serve --mtp --ctx 131072 --batch 48 --kv-ttl
+3600` decode-heavy and mix at C = 48, with the slot count and VRAM.

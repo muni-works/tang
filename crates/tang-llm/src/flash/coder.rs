@@ -1807,9 +1807,14 @@ impl Coder {
         self.commit_graphs.iter_mut().for_each(|g| *g = None);
     }
 
+    /// Bytes a position of one layer's K (or V) cache takes ([`ck::kv_row_bytes`]).
+    fn kv_row(&self) -> usize {
+        ck::kv_row_bytes(self.hp.n_head_kv, self.hp.head_dim)
+    }
+
     /// Device bytes one sequence slot takes (its GDN states, K/V and MTP K/V).
     pub fn slot_bytes(&self) -> usize {
-        let kv = self.max_ctx * self.hp.n_head_kv * self.hp.head_dim * 2 * 2;
+        let kv = self.max_ctx * self.kv_row() * 2;
         let gdn = (gdn_state_words(self.geo.gdn_hv) + 3 * self.geo.gdn_conv()) * 4;
         let per_layer: usize = self
             .layers
@@ -1860,7 +1865,8 @@ impl Coder {
         let (hv, conv, kv) = (
             self.geo.gdn_hv,
             self.geo.gdn_conv(),
-            self.max_ctx * self.hp.n_head_kv * self.hp.head_dim,
+            // bf16 elements a K (or V) cache buffer takes (rows are a multiple of 16 bytes).
+            self.max_ctx * self.kv_row() / 2,
         );
         let mut sl = Slot {
             gdn: Vec::with_capacity(self.layers.len()),
@@ -2082,7 +2088,7 @@ impl Coder {
         }
         let m = keep - 1;
         if off > 0 && m > 0 {
-            let cell = self.hp.n_head_kv * self.hp.head_dim * 2;
+            let cell = self.kv_row();
             for layer in &self.layers {
                 let Some(at) = &layer.attn else { continue };
                 for buf in [&at.k, &at.v] {
@@ -5944,7 +5950,7 @@ impl Coder {
                 "attn_part",
                 lb(&|l| {
                     if l.attn.is_some() {
-                        (pos0 * hp.n_head_kv * hp.head_dim * 4) as f64
+                        (pos0 * ck::kv_row_bytes(hp.n_head_kv, hp.head_dim) * 2) as f64
                     } else {
                         0.0
                     }
@@ -6047,7 +6053,7 @@ impl Coder {
                 b += e.w.estride as f64 * hp.n_expert_used as f64;
             }
             if l.attn.is_some() {
-                b += (ctx * hp.n_head_kv * hp.head_dim * 2 * 2) as f64;
+                b += (ctx * ck::kv_row_bytes(hp.n_head_kv, hp.head_dim) * 2) as f64;
             }
             if l.gdn.is_some() {
                 // the recurrent state, read and written
@@ -6268,8 +6274,8 @@ fn load_layer(
         let at = AttnL {
             qn: vecf(&t("attn_q_norm.weight"))?,
             kn: vecf(&t("attn_k_norm.weight"))?,
-            k: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
-            v: dev.alloc_bf16(max_ctx * hp.n_head_kv * hp.head_dim),
+            k: dev.alloc_bf16(max_ctx * ck::kv_row_bytes(hp.n_head_kv, hp.head_dim) / 2),
+            v: dev.alloc_bf16(max_ctx * ck::kv_row_bytes(hp.n_head_kv, hp.head_dim) / 2),
             proj: dev.alloc_f32(MAX_T * w_in.rows),
             ktab: dev.alloc_f32(2 * MAX_SLOTS),
             vtab: dev.alloc_f32(2 * MAX_SLOTS),
@@ -6699,7 +6705,7 @@ impl Coder {
     /// The positional buffers (attention K and V per layer, and the MTP layer's) of slot
     /// `slot`: device address, bytes a position.
     fn positional_bufs_at(&self, slot: usize) -> Result<Vec<(u64, usize)>> {
-        let row = self.hp.n_head_kv * self.hp.head_dim * 2;
+        let row = self.kv_row();
         if slot == 0 {
             return Ok(self
                 .layers
@@ -6753,8 +6759,8 @@ impl Coder {
             }
             bufs.push(host);
         }
+        let row = self.kv_row();
         if let Some(p) = self.peer.as_deref_mut() {
-            let row = self.hp.n_head_kv * self.hp.head_dim * 2;
             let bufs1: Vec<(&B, &B)> = if slot == 0 {
                 p.layers
                     .iter()
@@ -6845,8 +6851,8 @@ impl Coder {
                 )?;
             }
         }
+        let row = self.kv_row();
         if let Some(peer) = self.peer.as_deref_mut() {
-            let row = self.hp.n_head_kv * self.hp.head_dim * 2;
             let bufs1: Vec<(&B, &B)> = if slot == 0 {
                 peer.layers
                     .iter()
