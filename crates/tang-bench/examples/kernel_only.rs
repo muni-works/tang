@@ -54,7 +54,11 @@ fn rand(n: usize, seed: u64) -> Vec<f32> {
 fn main() {
     let device = GpuDevice::new_sync().expect("gpu");
     let mut cache = KernelCache::new();
-    println!("{} — kernel-only, {ITERS} launches per sample", device.name);
+    println!(
+        "{} — kernel-only, {ITERS} launches per sample, {:?}",
+        device.name,
+        device.wgsl_caps()
+    );
 
     // matmul
     for (m, k, n) in [
@@ -75,7 +79,7 @@ fn main() {
             if name == "split" {
                 continue;
             }
-            let exe = Executable::new(&device, g.to_wgsl(&[c]), &[&a, &b]);
+            let exe = Executable::new(&device, program_for(&device, &g, &[c]), &[&a, &b]);
             line.push_str(&format!(
                 "  {name} {:.3}",
                 time_exe(&device, &mut cache, &exe, c)
@@ -107,7 +111,7 @@ fn main() {
             if name == "flash_split" {
                 continue;
             }
-            let exe = Executable::new(&device, g.to_wgsl(&[y]), &[&q, &k, &v]);
+            let exe = Executable::new(&device, program_for(&device, &g, &[y]), &[&q, &k, &v]);
             line.push_str(&format!(
                 "  {name} {:.3}",
                 time_exe(&device, &mut cache, &exe, y)

@@ -13,6 +13,7 @@ members = [
     "crates/tang-hub",
     "crates/tang-bench",
     "crates/tang-site-wasm",
+    "crates/tang-derive-wasm",
     "crates/tang-expr",
     "crates/tang-mesh",
     "crates/tang-infer",

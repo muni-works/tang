@@ -12,6 +12,7 @@
 //!   sharded by id and the MoE combined by all-reduce (`docs/deepseek-ep.md`).
 //! - [`serve`] (cuda): the OpenAI-compatible backend (`tang-llm deepseek-serve <dir>`): chat
 //!   template, tokenizer, DSML tool calls.
+//! - [`tcx`]: CPU twins of the TCX grouped MoE kernels (`DS_MOE_TCX=1`).
 //! - [`forward`]: the CPU f32 reference forward, a transcription of `scripts/deepseek_ref.py`
 //!   (itself DeepSeek's `inference/model.py` in plain torch), checked against its dumps.
 //!
@@ -36,6 +37,7 @@ pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod serve;
 pub mod st;
+pub mod tcx;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;

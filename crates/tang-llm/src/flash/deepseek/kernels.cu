@@ -1908,6 +1908,126 @@ DS_KS(3, 1)
 DS_MOE_KS(2)
 DS_MOE_KS(3)
 
+// ---- TCX grouped MoE (DS_MOE_TCX=1, off by default): coder-next's cx_moe_*_q on fp4 experts ----
+//
+// The ds_moe_ks_* contract (blockIdx.y a slot of `elist`, expert e's rows its CSR segment, at
+// most 8 tokens) without the per-block activation staging: lane (g, tig) reads token g's
+// e4m3 codes straight from global as the m16n8k16 B fragment (8 bytes at 32 G + 8 tig, the
+// column permutation lin_mma uses, so A and B agree), and the two tokens' group scales
+// (2 tig, 2 tig + 1) from global too. No shared memory but the S-slice reduction, no barrier
+// before the first MMA, one block per row group (grid x = nbr, nothing to amortize).
+// Per warp the groups run G = si, si + S, ... in lin_mma's order with lin_mma's operands and
+// its fmaf(c, sw * sx * POW, acc) epilogue, and the slices meet in the same fixed order, so for
+// the same S the outputs are bit-identical to ds_moe_ks_*_f3 (the gate in engine.rs's
+// gpu_tiny_moe_tcx_matches_ks). fp4 (fmt 3) only: the routed experts' format.
+template <int GU>
+__device__ __forceinline__ void moe_tcx_body(DsW w, DsW w3, const unsigned char* __restrict__ xc,
+                                             const float* __restrict__ xsc, float* __restrict__ y, int t,
+                                             const float* __restrict__ rw, float lim, int S,
+                                             const int* __restrict__ xi) {
+    __shared__ float red[8][4][32];
+    const int cols = w.cols, nch = cols / 32;
+    const float POW = 16384.f * 256.f;
+    const int wib = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const int RW = 8 / S, rwi = wib / S, si = wib % S;
+    const int OUT = GU ? 8 : 16;
+    const long long rbytes = cols / 2;
+    const int br = blockIdx.x;
+    const int n0 = (br * RW + rwi) * OUT;
+    const int ra = n0 + g, rb = GU ? n0 + g : n0 + g + 8;
+    const bool va = ra < w.rows, vb = rb < w.rows;
+    const unsigned char* pa = (const unsigned char*)w.w + (va ? (long long)ra * rbytes : 0) + 4 * tig;
+    const unsigned char* pb = (const unsigned char*)(GU ? w3.w : w.w) + (vb ? (long long)rb * rbytes : 0) + 4 * tig;
+    const unsigned char* sa = (const unsigned char*)w.s + (long long)ra * nch;
+    const unsigned char* sbp = (const unsigned char*)(GU ? w3.s : w.s) + (long long)rb * nch;
+    // B fragment source: token g's codes; scale rows: tokens 2 tig, 2 tig + 1
+    const bool vg = g < t, v0 = 2 * tig < t, v1 = 2 * tig + 1 < t;
+    const long long rg = vg ? (xi ? (long long)__ldg(xi + g) : g) : 0;
+    const long long r0 = v0 ? (xi ? (long long)__ldg(xi + 2 * tig) : 2 * tig) : 0;
+    const long long r1 = v1 ? (xi ? (long long)__ldg(xi + 2 * tig + 1) : 2 * tig + 1) : 0;
+    const unsigned char* xg = xc + rg * cols + 8 * tig;
+    const float* s0p = xsc + r0 * nch;
+    const float* s1p = xsc + r1 * nch;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q0 = si; q0 < nch; q0 += KS_UG * S) {
+        unsigned int la[KS_UG], lb[KS_UG];
+        unsigned char ca[KS_UG], cb[KS_UG];
+        uint2 X[KS_UG];
+        float x0[KS_UG], x1[KS_UG];
+#pragma unroll
+        for (int u = 0; u < KS_UG; u++) {
+            const int G = q0 + u * S;
+            la[u] = lb[u] = 0u;
+            ca[u] = cb[u] = 0;
+            X[u] = make_uint2(0, 0);
+            x0[u] = x1[u] = 0.f;
+            if (G < nch) {
+                if (va) { la[u] = __ldg((const unsigned int*)(pa + (long long)G * 16)); ca[u] = __ldg(sa + G); }
+                if (vb) { lb[u] = __ldg((const unsigned int*)(pb + (long long)G * 16)); cb[u] = __ldg(sbp + G); }
+                if (vg) X[u] = __ldg((const uint2*)(xg + (long long)G * 32));
+                if (v0) x0[u] = __ldg(s0p + G) * POW;
+                if (v1) x1[u] = __ldg(s1p + G) * POW;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < KS_UG; u++) {
+            const int G = q0 + u * S;
+            if (G >= nch) break;
+            const unsigned int wa = la[u], wb = lb[u];
+            const uint2 Xu = X[u];
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            mma16816(c, f4h(wa << 12), f4h(wb << 12), f4h(wa << 8), f4h(wb << 8),
+                     f8h(__byte_perm(Xu.x, Xu.y, 0x4000)), f8h(__byte_perm(Xu.x, Xu.y, 0x5010)));
+            mma16816(c, f4h(wa << 4), f4h(wb << 4), f4h(wa), f4h(wb), f8h(__byte_perm(Xu.x, Xu.y, 0x6020)),
+                     f8h(__byte_perm(Xu.x, Xu.y, 0x7030)));
+            const float swa = e8m0(ca[u]), swb = e8m0(cb[u]);
+            acc[0] = fmaf(c[0], swa * x0[u], acc[0]);
+            acc[1] = fmaf(c[1], swa * x1[u], acc[1]);
+            acc[2] = fmaf(c[2], swb * x0[u], acc[2]);
+            acc[3] = fmaf(c[3], swb * x1[u], acc[3]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) red[wib][i][lane] = acc[i];
+    __syncthreads();
+    for (int e = threadIdx.x; e < RW * OUT * t; e += blockDim.x) {
+        const int j = e % t, o = (e / t) % OUT, rgi = e / (t * OUT);
+        const int n = (br * RW + rgi) * OUT + o;
+        if (n >= w.rows) continue;
+        // C fragment: (row g, token 2tig + i) in acc[i], (row g + 8, ...) in acc[2 + i]
+        const int ln = (o & 7) * 4 + j / 2, i = j & 1;
+        float a = 0.f, b = 0.f;
+        for (int s = 0; s < S; s++) {
+            a += red[rgi * S + s][GU || o < 8 ? i : 2 + i][ln];
+            if (GU) b += red[rgi * S + s][2 + i][ln];
+        }
+        if (GU) y[(long long)j * w.rows + n] = swiglu1(bf(a), bf(b), rw ? rw + j : 0, lim);
+        else y[(long long)j * w.rows + n] = bf(a);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) ds_moe_tcx_gu_f3(
+    const DsW* w1s, const DsW* w3s, const int* elist, const int* off, const int* rows, const float* rw,
+    const unsigned char* xc, const float* xsc, float* h, float lim, int S) { DS_PDL_ENTRY
+    int e = elist[blockIdx.y];
+    if (e < 0) return;
+    int o = off[e], n = off[e + 1] - o;
+    if (n <= 0) return;
+    DsW w = w1s[e];
+    moe_tcx_body<1>(w, w3s[e], xc, xsc, h + (long long)o * w.rows, n, rw + o, lim, S, rows + o);
+}
+extern "C" __global__ void __launch_bounds__(256) ds_moe_tcx_down_f3(
+    const DsW* w2s, const int* elist, const int* off, const unsigned char* hc, const float* hsc, float* part,
+    int S) { DS_PDL_ENTRY
+    int e = elist[blockIdx.y];
+    if (e < 0) return;
+    int o = off[e], n = off[e + 1] - o;
+    if (n <= 0) return;
+    DsW w = w2s[e];
+    moe_tcx_body<0>(w, w, hc + (long long)o * w.cols, hsc + (long long)o * (w.cols / 32),
+                    part + (long long)o * w.rows, n, 0, 0.f, S, 0);
+}
+
 // The grouped K-split MoE with the shared expert as one more slot (blockIdx.y == gridDim.y - 1
 // when sh != 0): every token routed to it at weight 1 (no rw), its own format SF (the shared
 // expert is fp8 where the routed ones are fp4), GU over x's codes in token order into

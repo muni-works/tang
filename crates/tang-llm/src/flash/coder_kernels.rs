@@ -11,13 +11,22 @@
 /// TCX expert kernels' K split (warps a 16-row tile): gate|up, down
 /// (`TANG_TCX_SGU` / `TANG_TCX_SDN`, divisors of 8 and of the superblock count).
 pub fn tcx_split() -> (usize, usize) {
-    let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let n = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     (n("TANG_TCX_SGU", 2), n("TANG_TCX_SDN", 1))
 }
 
 pub fn prelude(c: &Shapes, maxt: usize) -> String {
     let (sgu, sdn) = tcx_split();
-    let tiles = if std::env::var("TANG_CODER_TCX_TILES").is_ok_and(|v| v == "1") { "#define CX_TCX_TILES 1\n" } else { "" };
+    let tiles = if std::env::var("TANG_CODER_TCX_TILES").is_ok_and(|v| v == "1") {
+        "#define CX_TCX_TILES 1\n"
+    } else {
+        ""
+    };
     format!(
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\

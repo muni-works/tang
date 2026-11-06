@@ -185,6 +185,7 @@ fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
         view: View {
+            gather: None,
             guard: false,
             forms,
         },
