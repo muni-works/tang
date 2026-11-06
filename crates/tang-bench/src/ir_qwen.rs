@@ -1098,7 +1098,7 @@ pub fn split_cache_axis(
     kctx: usize,
     parts: usize,
 ) -> (TensorGraph, Vec<TensorId>) {
-    if parts < 2 || kctx % parts != 0 {
+    if parts < 2 || !kctx.is_multiple_of(parts) {
         return (g, outs);
     }
     loop {
