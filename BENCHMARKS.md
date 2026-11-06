@@ -2378,3 +2378,266 @@ pending)
 - Expected on the K1 (1.7B, estimates): 49 tokens 3451 ms → ~500–700 ms (maps, register block),
   ~250–400 ms (q4), ~150–250 ms (fp16). A 20-token turn ~100–250 ms. 512 tokens ~2–5 s. Decode is
   unchanged at ~55 ms/token.
+
+## Against Flashlight / EqiForge / FlexAttention (RTX 3090, attention variants)
+
+The six presets from the post's lab: causal, causal sliding window 128, ALiBi
+(slope 1/16, causal), soft cap 30·tanh(s/30) (causal), prefix LM 64 and
+bidirectional. tang builds each one the way the lab does
+(`tang_derive_wasm::naive_graph` + `derive_graph`: the naive `softmax(score)·v`,
+and for the backward `TensorGraph::backward` of `Σ O·dO`). It lowers it with
+`Program::tuned` on CUDA, which picks per kernel between TF32 `mma` tiles and
+transpiled WGSL. Single head, `[n, d]`, B = H = 1, because that is the graph
+tang builds and every system then runs exactly the same problem. RTX 3090
+(sm_86) on `mew`, PyTorch 2.10 + cu128, Triton 3.6.
+
+- **Harness:** [`crates/tang-bench/examples/attn_variants.rs`](crates/tang-bench/examples/attn_variants.rs)
+  times tang and writes its inputs and outputs.
+  [`scripts/attn_variants_bench.py`](scripts/attn_variants_bench.py) checks
+  them and runs the baselines on the same inputs.
+  [`scripts/attn_variants_table.py`](scripts/attn_variants_table.py) makes the
+  tables. Raw CSV: [`scripts/results/attn_variants_3090.csv`](scripts/results/attn_variants_3090.csv).
+- **Timing:** CUDA events, the minimum over 5 batches of 30 runs (10 at n ≥ 4096)
+  for every system, after warm-up and compilation. The GPU is shared: about
+  16 GB is held by resident `tang-llm` processes. The runs used
+  `flock ~/tang-gpu.lock`, but `nvidia-smi` read 100 % utilization at the
+  start of the baseline run, so small rows (under 0.1 ms) carry ±2× noise.
+  The large rows are stable between the two runs.
+- **TFLOPS:** the same FLOP count for every system, so it is only a rescaling
+  of ms. The forward is 4·n²·d × the unmasked fraction; forward + backward is
+  3.5× the forward (FlashAttention's convention). Masked work a system does
+  anyway is not credited.
+- **Correctness:** checked against a dense float64 PyTorch reference, as the
+  maximum absolute error over the maximum |reference| for O, or for dq ‖ dk ‖ dv.
+  Every row passes. tang is 1.1e-6 to 1.1e-3: pure fp32 where no tensor-core
+  tile is kept, TF32 where one is. FlexAttention fp32 is 7.5e-4 to 3.5e-3.
+  The bf16 systems are 3.3e-3 to 8.1e-3.
+- **Systems:**
+  - **FlexAttention** is `torch.compile(flex_attention)` with the variant as a
+    `score_mod` plus a `block_mask`. It runs in fp32 (TF32 matmuls allowed,
+    like tang) and in bf16. The fp32 build fails at d = 128 on the 3090
+    (`No valid triton configs … out of resource`: shared memory).
+  - **FA2** is FlashAttention-2 in bf16. The `flash_attn` package can't be
+    built on `mew` (no `nvcc`; no official wheel for torch 2.10), and I didn't
+    install third-party wheels. So this is PyTorch's bundled FA2 kernels
+    through SDPA's `FLASH_ATTENTION` backend, which supports causal and
+    bidirectional only. Sliding window, ALiBi and soft cap need the
+    `flash_attn` package. Prefix LM is supported by no FA2 build.
+  - **Flashlight** (arXiv 2511.02043) and **EqiForge** (arXiv 2609.12330) have
+    **no public code**: neither paper links a repository and no package exists.
+    They can't be run here; their published numbers are summarized below.
+
+### Results
+
+**d = 64, forward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.0315 (4.3) | 0.0835 (1.6) | 0.0442 (3.0) | **0.0131 (10.2)** |
+| causal | 2048 | 0.0602 (8.9) | 0.171 (3.1) | 0.0896 (6.0) | **0.0233 (23.0)** |
+| causal | 4096 | 0.227 (9.5) | 0.34 (6.3) | 0.177 (12.1) | **0.065 (33.0)** |
+| causal | 8192 | 0.888 (9.7) | 0.635 (13.5) | 0.326 (26.3) | **0.177 (48.5)** |
+| sliding128 | 1024 | 0.0322 (1.0) | 0.0245 (1.3) | **0.0145 (2.2)** | n/a |
+| sliding128 | 2048 | 0.0616 (1.1) | 0.0324 (2.0) | **0.0321 (2.0)** | n/a |
+| sliding128 | 4096 | 0.234 (0.6) | **0.0343 (3.9)** | 0.0347 (3.8) | n/a |
+| sliding128 | 8192 | 0.911 (0.3) | 0.0365 (7.3) | **0.0343 (7.8)** | n/a |
+| alibi | 1024 | **0.0315 (4.3)** | 0.4 (0.3) | 0.0464 (2.9) | n/a |
+| alibi | 2048 | **0.0603 (8.9)** | 0.171 (3.1) | 0.0936 (5.7) | n/a |
+| alibi | 4096 | 0.228 (9.4) | 0.34 (6.3) | **0.185 (11.6)** | n/a |
+| alibi | 8192 | 0.889 (9.7) | 0.677 (12.7) | **0.389 (22.1)** | n/a |
+| softcap | 1024 | **0.039 (3.4)** | 0.124 (1.1) | 0.0891 (1.5) | n/a |
+| softcap | 2048 | **0.0748 (7.2)** | 0.254 (2.1) | 0.172 (3.1) | n/a |
+| softcap | 4096 | **0.287 (7.5)** | 0.503 (4.3) | 0.341 (6.3) | n/a |
+| softcap | 8192 | 1.12 (7.6) | 0.949 (9.1) | **0.7 (12.3)** | n/a |
+| prefix64 | 1024 | **0.0329 (4.1)** | 0.0882 (1.5) | 0.0479 (2.8) | n/a |
+| prefix64 | 2048 | **0.0627 (8.6)** | 0.171 (3.1) | 0.0894 (6.0) | n/a |
+| prefix64 | 4096 | 0.238 (9.0) | 0.338 (6.3) | **0.178 (12.0)** | n/a |
+| prefix64 | 8192 | 0.928 (9.3) | 0.657 (13.1) | **0.353 (24.4)** | n/a |
+| bidirectional | 1024 | 0.0318 (8.4) | 0.0881 (3.0) | 0.0468 (5.7) | **0.0229 (11.7)** |
+| bidirectional | 2048 | 0.0609 (17.6) | 0.168 (6.4) | 0.0885 (12.1) | **0.0337 (31.9)** |
+| bidirectional | 4096 | 0.231 (18.6) | 0.333 (12.9) | 0.172 (24.9) | **0.0973 (44.1)** |
+| bidirectional | 8192 | 0.9 (19.1) | 0.618 (27.8) | 0.314 (54.7) | **0.296 (58.0)** |
+
+**d = 64, forward + backward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.224 (2.1) | 0.668 (0.7) | 0.296 (1.6) | **0.126 (3.7)** |
+| causal | 2048 | 0.554 (3.4) | 0.414 (4.5) | **0.202 (9.3)** | 0.228 (8.2) |
+| causal | 4096 | 1.81 (4.2) | 0.968 (7.8) | **0.42 (17.9)** | 0.469 (16.0) |
+| causal | 8192 | 6.76 (4.5) | 2.54 (11.8) | 0.965 (31.2) | **0.926 (32.5)** |
+| sliding128 | 1024 | 0.234 (0.5) | 0.049 (2.2) | **0.0331 (3.3)** | n/a |
+| sliding128 | 2048 | 0.58 (0.4) | **0.146 (1.6)** | 0.15 (1.5) | n/a |
+| sliding128 | 4096 | 1.9 (0.2) | 0.161 (2.9) | **0.148 (3.1)** | n/a |
+| sliding128 | 8192 | 7.34 (0.1) | 0.167 (5.6) | **0.148 (6.3)** | n/a |
+| alibi | 1024 | 0.23 (2.0) | 0.672 (0.7) | **0.146 (3.2)** | n/a |
+| alibi | 2048 | 0.55 (3.4) | 0.415 (4.5) | **0.207 (9.1)** | n/a |
+| alibi | 4096 | 1.81 (4.2) | 0.965 (7.8) | **0.441 (17.1)** | n/a |
+| alibi | 8192 | 6.83 (4.4) | 2.57 (11.7) | **1.11 (27.0)** | n/a |
+| softcap | 1024 | 0.285 (1.6) | 0.217 (2.2) | **0.196 (2.4)** | n/a |
+| softcap | 2048 | 0.802 (2.3) | 0.511 (3.7) | **0.324 (5.8)** | n/a |
+| softcap | 4096 | 2.88 (2.6) | 1.17 (6.4) | **0.665 (11.3)** | n/a |
+| softcap | 8192 | 11.3 (2.7) | 2.97 (10.1) | **1.56 (19.3)** | n/a |
+| prefix64 | 1024 | 0.227 (2.1) | 0.162 (2.9) | **0.145 (3.2)** | n/a |
+| prefix64 | 2048 | 0.556 (3.4) | 0.415 (4.5) | **0.2 (9.4)** | n/a |
+| prefix64 | 4096 | 1.81 (4.2) | 0.963 (7.8) | **0.423 (17.8)** | n/a |
+| prefix64 | 8192 | 7.01 (4.3) | 2.54 (11.8) | **0.98 (30.7)** | n/a |
+| bidirectional | 1024 | 0.213 (4.4) | 0.18 (5.2) | 0.17 (5.5) | **0.122 (7.7)** |
+| bidirectional | 2048 | 0.498 (7.5) | 0.447 (8.4) | **0.199 (18.9)** | 0.241 (15.6) |
+| bidirectional | 4096 | 1.58 (9.5) | 1.24 (12.1) | **0.498 (30.2)** | 0.505 (29.7) |
+| bidirectional | 8192 | 6.72 (8.9) | 3.99 (15.1) | 1.39 (43.4) | **1.07 (56.4)** |
+
+**d = 128, forward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 1.28 (0.2) | fails | 0.0839 (3.2) | **0.0233 (11.5)** |
+| causal | 2048 | 4.46 (0.2) | fails | 0.163 (6.6) | **0.0421 (25.5)** |
+| causal | 4096 | 17.1 (0.2) | fails | 0.318 (13.5) | **0.112 (38.5)** |
+| causal | 8192 | 68.5 (0.2) | fails | 0.592 (29.0) | **0.328 (52.5)** |
+| sliding128 | 1024 | 1.27 (0.1) | fails | **0.141 (0.5)** | n/a |
+| sliding128 | 2048 | 4.52 (0.0) | fails | **0.0244 (5.3)** | n/a |
+| sliding128 | 4096 | 17.3 (0.0) | fails | **0.0345 (7.7)** | n/a |
+| sliding128 | 8192 | 69 (0.0) | fails | **0.0351 (15.2)** | n/a |
+| alibi | 1024 | 1.27 (0.2) | fails | **0.0914 (2.9)** | n/a |
+| alibi | 2048 | 4.51 (0.2) | fails | **0.513 (2.1)** | n/a |
+| alibi | 4096 | 17.3 (0.2) | fails | **0.329 (13.1)** | n/a |
+| alibi | 8192 | 68.9 (0.2) | fails | **0.654 (26.3)** | n/a |
+| softcap | 1024 | 1.34 (0.2) | fails | **0.101 (2.7)** | n/a |
+| softcap | 2048 | 4.69 (0.2) | fails | **0.206 (5.2)** | n/a |
+| softcap | 4096 | 18 (0.2) | fails | **0.405 (10.6)** | n/a |
+| softcap | 8192 | 72.4 (0.2) | fails | **0.819 (21.0)** | n/a |
+| prefix64 | 1024 | 1.27 (0.2) | fails | **0.0848 (3.2)** | n/a |
+| prefix64 | 2048 | 4.51 (0.2) | fails | **0.151 (7.1)** | n/a |
+| prefix64 | 4096 | 17.3 (0.2) | fails | **0.299 (14.4)** | n/a |
+| prefix64 | 8192 | 69.1 (0.2) | fails | **0.628 (27.3)** | n/a |
+| bidirectional | 1024 | 1.28 (0.4) | fails | 0.0796 (6.8) | **0.025 (21.5)** |
+| bidirectional | 2048 | 4.53 (0.5) | fails | 0.159 (13.5) | **0.0568 (37.8)** |
+| bidirectional | 4096 | 17.3 (0.5) | fails | 0.297 (28.9) | **0.167 (51.5)** |
+| bidirectional | 8192 | 69 (0.5) | fails | 0.582 (59.1) | **0.545 (63.0)** |
+
+**d = 128, forward + backward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.822 (1.1) | fails | 0.358 (2.6) | **0.177 (5.3)** |
+| causal | 2048 | 1.75 (2.1) | fails | **0.355 (10.6)** | 0.489 (7.7) |
+| causal | 4096 | 5.65 (2.7) | fails | 0.784 (19.2) | **0.527 (28.5)** |
+| causal | 8192 | 21.8 (2.8) | fails | 2.09 (28.8) | **1.1 (54.8)** |
+| sliding128 | 1024 | 0.805 (0.3) | fails | **0.743 (0.3)** | n/a |
+| sliding128 | 2048 | 1.72 (0.3) | fails | **0.0578 (7.9)** | n/a |
+| sliding128 | 4096 | 5.89 (0.2) | fails | **0.151 (6.1)** | n/a |
+| sliding128 | 8192 | 22.4 (0.1) | fails | **0.209 (8.9)** | n/a |
+| alibi | 1024 | 0.813 (1.2) | fails | **0.519 (1.8)** | n/a |
+| alibi | 2048 | 1.74 (2.1) | fails | **0.717 (5.2)** | n/a |
+| alibi | 4096 | 5.84 (2.6) | fails | **0.806 (18.6)** | n/a |
+| alibi | 8192 | 22.4 (2.7) | fails | **2.17 (27.7)** | n/a |
+| softcap | 1024 | 1.09 (0.9) | fails | **0.258 (3.6)** | n/a |
+| softcap | 2048 | 2.35 (1.6) | fails | **0.484 (7.8)** | n/a |
+| softcap | 4096 | 7.54 (2.0) | fails | **1.01 (14.9)** | n/a |
+| softcap | 8192 | 28.9 (2.1) | fails | **2.71 (22.2)** | n/a |
+| prefix64 | 1024 | 0.756 (1.2) | fails | **0.528 (1.8)** | n/a |
+| prefix64 | 2048 | 1.64 (2.3) | fails | **0.374 (10.1)** | n/a |
+| prefix64 | 4096 | 5.52 (2.7) | fails | **0.786 (19.1)** | n/a |
+| prefix64 | 8192 | 21.2 (2.8) | fails | **2.09 (28.8)** | n/a |
+| bidirectional | 1024 | 0.717 (2.6) | fails | 0.306 (6.2) | **0.14 (13.4)** |
+| bidirectional | 2048 | 1.58 (4.8) | fails | 0.368 (20.4) | **0.263 (28.6)** |
+| bidirectional | 4096 | 5.23 (5.8) | fails | 1 (30.0) | **0.579 (52.0)** |
+| bidirectional | 8192 | 20.1 (6.0) | fails | 3.09 (38.9) | **2 (60.0)** |
+
+Geometric-mean speedup of tang over each baseline across the variant × n rows
+(> 1 means tang is faster):
+
+| d | pass | vs Flex fp32 | vs Flex bf16 | vs FA2 bf16 (causal, bidi) |
+|---|---|---:|---:|---:|
+| 64 | fwd | 1.31× (wins 15/24) | 0.74× (11/24) | 0.39× (0/8) |
+| 64 | fwd+bwd | 0.49× (2/24) | 0.26× (1/24) | 0.32× (0/8) |
+| 128 | fwd | – (Flex fp32 fails) | 0.02× (0/24) | 0.01× (0/8) |
+| 128 | fwd+bwd | – (Flex fp32 fails) | 0.16× (0/24) | 0.13× (0/8) |
+
+### Where tang wins and loses, and why
+
+- **d = 64 forward: competitive with FlexAttention, behind FA2.** At the same
+  precision (fp32/TF32), tang's derived single kernel beats FlexAttention
+  fp32 on causal, ALiBi, soft cap, prefix and bidirectional up to n = 4096,
+  by 1.4–2.8×, leaving out one noisy row. At n = 8192 it falls behind by 0.69–0.84×. Against Flex bf16
+  it wins only at n ≤ 2048. FA2 bf16 is 1.4–5× faster everywhere. Two reasons:
+  bf16 `mma` has twice the TF32 rate on the 3090, and FA2 is a hand-tuned
+  kernel. Both forward rows hold the property the post claims: one kernel,
+  no n×n buffer, the same code for every variant.
+- **Masks cost tang full price.** Sliding window and prefix LM take exactly
+  as long as bidirectional. The derived kernel evaluates the mask as an
+  additive −1e30 bias on every tile, and nothing in the rewrite skips a tile
+  that is entirely masked. FlexAttention's `block_mask` does skip them, so
+  sliding window 128 at n = 8192 is 25× faster in Flex (0.036 ms against
+  0.91 ms forward, 0.17 ms against 7.3 ms forward + backward). Causal skipping
+  is the same effect at 2×. This is the clearest missing rewrite: a
+  comprehension whose mask is a known affine predicate of (i, j) could carry
+  the block-sparsity forward as a loop bound.
+- **d = 128 forward is a cliff.** No tensor-core version is generated for the
+  derived d = 128 forward (`mma 0/0` in the CSV). The transpiled kernel spills
+  (fp32, error 1e-6) and runs 15–120× slower than Flex bf16 (sliding window aside): 69 ms at
+  n = 8192, against 0.59 ms for Flex bf16. The d = 128 forward + backward
+  (21.8 ms) is *faster* than the forward alone (68.5 ms), because the backward
+  graph recomputes O through tiled kernels with tensor cores. That points at
+  the forward's schedule choice, not at the IR. FlexAttention has its own
+  d = 128 limit on this chip: its fp32 build fails to compile.
+- **Backward: tang derives it but loses 1.3–7× (sliding window aside).** tang's backward is the
+  reverse-mode derivative of the naive graph, rewritten by the same passes.
+  Nobody wrote a backward kernel for any variant. It comes out as 9 kernels
+  with **2 n×n buffers** (P and dP are materialized) and no block skipping.
+  Against Flex bf16 that is 0.26× at d = 64 and 0.16× at d = 128. The one
+  win is the smallest row, causal n = 1024 (noise-level). At n ≥ 2048 the
+  n×n traffic dominates. The nested-contraction lowering being worked on in a
+  parallel branch removes those buffers on CUDA. This table is the "before"
+  number.
+
+### Who derives the backward
+
+| system | forward kernel | backward |
+|---|---|---|
+| **tang** | derived from the naive graph by rewrites (monoid-keyed `stabilize_softmax` / `substitute_maps` / `schedule_auto`) | **derived**: `TensorGraph::backward` of the naive graph, then the same passes. Any variant the lab can type gets one, with no per-variant code. Today 9 kernels, 2 n×n buffers |
+| FlexAttention | a fixed hand-written Triton template, with `score_mod` / `mask_mod` inlined | a **hand-written backward template**. `score_mod` is differentiated by autograd and inlined into it. Works for these variants, but only within the template's shape |
+| FA2 (bundled / `flash_attn`) | hand-written CUDA | **hand-written** backward per supported feature (causal, window, ALiBi, softcap). Prefix LM and arbitrary scores have no kernel and fall back to SDPA math |
+| Flashlight | Inductor graph rewrites to fused flash-style kernels | the paper describes forward fusion only. As far as the text says, the backward is not fused; it is whatever Inductor's autograd produces |
+| EqiForge | equality saturation over a tiled IR, emitting Triton | not described. Its evaluation covers inference (prefill and decode) only |
+
+### Flashlight and EqiForge: published numbers (not run here)
+
+Neither system has public code, so these are the papers' own numbers, on
+other GPUs, and not comparable row for row with the table above.
+
+- **Flashlight** (A100 and H100 at a locked 1290 MHz; PyTorch 2.5, Triton 3.1):
+  head dim 64, 16 heads, sequence 512–16k at 16k tokens per batch; sliding
+  window and prefix 256. The paper reports score_mod variants up to 1.48×
+  faster than FlexAttention. FlexAttention is "marginally faster" on vanilla
+  attention and on ALiBi at batch 1 on H100. For block-mask variants (sliding
+  window, prefix), FlexAttention's kernel is always faster and Flashlight wins
+  only once block-mask creation is counted. The paper reports no comparison
+  with FlashAttention and no backward numbers.
+- **EqiForge** (A100 80GB PCIe, RTX 5090; Triton 3.6): causal MHA. The paper
+  reports up to 1.87× faster than FlashAttention in decode and close to it in
+  prefill (a 3–6 % gap, as far as the HTML text could be read). Whole layers
+  against torch.compile: sliding-window GQA 1.06×, differential attention
+  1.51×, attention sinks 1.48×, QK-norm MLA 3.16×. There is no backward and
+  no FlexAttention comparison.
+
+What tang can claim against them on this evidence:
+
+- tang is the only one of the four that derives a backward from the forward
+  for an arbitrary typed variant and runs it on six backends.
+- On the 3090 its derived d = 64 forward matches template-level FlexAttention
+  at equal precision for n ≤ 4096.
+- What it can't claim is speed parity on the backward, at d = 128, or on
+  block-sparse masks. All three trace to missing rewrites and schedules (block
+  skipping, a d = 128 forward tile, nested contractions for the backward), not
+  to the two-primitive IR.
+
+Reproduce (on mew; takes the GPU lock):
+
+```
+cargo build --release -p tang-bench --features cuda --example attn_variants
+flock ~/tang-gpu.lock ./target/release/examples/attn_variants /tmp/attnvar 1024,2048,4096,8192 64,128 > tang.csv
+flock ~/tang-gpu.lock python3 scripts/attn_variants_bench.py /tmp/attnvar tang.csv > scripts/results/attn_variants_3090.csv
+python3 scripts/attn_variants_table.py scripts/results/attn_variants_3090.csv
+```

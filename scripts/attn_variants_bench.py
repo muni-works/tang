@@ -6,9 +6,11 @@ runs the baselines on the same inputs:
 
 - FlexAttention (torch.compile'd flex_attention, score_mod + block_mask), fp32
   with TF32 matmuls allowed (tang's tensor-core tiles are TF32 too), and bf16;
-- FlashAttention-2 (flash_attn package) in bf16 where the variant is supported
-  (causal, sliding window, ALiBi, softcap, bidirectional; prefix LM is not).
-- PyTorch SDPA with an explicit additive mask (math path), fp32, for context.
+- FlashAttention-2 in bf16 where the variant is supported: the flash_attn
+  package if importable (causal, sliding window, ALiBi, softcap,
+  bidirectional), else PyTorch's bundled FA2 kernels through SDPA's
+  FLASH_ATTENTION backend (causal and bidirectional only). Prefix LM is
+  never supported.
 
 Shape: B = 1, H = 1, [n, d] -- the shape tang's naive_graph builds (it has no
 head dim), so every system sees exactly the same problem.
@@ -28,7 +30,18 @@ except Exception:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 dev = "cuda"
-flex = torch.compile(flex_attention, dynamic=False)
+# one compiled flex per (variant, n, d, dtype, pass); the default recompile
+# limit (8) otherwise sends later configs to the eager, unfused fallback
+torch._dynamo.config.cache_size_limit = 4096
+torch._dynamo.config.accumulated_cache_size_limit = 4096
+torch._dynamo.config.error_on_recompile = False
+
+
+def flex(*a, **kw):
+    return _flex(*a, **kw)
+
+
+_flex = torch.compile(flex_attention, dynamic=False)
 
 SLOPE = 0.0625
 # (score_mod, mask_mod, dense keep(i,j), dense score(s,i,j), fa2 kwargs or None)
@@ -114,9 +127,31 @@ def run_flex(name, q, k, v, do, dtype, bm_cache):
     return fb, lambda: [g[0, 0] for g in fb()]
 
 
+def run_sdpa_flash(name, q, k, v, do):
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    if name not in ("causal", "bidirectional"):
+        return None
+    causal = name == "causal"
+    bwd = do is not None
+    q, k, v = (x.bfloat16()[None, None].detach().requires_grad_(bwd) for x in (q, k, v))
+
+    def f():
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    if not bwd:
+        return f, lambda: [f()[0, 0]]
+    dov = do.bfloat16()[None, None]
+
+    def fb():
+        return torch.autograd.grad(f(), (q, k, v), dov)
+    return fb, lambda: [g[0, 0] for g in fb()]
+
+
 def run_fa2(name, q, k, v, do):
     kw = VARIANTS[name][4]
-    if flash_attn_func is None or kw is None:
+    if flash_attn_func is None:
+        return run_sdpa_flash(name, q, k, v, do)
+    if kw is None:
         return None
     n, d = q.shape[-2:]
     if q.dim() == 2:
