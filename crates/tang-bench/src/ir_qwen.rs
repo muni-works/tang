@@ -984,7 +984,7 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     let (g, outs) = g.eliminate_common(&outs);
     // decode: split-K over the cache axis — attention's reductions over
     // the `kctx` keys run as P partial chunks plus a combine with each
-    // one's own monoid (`TANG_DECODE_SPLIT=P`, default `decode_split`)
+    // one's own monoid (`TANG_DECODE_SPLIT=P`, off by default)
     let (g, outs) = if dg.seq == 1 {
         split_cache_axis(g, outs, dg.kctx, decode_split(dg.kctx))
     } else {
@@ -1079,13 +1079,15 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
 }
 
 /// Split-K parts for a decode step over `kctx` cache rows:
-/// `$TANG_DECODE_SPLIT` if set (1 = off), else chunks of about 2k keys.
-pub fn decode_split(kctx: usize) -> usize {
-    if let Some(p) = std::env::var("TANG_DECODE_SPLIT").ok().and_then(|v| v.parse().ok()) {
-        return p;
-    }
-    let want = (kctx / 2048).max(1).next_power_of_two();
-    (1..=want).rev().find(|p| kctx % p == 0).unwrap_or(1)
+/// `$TANG_DECODE_SPLIT` (default 1 = off). The chunks are sized off
+/// `kctx`, not the runtime length, so at short contexts most are empty
+/// and the split costs more than it gives (3090: −10% at 1k–16k with
+/// ctx 33k, +11% at 32k).
+pub fn decode_split(_kctx: usize) -> usize {
+    std::env::var("TANG_DECODE_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
 }
 
 /// Every live reduction over exactly `kctx` keys (the cache axis) split
