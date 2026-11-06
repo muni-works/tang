@@ -107,6 +107,14 @@ pub struct Kernels {
     moe: [[[Func; 2]; 4]; 2],
     /// `ds_moe_ks_{gu,down}_f{fmt}`, the grouped MoE on the K-split path, by (fmt - 2, down).
     moe_ks: [[Func; 2]; 2],
+    /// `ds_moe_tcx_{gu,down}_f3`: the grouped fp4 MoE without activation staging (coder-next's
+    /// TCX expert GEMM, `docs/plans/ds-port-2026-11-05.md`), by down. Bit-identical to
+    /// [`Kernels::moe_ks`] at the same S.
+    moe_tcx: [Func; 2],
+    /// `DS_MOE_TCX=1` (default off): [`Kernels::moe_gu`] / [`Kernels::moe_down`] take
+    /// [`Kernels::moe_tcx`] for fp4 experts where they would take the K-split kernels, and the
+    /// shared expert stays out of the grouped launches. A Cell so tests can flip it.
+    pub moe_tcx_on: std::cell::Cell<bool>,
     /// `ds_moe_ks_{gu,down}_f{fmt}_s{sfmt}`: [`Kernels::moe_ks`] with the shared expert (format
     /// sfmt) as one more slot, by (fmt - 2, sfmt - 2, down).
     moe_ks_sh: [[[Func; 2]; 2]; 2],
@@ -387,6 +395,8 @@ impl Kernels {
                 [m.func("ds_moe_ks_gu_f2")?, m.func("ds_moe_ks_down_f2")?],
                 [m.func("ds_moe_ks_gu_f3")?, m.func("ds_moe_ks_down_f3")?],
             ],
+            moe_tcx: [m.func("ds_moe_tcx_gu_f3")?, m.func("ds_moe_tcx_down_f3")?],
+            moe_tcx_on: std::cell::Cell::new(std::env::var("DS_MOE_TCX").is_ok_and(|v| v == "1")),
             moe_ks_sh: {
                 let mut a = [[[std::ptr::null_mut(); 2]; 2]; 2];
                 for (f, af) in a.iter_mut().enumerate() {
@@ -1366,6 +1376,12 @@ impl Kernels {
             && cols <= 16384
     }
 
+    /// Whether the grouped MoE takes the TCX kernels for experts of format `fmt`
+    /// (`DS_MOE_TCX=1`, fp4 only; the caller has already chosen the K-split path).
+    pub fn tcx_takes(&self, fmt: i32) -> bool {
+        self.moe_tcx_on.get() && fmt == 3
+    }
+
     /// `ds_ks_quant` of `n` rows × `cols` at `x` into `ks_x`: (codes, scales).
     fn ks_quantize(&self, s: &Stream, x: u64, n: usize, cols: usize) -> Result<(u64, u64)> {
         let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
@@ -1428,6 +1444,19 @@ impl Kernels {
             let (codes, scales) = self.ks_quantize(s, xq, t, d)?;
             let (sp, nbr, gx) = self.moe_ks_grid(inter, 8, d);
             let (si, nbri) = (sp as i32, nbr as i32);
+            if self.tcx_takes(fmt) {
+                unsafe {
+                    super::obs::launch(
+                        self.moe_tcx[0],
+                        (nbr as u32, slots.max(1) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![w1s, w3s, elist, off, rows, rw, codes, scales, h, lim, si],
+                    )?
+                }
+                return Ok(());
+            }
             unsafe {
                 super::obs::launch(
                     f,
@@ -1481,6 +1510,19 @@ impl Kernels {
             let (codes, scales) = self.ks_quantize(s, hq, n, inter)?;
             let (sp, nbr, gx) = self.moe_ks_grid(d, 16, inter);
             let (si, nbri) = (sp as i32, nbr as i32);
+            if self.tcx_takes(fmt) {
+                unsafe {
+                    super::obs::launch(
+                        self.moe_tcx[1],
+                        (nbr as u32, slots.max(1) as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        s,
+                        tang_moe::args![w2s, elist, off, codes, scales, part, si],
+                    )?
+                }
+                return Ok(());
+            }
             unsafe {
                 super::obs::launch(
                     f,
@@ -1524,6 +1566,7 @@ impl Kernels {
         let [a, b, c] = sh;
         let n = t * (k + 1);
         !self.exact
+            && !self.tcx_takes(fmt)
             && (2..=3).contains(&fmt)
             && Self::fast_ok(a)
             && Self::fast_ok(c)
