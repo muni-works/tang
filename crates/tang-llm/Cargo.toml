@@ -70,6 +70,10 @@ required-features = ["metal"]
 name = "bench_batch"
 
 [[example]]
+name = "coder_moe_hand"
+required-features = ["cuda"]
+
+[[example]]
 name = "bench_prefill"
 required-features = ["metal"]
 

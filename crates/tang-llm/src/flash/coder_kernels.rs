@@ -15,15 +15,24 @@ pub fn tcx_split() -> (usize, usize) {
     (n("TANG_TCX_SGU", 2), n("TANG_TCX_SDN", 1))
 }
 
+/// `TANG_CODER_MOE2=1`: the per-32 int8 activations (MoE input and h) also store
+/// `float2(d, d·Σcodes)` per 32 in a region past the scales, and the batch GGUF expert kernels
+/// (`cx_moe_gu_q2` / `cx_moe_down_q2`) fold the Q4_K/Q5_K mins through `dmin·m·(d·Σc)` instead of
+/// a second MMA (after tang#152's IR-derived layer). Not bitwise equal to the default.
+pub fn moe2_on() -> bool {
+    std::env::var("TANG_CODER_MOE2").is_ok_and(|v| v == "1")
+}
+
 pub fn prelude(c: &Shapes, maxt: usize) -> String {
     let (sgu, sdn) = tcx_split();
     let tiles = if std::env::var("TANG_CODER_TCX_TILES").is_ok_and(|v| v == "1") { "#define CX_TCX_TILES 1\n" } else { "" };
+    let moe2 = if moe2_on() { "#define CX_MOE2 1\n" } else { "" };
     format!(
         "#define CX_HID {hid}\n#define CX_NH {nh}\n#define CX_NKV {nkv}\n#define CX_HD {hd}\n\
          #define CX_ROT {rot}\n#define CX_G {g}\n#define CX_QK {qk}\n#define CX_QV {qv}\n\
          #define CX_FF {ff}\n#define CX_TOPK {topk}\n#define CX_NE {ne}\n#define CX_NP {np}\n\
          #define CX_CHUNK {chunk}\n#define CX_MAXT {maxt}\n#define XQ8_T {maxt}\n\
-         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n{tiles}",
+         #define CX_TCX_SGU {sgu}\n#define CX_TCX_SDN {sdn}\n{tiles}{moe2}",
         hid = c.hidden,
         nh = c.n_head,
         nkv = c.n_kv,
@@ -110,6 +119,11 @@ __device__ void norm_q8_body(float* rt, float (&v)[16], int nv, const float* w, 
         const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(y / d), -127.f), 127.f);
         xq[(size_t)t * n + i] = (unsigned char)(signed char)q;
         if (lane == 0) xd[t * (n / 32) + i / 32] = d;
+#ifdef CX_MOE2
+        int cs = q;
+        for (int o = 16; o > 0; o >>= 1) cs += __shfl_xor_sync(0xffffffffu, cs, o);
+        if (lane == 0) ((float2*)(xd + XQ8_T * (n / 32)))[t * (n / 32) + i / 32] = make_float2(d, d * (float)cs);
+#endif
     }
 }
 extern "C" __global__ void cx_norm_q8(float* r, const float* y, const float* w, float* x, unsigned char* xq,
@@ -537,6 +551,13 @@ extern "C" __global__ void cx_silu_q(const float* gu, unsigned char* hq, int pba
     const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
     hq[(size_t)p * CX_FF + c * 32 + lane] = (unsigned char)(signed char)q;
     if (lane == 0) ((float*)(hq + (size_t)CX_NP * CX_FF))[p * (CX_FF / 32) + c] = d;
+#ifdef CX_MOE2
+    int cs = q;
+    for (int o = 16; o > 0; o >>= 1) cs += __shfl_xor_sync(0xffffffffu, cs, o);
+    if (lane == 0)
+        ((float2*)(hq + (size_t)CX_NP * CX_FF + (size_t)CX_NP * (CX_FF / 32) * 4))[p * (CX_FF / 32) + c] =
+            make_float2(d, d * (float)cs);
+#endif
 }
 
 // Experts' down rows (shared expert for p >= T·K): out[p][r], R rows a warp, staged. With
@@ -1803,7 +1824,53 @@ __device__ __forceinline__ void gg_rows(const unsigned char* wa, const unsigned 
         if (sb + 1 < sb1) { ra = pa; rb = pb; }
     }
 }
-template <bool DOWN>
+// MOE2 (after tang#152): gg_rows with the mins folded through the activation's stored d·Σc
+// (xa / xb: float2 (d, d·Σc) a 32 for columns 2 tig / 2 tig + 1), so one MMA a step:
+// acc += dx·(d·sc)·dot − (dmin·m)·(dx·Σc). One superblock at a time, no prefetch (the derived
+// kernel's shape, measured faster than gg_rows on an H200).
+template <int TY>
+__device__ __forceinline__ void gg_rows2(const unsigned char* wa, const unsigned char* wb, const unsigned char* xg,
+                                         const float2* xa, const float2* xb, float acc[4], int sb0, int sb1) {
+    constexpr int BB = TY == 12 ? 144 : 176;
+    const int tig = threadIdx.x & 3;
+    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+    for (int sb = sb0; sb < sb1; sb++) {
+        GgR ra, rb;
+        gg_load<TY>(wa + sb * BB, tig, ra);
+        gg_load<TY>(wb + sb * BB, tig, rb);
+        unsigned sa[2], ma[2], sbw[2], mbw[2];
+        sc_unpack(ra.sc, sa[0], sa[1], ma[0], ma[1]);
+        sc_unpack(rb.sc, sbw[0], sbw[1], mbw[0], mbw[1]);
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const int qp = s >> 1;
+            unsigned a[4];
+            #pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const GgR& r = (c & 1) ? rb : ra;
+                const unsigned w = (c >> 1) ? r.q[qp].y : r.q[qp].x;
+                unsigned v = (s & 1) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
+                if (TY == 13) v |= ((((c >> 1) ? r.h.y : r.h.x) >> s) & 0x01010101u) << 4;
+                a[c] = v;
+            }
+            const uint2 bb = __ldg((const uint2*)(xg + sb * 256 + s * 32));
+            int d[4];
+            mma_s8_16832(d, a, bb.x, bb.y);
+            const int sh = 8 * (s & 3);
+            const float fsa = ra.d * (float)((sa[s >> 2] >> sh) & 0xFFu);
+            const float fma_ = ra.dm * (float)((ma[s >> 2] >> sh) & 0xFFu);
+            const float fsb = rb.d * (float)((sbw[s >> 2] >> sh) & 0xFFu);
+            const float fmb = rb.dm * (float)((mbw[s >> 2] >> sh) & 0xFFu);
+            const int blk = sb * 8 + s;
+            const float2 x0 = __ldg(xa + blk), x1 = __ldg(xb + blk);
+            acc[0] = fmaf(fsa * x0.x, (float)d[0], fmaf(-fma_, x0.y, acc[0]));
+            acc[1] = fmaf(fsa * x1.x, (float)d[1], fmaf(-fma_, x1.y, acc[1]));
+            acc[2] = fmaf(fsb * x0.x, (float)d[2], fmaf(-fmb, x0.y, acc[2]));
+            acc[3] = fmaf(fsb * x1.x, (float)d[3], fmaf(-fmb, x1.y, acc[3]));
+        }
+    }
+}
+template <bool DOWN, bool V2 = false>
 __device__ __forceinline__ void moe_gg_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids, const unsigned char* xq,
                                             float* out, int T, int fast, const unsigned* plan) {
     constexpr int KA = DOWN ? CX_FF : CX_HID;
@@ -1847,7 +1914,14 @@ __device__ __forceinline__ void moe_gg_body(ExW g, ExW u, ExW sg, ExW su, const 
     const unsigned char* wb = wa + (size_t)8 * mw.row_bytes;
     const int sb0 = ks * NSB / S, sb1 = (ks + 1) * NSB / S;
     float acc[4];
-    if (mw.ty == 12) gg_rows<12, KA>(wa, wb, m, xg, da, db, acc, sb0, sb1);
+    if (V2) {
+        constexpr int XR = DOWN ? CX_NP : XQ8_T;
+        const float2* x2 = (const float2*)(xq + (size_t)XR * KA + (size_t)XR * (KA / 32) * 4);
+        const float2* xa2 = x2 + (da - xdg);
+        const float2* xb2 = x2 + (db - xdg);
+        if (mw.ty == 12) gg_rows2<12>(wa, wb, xg, xa2, xb2, acc, sb0, sb1);
+        else gg_rows2<13>(wa, wb, xg, xa2, xb2, acc, sb0, sb1);
+    } else if (mw.ty == 12) gg_rows<12, KA>(wa, wb, m, xg, da, db, acc, sb0, sb1);
     else gg_rows<13, KA>(wa, wb, m, xg, da, db, acc, sb0, sb1);
     if (S > 1) {
         red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
@@ -1876,6 +1950,16 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_q(ExW d, ExW sd, c
                                                                const unsigned char* hq, float* out, int T, int fast,
                                                                const unsigned* plan) {
     moe_gg_body<true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_q2(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
+                                                              const unsigned char* xq, float* out, int T, int fast,
+                                                              const unsigned* plan) {
+    moe_gg_body<false, true>(g, u, sg, su, ids, xq, out, T, fast, plan);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_q2(ExW d, ExW sd, const unsigned* ids,
+                                                                const unsigned char* hq, float* out, int T, int fast,
+                                                                const unsigned* plan) {
+    moe_gg_body<true, true>(d, d, sd, sd, ids, hq, out, T, fast, plan);
 }
 // ---- dense Q8X (Q8_0 repacked) on int8 tensor cores for batch windows ----
 //

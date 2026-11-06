@@ -611,6 +611,8 @@ struct Kern {
     moe_down_t32: Fun,
     moe_gu_q: Fun,
     moe_down_q: Fun,
+    moe_gu_q2: Fun,
+    moe_down_q2: Fun,
     q8k: Fun,
     silu_q8k: Fun,
     /// Int8 tensor-core dense Q8X (batch windows): the GEMM and its split reduction.
@@ -693,6 +695,8 @@ impl Kern {
             moe_down_t32: f("cx_moe_down_t32")?,
             moe_gu_q: f("cx_moe_gu_q")?,
             moe_down_q: f("cx_moe_down_q")?,
+            moe_gu_q2: f("cx_moe_gu_q2")?,
+            moe_down_q2: f("cx_moe_down_q2")?,
             q8k: f("cx_q8k")?,
             silu_q8k: f("cx_silu_q8k")?,
             mma_q8x: f("cx_mma_q8x")?,
@@ -816,6 +820,8 @@ impl Kern {
             moe_down_t32: f(cm, "cx_moe_down_t32")?,
             moe_gu_q: f(cm, "cx_moe_gu_q")?,
             moe_down_q: f(cm, "cx_moe_down_q")?,
+            moe_gu_q2: f(cm, "cx_moe_gu_q2")?,
+            moe_down_q2: f(cm, "cx_moe_down_q2")?,
             q8k: f(cm, "cx_q8k")?,
             silu_q8k: f(cm, "cx_silu_q8k")?,
             mma_q8x: f(cm, "cx_mma_q8x")?,
@@ -957,7 +963,8 @@ impl Scratch {
         let np = rows * (hp.n_expert_used + 1);
         let nchunk_max = max_ctx / ck::attn_chunk();
         let z = |n: usize| dev.alloc_f32(n);
-        let xq_words = |k: usize| (rows * k + rows * k / 32 * 4).div_ceil(4);
+        // codes, per-32 scales, then (TANG_CODER_MOE2) float2 (d, d·Σc) per 32.
+        let xq_words = |k: usize| (rows * k + rows * k / 32 * 12).div_ceil(4);
         let n = hp.n_embd;
         Scratch {
             ctl: z(8),
@@ -981,7 +988,7 @@ impl Scratch {
             w: z(rows * hp.n_expert_used),
             egu: z(np * 2 * hp.n_ff_exp),
             plan: z(2 * (4 + 2 * np)),
-            hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
+            hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 12).div_ceil(4)),
             parts: z(np * n),
             xk: z((rows * n + rows * n / 256 * 4).div_ceil(4)),
             hk: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 256 * 4).div_ceil(4)),
@@ -3146,6 +3153,8 @@ impl Coder {
             (k.moe_down_t32, "moe_down"),
             (k.moe_gu_q, "moe_gu"),
             (k.moe_down_q, "moe_down"),
+            (k.moe_gu_q2, "moe_gu"),
+            (k.moe_down_q2, "moe_down"),
             (k.q8k, "moe_q8k"),
             (k.silu_q8k, "silu_q"),
             (k.moe_gemm_gu, "moe_gu"),
@@ -4376,11 +4385,15 @@ impl Coder {
             let ni = n as i32;
             let groups = n.min(hp.n_expert + 1 + n / BATCH_GCHUNK) as u32;
             let (sgu, sdn) = ck::tcx_split();
+            // TANG_CODER_MOE2: mins through the stored d·Σc (the kernels' prelude writes it).
+            // Not with a peer GPU: the stage copy carries codes and scales only.
+            let m2 = ck::moe2_on() && self.peer.is_none();
+            let (fgu, fdn) = if m2 { (v.k.moe_gu_q2, v.k.moe_down_q2) } else { (v.k.moe_gu_q, v.k.moe_down_q) };
             unsafe {
                 self.launch_on(stream, v.k.moe_plan, (1, 1, 1), 1024, 0, tang_moe::args![ids, ti, pb, ni, plan]);
                 self.launch_on(
                     stream,
-                    v.k.moe_gu_q,
+                    fgu,
                     ((2 * ff * sgu / 128) as u32, groups, 1),
                     256,
                     0,
@@ -4389,7 +4402,7 @@ impl Coder {
                 self.launch_on(stream, v.k.silu_q, ((ff / 32) as u32, np, 1), 32, 0, tang_moe::args![egu, hq, pb]);
                 self.launch_on(
                     stream,
-                    v.k.moe_down_q,
+                    fdn,
                     ((nh * sdn / 128) as u32, groups, 1),
                     256,
                     0,
