@@ -2739,3 +2739,61 @@ absolute number, 378 GB/s is 40% of the 3090's 936 GB/s: one thread per output p
 gets no tile (tiles stage affine regions) and no split at this size (40960 points); a
 warp-per-row GEMV schedule for gathered contractions is the obvious next step before comparing
 against tang-llm's hand-written int8 MoE kernel.
+
+## Coder-Next MoE layer derived from the IR vs the hand kernels (H200, kernel-only)
+
+**Date:** 2026-11-06. **Branch:** `claude/moe-ir-derive` (on `claude/focused-elgamal-3af3c7`, gather views).
+**GPU:** 1× H200 SXM, RunPod secure (pod `29rjl4y2rn3fyk`, US-NC-1), idle: 0 MiB / 0% before the runs.
+**Run:** `cargo run --release -p tang-bench --features cuda --example coder_moe_ir` with
+`CODER_MOE_DUMP=dir`, then `cargo run --release -p tang-llm --features cuda --example coder_moe_hand -- dir`
+(the engine's own kernels from `coder_kernels.rs`, compiled and launched as `coder.rs` does, on the same bytes).
+
+**Layer.** Qwen3-Coder-Next 80B-A3B shapes: hidden 2048, 512 routed experts + 1 shared, top-10, expert
+FFN 512. Gate|up stored GGUF Q4_K, down Q5_K (random valid super-blocks; ~975 MB a layer), router f32.
+One IR graph: router GEMM → top-k (10 argmax rounds) → softmax weights + sigmoid shared gate → pairs
+sorted by expert (rank + inverse permutation, ordinary comps) → `gu[i] = Wgu[key[i]] · xq[tok[i]]` →
+SwiGLU → `dn[i] = Wd[key[i]] · h[i]` → combine reading `dn[rank[t, j]]`. No new op: the int8 path is
+schedule fields — `Format::Q4K/Q5K` (input storage), `Format::Q8x32` (int8 a 32, quantized by the
+writer) on `xq` and `h`, `IntMma { stage: Fragment, ksplit: (2, 1) }` on the two expert GEMMs
+(`docs/tensor-ir.md`, "Integer MMA and block formats").
+
+**Correctness.** Interpreter (`eval_emulated`, same int8 rounding) vs plain-Rust reference (small
+config): y 2.7e-7. GPU vs reference at B = 1/8/64: ≤ 2.8e-7 (gu, dn, y; top-k exact). Hand kernels vs
+derived on the same bytes: gate|up ≤ 2.7e-7, down ≤ 3.0e-7, combine ≤ 2.9e-7 (max abs / max |ref|).
+
+**Times** (ms a launch; median of 100 with the L2 flushed by a 256 MB memset before each — weights cold,
+as in the engine's 48-layer cycle. Warm minima within ~10% and in the same order.)
+
+| B | | derived (IR) | hand (engine) |
+|---|---|---|---|
+| 1 | gate\|up | 0.0174 (int8 MMA) | 0.0145 `cx_moe_gu_d2` (per pair, dp4a) |
+| | down | 0.0129 + SwiGLU→Q8 0.0062 | 0.0189 `cx_moe_down_d2f` (SiLU fused) |
+| | x→Q8 / combine | 0.0055 / 0.0063 | — (fused in norm) / 0.0113 `cx_moe_add_norm` |
+| | **expert half** | **0.0484** | **0.0447** |
+| 8 | gate\|up | 0.0481 | 0.0535 `cx_moe_gu_d4` |
+| | down | 0.0312 + 0.0065 | 0.0607 `cx_moe_down_d4f` |
+| | **expert half** | **0.0981** | **0.1256** |
+| 64 | gate\|up | **0.158** | 0.180 `cx_moe_gu_q` (the §8 int8 MMA) |
+| | down | **0.0885** + 0.0085 | 0.124 `cx_moe_down_q` + 0.0126 `cx_silu_q` |
+| | plan / x→Q8 / combine | — (sort in routing) / 0.0060 / 0.0084 | 0.0064 / — / 0.0125 |
+| | **expert half** | **0.270** | **0.336** |
+
+Stage and split at B=64 (gate|up / down, cold): Fragment (2,1) 0.158 / 0.089; Fragment (1,1) 0.165 /
+0.088; (4,2) 0.165 / 0.101; (8,2) 0.177 / 0.101; MMA k order (2,1) 0.199 / 0.097 — fragment-order
+staging is worth ~20% on gate|up.
+
+**Reading.** The derived expert GEMMs match or beat the hand kernels at B = 8 and 64 (B=64 gate|up −12%,
+down −29%) and trail at B = 1 (+20% gate|up: one pair a tile, where the hand per-pair dp4a GEMV with
+more warps a pair wins). Likely sources of the B=64 win: mins folded through the stored `dₓ·Σc` (no
+second MMA), groups cut at 8-position tiles with no plan kernel, and ksplit 1 on down.
+
+**What is missing (the gap that remains).**
+- *Routing.* The derived router + top-k + sort is 27 small kernels (0.35 ms at B=1, 0.6 ms at B=64);
+  the engine's is one router GEMV + `cx_route` (not timed here). Top-k as k argmax rounds, one kernel
+  each, is the cost; a warp-level top-k schedule (or a fused reduction) is the next field.
+- *Fusion.* The engine fuses x's int8 into the previous RMSnorm, SiLU into the B≤8 down kernel, and the
+  combine into residual + next norm; the derived layer keeps SwiGLU→Q8 and x→Q8 as their own kernels
+  (~0.012 ms a layer).
+- *B=1.* A narrow-window schedule (one pair over more warps, dp4a instead of MMA) is not expressible yet.
+- Synthetic weights (random valid k-quant blocks, gate/up Q4_K, down Q5_K); the real UD-Q4_K_XL mixes
+  types per layer. Kernel-only times; no CUDA graph, no end-to-end step.
