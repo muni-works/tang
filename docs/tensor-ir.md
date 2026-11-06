@@ -41,6 +41,14 @@ not be 0. The gradient of a guarded read eliminates a coordinate rather
 than scattering: for `x[c, t + 3k − 9]`, `dx[c, τ]` reads `dy[o, τ − 3k + 9]`
 through a guard, so padding contributions never reach `x`.
 
+A view can also *gather*: one source coordinate is data. `View::gather`
+adds `coef · round(index)` to a source dim's form, the index being the
+value of a sibling arg of the same comprehension (an integer-valued tensor
+read through its own affine view). An embedding lookup is
+`table[ids[t], j]`, a paged KV read `cache[table[s, blk], off, c]`, an MoE
+expert read `W[sel[t, k], f, d]`. See [Gather views](#gather-views) for
+what the passes do with them.
+
 **Comprehensions.** The only compute op:
 
 ```
@@ -140,7 +148,8 @@ dropped, since a kernel would still bind them.
 
 **Flash backward is nesting.** A short contraction (one reduce dim, at most
 128) whose every reader is a tile, or a map recomputed in tiles, is inlined
-(`schedule_nested_contractions`, applied by `to_cuda`). The attention
+(`schedule_nested_contractions`, applied by `to_cuda`, `to_wgsl` and
+`to_msl`). The attention
 backward then reads `S = Q·Kᵀ` and `dP = dO·Vᵀ` only through `P̃` and `dS`,
 which the dQ, dK and dV tiles recompute, so nothing n×n is written.
 `cuda_mma_kernel` runs each nested contraction as `mma` per staged block:
@@ -155,6 +164,24 @@ the same sum the forward reduced. Chunks where a staged operand of every
 term is a masked exponential, zero by an affine condition (`map_zero_cond`),
 are left out of the k range. `merge_reduce_dims` leaves a map over a
 contraction this big unmerged, since a reshape would pin it to memory.
+
+The scalar tiled lowering (WGSL, and MSL translated from it) has no nested
+GEMM. It nests through `schedule_nested_contractions_scalar`. That version
+also reads through a tile's epilogue-inlined reduction (dK = (Σ dS·Q)·c),
+which is a reader `to_cuda` does not nest into. The tiled emitter already
+computes a shared comp once per chunk into workgroup memory: an inlined
+producer that varies along the reduce and row axes but not the lanes, here
+dS and P̃. So each dS element in the chunk evaluates S and dP as a 64-FMA
+dot, on one thread. A tile that recomputes a nested contraction is
+reshaped from 4 rows × 64 lanes to 16 rows × 16 threads of 4 lanes, so a
+chunk has one dS element per thread instead of 128 elements across 256
+threads. Nothing n×n is written on any backend. The cost is time: the
+scalar dots run 1.3× (MSL) to 4× (Vulkan on a 3090) slower than reading
+the materialized buffers (BENCHMARKS.md, "Flash backward without n×n on
+WGSL and MSL"). `to_wgsl_with(outputs, false)` and `to_msl_with(…, false)`
+lower the materialized schedule. Staging the chunk side (K, V rows) of the
+nested dots in workgroup memory was measured slower on both GPUs. It
+needs a second barrier, and the 16 KiB budget then halves the chunk.
 
 **Schedules are separate from algebra.** A comprehension says *what*. The
 schedule fields on a node say *how*, and can't change the answer:
@@ -186,6 +213,108 @@ hand-written kernel is as an intrinsic: "this comprehension shape has a
 fast implementation on this chip". The compiler picks it when it wins and
 derives one when it doesn't. The existing kernels keep their speed and stop
 being forks.
+
+## Gather views
+
+Affine views cover every layout, but not data-dependent addressing: MoE
+token→expert routing, paged KV caches and token embeddings read a source
+at a coordinate held in another tensor. A gather view makes that a
+comprehension read rather than a special op:
+
+```
+out[t, k, f] = Σ_d x[t, d] · W[sel[t, k], f, d]
+             = Σ_d x[view₀] · W[forms + 1·round(arg₂)] ,  arg₂ = sel[t, k]
+```
+
+**Representation.** `View.gather: Option<Gather { arg, coefs }>`: source
+coordinate `d` is `forms[d] + coefs[d] · round(args[arg])`. The index is
+named by *arg position*, not by tensor: it is an ordinary arg of the
+comprehension, so dependency tracking, liveness and every pass that
+renumbers nodes (`eliminate_dead`, `substitute_maps`, …) handle it with
+no new code. The index arg must itself be affine (`push_comp` rejects a
+gathered index: one level, no pointer chasing). `coefs` per source dim
+allow a scaled, offset address: a paged read iterates `(blk, off)` and
+reads row `bs · table[blk] + off`. A gathered dim cannot be range-checked
+at construction; with `guard` set, an out-of-range index (a `-1` pad)
+reads 0, otherwise it is a caller bug (the interpreter panics). Index
+tensors are f32 like everything else: exact below 2²⁴.
+
+**Interpreter.** Affine args are read first, then gathered args read
+their index from them (`eval` and `eval_emulated` alike).
+
+**Backward.** A gathered dim of the differentiated arg is a scatter dim:
+the gradient comprehension iterates the source coordinate as an out dim
+and gates the body by `[coord == form + coef · index]`, the index read
+through the renamed index arg. That is a scatter-add — `dtable[v, :] =
+Σ_t [ids[t] == v] · dy[t, :]`, repeated ids summed, guarded pads
+dropped — written as a dense gated sum: it costs `|source dim| ×
+|iteration space|`, a one-hot matmul. Correct (tests check it against
+hand scatter-adds), fine for small vocabularies, not for a 150k-entry
+embedding; a segmented-sum or atomic lowering of the same comprehension
+is the follow-up. The gradient with respect to the index is 0 (it only
+addresses).
+
+**Fusion.** Composition carries a gather linearly: an affine map read
+through a gather has the gather pushed into its own args (`2·table` read
+at `ids[t]` becomes `2·table[ids[t]]`), and a gathering map read through
+an affine view brings its gather and its index arg into the reader. So
+`x[tok]`, an activation and the GEMM that consumes them are one kernel.
+What `substitute_maps` keeps materialized, and why:
+
+- *Index tensors* are pinned leaves: an address needs a value in memory,
+  not an expression to recompute per read.
+- *Nested gathers*: a gathering map read through a gather (directly or
+  through a chain of substituted maps) stays a buffer — inlining it would
+  make an index read data-dependent.
+
+Everything else fuses. Passes that drop, reorder, or split a comp's args
+(`hoist_invariant_factors`, `merge_siblings`, the softmax rewrite) skip
+gathered comps; `relayout`, `merge_reduce_dims` and `through_reshape`
+leave a gathered source's layout alone (its `coefs` name source dims);
+iteration-space rewrites (`split_reduce_dims`, `shard_reduction`) carry
+the gather through unchanged; CSE keys on it.
+
+**Schedules and lowering.** Tiles stage affine regions of their operands
+and a gathered read has none, so `schedule_auto` gives gathered comps a
+workgroup split (few points) or one thread per point, never a tile or a
+tensor-core fragment. Every backend that emits through the WGSL arg read
+(WGSL; CUDA's generic path, which transpiles it; MSL; OpenCL) reads the
+index inline as `i32(round(read_idx(…)))`. The C backend rejects gathers.
+
+**Worked example.** `crates/tang-bench/examples/moe_gather.rs` builds a
+top-k MoE FFN as one graph — router GEMM, top-k as k rounds of argmax
+with the earlier picks masked, softmax over the selected logits, SwiGLU
+experts reading `W[sel[t, k]]` through gather views, weighted combine —
+checks it against the f64 interpreter and a plain-Rust reference (top-k
+indices exact; output within 4e-6 on Metal, 4e-5 on CUDA, whose router GEMM is a TF32 tile), and times it against the same
+expert math over host-pre-gathered (affine) weights. The data-dependent
+address costs nothing measurable on either chip (BENCHMARKS.md, "MoE
+through gather views"). The token-major form is the decode shape; an
+expert-major dispatch (tokens grouped per expert, then grouped GEMMs)
+needs a compaction — a scan — which is not a comprehension.
+
+## Integer MMA and block formats (schedule fields)
+
+Quantized expert GEMMs need no new op. Three storage formats join `Precision`:
+
+- `Format::Q4K`, `Format::Q5K`: GGUF k-quant super-blocks (256 along the last dim), input storage
+  only. The graph's values are the dequantized weights; the buffer holds the GGUF bytes as they are.
+- `Format::Q8x32`: int8 codes with one f32 scale a 32 (`d = amax / 127`) and `d · Σcodes` beside it.
+  The writer quantizes (any one-thread-per-point kernel: its store becomes a warp-level quantize);
+  `eval_emulated` rounds the same way, so the interpreter predicts the int8 error.
+
+and one field on the node, `TNode::int_mma: Option<IntMma { stage, ksplit }>`, for a contraction
+`out[p…, r] = Σ_k W[idx(p), r, k] · X[p…, k]` with `W` Q4K/Q5K (first dim optionally gathered) and
+`X` Q8x32 (rows optionally gathered). The CUDA lowering (`tensor_cuda_int8.rs`) generates the kernel
+from the comp's views: a warp owns 16 rows × 8 consecutive positions (`mma.sync.m16n8k32.s8`), the
+4/5-bit codes are the A fragment after one shift and mask, scales/mins are unpacked once a
+super-block, and `acc += dₓ·(d·sc)·dot − (dmin·m)·(dₓ·Σc)` (the mins need no second MMA because
+`Σc` is stored with the activation). Consecutive positions with the same gather index share A
+fragments, so a position dim *sorted by the index* reads each expert once a tile; the sort is
+ordinary IR (a rank comp and its inverse permutation). `stage: Fragment` loads each lane's B as 8
+consecutive bytes (A takes the same column permutation); `Stage::Mma` uses the MMA's own k order.
+`ksplit` warps split a tile's reduction. `crates/tang-bench/examples/coder_moe_ir.rs` builds a whole
+Coder-Next MoE layer this way; BENCHMARKS.md has it against the hand kernels.
 
 ## Precision is a schedule
 
@@ -599,8 +728,10 @@ Not done, and what it costs (BENCHMARKS.md, "Flash attention on Hopper"):
 - Scatter gradients reduce over the whole source coordinate they gate on;
   a stride-2 read pays 2× in the backward pass. Fine for rope, not for a
   large gather.
-- Non-affine indexing — KV-cache paging, MoE routing — needs a `Gather`
-  view that reads an index tensor, which blocks some fusion.
+- Gathers ([above](#gather-views)): the backward is a dense gated sum
+  (a segmented-sum or atomic lowering is the follow-up); gathered reads
+  never tile, so a prefill-sized MoE GEMM runs one thread per point;
+  expert-major dispatch needs a scan; the C backend rejects them.
 - Placement is a transform now (`shard_reduction` + `fold_partials`:
   partial reductions over slices, the all-reduce as a comprehension over
   the monoid's combine; `examples/shard_attention.rs` runs flash

@@ -406,6 +406,9 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             }
         };
         let elem = |f: super::Format| {
@@ -1074,6 +1077,9 @@ impl TensorGraph {
                                 "tang_b2f(src[0])".to_string(),
                                 format!("tang_b2f(src[{ce}])"),
                             ),
+                            super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                                unreachable!("block formats lower only through the int8 MMA kernel")
+                            }
                         };
                         writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? {s0} : 0.0f), tang_tf32(ok ? {s1} : 0.0f)}};").unwrap();
                         writeln!(s, "            #pragma unroll").unwrap();
@@ -1652,6 +1658,9 @@ impl TensorGraph {
                 super::Format::F32 => v.clone(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             };
             writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
         }
@@ -1825,6 +1834,7 @@ impl TensorGraph {
             let pv = sa.view.compose(&outer.view, rank);
             let inner = super::View {
                 guard: false,
+                gather: None,
                 forms: pv
                     .forms
                     .iter()
@@ -1937,12 +1947,48 @@ impl TensorGraph {
         outputs: &[TensorId],
         variant: Option<usize>,
     ) -> WgslProgram {
+        // Block formats (Q4K / Q5K / Q8x32) have no WGSL element type: the
+        // program is laid out with them as f32, then their buffers get their
+        // formats back and the kernels touching them are replaced below.
+        let blocky = |g: &TensorGraph, i: usize| g.nodes[i].precision.storage.is_block();
+        let mut plain = self.clone();
+        for n in &mut plain.nodes {
+            if n.precision.storage.is_block() {
+                n.precision.storage = super::Format::F32;
+            }
+        }
         let mut program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
-            self.to_program_numbered(outputs, Target::Wgsl)
+            plain.to_program_numbered(outputs, Target::Wgsl)
         });
+        for b in &mut program.buffers {
+            b.format = self.nodes[b.node.index()].precision.storage;
+        }
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            if let Some(s) = self.nodes[root].int_mma {
+                let (src, threads, blocks) = self
+                    .cuda_int8_kernel(root, &reads, s)
+                    .unwrap_or_else(|e| panic!("int8 MMA schedule on node {root}: {e}"));
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = (threads * blocks) as u32;
+                continue;
+            }
+            assert!(
+                !reads.iter().any(|&r| blocky(self, r)),
+                "node {root} reads a block-format buffer without an int8 MMA schedule"
+            );
+            if blocky(self, root) {
+                assert!(
+                    self.nodes[root].precision.storage == super::Format::Q8x32,
+                    "only Q8x32 can be written"
+                );
+                let src = wgsl_to_cuda(&k.source, k.workgroup_size);
+                k.source = super::cuda_int8::q8x32_writer(&src, k.points as usize)
+                    .unwrap_or_else(|| panic!("node {root}: a Q8x32 store needs a one-thread-per-point kernel over a multiple of 32 points"));
+                continue;
+            }
             let native = match variant {
                 Some(v) if self.nodes[root].tile.0 > 0 => v
                     .checked_sub(MMA_SHAPES.len())
@@ -2761,6 +2807,9 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             }
         };
         let elem = |f: super::Format| {
@@ -4054,6 +4103,9 @@ impl TensorGraph {
                 super::Format::F32 => v.to_string(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    unreachable!("block formats lower only through the int8 MMA kernel")
+                }
             };
             writeln!(s, "            out[g * {w_out}u + 0u] = {};", st_v("m_v")).unwrap();
             writeln!(s, "            out[g * {w_out}u + 1u] = {};", st_v("l_v")).unwrap();
@@ -4101,6 +4153,9 @@ impl TensorGraph {
                     super::Format::F32 => v.clone(),
                     super::Format::F16 => format!("tang_f2h({v})"),
                     super::Format::BF16 => format!("tang_f2b({v})"),
+                    super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                        unreachable!("block formats lower only through the int8 MMA kernel")
+                    }
                 };
                 writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }

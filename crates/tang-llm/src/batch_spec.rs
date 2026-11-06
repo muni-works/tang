@@ -292,7 +292,7 @@ impl Tuner {
         let (_, b, mtp) = best;
         if !fresh {
             // Nothing to verify this step; run the head if drafting would pay, or to probe.
-            let probe = self.depth.is_empty() || self.steps % PROBE == 0;
+            let probe = self.depth.is_empty() || self.steps.is_multiple_of(PROBE);
             return none(mtp || probe);
         }
         // Plain steps are only measured while plain decoding runs: while drafting wins, run
@@ -306,7 +306,7 @@ impl Tuner {
         if b > 0 && self.steps % every == every / 2 {
             return none(false);
         }
-        let probe = self.steps % PROBE == 0;
+        let probe = self.steps.is_multiple_of(PROBE);
         // Acceptance is only measured while drafting: now and then, verify one draft a stream
         // anyway, so a low `alpha` (an earlier, unlucky load) can recover.
         let b = if b == 0 && probe { live.min(room) } else { b };
