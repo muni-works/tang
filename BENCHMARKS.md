@@ -2379,6 +2379,49 @@ pending)
   ~250–400 ms (q4), ~150–250 ms (fp16). A 20-token turn ~100–250 ms. 512 tokens ~2–5 s. Decode is
   unchanged at ~55 ms/token.
 
+### Flash backward without n×n on WGSL and MSL
+
+`to_wgsl` and `to_msl` now nest S = Q·Kᵀ and dP = dO·Vᵀ in the dQ, dK and dV tiles, as `to_cuda` already did (`schedule_nested_contractions_scalar`; see `docs/tensor-ir.md`, "Flash backward is nesting"). The derived attention forward + backward of `tang-derive-wasm` (the research post's lab) writes no n×n buffer on any backend. `cargo run -p tang-derive-wasm --example gallery` now gives 7 kernels and 0 n×n buffers in the fwd+bwd column for all six presets. Before, it gave 9 kernels and 2 n×n buffers.
+
+Gradients match the f64 interpreter. The test is `derived_attention_backward_nested_on_gpu`, at n = 256, d = 32: causal, soft-cap + prefix-LM, and bidirectional, max error ≤ 1.7e-5 at gradient scale 15–36. It passes on the M4 (Metal through wgpu) and on the 3090 (Vulkan). At n ≤ 1024 the bench's max relative error is the same with and without nesting.
+
+The cost is time. The scalar tiles evaluate each dS element's S and dP as dots on one thread, once per chunk in workgroup memory, which is more work than reading them back. `cargo run --release -p tang-bench [--features metal] --example attention_backward` times the whole program: d = 64, mean of 20 launches after warm-up, best of 3. "Materialized" is `to_wgsl_with(…, false)` / `to_msl_with(…, false)`, the schedule before this change. Each cell gives ms, with the number of n×n buffers in parentheses.
+
+**Apple M4 Max**, 2026-11-06 09:00 EST. Load average 18.9, from other sessions' builds; the GPU was otherwise idle.
+
+| preset | n | wgpu (Metal) before | after | MSL before | after |
+|---|---|---|---|---|---|
+| causal | 512 | 0.651 (2) | 1.848 (0) | 0.462 (2) | 0.644 (0) |
+| bidirectional | 512 | 0.622 (2) | 1.840 (0) | 0.357 (2) | 0.519 (0) |
+| causal | 1024 | 1.624 (2) | 3.886 (0) | 1.102 (2) | 1.420 (0) |
+| bidirectional | 1024 | 1.571 (2) | 3.863 (0) | 0.923 (2) | 1.180 (0) |
+| causal | 2048 | 5.430 (2) | 11.839 (0) | 3.014 (2) | 4.560 (0) |
+| bidirectional | 2048 | 5.174 (2) | 11.635 (0) | 2.607 (2) | 4.099 (0) |
+| causal | 4096 | 19.634 (2) | 36.831 (0) | 10.506 (2) | 14.916 (0) |
+| bidirectional | 4096 | 20.112 (2) | 37.894 (0) | 9.561 (2) | 14.113 (0) |
+
+**RTX 3090** (`mew`, Vulkan through wgpu), 2026-11-06 14:00 UTC. The machine is shared: load average 18.8, 29 users, about 16.5 GB of VRAM held by other processes. GPU utilization was 1% at the start of the run and 100% at the end, from another tenant. An earlier run on the same build gave the same ratios (0.23–0.25× at n ≤ 1024).
+
+| preset | n | before | after |
+|---|---|---|---|
+| causal | 512 | 0.629 (2) | 2.837 (0) |
+| bidirectional | 512 | 0.609 (2) | 2.678 (0) |
+| causal | 1024 | 1.281 (2) | 5.136 (0) |
+| bidirectional | 1024 | 1.326 (2) | 5.244 (0) |
+| causal | 2048 | 3.360 (2) | 12.396 (0) |
+| bidirectional | 2048 | 3.350 (2) | 12.621 (0) |
+| causal | 4096 | 9.765 (2) | 35.957 (0) |
+| bidirectional | 4096 | 9.868 (2) | 36.158 (0) |
+
+Per kernel on the M4 (MSL, causal, n = 1024, before → after): dQ 0.13 → 0.37 ms, dK 0.13 → 0.35 ms, dV 0.22 → 0.25 ms. The forward tile goes from 0.55 to 0.93 ms because it now recomputes S, and the S and dP kernels (0.04 ms each) are gone.
+
+Three things were tried and dropped:
+- Keeping the 4-row × 64-lane tile: dQ/dK at 0.36 ms. A chunk had 128 dS elements across 256 threads.
+- Staging the dots' K/V rows in workgroup memory per chunk: 1.9 ms vs 1.4 ms (MSL) and 45 vs 36 ms (3090, n = 4096). It adds a barrier, and the 16 KiB budget halves the chunk.
+- Larger 4×4 and 4×2 register tiles: 2.3–2.6 ms.
+
+Matching the materialized time needs the nested dots register-blocked (k-chunked) as a small GEMM, as `cuda_mma_kernel` does on `mma`, or on simdgroup matrices on Metal.
+
 ## MoE through gather views (M4 Max and RTX 3090, kernel-only)
 
 **Date:** 2026-11-06. **Branch:** `claude/focused-elgamal-3af3c7` (gather views, `docs/tensor-ir.md`
