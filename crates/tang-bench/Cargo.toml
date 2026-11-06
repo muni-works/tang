@@ -108,3 +108,7 @@ required-features = ["metal"]
 [[example]]
 name = "conv_frag"
 required-features = ["metal"]
+
+[[example]]
+name = "cuda_half_matmul"
+required-features = ["cuda"]
