@@ -184,19 +184,31 @@ fn main() {
                 p
             })
             .collect();
+        // paired rounds: every program once per round, scored by its
+        // ratio to the exhaustive pick in that round (drift cancels)
         let mut samples = vec![Vec::new(); progs.len()];
-        for _ in 0..10 {
-            for (i, p) in progs.iter().enumerate() {
-                samples[i].extend(program_samples(&rt, p, 2, 10));
+        let mut ratios = vec![Vec::new(); progs.len()];
+        for _ in 0..12 {
+            let f: Vec<f64> = progs
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let s = program_samples(&rt, p, 2, 10);
+                    let f = Stats::of(&s).fast;
+                    samples[i].extend(s);
+                    f
+                })
+                .collect();
+            for i in 0..progs.len() {
+                ratios[i].push(f[i] / f[0]);
             }
         }
         let st: Vec<Stats> = samples.iter().map(|s| Stats::of(s)).collect();
+        let rel: Vec<f64> = ratios.iter().map(|r| Stats::of(r).median).collect();
         // gap to the fastest program measured here: the exhaustive pick
         // or, where it lost the re-timing, the best rerun pick
-        let best = st[0]
-            .fast
-            .min(st[2..].iter().map(|s| s.fast).fold(f64::INFINITY, f64::min));
-        let gaps: Vec<f64> = st[2..].iter().map(|s| s.fast / best - 1.0).collect();
+        let best = rel[2..].iter().cloned().fold(1.0, f64::min);
+        let gaps: Vec<f64> = rel[2..].iter().map(|r| r / best - 1.0).collect();
         let worst = gaps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         println!(
             "| {name} | {} | {timed_ex} | {timed_model} | {} | {:+.1}% (exh. {:.3} ms ±{:.1}%) | {:.3} → {:.3} ms |",
@@ -205,8 +217,8 @@ fn main() {
             worst * 100.0,
             st[0].fast,
             st[0].noise * 100.0,
-            st[1].fast,
-            st[2].fast,
+            st[0].fast * rel[1],
+            st[0].fast * rel[2],
         );
         if !stable {
             for (r, p) in picks.iter().enumerate() {

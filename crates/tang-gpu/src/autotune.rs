@@ -4,7 +4,7 @@
 //!   Metal and Vulkan), CUDA events or OpenCL profiling events
 //!   ([`Program::kernel_samples`]), never host wall clock where the
 //!   backend has a GPU timer. Each candidate gets warm-up launches, then
-//!   `samples` timed ones; the 20th percentile is its time (a shared GPU
+//!   `samples` timed ones; the 5th percentile is its time (a shared GPU
 //!   only ever adds time), the MAD its noise.
 //! - **Playoffs, not single shots.** Candidates within `playoff` of the
 //!   best screening time are re-timed interleaved (round-robin, so thermal
@@ -78,7 +78,7 @@ impl Default for TuneOptions {
             max_samples: 60,
             noise: 0.05,
             playoff: 0.15,
-            tie: 0.04,
+            tie: 0.05,
             model: None,
             keep: 6,
             keep_frac: 0.25,
@@ -101,9 +101,10 @@ pub fn default_dir() -> Option<PathBuf> {
 /// A sample set's summary.
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
-    /// 20th percentile: the decision statistic. A shared GPU (another
-    /// process, the compositor) only ever adds time, so a low quantile
-    /// is what the kernel costs; the median drifts with contention.
+    /// 5th percentile: the decision statistic. A shared GPU (another
+    /// process time-slicing in, the compositor) only ever adds time to a
+    /// pass, so the low tail is what the kernel costs; the median moves
+    /// with whoever else is running.
     pub fast: f64,
     pub median: f64,
     pub min: f64,
@@ -120,7 +121,7 @@ impl Stats {
         let mut dev: Vec<f64> = s.iter().map(|x| (x - median).abs()).collect();
         dev.sort_by(f64::total_cmp);
         Self {
-            fast: s[(s.len() - 1) / 5],
+            fast: s[(s.len() - 1) / 20],
             median,
             min: s[0],
             noise: 1.4826 * med(&dev) / median.max(1e-12),
@@ -136,6 +137,21 @@ fn med(s: &[f64]) -> f64 {
     } else {
         0.5 * (s[n / 2 - 1] + s[n / 2])
     }
+}
+
+/// Paired playoff rounds, at least.
+const PLAYOFF_ROUNDS: usize = 7;
+
+fn quantile(v: &[f64], q: f64) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    s[((s.len() - 1) as f64 * q).round() as usize]
+}
+
+/// Interquartile range over the median: how much a ratio moves round to
+/// round.
+fn spread(v: &[f64]) -> f64 {
+    (quantile(v, 0.75) - quantile(v, 0.25)) / quantile(v, 0.5)
 }
 
 /// One candidate's fate.
@@ -154,7 +170,7 @@ pub struct KernelTune {
     /// Cache key: device + neutral-schedule kernel source.
     pub key: u64,
     pub picked: Candidate,
-    /// Time of the picked candidate (its playoff 20th percentile), ms.
+    /// Time of the picked candidate (its playoff 5th percentile), ms.
     pub ms: f64,
     /// Time of the node's schedule before tuning, ms.
     pub base_ms: f64,
@@ -176,6 +192,17 @@ pub const WARM_MS: f64 = 20.0;
 /// Minimum GPU time the kept samples span, ms.
 pub const SPAN_MS: f64 = 10.0;
 
+/// Samples with the zeros dropped: a Metal pass too short for the
+/// counter's resolution reads begin = end. All zero: one `INFINITY`, so
+/// an unmeasurable candidate never wins.
+fn positive(mut v: Vec<f64>) -> Vec<f64> {
+    v.retain(|&x| x > 0.0);
+    if v.is_empty() {
+        v.push(f64::INFINITY);
+    }
+    v
+}
+
 /// Probe the per-launch time, then time with warm-up and sample counts
 /// scaled to [`WARM_MS`] / [`SPAN_MS`].
 fn budgeted(
@@ -183,7 +210,9 @@ fn budgeted(
     warmup: usize,
     n: usize,
 ) -> Option<Vec<f64>> {
-    let probe = Stats::of(&f(warmup.max(1), 3)?).median.max(1e-4);
+    let probe = Stats::of(&positive(f(warmup.max(1), 3)?))
+        .median
+        .clamp(1e-4, 1e3);
     let w = ((WARM_MS / probe).ceil() as usize).clamp(warmup, 4000);
     let m = ((SPAN_MS / probe).ceil() as usize).clamp(n, 1000);
     f(w, m)
@@ -204,7 +233,7 @@ pub fn kernel_samples(
     n: usize,
 ) -> (Vec<f64>, bool) {
     if let Some(v) = budgeted(|w, m| p.kernel_samples(rt, k, w, m), warmup, n) {
-        return (v, false);
+        return (positive(v), false);
     }
     for _ in 0..warmup {
         p.run_kernel(rt, k);
@@ -224,7 +253,7 @@ pub fn kernel_samples(
 /// GPU-clock samples of whole runs of `p` (host clock as a fallback).
 pub fn program_samples(rt: &Runtime, p: &Program, warmup: usize, n: usize) -> Vec<f64> {
     if let Some(v) = budgeted(|w, m| p.program_samples(rt, w, m), warmup, n) {
-        return v;
+        return positive(v);
     }
     for _ in 0..warmup {
         p.run(rt);
@@ -241,7 +270,7 @@ pub fn program_samples(rt: &Runtime, p: &Program, warmup: usize, n: usize) -> Ve
 }
 
 /// Pick the fastest of several whole graphs (algebra choices: fused vs
-/// unfused, materialized vs recomputed) by interleaved GPU-clock 20th percentiles
+/// unfused, materialized vs recomputed) by interleaved GPU-clock 5th percentiles
 /// of whole runs; ties within `tie` go to the earliest. Returns the index
 /// and each graph's stats (`None`: failed to lower or run).
 pub fn pick_graph(
@@ -623,61 +652,120 @@ fn tune_kernel(
     });
     contenders.truncate(8);
     contenders.sort();
+    // Paired rounds: every round times each contender once, back to
+    // back, and scores it by its ratio to that round's fastest. Drift
+    // between rounds (clocks, other tenants) cancels; a contender's score
+    // is its median ratio, its noise the spread of its ratios.
+    let mut ratios: HashMap<usize, Vec<f64>> = HashMap::new();
     let mut pool: HashMap<usize, Vec<f64>> = HashMap::new();
-    if contenders.len() > 1 {
-        let progs: Vec<(usize, Program, usize)> = contenders
+    let progs: Vec<(usize, Program, usize)> = if contenders.len() > 1 {
+        contenders
             .iter()
             .filter_map(|&i| {
                 let v = &live.iter().find(|(j, _)| *j == i)?.1;
                 build(v).map(|(p, k)| (i, p, k))
             })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let per = (opts.samples / 2).max(3);
+    let mut round = |ratios: &mut HashMap<usize, Vec<f64>>| {
+        let fasts: Vec<(usize, f64)> = progs
+            .iter()
+            .map(|(i, p, k)| {
+                let s = kernel_samples(rt, p, *k, 2, per).0;
+                let f = Stats::of(&s).fast;
+                pool.entry(*i).or_default().extend(s);
+                (*i, f)
+            })
             .collect();
-        let rounds = 4;
-        let per = (opts.samples / 2).max(3);
-        for _ in 0..rounds {
-            for (i, p, k) in &progs {
-                pool.entry(*i)
-                    .or_default()
-                    .extend(kernel_samples(rt, p, *k, 2, per).0);
-            }
+        let b = fasts.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+        for (i, f) in fasts {
+            ratios.entry(i).or_default().push(f / b);
         }
-        // noisy contenders get more, up to max_samples
-        for (i, p, k) in &progs {
-            let s = pool.get_mut(i).unwrap();
-            while Stats::of(s).noise > opts.noise && s.len() < opts.max_samples {
-                s.extend(kernel_samples(rt, p, *k, 1, per).0);
+    };
+    if progs.len() > 1 {
+        let max_rounds = (opts.max_samples / per).max(PLAYOFF_ROUNDS);
+        for r in 1..=max_rounds {
+            round(&mut ratios);
+            // more rounds while the leaders' order is unclear
+            if r >= PLAYOFF_ROUNDS && ratios.values().all(|r| spread(r) <= opts.noise) {
+                break;
             }
-        }
-        for (i, s) in &pool {
-            measured[*i].stats = Some(Stats::of(s));
         }
     }
-    let stat = |i: usize| measured[i].stats.unwrap();
-    let clean: Vec<usize> = contenders
-        .iter()
-        .copied()
-        .filter(|&i| stat(i).noise <= opts.noise)
-        .collect();
-    let fastest = contenders
-        .iter()
-        .copied()
-        .min_by(|a, b| stat(*a).fast.total_cmp(&stat(*b).fast))
-        .unwrap();
-    let pool_from = if clean.is_empty() {
-        contenders.clone()
-    } else {
-        clean
+    // (pick, rejected_noisy, near misses: earlier candidates just outside
+    // the tie band, whose verdict a few more rounds could flip)
+    let decide = |ratios: &HashMap<usize, Vec<f64>>| -> (usize, bool, bool) {
+        let score = |i: usize| ratios.get(&i).map_or(1.0, |r| quantile(r, 0.5));
+        // noisy = an outlier among the contenders: on a shared GPU every
+        // ratio moves; one that moves far more than the rest is not trusted
+        let typical = {
+            let v: Vec<f64> = ratios.values().map(|r| spread(r)).collect();
+            if v.is_empty() {
+                0.0
+            } else {
+                quantile(&v, 0.5)
+            }
+        };
+        let noisy = |i: usize| {
+            ratios
+                .get(&i)
+                .is_some_and(|r| spread(r) > opts.noise.max(2.0 * typical))
+        };
+        let clean: Vec<usize> = contenders.iter().copied().filter(|&i| !noisy(i)).collect();
+        let fastest = contenders
+            .iter()
+            .copied()
+            .min_by(|a, b| score(*a).total_cmp(&score(*b)))
+            .unwrap();
+        let pool_from = if clean.is_empty() {
+            contenders.clone()
+        } else {
+            clean
+        };
+        let leader = *pool_from
+            .iter()
+            .min_by(|a, b| score(**a).total_cmp(&score(**b)))
+            .unwrap();
+        let best = score(leader);
+        // Equivalent: within `tie`, or within what the playoff can
+        // resolve (2 standard errors of the leader's median ratio, at
+        // most 8%). The earliest in the space's order wins, so a rerun
+        // that sees the same near-tie in another order picks the same.
+        let se = ratios.get(&leader).map_or(0.0, |r| {
+            // median's standard error from the IQR (σ ≈ IQR/1.35)
+            1.25 * spread(r) / 1.35 / (r.len() as f64).sqrt()
+        });
+        let tie = opts.tie.max((2.0 * se).min(0.08));
+        let pick = *pool_from
+            .iter()
+            .filter(|&&i| score(i) <= best * (1.0 + tie))
+            .min()
+            .unwrap();
+        let near = pool_from
+            .iter()
+            .any(|&i| i < pick && score(i) <= best * (1.0 + 2.0 * tie));
+        (pick, !pool_from.contains(&fastest), near)
     };
-    let rejected_noisy = !pool_from.contains(&fastest);
-    let best = pool_from
-        .iter()
-        .map(|&i| stat(i).fast)
-        .fold(f64::INFINITY, f64::min);
-    let pick = *pool_from
-        .iter()
-        .filter(|&&i| stat(i).fast <= best * (1.0 + opts.tie))
-        .min()
-        .unwrap();
+    let (mut pick, mut rejected_noisy, mut near) = decide(&ratios);
+    // settle near misses with more rounds (twice at most)
+    for _ in 0..2 {
+        if !near {
+            break;
+        }
+        for _ in 0..PLAYOFF_ROUNDS {
+            round(&mut ratios);
+        }
+        (pick, rejected_noisy, near) = decide(&ratios);
+    }
+    drop(round);
+    for (i, s) in &pool {
+        measured[*i].stats = Some(Stats::of(s));
+    }
+    let score = |i: usize| ratios.get(&i).map_or(1.0, |r| quantile(r, 0.5));
+    let stat = |i: usize| measured[i].stats.unwrap();
     let picked = measured[pick].candidate.clone();
     space.apply(g, node, &picked);
     // remember
@@ -699,6 +787,19 @@ fn tune_kernel(
     store.log(opts.group, key, &rows);
     store.put(key, &picked.encode(space), stat(pick).fast);
     if opts.verbose {
+        for &i in &contenders {
+            let st = stat(i);
+            eprintln!(
+                "  #{i:<4} {:<44} score {:.3} ±{:.1}% fast {:.4} med {:.4} noise {:.1}% n {}",
+                measured[i].candidate.encode(space),
+                score(i),
+                ratios.get(&i).map_or(0.0, |r| spread(r) * 100.0),
+                st.fast,
+                st.median,
+                st.noise * 100.0,
+                st.n
+            );
+        }
         eprintln!(
             "autotune node {} : {} distinct of {}, timed {}, picked {} {:.4} ms (base {:.4}){}",
             node.index(),
@@ -734,6 +835,32 @@ fn tune_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_round_trips() {
+        let dir = std::env::temp_dir().join(format!("tang-tune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut st = TuneStore::open(Some(&dir), "Some GPU (Metal)");
+            st.put(0xabc, "split=0;tile=16,16,32", 0.5);
+            st.log(7, 0xabc, &[(-0.25, vec![1.0, 2.0]), (0.1, vec![3.0, 4.0])]);
+        }
+        let st = TuneStore::open(Some(&dir), "Some GPU (Metal)");
+        assert_eq!(st.get(0xabc), Some("split=0;tile=16,16,32"));
+        assert_eq!(TuneStore::open(Some(&dir), "Other GPU").get(0xabc), None);
+        let s = st.samples();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].group, 7);
+        assert!((s[0].target + 0.25).abs() < 1e-6);
+        assert_eq!(s[1].features, vec![3.0, 4.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_samples_never_win() {
+        assert_eq!(positive(vec![0.0, 0.0]), vec![f64::INFINITY]);
+        assert_eq!(positive(vec![0.0, 2.0]), vec![2.0]);
+    }
 
     #[test]
     fn stats_are_robust() {
