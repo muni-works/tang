@@ -233,6 +233,21 @@ impl TensorGraph {
         with_caps(caps, || self.to_program(outputs, Target::MslMma))
     }
 
+    /// [`to_wgsl_caps`](Self::to_wgsl_caps) for a wgpu device with MSL
+    /// passthrough: nodes scheduled `fragment` with a simdgroup-matrix
+    /// plan run their native Metal kernel; everything else stays WGSL
+    /// (unlike [`to_msl_mma_caps`](Self::to_msl_mma_caps), which also
+    /// moves f32 tiles to MSL).
+    pub fn to_wgsl_fragments(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || {
+            let mut g = self.clone();
+            g.schedule_nested_contractions_scalar(outputs);
+            let mut p = g.to_program_numbered(outputs, Target::Wgsl);
+            g.splice_fragment_kernels(outputs, &mut p);
+            p.canonical()
+        })
+    }
+
     /// [`to_wgsl`](Self::to_wgsl) with short contractions nested in the
     /// tiles that read them
     /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions))

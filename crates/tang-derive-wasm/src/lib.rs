@@ -424,17 +424,12 @@ pub fn naive_graph(
     Ok((g, grads))
 }
 
-/// tang's pass pipeline, as the training examples run it.
+/// tang's pass pipeline, as the training examples run it: the
+/// FlashAttention-2 point of the memory-placement axis
+/// ([`MemorySchedule::flash`](tang_compile::tensor::MemorySchedule::flash)).
 pub fn derive_graph(g: &TensorGraph, outs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
-    let (g, outs) = g.stabilize_softmax(outs);
-    let (g, outs) = g.substitute_maps(&outs);
-    let (g, outs) = g.eliminate_common(&outs);
-    let (g, outs) = g.merge_siblings(&outs);
-    let (g, outs) = g.relayout(&outs);
-    let (g, outs) = g.merge_reduce_dims(&outs);
-    let (mut g, outs) = g.split_reduce_dims(&outs);
-    g.schedule_auto(&outs);
-    (g, outs)
+    let p = g.place(outs, &tang_compile::tensor::MemorySchedule::flash());
+    (p.graph, p.outputs)
 }
 
 /// The naive graph run as written: every comprehension materialized, one thread per point.
