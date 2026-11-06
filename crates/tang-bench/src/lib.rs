@@ -1251,6 +1251,7 @@ pub mod ir_gpu {
                             Precision {
                                 storage: Format::F16,
                                 accum: Format::F32,
+                                operand: Format::F32,
                             },
                         );
                     }
