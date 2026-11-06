@@ -200,6 +200,34 @@ impl Step {
         let t = Instant::now();
         let mut prog = Program::with_shared(rt, program, &refs, &plan, &shared);
         drop(words);
+        // TANG_MEGA=1: the decode step as one persistent kernel
+        // (TANG_MEGA_THREADS per block, TANG_MEGA_PER_SM blocks per SM,
+        // stages of at most TANG_MEGA_DUP blocks replicated per block,
+        // TANG_MEGA_MINB min blocks per SM, TANG_MEGA_MAX_BLOCKS: only kernels
+        // of at most that many blocks fuse (runs between the big ones), TANG_MEGA_PREFETCH KiB of weights
+        // prefetched into L2 at each barrier)
+        #[cfg(feature = "cuda")]
+        if seq == 1 && rt.kind() == BackendKind::Cuda && env("TANG_MEGA") == 1 {
+            let tm = Instant::now();
+            let (launches, phases, grid) = prog.megakernel(
+                rt,
+                &tang_compile::tensor::cuda_mega::MegaOpts {
+                    threads: env("TANG_MEGA_THREADS") as u32,
+                    dup: env("TANG_MEGA_DUP") as u32,
+                    min_blocks: env("TANG_MEGA_MINB") as u32,
+                    prefetch: env("TANG_MEGA_PREFETCH") << 10,
+                    slot_bytes: Vec::new(),
+                    trace: env("TANG_MEGA_TRACE") == 1,
+                },
+                env("TANG_MEGA_PER_SM") as u32,
+                env("TANG_MEGA_MAX_BLOCKS") as u32,
+            );
+            eprintln!(
+                "megakernel: {} kernels as {launches} launches, {phases} phases, grid {grid}, built in {:.1}s",
+                prog.program.kernels.len(),
+                tm.elapsed().as_secs_f64()
+            );
+        }
         prog.capture(rt);
         eprintln!(
             "step seq {seq} (window {kctx}): {} kernels ({} native), lowered in {lowered:.2}s, \
