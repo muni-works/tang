@@ -6210,6 +6210,7 @@ dependencies = [
  "tang",
  "tang-ad",
  "tang-compile",
+ "tang-derive-wasm",
  "tang-expr",
  "tang-gpu",
  "tang-infer",
@@ -6225,6 +6226,7 @@ name = "tang-compile"
 version = "0.1.0"
 dependencies = [
  "half",
+ "naga",
  "tang",
  "tang-expr",
 ]

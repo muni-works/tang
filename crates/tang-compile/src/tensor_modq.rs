@@ -363,6 +363,7 @@ impl ModGraph {
                 })
                 .collect(),
             guard: false,
+            gather: None,
         }
     }
 

@@ -300,6 +300,7 @@ struct CompRegion {
     uses_py: bool,
 }
 
+#[derive(Clone)]
 enum Val {
     Expr(String),
     Arr(String),
@@ -341,6 +342,11 @@ struct Ctx<'a> {
     comp_regions: Vec<CompRegion>,
     /// inside a cooperative load loop: every read goes straight to its buffer
     in_load: bool,
+    /// inside a cooperative load: comps already expanded in this load
+    /// loop, by `(node, coords)` — the loads of several shared comps run
+    /// in one loop and evaluate a common producer (flash backward's
+    /// S = Q·Kᵀ under both P̃ and dS) once
+    load_memo: Vec<(usize, Vec<Sym>, Val)>,
     /// first pass collects regions, second emits against them
     collect: bool,
     /// node whose value is already in a named array (an epilogue's
@@ -577,7 +583,30 @@ impl Ctx<'_> {
                     slot.wgsl()
                 ))
             }
-            Op::Comp(c) => {
+            Op::Comp(_) if self.in_load && !self.collect => {
+                if let Some((_, _, v)) = self
+                    .load_memo
+                    .iter()
+                    .find(|(m, cs, _)| *m == j && cs.as_slice() == coords)
+                {
+                    return v.clone();
+                }
+                let v = self.expand_comp(out, j, coords);
+                self.load_memo.push((j, coords.to_vec(), v.clone()));
+                v
+            }
+            Op::Comp(_) => self.expand_comp(out, j, coords),
+        }
+    }
+
+    /// An inlined comp evaluated at `coords`: its body, and its reduction
+    /// as a loop.
+    fn expand_comp(&mut self, out: &mut String, j: usize, coords: &[Sym]) -> Val {
+        let Op::Comp(c) = &self.g.nodes[j].op else {
+            unreachable!()
+        };
+        {
+            {
                 let k = c.points().len();
                 let n = self.fresh();
                 let w = c.width();
@@ -872,6 +901,7 @@ impl TensorGraph {
             hoists: Vec::new(),
             comp_regions: Vec::new(),
             in_load: false,
+            load_memo: Vec::new(),
             collect: true,
             subst: None,
             guard: None,
@@ -1027,9 +1057,14 @@ impl TensorGraph {
         }
         // Cooperative loads for shared comps are expanded in the load
         // phase with r0 := chunk + t and py := tile_y*by + ly.
+        // Regions with the same row count load in one loop, sharing the
+        // producers they have in common (`Ctx::load_memo`); a lane-split
+        // region (below) gets a loop of its own.
         // (rows, load code, lanes per staged value, fold of the lanes)
         let mut comp_loads: Vec<(usize, String, usize, String)> = Vec::new();
-        for i in 0..ctx.comp_regions.len() {
+        let mut order: Vec<usize> = (0..ctx.comp_regions.len()).collect();
+        order.sort_by_key(|&i| !ctx.comp_regions[i].uses_py);
+        for i in order {
             let r = &ctx.comp_regions[i];
             let rows = if r.uses_py { py_n } else { 1 };
             writeln!(
@@ -1077,6 +1112,13 @@ impl TensorGraph {
                 }
                 l
             });
+            let joins = lanes == 1
+                && comp_loads
+                    .last()
+                    .is_some_and(|(r, _, l, _)| *l == 1 && *r == rows);
+            if !joins {
+                ctx.load_memo.clear();
+            }
             let mut code = String::new();
             ctx.in_load = true;
             ctx.load_lanes = (lanes > 1).then_some((node, lanes));
@@ -1143,8 +1185,12 @@ impl TensorGraph {
                     .unwrap();
                 }
             }
-            comp_loads.push((rows, code, lanes, fold));
+            match comp_loads.last_mut() {
+                Some((r, c, 1, _)) if lanes == 1 && *r == rows => c.push_str(&code),
+                _ => comp_loads.push((rows, code, lanes, fold)),
+            }
         }
+        ctx.load_memo.clear();
 
         writeln!(s, "@compute @workgroup_size({threads})").unwrap();
         writeln!(
