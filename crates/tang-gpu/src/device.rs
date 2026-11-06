@@ -43,6 +43,9 @@ pub struct GpuDevice {
     /// WGSL kernels may use `f64` (wgpu `SHADER_F64`: Vulkan and DX12 on
     /// most desktop GPUs; not Metal).
     pub shader_f64: bool,
+    /// Compute passes can write GPU timestamps (wgpu `TIMESTAMP_QUERY`):
+    /// kernel times from the GPU's clock instead of the host's.
+    pub timestamps: bool,
 }
 
 impl GpuDevice {
@@ -82,7 +85,8 @@ impl GpuDevice {
         let required_features = adapter.features()
             & (wgpu::Features::MSL_SHADER_PASSTHROUGH
                 | wgpu::Features::SPIRV_SHADER_PASSTHROUGH
-                | wgpu::Features::SHADER_F64);
+                | wgpu::Features::SHADER_F64
+                | wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tang-gpu"),
@@ -105,6 +109,7 @@ impl GpuDevice {
             msl_passthrough,
             spirv_passthrough,
             shader_f64: required_features.contains(wgpu::Features::SHADER_F64),
+            timestamps: required_features.contains(wgpu::Features::TIMESTAMP_QUERY),
         })
     }
 

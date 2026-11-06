@@ -69,6 +69,9 @@ pub mod opencl;
 pub mod opencl_gemv;
 #[path = "tensor_precision.rs"]
 pub mod precision;
+/// The declarative schedule search space and the autotuner's cost model.
+#[path = "tensor_space.rs"]
+pub mod space;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
