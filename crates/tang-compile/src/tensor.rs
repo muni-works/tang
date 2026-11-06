@@ -3034,7 +3034,6 @@ impl TensorGraph {
                 }
             }
             let key = format!("shared {members:?}");
-            if std::env::var("TANG_DEBUG_MERGE").is_ok() { eprintln!("merge {key}"); }
             order.push(key.clone());
             groups.insert(key, members);
         }
