@@ -24,6 +24,7 @@ use super::{TensorGraph, TensorId};
 #[path = "tensor_cuda_fp8.rs"]
 mod fp8;
 pub use fp8::SM90_FP8_SHAPES;
+use fp8::{Fp8FlashCtx, FP8_FLASH_PRELUDE};
 
 /// A tensor-core tile's block shape: a `bm × bn` output block per thread
 /// block of `warps_m × warps_n` warps (each a `bm/warps_m × bn/warps_n`
@@ -239,6 +240,25 @@ pub const SM90_FLASH_SHAPES: [FlashShape; 4] = [
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
 /// m16n8k8, and `cp.async` (zero-filling when the source is out of range).
+/// Hopper FP8 flash shapes (128 keys per step: one 128-byte row of Vᵀ
+/// and of P per row).
+pub const SM90_FP8_FLASH_SHAPES: [FlashShape; 4] = {
+    const fn sh(consumers: usize, stages: usize) -> FlashShape {
+        FlashShape {
+            bi: 0,
+            bj: 128,
+            stages,
+            kw: 1,
+            sm90: Some(Sm90Flash {
+                consumers,
+                producer_regs: 40,
+                consumer_regs: 232,
+            }),
+        }
+    }
+    [sh(2, 2), sh(2, 3), sh(2, 4), sh(1, 4)]
+};
+
 const MMA_PRELUDE: &str = r#"static __device__ __forceinline__ unsigned tang_tf32(float x) {
     // round to nearest, ties away (cvt.rna): the mma reads only the top
     // 19 bits, so adding half a TF32 ulp is the whole conversion
@@ -1959,14 +1979,21 @@ impl TensorGraph {
             let fp8 = reads.iter().any(|&j| self.nodes[j].precision.storage.is_fp8());
             let native = match variant {
                 _ if fp8 => {
-                    let sh = SM90_FP8_SHAPES[variant.unwrap_or(0) % SM90_FP8_SHAPES.len()];
+                    let v = variant.unwrap_or(0);
+                    let sh = SM90_FP8_SHAPES[v % SM90_FP8_SHAPES.len()];
+                    let fs = SM90_FP8_FLASH_SHAPES[v % SM90_FP8_FLASH_SHAPES.len()];
                     Some(
                         self.cuda_fp8_kernel_shaped(root, &reads, sh)
                             .or_else(|| self.cuda_fp8_kernel_shaped(root, &reads, SM90_FP8_SHAPES[0]))
+                            .or_else(|| self.cuda_flash_kernel_shaped(root, &reads, fs))
+                            .or_else(|| {
+                                self.cuda_flash_kernel_shaped(root, &reads, SM90_FP8_FLASH_SHAPES[0])
+                            })
                             .unwrap_or_else(|| {
                                 panic!(
                                     "kernel {root} reads FP8 storage but is not an FP8 tile \
-                                     (a contraction of two FP8 operands contiguous along k)"
+                                     (a contraction of two FP8 operands contiguous along k, \
+                                     or attention with FP8 Q, K, Vᵀ and an E4M3 operand format)"
                                 )
                             }),
                     )
@@ -2783,21 +2810,21 @@ impl TensorGraph {
             return None;
         }
         let fmt = |j: usize| self.nodes[j].precision.storage;
-        // fp8 operands have their own tile (tensor_cuda_fp8)
-        if reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
-            return None;
-        }
         let ld = |j: usize, idx: &str| -> String {
             match fmt(j) {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
-                _ => unreachable!("fp8 has its own tile"),
+                // FP8 operands are staged by the tile; a stray scalar read
+                // fails to compile
+                _ => format!("tang_fp8_scalar_read(b{j}[{idx}])"),
             }
         };
         let elem = |f: super::Format| {
             if f == super::Format::F32 {
                 "float"
+            } else if f.is_fp8() {
+                "unsigned char"
             } else {
                 "unsigned short"
             }
@@ -2823,6 +2850,10 @@ impl TensorGraph {
             Err(_) => sh,
         };
         let hop = sh.sm90;
+        // FP8 operands: the Hopper schedule only
+        if hop.is_none() && reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
+            return None;
+        }
         let (bj, kw) = (sh.bj, if hop.is_some() { 1 } else { sh.kw });
         // keys per pipeline step, over all warp groups
         let bjs = bj * kw;
@@ -2899,7 +2930,14 @@ impl TensorGraph {
         if let Some((vb, _)) = &plain_v {
             plain.push(fmt(*vb));
         }
+        // FP8 Q, K and V (each with its own block scales): the Hopper
+        // FP8 schedule below
+        let fp8 = !plain.is_empty() && plain.iter().all(|f| f.is_fp8());
+        if !fp8 && plain.iter().any(|f| f.is_fp8()) {
+            return None;
+        }
         let half = match plain.first() {
+            _ if fp8 => None,
             None => None,
             Some(&g) if plain.iter().any(|&x| x != g) => return None,
             Some(&super::Format::F32) => None,
@@ -2939,8 +2977,13 @@ impl TensorGraph {
         if hop.is_none() && smem_bytes > 99 * 1024 {
             return None;
         }
+        let fp8_plan = match hop {
+            Some(h) if fp8 => Some(self.fp8_flash_plan(&f, rc, plain_v.as_ref()?, h, bj, kd, d, sh.stages)?),
+            _ => None,
+        };
         let smem_bytes = match hop {
             None => smem_bytes,
+            Some(_) if fp8 => fp8_plan.as_ref()?.smem,
             Some(h) => {
                 // Q, the K/V ring, the mbarriers; 1024 bytes of alignment slack
                 let ok = half.is_some()
@@ -3083,6 +3126,7 @@ impl TensorGraph {
 
         let mut s = String::new();
         let kind = match half {
+            _ if fp8 => "FP8",
             None => "TF32",
             Some(super::Format::BF16) => "BF16",
             Some(_) => "F16",
@@ -3106,6 +3150,12 @@ impl TensorGraph {
         s.push_str(MMA_PRELUDE);
         if typed {
             s.push_str(HALF_PRELUDE);
+        }
+        if let Some(pl) = &fp8_plan {
+            s.push_str(SM90_PRELUDE);
+            s.push_str(&fp8::wgmma_fp8_named("tang_wgs", fp8::ptx_ty(pl.fq), fp8::ptx_ty(pl.fk), bj));
+            s.push_str(&fp8::wgmma_fp8_named("tang_wgo", "e4m3", fp8::ptx_ty(pl.fv), d));
+            s.push_str(FP8_FLASH_PRELUDE);
         }
         if let Some(hf) = half {
             s.push_str(&mma16_prelude(hf));
@@ -3198,7 +3248,29 @@ impl TensorGraph {
 
         let nsf = bj / 8;
         let nof = d / 8;
-        if let Some(h) = hop {
+        if let (Some(h), Some(pl)) = (hop, &fp8_plan) {
+            self.fp8_flash_body(
+                &mut s,
+                &f,
+                rc,
+                pl,
+                h,
+                Fp8FlashCtx {
+                    bj,
+                    d,
+                    stages: sh.stages,
+                    threads: T,
+                    nsf,
+                    nof,
+                },
+                &row_coords,
+                &arg_value,
+                &emit_body,
+                &coord,
+                &score_coord,
+                &addr_expr,
+            );
+        } else if let Some(h) = hop {
             // Hopper: one producer warpgroup stages Q, K and V with 16-byte
             // `cp.async` into 128-byte-swizzled tiles and signals a ring of
             // mbarriers; `h.consumers` warpgroups of 64 rows each run

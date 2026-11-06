@@ -89,7 +89,7 @@ fn main() {
             } else {
                 Format::F32
             };
-            g.set_precision(c, Precision { storage: out_f, accum });
+            g.set_precision(c, Precision { storage: out_f, accum, operand: Format::F32 });
             (g, a, b, c)
         };
         let (g, a, b, c) = build(fp8);

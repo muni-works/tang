@@ -1429,6 +1429,7 @@ mod tests {
             let full = Precision {
                 storage: f,
                 accum: f,
+                operand: Format::F32,
             };
             for t in [a, b] {
                 g.set_precision(t, Precision::storage(f));

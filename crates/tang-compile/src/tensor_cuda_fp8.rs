@@ -45,7 +45,7 @@ pub const SM90_FP8_SHAPES: [MmaShape; 6] = [
     MmaShape::new(64, 256, 8, 1).with(128, 6, 1).wg(),
 ];
 
-fn ptx_ty(f: Format) -> &'static str {
+pub(super) fn ptx_ty(f: Format) -> &'static str {
     match f {
         Format::E4M3(_) => "e4m3",
         _ => "e5m2",
@@ -55,11 +55,16 @@ fn ptx_ty(f: Format) -> &'static str {
 /// `wgmma` m64n`n`k32 over FP8, A and B from shared-memory descriptors
 /// (both K-major); `acc` false zeroes the accumulator first.
 fn wgmma_fp8(ta: &str, tb: &str, n: usize) -> String {
+    wgmma_fp8_named("tang_wg8", ta, tb, n)
+}
+
+/// [`wgmma_fp8`] under another function name.
+pub(super) fn wgmma_fp8_named(name: &str, ta: &str, tb: &str, n: usize) -> String {
     let regs = n / 2;
     let outs: Vec<String> = (0..regs).map(|i| format!("%{i}")).collect();
     let cons: Vec<String> = (0..regs).map(|i| format!("\"+f\"(d[{i}])")).collect();
     format!(
-        "static __device__ __forceinline__ void tang_wg8(float* d, unsigned long long a, unsigned long long b, int acc) {{\n    asm volatile(\"{{ .reg .pred p; setp.ne.s32 p, %{}, 0; wgmma.mma_async.sync.aligned.m64n{n}k32.f32.{ta}.{tb} {{{}}}, %{}, %{}, p, 1, 1; }}\"\n        : {}\n        : \"l\"(a), \"l\"(b), \"r\"(acc));\n}}\n",
+        "static __device__ __forceinline__ void {name}(float* d, unsigned long long a, unsigned long long b, int acc) {{\n    asm volatile(\"{{ .reg .pred p; setp.ne.s32 p, %{}, 0; wgmma.mma_async.sync.aligned.m64n{n}k32.f32.{ta}.{tb} {{{}}}, %{}, %{}, p, 1, 1; }}\"\n        : {}\n        : \"l\"(a), \"l\"(b), \"r\"(acc));\n}}\n",
         regs + 2,
         outs.join(", "),
         regs,
@@ -499,5 +504,337 @@ impl TensorGraph {
         writeln!(s, "    }}").unwrap();
         writeln!(s, "}}").unwrap();
         Some(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 flash attention (forward) on the Hopper flash schedule
+// ---------------------------------------------------------------------------
+
+/// e4m3 pair packing and unpacking for the softmax weights.
+pub(super) const FP8_FLASH_PRELUDE: &str = r#"static __device__ __forceinline__ unsigned short tang_f2e4x2(float lo, float hi) { unsigned short r; asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo)); return r; }
+static __device__ __forceinline__ float2 tang_e4x2f(unsigned short v) {
+    unsigned h; asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(v));
+    float2 f; asm("{ .reg .f16 a, b; mov.b32 {a, b}, %2; cvt.f32.f16 %0, a; cvt.f32.f16 %1, b; }" : "=f"(f.x), "=f"(f.y) : "r"(h));
+    return f;
+}
+static __device__ __forceinline__ void tang_cp4s(unsigned d, const void* src, bool ok) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(d), "l"(src), "r"(ok ? 4 : 0) : "memory");
+}
+"#;
+
+/// Layout of an FP8 flash tile: formats, block sizes (`None`: one scale
+/// for the tensor), byte offsets of each operand's scales in its buffer,
+/// and the shared-memory map.
+pub(super) struct Fp8FlashPlan {
+    pub fq: Format,
+    pub fk: Format,
+    pub fv: Format,
+    blk: [Option<usize>; 3],
+    scale_off: [usize; 3],
+    bufs: [usize; 3],
+    addrs: [super::super::msl_mma::Addr; 3],
+    qsc_off: usize,
+    p_off: usize,
+    st_off: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+    stage_bytes: usize,
+    bar_off: usize,
+    pub smem: usize,
+}
+
+/// Shape facts the FP8 flash body needs from the schedule.
+pub(super) struct Fp8FlashCtx {
+    pub bj: usize,
+    pub d: usize,
+    pub stages: usize,
+    pub threads: usize,
+    pub nsf: usize,
+    pub nof: usize,
+}
+
+type Addr = super::super::msl_mma::Addr;
+
+impl TensorGraph {
+    /// Whether the flash tile `f` can run on FP8 `wgmma`, and its layout:
+    /// one term, Q and K contiguous along the 128-wide head dim (one
+    /// 128-byte row each), V contiguous along the keys (stored `[d, n]`:
+    /// FP8 `wgmma` reads K-major B only), 128 keys per step, scales per
+    /// row (Q, K: blocks of 128 along the head dim) or per 128 keys (V),
+    /// or per tensor; the reduction's `operand` format E4M3 (the softmax
+    /// weights are rounded to it).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fp8_flash_plan(
+        &self,
+        f: &super::Flash,
+        rc: &super::super::Comp,
+        plain_v: &(usize, Addr),
+        h: super::Sm90Flash,
+        bj: usize,
+        kd: usize,
+        d: usize,
+        stages: usize,
+    ) -> Option<Fp8FlashPlan> {
+        if f.terms.len() != 1 || f.score_buf.is_some() {
+            return None;
+        }
+        if !matches!(self.nodes[f.red_node].precision.operand, Format::E4M3(_)) {
+            return None;
+        }
+        if kd != 128 || bj != 128 || d % 64 != 0 || d > 256 || f.n_keys % 16 != 0 {
+            return None;
+        }
+        let (qb, qa, kb, ka) = &f.terms[0];
+        let (vb, va) = plain_v;
+        let inner = f.score_to_red.len();
+        let jdim = rc.rank() - 1;
+        let fmt = |j: usize| self.nodes[j].precision.storage;
+        let (fq, fk, fv) = (fmt(*qb), fmt(*kb), fmt(*vb));
+        if !(fq.is_fp8() && fk.is_fp8() && fv.is_fp8()) {
+            return None;
+        }
+        // contiguous along `along`, 16-byte aligned rows
+        let rows16 = |a: &Addr, along: usize| {
+            a.coefs[along] == 1
+                && a.offset % 16 == 0
+                && a.coefs.iter().enumerate().all(|(k, &c)| k == along || c % 16 == 0)
+        };
+        if !rows16(qa, inner) || !rows16(ka, inner) || !rows16(va, jdim) {
+            return None;
+        }
+        // a block scale must be constant over the 128 elements a step
+        // reads along the contiguous dim
+        let blk = |j: usize, a: &Addr, along: usize| -> Option<Option<usize>> {
+            let n = numel(&self.nodes[j].shape);
+            let b = fmt(j).block(n)?;
+            if b == n {
+                return Some(None);
+            }
+            let aligned = b % 128 == 0
+                && a.offset % 128 == 0
+                && a.coefs.iter().enumerate().all(|(k, &c)| k == along || c % b as i64 == 0 || c % 128 == 0);
+            aligned.then_some(Some(b))
+        };
+        let bq = blk(*qb, qa, inner)?;
+        let bk = blk(*kb, ka, inner)?;
+        let bv = blk(*vb, va, jdim)?;
+        let bm = 64 * h.consumers;
+        let up = |x: usize| x.next_multiple_of(1024);
+        let q_bytes = bm * 128;
+        let qsc_off = q_bytes;
+        let p_off = up(qsc_off + 4 * bm);
+        let st_off = up(p_off + h.consumers * 64 * bj);
+        let k_bytes = bj * 128;
+        let v_bytes = d * 128;
+        let stage_bytes = up(k_bytes + v_bytes + 4 * (bj + d));
+        let bar_off = st_off + stages * stage_bytes;
+        let smem = bar_off + 16 * stages + 1024;
+        if smem > 227 * 1024 {
+            return None;
+        }
+        let soff = |j: usize| Format::scale_offset(numel(&self.nodes[j].shape));
+        Some(Fp8FlashPlan {
+            fq,
+            fk,
+            fv,
+            blk: [bq, bk, bv],
+            scale_off: [soff(*qb), soff(*kb), soff(*vb)],
+            bufs: [*qb, *kb, *vb],
+            addrs: [qa.clone(), ka.clone(), va.clone()],
+            qsc_off,
+            p_off,
+            st_off,
+            k_bytes,
+            v_bytes,
+            stage_bytes,
+            bar_off,
+            smem,
+        })
+    }
+
+    /// The FP8 Hopper flash schedule's body: Q (and its scales) staged by
+    /// every thread, then a producer warpgroup ringing K, Vᵀ and their
+    /// scales through `stages` buffers, and consumer warpgroups of 64
+    /// rows: S = Q·Kᵀ on FP8 `wgmma`, scaled by `sq[row]·sk[key]`, the
+    /// online softmax with the weights P rounded to e4m3 (the row sum
+    /// adds the rounded weights, as the emulator does), P through shared
+    /// memory into P·V on FP8 `wgmma`, scaled by `sv[col]` into O. Leaves
+    /// `o`, `m_row` (natural log) and `l_row` for the shared epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fp8_flash_body(
+        &self,
+        s: &mut String,
+        f: &super::Flash,
+        rc: &super::super::Comp,
+        pl: &Fp8FlashPlan,
+        h: super::Sm90Flash,
+        cx: Fp8FlashCtx,
+        row_coords: &dyn Fn(&mut String, &str, &str),
+        arg_value: &dyn Fn(&super::super::Arg) -> String,
+        emit_body: &dyn Fn(&mut String, &str, &tang_expr::ExprGraph, &[tang_expr::ExprId], &str, &[String]) -> Vec<String>,
+        coord: &dyn Fn(usize) -> String,
+        score_coord: &dyn Fn(usize) -> String,
+        addr_expr: &dyn Fn(&Addr, &dyn Fn(usize) -> String) -> String,
+    ) {
+        let Fp8FlashCtx { bj, d, stages, threads: t_all, nsf, nof } = cx;
+        let cw = h.consumers;
+        let bm = 64 * cw;
+        let [qb, kb, vb] = pl.bufs;
+        let [qa, ka, va] = &pl.addrs;
+        let swz = |r: &str, c16: &str| format!("({r}) * 128u + ((({c16}) ^ (({r}) % 8u)) * 16u)");
+        let sidx = |i: usize, a: &Addr, cf: &dyn Fn(usize) -> String| match pl.blk[i] {
+            None => "0u".to_string(),
+            Some(b) => format!("(unsigned)(({}) / {b})", addr_expr(a, cf)),
+        };
+        let (st_off, stage_bytes, k_bytes, v_bytes) = (pl.st_off, pl.stage_bytes, pl.k_bytes, pl.v_bytes);
+        let w = |s: &mut String, line: String| {
+            s.push_str(&line);
+            s.push('\n');
+        };
+        w(s, "    unsigned sbase = ((unsigned)__cvta_generic_to_shared(smem) + 1023u) & ~1023u;".into());
+        w(s, "    const float* smf = (const float*)((const char*)smem + (sbase - (unsigned)__cvta_generic_to_shared(smem)));".into());
+        w(s, format!("    unsigned bar_f = sbase + {}u, bar_e = bar_f + {}u;", pl.bar_off, 8 * stages));
+        for (i, (nm, b)) in [("sq_g", qb), ("sk_g", kb), ("sv_g", vb)].iter().enumerate() {
+            w(s, format!("    const float* {nm} = (const float*)((const unsigned char*)b{b} + {}u);", pl.scale_off[i]));
+        }
+        w(s, "    if (tid == 0u) {".into());
+        w(s, format!("        for (unsigned q = 0u; q < {stages}u; q++) {{ tang_bar_init(bar_f + 8u * q, 128u); tang_bar_init(bar_e + 8u * q, {}u); }}", 128 * cw));
+        w(s, "        asm volatile(\"fence.mbarrier_init.release.cluster;\" ::: \"memory\");".into());
+        w(s, "    }".into());
+        // Q bytes and scales, by every thread
+        w(s, format!("    for (unsigned idx = tid; idx < {}u; idx += {t_all}u) {{", bm * 8));
+        w(s, "        unsigned r = idx / 8u, c16 = idx % 8u, dd = c16 * 16u;".into());
+        row_coords(s, "        ", "r");
+        w(s, format!("        bool ok = ii < {}u;", f.m));
+        w(s, format!("        tang_cp16s(sbase + {}, b{qb} + (ok ? (unsigned)({}) : 0u), ok);", swz("r", "c16"), addr_expr(qa, score_coord)));
+        w(s, "    }".into());
+        w(s, format!("    for (unsigned r = tid; r < {bm}u; r += {t_all}u) {{"));
+        w(s, "        unsigned dd = 0u; (void)dd;".into());
+        row_coords(s, "        ", "r");
+        w(s, format!("        bool ok = ii < {}u;", f.m));
+        w(s, format!("        tang_cp4s(sbase + {}u + 4u * r, sq_g + (ok ? {} : 0u), ok);", pl.qsc_off, sidx(0, qa, score_coord)));
+        w(s, "    }".into());
+        w(s, "    tang_cp_commit(); tang_cp_wait<0>(); tang_fence_async();".into());
+        w(s, "    __syncthreads();".into());
+
+        // producer
+        w(s, "    if (warp < 4u) {".into());
+        w(s, format!("        tang_setmaxnreg_dec<{}>();", h.producer_regs));
+        w(s, "        unsigned it = 0u;".into());
+        w(s, "        for (unsigned c = c_lo; c < c_hi; c++, it++) {".into());
+        w(s, format!("            unsigned q = it % {stages}u;"));
+        w(s, format!("            tang_bar_wait(bar_e + 8u * q, ((it / {stages}u) & 1u) ^ 1u);"));
+        w(s, format!("            unsigned st = sbase + {st_off}u + q * {stage_bytes}u;"));
+        w(s, format!("            for (unsigned idx = tid; idx < {}u; idx += 128u) {{", bj * 8));
+        w(s, format!("                unsigned r = idx / 8u, c16 = idx % 8u, dd = c16 * 16u, jj = c * {bj}u + r;"));
+        w(s, format!("                bool ok = jj < {}u;", f.n_keys));
+        w(s, format!("                tang_cp16s(st + {}, b{kb} + (ok ? (unsigned)({}) : 0u), ok);", swz("r", "c16"), addr_expr(ka, score_coord)));
+        w(s, "            }".into());
+        w(s, format!("            for (unsigned idx = tid; idx < {}u; idx += 128u) {{", d * 8));
+        w(s, format!("                unsigned nn = idx / 8u, c16 = idx % 8u, jj = c * {bj}u + c16 * 16u;"));
+        w(s, format!("                bool ok = jj < {}u;", f.n_keys));
+        w(s, format!("                tang_cp16s(st + {k_bytes}u + {}, b{vb} + (ok ? (unsigned)({}) : 0u), ok);", swz("nn", "c16"), addr_expr(va, coord)));
+        w(s, "            }".into());
+        w(s, format!("            for (unsigned r = tid; r < {}u; r += 128u) {{", bj + d));
+        w(s, format!("                if (r < {bj}u) {{ unsigned dd = 0u, jj = c * {bj}u + r; (void)dd; bool ok = jj < {}u; tang_cp4s(st + {}u + 4u * r, sk_g + (ok ? {} : 0u), ok); }}", f.n_keys, k_bytes + v_bytes, sidx(1, ka, score_coord)));
+        w(s, format!("                else {{ unsigned nn = r - {bj}u, jj = c * {bj}u; tang_cp4s(st + {}u + 4u * r, sv_g + {}, true); }}", k_bytes + v_bytes, sidx(2, va, coord)));
+        w(s, "            }".into());
+        w(s, "            asm volatile(\"cp.async.mbarrier.arrive.noinc.shared::cta.\" \"b\" \"64 [%0];\" :: \"r\"(bar_f + 8u * q) : \"memory\");".into());
+        w(s, "        }".into());
+        w(s, "        tang_cp_wait<0>();".into());
+        w(s, "        return;".into());
+        w(s, "    }".into());
+
+        // consumers
+        w(s, format!("    tang_setmaxnreg_inc<{}>();", h.consumer_regs));
+        w(s, "    unsigned cwi = warp / 4u - 1u;".into());
+        w(s, "    unsigned wrow = cwi * 64u + (warp % 4u) * 16u;".into());
+        w(s, format!("    unsigned qaddr = sbase + cwi * {}u;", 64 * 128));
+        w(s, format!("    unsigned pbase = sbase + {}u + cwi * {}u;", pl.p_off, 64 * bj));
+        w(s, format!("    float o[{nof}][4], ot[{nof}][4];"));
+        w(s, "    #pragma unroll".into());
+        w(s, format!("    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"));
+        w(s, "    float m_row[2] = {-1.0e30f, -1.0e30f};".into());
+        w(s, "    float l_row[2] = {0.0f, 0.0f};".into());
+        w(s, format!("    float sq_r[2] = {{smf[{q}u + wrow + gq], smf[{q}u + wrow + gq + 8u]}};", q = pl.qsc_off / 4));
+        w(s, "    unsigned it = 0u;".into());
+        w(s, "    for (unsigned c = c_lo; c < c_hi; c++, it++) {".into());
+        w(s, format!("        unsigned q = it % {stages}u;"));
+        w(s, format!("        tang_bar_wait(bar_f + 8u * q, (it / {stages}u) & 1u); tang_fence_async();"));
+        w(s, format!("        unsigned kaddr = sbase + {st_off}u + q * {stage_bytes}u, vaddr = kaddr + {k_bytes}u;"));
+        w(s, format!("        const float* skp = smf + ({st_off}u + q * {stage_bytes}u + {}u) / 4u;", k_bytes + v_bytes));
+        w(s, format!("        const float* svp = skp + {bj}u;"));
+        w(s, format!("        float sc[{nsf}][4];"));
+        w(s, "        tang_wg_fence();".into());
+        w(s, "        #pragma unroll".into());
+        w(s, "        for (int kk = 0; kk < 4; kk++)".into());
+        w(s, "            tang_wgs(&sc[0][0], tang_desc(qaddr + kk * 32u, 16u, 1024u), tang_desc(kaddr + kk * 32u, 16u, 1024u), kk > 0);".into());
+        w(s, "        tang_wg_commit(); tang_wg_wait<0>();".into());
+        w(s, format!("        unsigned j0 = c * {bj}u;"));
+        w(s, "        #pragma unroll".into());
+        w(s, "        for (int h = 0; h < 2; h++) {".into());
+        row_coords(s, "            ", "wrow + gq + 8u * h");
+        w(s, "            float mloc = -1.0e30f;".into());
+        w(s, "            #pragma unroll".into());
+        w(s, format!("            for (int j = 0; j < {nsf}; j++)"));
+        w(s, "            #pragma unroll".into());
+        w(s, "            for (int e = 0; e < 2; e++) {".into());
+        w(s, "                unsigned jj = j0 + 8u * j + 2u * tq + e;".into());
+        w(s, format!("                float sval = sc[j][2 * h + e] * ({}f * sq_r[h] * skp[8u * j + 2u * tq + e]);", super::f32_lit(f.scale)));
+        {
+            let vals: Vec<String> = rc
+                .args
+                .iter()
+                .enumerate()
+                .map(|(k, a)| if k == f.score_arg { "sval".to_string() } else { arg_value(a) })
+                .collect();
+            let o = emit_body(s, "                ", &rc.body, &[rc.body_outs[0]], "s0_", &vals);
+            w(s, format!("                float v = (jj < {}u) ? ({}) * 1.4426950408889634f : -1.0e30f;", f.n_keys, o[0]));
+        }
+        w(s, "                sc[j][2 * h + e] = v;".into());
+        w(s, "                mloc = fmaxf(mloc, v);".into());
+        w(s, "            }".into());
+        w(s, "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));".into());
+        w(s, "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));".into());
+        w(s, "            float m_new = fmaxf(m_row[h], mloc);".into());
+        w(s, "            float alpha = exp2f(m_row[h] - m_new);".into());
+        w(s, "            float lsum = 0.0f;".into());
+        w(s, "            #pragma unroll".into());
+        w(s, format!("            for (int j = 0; j < {nsf}; j++) {{"));
+        // the weights rounded to e4m3; the sum adds the rounded values
+        w(s, "                float2 pr = tang_e4x2f(tang_f2e4x2(exp2f(sc[j][2 * h] - m_new), exp2f(sc[j][2 * h + 1] - m_new)));".into());
+        w(s, "                sc[j][2 * h] = pr.x; sc[j][2 * h + 1] = pr.y; lsum += pr.x + pr.y;".into());
+        w(s, "            }".into());
+        w(s, "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;".into());
+        w(s, "            #pragma unroll".into());
+        w(s, format!("            for (int j = 0; j < {nof}; j++) {{ o[j][2 * h] *= alpha; o[j][2 * h + 1] *= alpha; }}"));
+        w(s, "        }".into());
+        // P to shared memory, K-major 128-byte swizzled rows (the warpgroup's
+        // previous P·V has retired: its wgmma were waited on)
+        w(s, "        asm volatile(\"bar.sync %0, 128;\" :: \"r\"(1u + cwi) : \"memory\");".into());
+        w(s, "        #pragma unroll".into());
+        w(s, format!("        for (int j = 0; j < {nsf}; j++)"));
+        w(s, "        #pragma unroll".into());
+        w(s, "        for (int h = 0; h < 2; h++) {".into());
+        w(s, "            unsigned lr = (warp % 4u) * 16u + gq + 8u * h, col = 8u * j + 2u * tq;".into());
+        w(s, "            unsigned short pv = tang_f2e4x2(sc[j][2 * h], sc[j][2 * h + 1]);".into());
+        w(s, "            asm volatile(\"st.shared.u16 [%0], %1;\" :: \"r\"(pbase + lr * 128u + (((col / 16u) ^ (lr % 8u)) * 16u) + col % 16u), \"h\"(pv) : \"memory\");".into());
+        w(s, "        }".into());
+        w(s, "        tang_fence_async();".into());
+        w(s, "        asm volatile(\"bar.sync %0, 128;\" :: \"r\"(1u + cwi) : \"memory\");".into());
+        w(s, "        tang_wg_fence();".into());
+        w(s, "        #pragma unroll".into());
+        w(s, format!("        for (int kk = 0; kk < {}; kk++)", bj / 32));
+        w(s, "            tang_wgo(&ot[0][0], tang_desc(pbase + kk * 32u, 16u, 1024u), tang_desc(vaddr + kk * 32u, 16u, 1024u), kk > 0);".into());
+        w(s, "        tang_wg_commit(); tang_wg_wait<0>();".into());
+        w(s, "        #pragma unroll".into());
+        w(s, format!("        for (int j = 0; j < {nof}; j++) {{"));
+        w(s, "            float2 sv = *(const float2*)(svp + 8u * j + 2u * tq);".into());
+        w(s, "            o[j][0] += ot[j][0] * sv.x; o[j][1] += ot[j][1] * sv.y; o[j][2] += ot[j][2] * sv.x; o[j][3] += ot[j][3] * sv.y;".into());
+        w(s, "        }".into());
+        w(s, "        tang_bar_arrive(bar_e + 8u * q);".into());
+        w(s, "    }".into());
+        w(s, "    m_row[0] *= 0.6931471805599453f; m_row[1] *= 0.6931471805599453f;".into());
     }
 }

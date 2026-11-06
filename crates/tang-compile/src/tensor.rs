@@ -3342,9 +3342,33 @@ impl Evaluator<'_> {
         let combine = k.combine.as_ref().unwrap();
         let mut elem = vec![0.0; w];
         let mut pair = vec![0.0; 2 * w];
+        // softmax weights rounded to the operand format (an online-softmax
+        // reduction on a tile that feeds exp(s − m) to the tensor cores):
+        // the element's weight is rounded before it scales g₁…gₖ
+        let operand = self.g.nodes[i].precision.operand;
+        let round_weights =
+            self.emulate && operand != Format::F32 && m.kind() == MonoidKind::OnlineSoftmax;
         for red_idx in indices(&fixed(&c.red)) {
             idx[base..].copy_from_slice(&red_idx);
             body_at(&idx, &mut elem);
+            if round_weights {
+                // m' = max(m, s); accᵢ' = accᵢ·exp(m − m') + gᵢ·round(exp(s − m'))
+                let mx = vals[0].max(elem[0]);
+                if mx == f64::NEG_INFINITY {
+                    continue;
+                }
+                let sa = if vals[0] == f64::NEG_INFINITY { 0.0 } else { (vals[0] - mx).exp() };
+                let se = operand.round((elem[0] - mx).exp());
+                vals[0] = mx;
+                for t in 1..w {
+                    vals[t] = vals[t] * sa + elem[t] * se;
+                }
+                if self.emulate {
+                    let f = self.g.nodes[i].precision.accum;
+                    vals.iter_mut().for_each(|v| *v = f.round(*v));
+                }
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(&elem);
             combine(&pair, vals);

@@ -1365,6 +1365,7 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
                             Precision {
                                 storage: Format::F32,
                                 accum: Format::F16,
+                                operand: Format::F32,
                             },
                         );
                         let e = v.precision_error(sin, &outs);

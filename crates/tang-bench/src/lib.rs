@@ -1429,6 +1429,7 @@ pub mod ir_gpu {
                         Precision {
                             storage: Format::F16,
                             accum,
+                            operand: Format::F32,
                         },
                     );
                     g.set_schedule(y, split, tile, reg);

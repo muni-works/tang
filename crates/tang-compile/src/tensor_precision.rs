@@ -303,23 +303,30 @@ pub fn bf16_from_bits(b: u16) -> f64 {
 }
 
 /// Number formats of one node: `storage` for its buffer, `accum` for its
-/// running reduction state (meaningless on a map).
+/// running reduction state (meaningless on a map), and `operand` for a
+/// multiplicand the reduction computes itself rather than reads: the
+/// softmax weights `exp(s − m)` of an online-softmax reduction (P in
+/// attention's P·V), which a tensor-core tile rounds to its operand
+/// format. `F32`: not rounded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Precision {
     pub storage: Format,
     pub accum: Format,
+    pub operand: Format,
 }
 
 impl Precision {
     pub const F32: Precision = Precision {
         storage: Format::F32,
         accum: Format::F32,
+        operand: Format::F32,
     };
 
     pub fn storage(f: Format) -> Self {
         Precision {
             storage: f,
             accum: Format::F32,
+            operand: Format::F32,
         }
     }
 }
@@ -531,6 +538,7 @@ mod tests {
             Precision {
                 storage: Format::F16,
                 accum: Format::F16,
+                operand: Format::F32,
             },
         );
         assert_eq!(g.eval(std::slice::from_ref(&xs), &[s]), a);
@@ -559,6 +567,7 @@ mod tests {
             Precision {
                 storage: Format::F32,
                 accum: Format::F16,
+                operand: Format::F32,
             },
         );
         let st = g.precision_error(&xs, &[s]);
@@ -623,6 +632,7 @@ mod tests {
                 Precision {
                     storage: Format::F32,
                     accum: Format::F16,
+                    operand: Format::F32,
                 },
             );
         }
