@@ -46,6 +46,22 @@ pub struct GpuDevice {
     /// Compute passes can write GPU timestamps (wgpu `TIMESTAMP_QUERY`):
     /// kernel times from the GPU's clock instead of the host's.
     pub timestamps: bool,
+    /// WGSL subgroup operations (wgpu `SUBGROUP`).
+    pub subgroups: bool,
+    /// WGSL `enable f16;` (wgpu `SHADER_F16`).
+    pub shader_f16: bool,
+}
+
+impl GpuDevice {
+    /// What generated WGSL may use on this device
+    /// ([`TensorGraph::to_wgsl_caps`](tang_compile::tensor::TensorGraph::to_wgsl_caps)).
+    /// `TANG_NO_SUBGROUPS` / `TANG_NO_F16` turn either off, for A/B runs.
+    pub fn wgsl_caps(&self) -> tang_compile::tensor::WgslCaps {
+        tang_compile::tensor::WgslCaps {
+            subgroups: self.subgroups && std::env::var_os("TANG_NO_SUBGROUPS").is_none(),
+            f16: self.shader_f16 && std::env::var_os("TANG_NO_F16").is_none(),
+        }
+    }
 }
 
 impl GpuDevice {
@@ -86,7 +102,9 @@ impl GpuDevice {
             & (wgpu::Features::MSL_SHADER_PASSTHROUGH
                 | wgpu::Features::SPIRV_SHADER_PASSTHROUGH
                 | wgpu::Features::SHADER_F64
-                | wgpu::Features::TIMESTAMP_QUERY);
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::SHADER_F16);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tang-gpu"),
@@ -110,6 +128,8 @@ impl GpuDevice {
             spirv_passthrough,
             shader_f64: required_features.contains(wgpu::Features::SHADER_F64),
             timestamps: required_features.contains(wgpu::Features::TIMESTAMP_QUERY),
+            subgroups: required_features.contains(wgpu::Features::SUBGROUP),
+            shader_f16: required_features.contains(wgpu::Features::SHADER_F16),
         })
     }
 

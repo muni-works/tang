@@ -19,3 +19,5 @@ tang-expr = { workspace = true }
 [dev-dependencies]
 # reference f32 -> f16 rounding for the GLSL decode prelude
 half = "2"
+# validates the caps lowerings (subgroups, f16) with the workspace naga
+naga = { version = "25", features = ["wgsl-in"] }

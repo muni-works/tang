@@ -2378,3 +2378,530 @@ pending)
 - Expected on the K1 (1.7B, estimates): 49 tokens 3451 ms → ~500–700 ms (maps, register block),
   ~250–400 ms (q4), ~150–250 ms (fp16). A 20-token turn ~100–250 ms. 512 tokens ~2–5 s. Decode is
   unchanged at ~55 ms/token.
+
+## Against Flashlight / EqiForge / FlexAttention (RTX 3090, attention variants)
+
+The six presets from the post's lab: causal, causal sliding window 128, ALiBi
+(slope 1/16, causal), soft cap 30·tanh(s/30) (causal), prefix LM 64 and
+bidirectional. tang builds each one the way the lab does
+(`tang_derive_wasm::naive_graph` + `derive_graph`: the naive `softmax(score)·v`,
+and for the backward `TensorGraph::backward` of `Σ O·dO`). It lowers it with
+`Program::tuned` on CUDA, which picks per kernel between TF32 `mma` tiles and
+transpiled WGSL. Single head, `[n, d]`, B = H = 1, because that is the graph
+tang builds and every system then runs exactly the same problem. RTX 3090
+(sm_86) on `mew`, PyTorch 2.10 + cu128, Triton 3.6.
+
+- **Harness:** [`crates/tang-bench/examples/attn_variants.rs`](crates/tang-bench/examples/attn_variants.rs)
+  times tang and writes its inputs and outputs.
+  [`scripts/attn_variants_bench.py`](scripts/attn_variants_bench.py) checks
+  them and runs the baselines on the same inputs.
+  [`scripts/attn_variants_table.py`](scripts/attn_variants_table.py) makes the
+  tables. Raw CSV: [`scripts/results/attn_variants_3090.csv`](scripts/results/attn_variants_3090.csv).
+- **Timing:** CUDA events, the minimum over 5 batches of 30 runs (10 at n ≥ 4096)
+  for every system, after warm-up and compilation. The GPU is shared: about
+  16 GB is held by resident `tang-llm` processes. The runs used
+  `flock ~/tang-gpu.lock`, but `nvidia-smi` read 100 % utilization at the
+  start of the baseline run, so small rows (under 0.1 ms) carry ±2× noise.
+  The large rows are stable between the two runs.
+- **TFLOPS:** the same FLOP count for every system, so it is only a rescaling
+  of ms. The forward is 4·n²·d × the unmasked fraction; forward + backward is
+  3.5× the forward (FlashAttention's convention). Masked work a system does
+  anyway is not credited.
+- **Correctness:** checked against a dense float64 PyTorch reference, as the
+  maximum absolute error over the maximum |reference| for O, or for dq ‖ dk ‖ dv.
+  Every row passes. tang is 1.1e-6 to 1.1e-3: pure fp32 where no tensor-core
+  tile is kept, TF32 where one is. FlexAttention fp32 is 7.5e-4 to 3.5e-3.
+  The bf16 systems are 3.3e-3 to 8.1e-3.
+- **Systems:**
+  - **FlexAttention** is `torch.compile(flex_attention)` with the variant as a
+    `score_mod` plus a `block_mask`. It runs in fp32 (TF32 matmuls allowed,
+    like tang) and in bf16. The fp32 build fails at d = 128 on the 3090
+    (`No valid triton configs … out of resource`: shared memory).
+  - **FA2** is FlashAttention-2 in bf16. The `flash_attn` package can't be
+    built on `mew` (no `nvcc`; no official wheel for torch 2.10), and I didn't
+    install third-party wheels. So this is PyTorch's bundled FA2 kernels
+    through SDPA's `FLASH_ATTENTION` backend, which supports causal and
+    bidirectional only. Sliding window, ALiBi and soft cap need the
+    `flash_attn` package. Prefix LM is supported by no FA2 build.
+  - **Flashlight** (arXiv 2511.02043) and **EqiForge** (arXiv 2609.12330) have
+    **no public code**: neither paper links a repository and no package exists.
+    They can't be run here; their published numbers are summarized below.
+
+### Results
+
+**d = 64, forward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.0315 (4.3) | 0.0835 (1.6) | 0.0442 (3.0) | **0.0131 (10.2)** |
+| causal | 2048 | 0.0602 (8.9) | 0.171 (3.1) | 0.0896 (6.0) | **0.0233 (23.0)** |
+| causal | 4096 | 0.227 (9.5) | 0.34 (6.3) | 0.177 (12.1) | **0.065 (33.0)** |
+| causal | 8192 | 0.888 (9.7) | 0.635 (13.5) | 0.326 (26.3) | **0.177 (48.5)** |
+| sliding128 | 1024 | 0.0322 (1.0) | 0.0245 (1.3) | **0.0145 (2.2)** | n/a |
+| sliding128 | 2048 | 0.0616 (1.1) | 0.0324 (2.0) | **0.0321 (2.0)** | n/a |
+| sliding128 | 4096 | 0.234 (0.6) | **0.0343 (3.9)** | 0.0347 (3.8) | n/a |
+| sliding128 | 8192 | 0.911 (0.3) | 0.0365 (7.3) | **0.0343 (7.8)** | n/a |
+| alibi | 1024 | **0.0315 (4.3)** | 0.4 (0.3) | 0.0464 (2.9) | n/a |
+| alibi | 2048 | **0.0603 (8.9)** | 0.171 (3.1) | 0.0936 (5.7) | n/a |
+| alibi | 4096 | 0.228 (9.4) | 0.34 (6.3) | **0.185 (11.6)** | n/a |
+| alibi | 8192 | 0.889 (9.7) | 0.677 (12.7) | **0.389 (22.1)** | n/a |
+| softcap | 1024 | **0.039 (3.4)** | 0.124 (1.1) | 0.0891 (1.5) | n/a |
+| softcap | 2048 | **0.0748 (7.2)** | 0.254 (2.1) | 0.172 (3.1) | n/a |
+| softcap | 4096 | **0.287 (7.5)** | 0.503 (4.3) | 0.341 (6.3) | n/a |
+| softcap | 8192 | 1.12 (7.6) | 0.949 (9.1) | **0.7 (12.3)** | n/a |
+| prefix64 | 1024 | **0.0329 (4.1)** | 0.0882 (1.5) | 0.0479 (2.8) | n/a |
+| prefix64 | 2048 | **0.0627 (8.6)** | 0.171 (3.1) | 0.0894 (6.0) | n/a |
+| prefix64 | 4096 | 0.238 (9.0) | 0.338 (6.3) | **0.178 (12.0)** | n/a |
+| prefix64 | 8192 | 0.928 (9.3) | 0.657 (13.1) | **0.353 (24.4)** | n/a |
+| bidirectional | 1024 | 0.0318 (8.4) | 0.0881 (3.0) | 0.0468 (5.7) | **0.0229 (11.7)** |
+| bidirectional | 2048 | 0.0609 (17.6) | 0.168 (6.4) | 0.0885 (12.1) | **0.0337 (31.9)** |
+| bidirectional | 4096 | 0.231 (18.6) | 0.333 (12.9) | 0.172 (24.9) | **0.0973 (44.1)** |
+| bidirectional | 8192 | 0.9 (19.1) | 0.618 (27.8) | 0.314 (54.7) | **0.296 (58.0)** |
+
+**d = 64, forward + backward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.224 (2.1) | 0.668 (0.7) | 0.296 (1.6) | **0.126 (3.7)** |
+| causal | 2048 | 0.554 (3.4) | 0.414 (4.5) | **0.202 (9.3)** | 0.228 (8.2) |
+| causal | 4096 | 1.81 (4.2) | 0.968 (7.8) | **0.42 (17.9)** | 0.469 (16.0) |
+| causal | 8192 | 6.76 (4.5) | 2.54 (11.8) | 0.965 (31.2) | **0.926 (32.5)** |
+| sliding128 | 1024 | 0.234 (0.5) | 0.049 (2.2) | **0.0331 (3.3)** | n/a |
+| sliding128 | 2048 | 0.58 (0.4) | **0.146 (1.6)** | 0.15 (1.5) | n/a |
+| sliding128 | 4096 | 1.9 (0.2) | 0.161 (2.9) | **0.148 (3.1)** | n/a |
+| sliding128 | 8192 | 7.34 (0.1) | 0.167 (5.6) | **0.148 (6.3)** | n/a |
+| alibi | 1024 | 0.23 (2.0) | 0.672 (0.7) | **0.146 (3.2)** | n/a |
+| alibi | 2048 | 0.55 (3.4) | 0.415 (4.5) | **0.207 (9.1)** | n/a |
+| alibi | 4096 | 1.81 (4.2) | 0.965 (7.8) | **0.441 (17.1)** | n/a |
+| alibi | 8192 | 6.83 (4.4) | 2.57 (11.7) | **1.11 (27.0)** | n/a |
+| softcap | 1024 | 0.285 (1.6) | 0.217 (2.2) | **0.196 (2.4)** | n/a |
+| softcap | 2048 | 0.802 (2.3) | 0.511 (3.7) | **0.324 (5.8)** | n/a |
+| softcap | 4096 | 2.88 (2.6) | 1.17 (6.4) | **0.665 (11.3)** | n/a |
+| softcap | 8192 | 11.3 (2.7) | 2.97 (10.1) | **1.56 (19.3)** | n/a |
+| prefix64 | 1024 | 0.227 (2.1) | 0.162 (2.9) | **0.145 (3.2)** | n/a |
+| prefix64 | 2048 | 0.556 (3.4) | 0.415 (4.5) | **0.2 (9.4)** | n/a |
+| prefix64 | 4096 | 1.81 (4.2) | 0.963 (7.8) | **0.423 (17.8)** | n/a |
+| prefix64 | 8192 | 7.01 (4.3) | 2.54 (11.8) | **0.98 (30.7)** | n/a |
+| bidirectional | 1024 | 0.213 (4.4) | 0.18 (5.2) | 0.17 (5.5) | **0.122 (7.7)** |
+| bidirectional | 2048 | 0.498 (7.5) | 0.447 (8.4) | **0.199 (18.9)** | 0.241 (15.6) |
+| bidirectional | 4096 | 1.58 (9.5) | 1.24 (12.1) | **0.498 (30.2)** | 0.505 (29.7) |
+| bidirectional | 8192 | 6.72 (8.9) | 3.99 (15.1) | 1.39 (43.4) | **1.07 (56.4)** |
+
+**d = 128, forward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 1.28 (0.2) | fails | 0.0839 (3.2) | **0.0233 (11.5)** |
+| causal | 2048 | 4.46 (0.2) | fails | 0.163 (6.6) | **0.0421 (25.5)** |
+| causal | 4096 | 17.1 (0.2) | fails | 0.318 (13.5) | **0.112 (38.5)** |
+| causal | 8192 | 68.5 (0.2) | fails | 0.592 (29.0) | **0.328 (52.5)** |
+| sliding128 | 1024 | 1.27 (0.1) | fails | **0.141 (0.5)** | n/a |
+| sliding128 | 2048 | 4.52 (0.0) | fails | **0.0244 (5.3)** | n/a |
+| sliding128 | 4096 | 17.3 (0.0) | fails | **0.0345 (7.7)** | n/a |
+| sliding128 | 8192 | 69 (0.0) | fails | **0.0351 (15.2)** | n/a |
+| alibi | 1024 | 1.27 (0.2) | fails | **0.0914 (2.9)** | n/a |
+| alibi | 2048 | 4.51 (0.2) | fails | **0.513 (2.1)** | n/a |
+| alibi | 4096 | 17.3 (0.2) | fails | **0.329 (13.1)** | n/a |
+| alibi | 8192 | 68.9 (0.2) | fails | **0.654 (26.3)** | n/a |
+| softcap | 1024 | 1.34 (0.2) | fails | **0.101 (2.7)** | n/a |
+| softcap | 2048 | 4.69 (0.2) | fails | **0.206 (5.2)** | n/a |
+| softcap | 4096 | 18 (0.2) | fails | **0.405 (10.6)** | n/a |
+| softcap | 8192 | 72.4 (0.2) | fails | **0.819 (21.0)** | n/a |
+| prefix64 | 1024 | 1.27 (0.2) | fails | **0.0848 (3.2)** | n/a |
+| prefix64 | 2048 | 4.51 (0.2) | fails | **0.151 (7.1)** | n/a |
+| prefix64 | 4096 | 17.3 (0.2) | fails | **0.299 (14.4)** | n/a |
+| prefix64 | 8192 | 69.1 (0.2) | fails | **0.628 (27.3)** | n/a |
+| bidirectional | 1024 | 1.28 (0.4) | fails | 0.0796 (6.8) | **0.025 (21.5)** |
+| bidirectional | 2048 | 4.53 (0.5) | fails | 0.159 (13.5) | **0.0568 (37.8)** |
+| bidirectional | 4096 | 17.3 (0.5) | fails | 0.297 (28.9) | **0.167 (51.5)** |
+| bidirectional | 8192 | 69 (0.5) | fails | 0.582 (59.1) | **0.545 (63.0)** |
+
+**d = 128, forward + backward** — ms (TFLOPS); best per row in bold
+
+| variant | n | tang (fp32, TF32 mma) | Flex fp32/TF32 | Flex bf16 | FA2 bf16 |
+|---|---:|---:|---:|---:|---:|
+| causal | 1024 | 0.822 (1.1) | fails | 0.358 (2.6) | **0.177 (5.3)** |
+| causal | 2048 | 1.75 (2.1) | fails | **0.355 (10.6)** | 0.489 (7.7) |
+| causal | 4096 | 5.65 (2.7) | fails | 0.784 (19.2) | **0.527 (28.5)** |
+| causal | 8192 | 21.8 (2.8) | fails | 2.09 (28.8) | **1.1 (54.8)** |
+| sliding128 | 1024 | 0.805 (0.3) | fails | **0.743 (0.3)** | n/a |
+| sliding128 | 2048 | 1.72 (0.3) | fails | **0.0578 (7.9)** | n/a |
+| sliding128 | 4096 | 5.89 (0.2) | fails | **0.151 (6.1)** | n/a |
+| sliding128 | 8192 | 22.4 (0.1) | fails | **0.209 (8.9)** | n/a |
+| alibi | 1024 | 0.813 (1.2) | fails | **0.519 (1.8)** | n/a |
+| alibi | 2048 | 1.74 (2.1) | fails | **0.717 (5.2)** | n/a |
+| alibi | 4096 | 5.84 (2.6) | fails | **0.806 (18.6)** | n/a |
+| alibi | 8192 | 22.4 (2.7) | fails | **2.17 (27.7)** | n/a |
+| softcap | 1024 | 1.09 (0.9) | fails | **0.258 (3.6)** | n/a |
+| softcap | 2048 | 2.35 (1.6) | fails | **0.484 (7.8)** | n/a |
+| softcap | 4096 | 7.54 (2.0) | fails | **1.01 (14.9)** | n/a |
+| softcap | 8192 | 28.9 (2.1) | fails | **2.71 (22.2)** | n/a |
+| prefix64 | 1024 | 0.756 (1.2) | fails | **0.528 (1.8)** | n/a |
+| prefix64 | 2048 | 1.64 (2.3) | fails | **0.374 (10.1)** | n/a |
+| prefix64 | 4096 | 5.52 (2.7) | fails | **0.786 (19.1)** | n/a |
+| prefix64 | 8192 | 21.2 (2.8) | fails | **2.09 (28.8)** | n/a |
+| bidirectional | 1024 | 0.717 (2.6) | fails | 0.306 (6.2) | **0.14 (13.4)** |
+| bidirectional | 2048 | 1.58 (4.8) | fails | 0.368 (20.4) | **0.263 (28.6)** |
+| bidirectional | 4096 | 5.23 (5.8) | fails | 1 (30.0) | **0.579 (52.0)** |
+| bidirectional | 8192 | 20.1 (6.0) | fails | 3.09 (38.9) | **2 (60.0)** |
+
+Geometric-mean speedup of tang over each baseline across the variant × n rows
+(> 1 means tang is faster):
+
+| d | pass | vs Flex fp32 | vs Flex bf16 | vs FA2 bf16 (causal, bidi) |
+|---|---|---:|---:|---:|
+| 64 | fwd | 1.31× (wins 15/24) | 0.74× (11/24) | 0.39× (0/8) |
+| 64 | fwd+bwd | 0.49× (2/24) | 0.26× (1/24) | 0.32× (0/8) |
+| 128 | fwd | – (Flex fp32 fails) | 0.02× (0/24) | 0.01× (0/8) |
+| 128 | fwd+bwd | – (Flex fp32 fails) | 0.16× (0/24) | 0.13× (0/8) |
+
+### Where tang wins and loses, and why
+
+- **d = 64 forward: competitive with FlexAttention, behind FA2.** At the same
+  precision (fp32/TF32), tang's derived single kernel beats FlexAttention
+  fp32 on causal, ALiBi, soft cap, prefix and bidirectional up to n = 4096,
+  by 1.4–2.8×, leaving out one noisy row. At n = 8192 it falls behind by 0.69–0.84×. Against Flex bf16
+  it wins only at n ≤ 2048. FA2 bf16 is 1.4–5× faster everywhere. Two reasons:
+  bf16 `mma` has twice the TF32 rate on the 3090, and FA2 is a hand-tuned
+  kernel. Both forward rows hold the property the post claims: one kernel,
+  no n×n buffer, the same code for every variant.
+- **Masks cost tang full price.** Sliding window and prefix LM take exactly
+  as long as bidirectional. The derived kernel evaluates the mask as an
+  additive −1e30 bias on every tile, and nothing in the rewrite skips a tile
+  that is entirely masked. FlexAttention's `block_mask` does skip them, so
+  sliding window 128 at n = 8192 is 25× faster in Flex (0.036 ms against
+  0.91 ms forward, 0.17 ms against 7.3 ms forward + backward). Causal skipping
+  is the same effect at 2×. This is the clearest missing rewrite: a
+  comprehension whose mask is a known affine predicate of (i, j) could carry
+  the block-sparsity forward as a loop bound.
+- **d = 128 forward is a cliff.** No tensor-core version is generated for the
+  derived d = 128 forward (`mma 0/0` in the CSV). The transpiled kernel spills
+  (fp32, error 1e-6) and runs 15–120× slower than Flex bf16 (sliding window aside): 69 ms at
+  n = 8192, against 0.59 ms for Flex bf16. The d = 128 forward + backward
+  (21.8 ms) is *faster* than the forward alone (68.5 ms), because the backward
+  graph recomputes O through tiled kernels with tensor cores. That points at
+  the forward's schedule choice, not at the IR. FlexAttention has its own
+  d = 128 limit on this chip: its fp32 build fails to compile.
+- **Backward: tang derives it but loses 1.3–7× (sliding window aside).** tang's backward is the
+  reverse-mode derivative of the naive graph, rewritten by the same passes.
+  Nobody wrote a backward kernel for any variant. It comes out as 9 kernels
+  with **2 n×n buffers** (P and dP are materialized) and no block skipping.
+  Against Flex bf16 that is 0.26× at d = 64 and 0.16× at d = 128. The one
+  win is the smallest row, causal n = 1024 (noise-level). At n ≥ 2048 the
+  n×n traffic dominates. The nested-contraction lowering being worked on in a
+  parallel branch removes those buffers on CUDA. This table is the "before"
+  number.
+
+### Who derives the backward
+
+| system | forward kernel | backward |
+|---|---|---|
+| **tang** | derived from the naive graph by rewrites (monoid-keyed `stabilize_softmax` / `substitute_maps` / `schedule_auto`) | **derived**: `TensorGraph::backward` of the naive graph, then the same passes. Any variant the lab can type gets one, with no per-variant code. Today 9 kernels, 2 n×n buffers |
+| FlexAttention | a fixed hand-written Triton template, with `score_mod` / `mask_mod` inlined | a **hand-written backward template**. `score_mod` is differentiated by autograd and inlined into it. Works for these variants, but only within the template's shape |
+| FA2 (bundled / `flash_attn`) | hand-written CUDA | **hand-written** backward per supported feature (causal, window, ALiBi, softcap). Prefix LM and arbitrary scores have no kernel and fall back to SDPA math |
+| Flashlight | Inductor graph rewrites to fused flash-style kernels | the paper describes forward fusion only. As far as the text says, the backward is not fused; it is whatever Inductor's autograd produces |
+| EqiForge | equality saturation over a tiled IR, emitting Triton | not described. Its evaluation covers inference (prefill and decode) only |
+
+### Flashlight and EqiForge: published numbers (not run here)
+
+Neither system has public code, so these are the papers' own numbers, on
+other GPUs, and not comparable row for row with the table above.
+
+- **Flashlight** (A100 and H100 at a locked 1290 MHz; PyTorch 2.5, Triton 3.1):
+  head dim 64, 16 heads, sequence 512–16k at 16k tokens per batch; sliding
+  window and prefix 256. The paper reports score_mod variants up to 1.48×
+  faster than FlexAttention. FlexAttention is "marginally faster" on vanilla
+  attention and on ALiBi at batch 1 on H100. For block-mask variants (sliding
+  window, prefix), FlexAttention's kernel is always faster and Flashlight wins
+  only once block-mask creation is counted. The paper reports no comparison
+  with FlashAttention and no backward numbers.
+- **EqiForge** (A100 80GB PCIe, RTX 5090; Triton 3.6): causal MHA. The paper
+  reports up to 1.87× faster than FlashAttention in decode and close to it in
+  prefill (a 3–6 % gap, as far as the HTML text could be read). Whole layers
+  against torch.compile: sliding-window GQA 1.06×, differential attention
+  1.51×, attention sinks 1.48×, QK-norm MLA 3.16×. There is no backward and
+  no FlexAttention comparison.
+
+What tang can claim against them on this evidence:
+
+- tang is the only one of the four that derives a backward from the forward
+  for an arbitrary typed variant and runs it on six backends.
+- On the 3090 its derived d = 64 forward matches template-level FlexAttention
+  at equal precision for n ≤ 4096.
+- What it can't claim is speed parity on the backward, at d = 128, or on
+  block-sparse masks. All three trace to missing rewrites and schedules (block
+  skipping, a d = 128 forward tile, nested contractions for the backward), not
+  to the two-primitive IR.
+
+Reproduce (on mew; takes the GPU lock):
+
+```
+cargo build --release -p tang-bench --features cuda --example attn_variants
+flock ~/tang-gpu.lock ./target/release/examples/attn_variants /tmp/attnvar 1024,2048,4096,8192 64,128 > tang.csv
+flock ~/tang-gpu.lock python3 scripts/attn_variants_bench.py /tmp/attnvar tang.csv > scripts/results/attn_variants_3090.csv
+python3 scripts/attn_variants_table.py scripts/results/attn_variants_3090.csv
+```
+
+### Flash backward without n×n on WGSL and MSL
+
+`to_wgsl` and `to_msl` now nest S = Q·Kᵀ and dP = dO·Vᵀ in the dQ, dK and dV tiles, as `to_cuda` already did (`schedule_nested_contractions_scalar`; see `docs/tensor-ir.md`, "Flash backward is nesting"). The derived attention forward + backward of `tang-derive-wasm` (the research post's lab) writes no n×n buffer on any backend. `cargo run -p tang-derive-wasm --example gallery` now gives 7 kernels and 0 n×n buffers in the fwd+bwd column for all six presets. Before, it gave 9 kernels and 2 n×n buffers.
+
+Gradients match the f64 interpreter. The test is `derived_attention_backward_nested_on_gpu`, at n = 256, d = 32: causal, soft-cap + prefix-LM, and bidirectional, max error ≤ 1.7e-5 at gradient scale 15–36. It passes on the M4 (Metal through wgpu) and on the 3090 (Vulkan). At n ≤ 1024 the bench's max relative error is the same with and without nesting.
+
+The cost is time. The scalar tiles evaluate each dS element's S and dP as dots on one thread, once per chunk in workgroup memory, which is more work than reading them back. `cargo run --release -p tang-bench [--features metal] --example attention_backward` times the whole program: d = 64, mean of 20 launches after warm-up, best of 3. "Materialized" is `to_wgsl_with(…, false)` / `to_msl_with(…, false)`, the schedule before this change. Each cell gives ms, with the number of n×n buffers in parentheses.
+
+**Apple M4 Max**, 2026-11-06 09:00 EST. Load average 18.9, from other sessions' builds; the GPU was otherwise idle.
+
+| preset | n | wgpu (Metal) before | after | MSL before | after |
+|---|---|---|---|---|---|
+| causal | 512 | 0.651 (2) | 1.848 (0) | 0.462 (2) | 0.644 (0) |
+| bidirectional | 512 | 0.622 (2) | 1.840 (0) | 0.357 (2) | 0.519 (0) |
+| causal | 1024 | 1.624 (2) | 3.886 (0) | 1.102 (2) | 1.420 (0) |
+| bidirectional | 1024 | 1.571 (2) | 3.863 (0) | 0.923 (2) | 1.180 (0) |
+| causal | 2048 | 5.430 (2) | 11.839 (0) | 3.014 (2) | 4.560 (0) |
+| bidirectional | 2048 | 5.174 (2) | 11.635 (0) | 2.607 (2) | 4.099 (0) |
+| causal | 4096 | 19.634 (2) | 36.831 (0) | 10.506 (2) | 14.916 (0) |
+| bidirectional | 4096 | 20.112 (2) | 37.894 (0) | 9.561 (2) | 14.113 (0) |
+
+**RTX 3090** (`mew`, Vulkan through wgpu), 2026-11-06 14:00 UTC. The machine is shared: load average 18.8, 29 users, about 16.5 GB of VRAM held by other processes. GPU utilization was 1% at the start of the run and 100% at the end, from another tenant. An earlier run on the same build gave the same ratios (0.23–0.25× at n ≤ 1024).
+
+| preset | n | before | after |
+|---|---|---|---|
+| causal | 512 | 0.629 (2) | 2.837 (0) |
+| bidirectional | 512 | 0.609 (2) | 2.678 (0) |
+| causal | 1024 | 1.281 (2) | 5.136 (0) |
+| bidirectional | 1024 | 1.326 (2) | 5.244 (0) |
+| causal | 2048 | 3.360 (2) | 12.396 (0) |
+| bidirectional | 2048 | 3.350 (2) | 12.621 (0) |
+| causal | 4096 | 9.765 (2) | 35.957 (0) |
+| bidirectional | 4096 | 9.868 (2) | 36.158 (0) |
+
+Per kernel on the M4 (MSL, causal, n = 1024, before → after): dQ 0.13 → 0.37 ms, dK 0.13 → 0.35 ms, dV 0.22 → 0.25 ms. The forward tile goes from 0.55 to 0.93 ms because it now recomputes S, and the S and dP kernels (0.04 ms each) are gone.
+
+Three things were tried and dropped:
+- Keeping the 4-row × 64-lane tile: dQ/dK at 0.36 ms. A chunk had 128 dS elements across 256 threads.
+- Staging the dots' K/V rows in workgroup memory per chunk: 1.9 ms vs 1.4 ms (MSL) and 45 vs 36 ms (3090, n = 4096). It adds a barrier, and the 16 KiB budget halves the chunk.
+- Larger 4×4 and 4×2 register tiles: 2.3–2.6 ms.
+
+Matching the materialized time needs the nested dots register-blocked (k-chunked) as a small GEMM, as `cuda_mma_kernel` does on `mma`, or on simdgroup matrices on Metal.
+
+### Flash backward: dK and dV in one tile, S recomputed once
+
+`merge_siblings` now also merges same-shape reductions that recompute a common read through their inlinable map operands, even when their readers differ or one is a program output. The read is a `(source, view)` larger than the reduction's points. Outputs read their slot through a copy. In the derived attention backward, dV = Σᵢ P̃ᵀ·dO and dK = Σᵢ dSᵀ·Q both evaluate S = Q·Kᵀ at (j, i). They become one tile. The tiled emitter runs the cooperative loads of its shared comps (P̃, dS) in one loop and memoizes nested producers by (node, coords), so S is a single dot per element (plus dP). This is the structure of FA2's dK/dV kernel. dQ stays its own tile.
+
+Gallery fwd+bwd: 8 kernels, 0 n×n. Heavy (n²) kernels go from 4 to 3: fwd, dK+dV, dQ. Two kernels are 32K-element slot copies (dK·scale and dV, ~0.01 ms each), and 3 are O(n·d) preprocess. Nested dots per (i, j) go from 5 to 4. Gradients still match the f64 interpreter (`derived_attention_backward_nested_on_gpu`, 3 variants).
+
+Whole fwd+bwd, d = 64, best of 3 (M4) or 2 (3090) interleaved A/B rounds. "#150" is that PR's nested schedule. "Materialized" is #150's `nested = false`.
+
+**Apple M4 Max, MSL**, 2026-11-06 ~13:00 EST. Load average 30–440 from other sessions, so treat these as rough.
+
+| preset | n | materialized | #150 nested | this | vs #150 |
+|---|---|---|---|---|---|
+| causal | 512 | 0.480 | 0.662 | 0.603 | 1.10× |
+| bidirectional | 512 | 0.359 | 0.540 | 0.465 | 1.16× |
+| causal | 1024 | 1.116 | 1.446 | 1.311 | 1.10× |
+| bidirectional | 1024 | 0.926 | 1.205 | 1.045 | 1.15× |
+| causal | 2048 | 3.117 | 4.668 | 4.299 | 1.09× |
+| bidirectional | 2048 | 2.694 | 4.177 | 3.952 | 1.06× |
+| causal | 4096 | 12.937 | 19.895 | 13.863 | 1.44× |
+| bidirectional | 4096 | 10.671 | 15.932 | 12.935 | 1.23× |
+
+wgpu (Metal) on the M4: 0.93–1.50× vs #150. It is slower at n = 512 and faster from n = 2048 up (4096: 44.9 → 29.9 ms causal).
+
+**RTX 3090, Vulkan through wgpu** (`mew`, under `flock`). PyTorch 2.10 SDPA fwd+bwd is f32, one head, TF32 off, on the same GPU.
+
+| preset | n | materialized | #150 nested | this | vs #150 | SDPA efficient | SDPA math |
+|---|---|---|---|---|---|---|---|
+| causal | 512 | 0.587 | 2.822 | 2.253 | 1.25× | 0.294 | 0.228 |
+| bidirectional | 512 | 0.590 | 2.853 | 2.334 | 1.22× | 0.303 | 0.194 |
+| causal | 1024 | 1.318 | 5.207 | 4.319 | 1.21× | 0.573 | 0.228 |
+| bidirectional | 1024 | 1.336 | 5.232 | 4.374 | 1.20× | 0.588 | 0.197 |
+| causal | 2048 | 3.332 | 12.523 | 10.265 | 1.22× | 1.138 | 0.646 |
+| bidirectional | 2048 | 3.374 | 12.625 | 10.375 | 1.22× | 1.167 | 0.513 |
+| causal | 4096 | 9.811 | 36.171 | 28.729 | 1.26× | 2.322 | 2.203 |
+| bidirectional | 4096 | 9.927 | 36.448 | 28.801 | 1.27× | 2.462 | 1.767 |
+
+The structure now matches FA2, but the per-element scalar dot inside the nested tiles still dominates. It is 0.25–0.34× the materialized schedule on the 3090 and about 12× behind SDPA there. Closing that needs the nested S/dP computed as a register-blocked GEMM per chunk (mma / simdgroup matrices), which this change makes a single site per tile.
+
+## MoE through gather views (M4 Max and RTX 3090, kernel-only)
+
+**Date:** 2026-11-06. **Branch:** `claude/focused-elgamal-3af3c7` (gather views, `docs/tensor-ir.md`
+"Gather views"). **Run:** `cargo run --release -p tang-bench [--features cuda] --example moe_gather`
+(`MOE_DIMS=T,D,E,K,F` for other sizes). Times are per kernel, mean of 50 dispatches
+(`Program::time_kernel`); f32 storage everywhere.
+
+- **M4 Max** (Metal via wgpu), on AC power (battery charging at 11%), desktop session otherwise idle.
+  Absolute M4 times drift up to ~2× with power state; compare columns within a run.
+- **RTX 3090** (`ssh mew`, CUDA sm_86 via `to_cuda`), shared host: 1% GPU utilization and 16.1 of
+  24 GB in use by other processes (a resident `tang-llm`, ffmpeg) before and after the run.
+
+**What runs.** A top-k MoE FFN layer as one IR graph: router GEMM, top-k as k rounds of argmax over
+the logits with earlier picks masked, softmax over the selected logits, SwiGLU experts reading
+`W1/W3[sel[t,k], f, d]` and `W2[sel[t,k], d, f]` through gather views, weighted combine. Token-major
+(decode-style); the host does no routing. `substitute_maps` + `schedule_auto`: 16 comps → 11 kernels
+(small config), 17 kernels at k = 10. The down projection is inlined into the combine (one kernel).
+
+**Correctness.** Small config (T 4, D 64, E 16, K 4, F 32): interpreter vs a plain-Rust f64
+reference 1.1e-13, interpreter before vs after the passes 0; GPU vs reference 4.3e-7 (M4),
+1.4e-4 (3090: the router GEMM is a TF32 `mma.sync` tile). Top-k indices match the reference
+exactly on both chips at both sizes.
+
+**Timed config:** T 8, D 2048, E 128, K 10, F 512 (Qwen3-Next-80B-A3B's hidden size, expert FFN
+width and top-k, with 128 of its 512 experts to fit the 3090's free memory). The expert half reads
+3 matrices × 80 (token, slot) pairs = 1007 MB of weights per layer.
+The baseline is the same expert math over weights the host gathered into contiguous `[T, K, …]`
+buffers (affine views): same FLOPs, same bytes, no data-dependent address. It runs under its own
+`schedule_auto` choice (a 16×16 tile) and again with every node forced to one thread per point
+(the gathered kernels' schedule).
+
+| expert GEMMs + combine | M4 Max | RTX 3090 |
+|---|---|---|
+| **gathered (`W[sel[t,k]]`)** | **2.17 ms** (464 GB/s) | **2.66 ms** (378 GB/s) |
+| pre-gathered, `schedule_auto` (tile) | 2.89 ms (348 GB/s) | 3.55 ms (283 GB/s) |
+| pre-gathered, one thread per point | 2.91 ms (346 GB/s) | 3.77 ms (267 GB/s) |
+| whole layer (router, top-k, experts) | 2.95 ms | 2.82 ms |
+
+Per kernel (gathered layer): gate 0.55 / 0.80 ms, up 0.62 / 0.77 ms, combine with the inlined
+down projection 0.95 / 1.09 ms (M4 / 3090). On the 3090 router + top-k are 0.07 ms in all (12
+kernels of 3–12 µs); on the M4 they are ~1.2 ms, ~0.08 ms per dispatch — launch overhead.
+
+M4 at T 32 (4.0 GB of weight reads): gathered 9.53 ms (423 GB/s), pre-gathered 11.67 ms tiled /
+11.55 ms per point.
+
+**Reading.** The data-dependent address costs nothing measurable: the gathered layer is *faster*
+than the affine baseline on both chips, under either baseline schedule. Not explained yet — the
+inner loop and the bytes are the same; the gathered kernels index 3 matrices of 64 MB per expert
+instead of 1 GB of per-(token, slot) copies, which may treat the TLB and page mapping better. As an
+absolute number, 378 GB/s is 40% of the 3090's 936 GB/s: one thread per output point walks its
+8 KB weight row alone, so adjacent threads' reads are 8 KB apart (uncoalesced). The gathered comp
+gets no tile (tiles stage affine regions) and no split at this size (40960 points); a
+warp-per-row GEMV schedule for gathered contractions is the obvious next step before comparing
+against tang-llm's hand-written int8 MoE kernel.
+
+## Coder-Next MoE layer derived from the IR vs the hand kernels (H200, kernel-only)
+
+**Date:** 2026-11-06. **Branch:** `claude/moe-ir-derive` (on `claude/focused-elgamal-3af3c7`, gather views).
+**GPU:** 1× H200 SXM, RunPod secure (pod `29rjl4y2rn3fyk`, US-NC-1), idle: 0 MiB / 0% before the runs.
+**Run:** `cargo run --release -p tang-bench --features cuda --example coder_moe_ir` with
+`CODER_MOE_DUMP=dir`, then `cargo run --release -p tang-llm --features cuda --example coder_moe_hand -- dir`
+(the engine's own kernels from `coder_kernels.rs`, compiled and launched as `coder.rs` does, on the same bytes).
+
+**Layer.** Qwen3-Coder-Next 80B-A3B shapes: hidden 2048, 512 routed experts + 1 shared, top-10, expert
+FFN 512. Gate|up stored GGUF Q4_K, down Q5_K (random valid super-blocks; ~975 MB a layer), router f32.
+One IR graph: router GEMM → top-k (10 argmax rounds) → softmax weights + sigmoid shared gate → pairs
+sorted by expert (rank + inverse permutation, ordinary comps) → `gu[i] = Wgu[key[i]] · xq[tok[i]]` →
+SwiGLU → `dn[i] = Wd[key[i]] · h[i]` → combine reading `dn[rank[t, j]]`. No new op: the int8 path is
+schedule fields — `Format::Q4K/Q5K` (input storage), `Format::Q8x32` (int8 a 32, quantized by the
+writer) on `xq` and `h`, `IntMma { stage: Fragment, ksplit: (2, 1) }` on the two expert GEMMs
+(`docs/tensor-ir.md`, "Integer MMA and block formats").
+
+**Correctness.** Interpreter (`eval_emulated`, same int8 rounding) vs plain-Rust reference (small
+config): y 2.7e-7. GPU vs reference at B = 1/8/64: ≤ 2.8e-7 (gu, dn, y; top-k exact). Hand kernels vs
+derived on the same bytes: gate|up ≤ 2.7e-7, down ≤ 3.0e-7, combine ≤ 2.9e-7 (max abs / max |ref|).
+
+**Times** (ms a launch; median of 100 with the L2 flushed by a 256 MB memset before each — weights cold,
+as in the engine's 48-layer cycle. Warm minima within ~10% and in the same order.)
+
+| B | | derived (IR) | hand (engine) |
+|---|---|---|---|
+| 1 | gate\|up | 0.0174 (int8 MMA) | 0.0145 `cx_moe_gu_d2` (per pair, dp4a) |
+| | down | 0.0129 + SwiGLU→Q8 0.0062 | 0.0189 `cx_moe_down_d2f` (SiLU fused) |
+| | x→Q8 / combine | 0.0055 / 0.0063 | — (fused in norm) / 0.0113 `cx_moe_add_norm` |
+| | **expert half** | **0.0484** | **0.0447** |
+| 8 | gate\|up | 0.0481 | 0.0535 `cx_moe_gu_d4` |
+| | down | 0.0312 + 0.0065 | 0.0607 `cx_moe_down_d4f` |
+| | **expert half** | **0.0981** | **0.1256** |
+| 64 | gate\|up | **0.158** | 0.180 `cx_moe_gu_q` (the §8 int8 MMA) |
+| | down | **0.0885** + 0.0085 | 0.124 `cx_moe_down_q` + 0.0126 `cx_silu_q` |
+| | plan / x→Q8 / combine | — (sort in routing) / 0.0060 / 0.0084 | 0.0064 / — / 0.0125 |
+| | **expert half** | **0.270** | **0.336** |
+
+Stage and split at B=64 (gate|up / down, cold): Fragment (2,1) 0.158 / 0.089; Fragment (1,1) 0.165 /
+0.088; (4,2) 0.165 / 0.101; (8,2) 0.177 / 0.101; MMA k order (2,1) 0.199 / 0.097 — fragment-order
+staging is worth ~20% on gate|up.
+
+**Reading.** The derived expert GEMMs match or beat the hand kernels at B = 8 and 64 (B=64 gate|up −12%,
+down −29%) and trail at B = 1 (+20% gate|up: one pair a tile, where the hand per-pair dp4a GEMV with
+more warps a pair wins). Likely sources of the B=64 win: mins folded through the stored `dₓ·Σc` (no
+second MMA), groups cut at 8-position tiles with no plan kernel, and ksplit 1 on down.
+
+**What is missing (the gap that remains).**
+- *Routing.* The derived router + top-k + sort is 27 small kernels (0.35 ms at B=1, 0.6 ms at B=64);
+  the engine's is one router GEMV + `cx_route` (not timed here). Top-k as k argmax rounds, one kernel
+  each, is the cost; a warp-level top-k schedule (or a fused reduction) is the next field.
+- *Fusion.* The engine fuses x's int8 into the previous RMSnorm, SiLU into the B≤8 down kernel, and the
+  combine into residual + next norm; the derived layer keeps SwiGLU→Q8 and x→Q8 as their own kernels
+  (~0.012 ms a layer).
+- *B=1.* A narrow-window schedule (one pair over more warps, dp4a instead of MMA) is not expressible yet.
+- Synthetic weights (random valid k-quant blocks, gate/up Q4_K, down Q5_K); the real UD-Q4_K_XL mixes
+  types per layer. Kernel-only times; no CUDA graph, no end-to-end step.
+
+## WGSL/MSL lowering caps: subgroups, native f16, simdgroup fragments under wgpu
+
+`TensorGraph::to_wgsl_caps(outputs, WgslCaps { subgroups, f16 })` lets the
+WGSL lowering use what the device has (`GpuDevice::wgsl_caps()`; wgpu
+`SUBGROUP`, `SHADER_F16`; `TANG_NO_SUBGROUPS` / `TANG_NO_F16` turn them off).
+Plain `to_wgsl` is unchanged, portable WGSL.
+
+- **Subgroup split combine** (`subgroup` schedule field, set by
+  `schedule_auto` on its splits; `set_subgroup`): a split reduction folds
+  its per-thread partials with `subgroupAdd` / `subgroupMax` (sum, max) or a
+  `subgroupShuffleXor` butterfly through the monoid's combine (any monoid:
+  argmax, online softmax), then one barrier and a fold of the per-subgroup
+  partials, instead of a log₂(split) workgroup-memory tree. Splits that are
+  a power of two of at least 128 only. MSL always has it (`simd_sum`,
+  `simd_max`, `simd_shuffle_xor`), so the native backend uses it too.
+- **Native f16** (`enable f16;`): f16 buffers become `array<f16>` (same bytes
+  as the packed-u32 fallback), stores are plain instead of two atomics, and
+  f16 accumulator rounding is a cast. Works on Metal with wgpu 25. **Not on
+  the 3090:** wgpu 25's Vulkan adapter does not expose `SHADER_F16` there
+  (NVIDIA lacks `storageInputOutput16`, which, as far as I can tell, wgpu
+  requires for that feature), so the 3090 keeps the packed path. The
+  numbers are the same either way.
+- **Fragments under wgpu** (`to_msl_mma[_caps]`, Metal MSL passthrough): a
+  node scheduled `fragment` that has a simdgroup-matrix plan (f16
+  contraction, fused f16 attention) now runs the native backend's
+  `simdgroup_matrix` 8×8 kernel inside the wgpu program. Same buffers in the
+  same order, static threadgroup memory, same grid. Before this they only
+  ran on the separate `metal`-feature backend. WGSL has no matrix path:
+  wgpu 25 exposes no cooperative/subgroup-matrix feature.
+
+`cargo run --release -p tang-bench --example lowering_caps` (A/B interleaved,
+best of 5×30 launches, kernel-only, ms) and `scripts/torch_lowering_caps.py`
+(the same shapes; f32 matmul without TF32). The M4 was shared with other
+sessions during these runs, and its absolute times moved up to 2× between
+runs. Compare columns within one run.
+
+**Caps A/B (portable → caps).** M4 Max: within ±10% for split reductions
+(one 1.74× outlier on `sum [512,8192]` that a rerun did not reproduce),
+f16-input matmul and attention fwd and fwd+bwd. 3090 (subgroups only):
+0.97–1.04× everywhere. These kernels are not limited by the combine tree
+or by f16 unpacking. Both features are correct and validated, but they
+are not where the gap to PyTorch comes from.
+
+**Fragments under wgpu (M4, f16 q/k/v or a/b, f32 accumulate) vs the f32
+WGSL schedule, and vs PyTorch 2.15 MPS (separate run, same afternoon):**
+
+| workload | WGSL f32 auto | wgpu fragment | speedup | TFLOP/s | MPS f32 | MPS f16 |
+|---|---|---|---|---|---|---|
+| attn h1 n1024 | 0.943 | 0.122 | 7.7× | 2.2 | 0.096 | 0.117 |
+| attn h8 n1024 | 12.68 | 0.874 | 14.5× | 2.5 | 0.311 | 0.288 |
+| attn h8 n2048 | 34.86 | 1.648 | 21× | 5.2 | 1.062 | 0.946 |
+| attn h8 n2048 causal | 35.85 | 1.332 | 27× | 3.2 | 0.654 | 0.568 |
+| attn h8 n4096 | 105.6 | 3.768 | 28× | 9.1 | 4.092 | 3.783 |
+| matmul 1024³ | 0.750 | 0.291 | 2.6× | 7.4 | 0.245 | 0.230 |
+| matmul 2048³ | 5.237 | 2.066 | 2.5× | 8.3 | 1.564 | 1.409 |
+| matmul 512×576×1536 | 0.372 | 0.125 | 3.0× | 7.2 | 0.133 | 0.116 |
+
+(The WGSL f32 column was unusually slow in this run: the same schedule
+took 5.6–11 ms at h8 n1024 in other runs. The fragment column is the
+number that matters.) Through wgpu, Metal attention now ties MPS f16 at
+h8 × 4096 and trails it by 1.7–2.3× at n ≤ 2048. Matmul is 1.1–1.5× behind
+MPS f16. Max |fragment − f32| is 0.7–2.2e-3 for attention; for matmul it is
+0.09–0.16 on outputs of magnitude ~30–45, which is what rounding the
+inputs to f16 costs.
+
+**3090 vs PyTorch 2.10 cu128 (WGSL via Vulkan, caps on):** matmul 1024³
+0.350 vs 0.108 f32 / 0.041 f16; attention h8 n1024 4.31 vs 0.280 / 0.044;
+fwd+bwd h8 n1024 4.81 vs 1.19 / 0.164. The 3090's gap is tensor cores,
+which WGSL cannot reach in wgpu 25. That is the CUDA backend's job.

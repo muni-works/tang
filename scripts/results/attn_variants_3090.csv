@@ -1,0 +1,385 @@
+variant,d,n,pass,system,heads,ms,tflops,rel_err,note
+causal,64,1024,fwd,tang,1,0.0315,4.27,5.66e-04,kernels=1 nxn=0 mma=1/1
+causal,64,1024,fwd,flex_fp32,1,0.0835,1.61,1.57e-03,
+causal,64,1024,fwd,flex_bf16,1,0.0442,3.04,5.72e-03,
+causal,64,1024,fwd,fa2_bf16,1,0.0131,10.25,5.72e-03,
+causal,64,1024,fwdbwd,tang,1,0.2244,2.10,5.08e-04,kernels=9 nxn=2 mma=6/6
+causal,64,1024,fwdbwd,flex_fp32,1,0.6676,0.70,2.64e-03,
+causal,64,1024,fwdbwd,flex_bf16,1,0.2957,1.59,5.17e-03,
+causal,64,1024,fwdbwd,fa2_bf16,1,0.1261,3.73,4.88e-03,
+sliding128,64,1024,fwd,tang,1,0.0322,0.98,5.66e-04,kernels=1 nxn=0 mma=1/1
+sliding128,64,1024,fwd,flex_fp32,1,0.0245,1.29,1.10e-03,
+sliding128,64,1024,fwd,flex_bf16,1,0.0145,2.17,5.72e-03,
+sliding128,64,1024,fwd,fa2_bf16,1,,,,unsupported
+sliding128,64,1024,fwdbwd,tang,1,0.2339,0.47,4.69e-04,kernels=9 nxn=2 mma=6/6
+sliding128,64,1024,fwdbwd,flex_fp32,1,0.0490,2.25,3.01e-03,
+sliding128,64,1024,fwdbwd,flex_bf16,1,0.0331,3.33,5.04e-03,
+sliding128,64,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,64,1024,fwd,tang,1,0.0315,4.27,5.79e-04,kernels=1 nxn=0 mma=1/1
+alibi,64,1024,fwd,flex_fp32,1,0.3995,0.34,1.22e-03,
+alibi,64,1024,fwd,flex_bf16,1,0.0464,2.89,5.92e-03,
+alibi,64,1024,fwd,fa2_bf16,1,,,,unsupported
+alibi,64,1024,fwdbwd,tang,1,0.2298,2.05,3.06e-04,kernels=9 nxn=2 mma=6/6
+alibi,64,1024,fwdbwd,flex_fp32,1,0.6716,0.70,2.89e-03,
+alibi,64,1024,fwdbwd,flex_bf16,1,0.1456,3.23,4.97e-03,
+alibi,64,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,64,1024,fwd,tang,1,0.0390,3.44,5.25e-04,kernels=1 nxn=0 mma=1/1
+softcap,64,1024,fwd,flex_fp32,1,0.1236,1.09,9.28e-04,
+softcap,64,1024,fwd,flex_bf16,1,0.0891,1.51,4.88e-03,
+softcap,64,1024,fwd,fa2_bf16,1,,,,unsupported
+softcap,64,1024,fwdbwd,tang,1,0.2847,1.65,5.15e-04,kernels=9 nxn=2 mma=6/6
+softcap,64,1024,fwdbwd,flex_fp32,1,0.2171,2.17,2.00e-03,
+softcap,64,1024,fwdbwd,flex_bf16,1,0.1955,2.41,3.64e-03,
+softcap,64,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,64,1024,fwd,tang,1,0.0329,4.10,5.26e-04,kernels=1 nxn=0 mma=1/1
+prefix64,64,1024,fwd,flex_fp32,1,0.0882,1.53,1.76e-03,
+prefix64,64,1024,fwd,flex_bf16,1,0.0479,2.82,5.73e-03,
+prefix64,64,1024,fwd,fa2_bf16,1,,,,unsupported
+prefix64,64,1024,fwdbwd,tang,1,0.2270,2.08,5.30e-04,kernels=9 nxn=2 mma=6/6
+prefix64,64,1024,fwdbwd,flex_fp32,1,0.1622,2.91,2.53e-03,
+prefix64,64,1024,fwdbwd,flex_bf16,1,0.1455,3.24,4.97e-03,
+prefix64,64,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,64,1024,fwd,tang,1,0.0318,8.44,4.69e-04,kernels=1 nxn=0 mma=1/1
+bidirectional,64,1024,fwd,flex_fp32,1,0.0881,3.05,1.84e-03,
+bidirectional,64,1024,fwd,flex_bf16,1,0.0468,5.74,5.12e-03,
+bidirectional,64,1024,fwd,fa2_bf16,1,0.0229,11.72,5.12e-03,
+bidirectional,64,1024,fwdbwd,tang,1,0.2131,4.41,3.85e-04,kernels=9 nxn=2 mma=6/6
+bidirectional,64,1024,fwdbwd,flex_fp32,1,0.1798,5.22,2.68e-03,
+bidirectional,64,1024,fwdbwd,flex_bf16,1,0.1697,5.54,6.45e-03,
+bidirectional,64,1024,fwdbwd,fa2_bf16,1,0.1223,7.68,6.45e-03,
+causal,64,2048,fwd,tang,1,0.0602,8.92,5.42e-04,kernels=1 nxn=0 mma=1/1
+causal,64,2048,fwd,flex_fp32,1,0.1710,3.14,1.20e-03,
+causal,64,2048,fwd,flex_bf16,1,0.0896,5.99,6.34e-03,
+causal,64,2048,fwd,fa2_bf16,1,0.0233,23.04,6.34e-03,
+causal,64,2048,fwdbwd,tang,1,0.5539,3.39,1.03e-03,kernels=9 nxn=2 mma=6/6
+causal,64,2048,fwdbwd,flex_fp32,1,0.4145,4.53,3.34e-03,
+causal,64,2048,fwdbwd,flex_bf16,1,0.2022,9.30,5.81e-03,
+causal,64,2048,fwdbwd,fa2_bf16,1,0.2280,8.25,5.81e-03,
+sliding128,64,2048,fwd,tang,1,0.0616,1.06,5.64e-04,kernels=1 nxn=0 mma=1/1
+sliding128,64,2048,fwd,flex_fp32,1,0.0324,2.01,1.20e-03,
+sliding128,64,2048,fwd,flex_bf16,1,0.0321,2.03,6.34e-03,
+sliding128,64,2048,fwd,fa2_bf16,1,,,,unsupported
+sliding128,64,2048,fwdbwd,tang,1,0.5798,0.39,8.79e-04,kernels=9 nxn=2 mma=6/6
+sliding128,64,2048,fwdbwd,flex_fp32,1,0.1461,1.56,3.45e-03,
+sliding128,64,2048,fwdbwd,flex_bf16,1,0.1500,1.52,5.49e-03,
+sliding128,64,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,64,2048,fwd,tang,1,0.0603,8.91,6.25e-04,kernels=1 nxn=0 mma=1/1
+alibi,64,2048,fwd,flex_fp32,1,0.1712,3.14,1.39e-03,
+alibi,64,2048,fwd,flex_bf16,1,0.0936,5.74,6.18e-03,
+alibi,64,2048,fwd,fa2_bf16,1,,,,unsupported
+alibi,64,2048,fwdbwd,tang,1,0.5498,3.42,7.51e-04,kernels=9 nxn=2 mma=6/6
+alibi,64,2048,fwdbwd,flex_fp32,1,0.4155,4.52,3.36e-03,
+alibi,64,2048,fwdbwd,flex_bf16,1,0.2068,9.09,6.48e-03,
+alibi,64,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,64,2048,fwd,tang,1,0.0748,7.18,4.29e-04,kernels=1 nxn=0 mma=1/1
+softcap,64,2048,fwd,flex_fp32,1,0.2538,2.12,7.99e-04,
+softcap,64,2048,fwd,flex_bf16,1,0.1719,3.13,4.86e-03,
+softcap,64,2048,fwd,fa2_bf16,1,,,,unsupported
+softcap,64,2048,fwdbwd,tang,1,0.8021,2.34,8.76e-04,kernels=9 nxn=2 mma=6/6
+softcap,64,2048,fwdbwd,flex_fp32,1,0.5115,3.68,2.38e-03,
+softcap,64,2048,fwdbwd,flex_bf16,1,0.3244,5.80,5.96e-03,
+softcap,64,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,64,2048,fwd,tang,1,0.0627,8.57,5.93e-04,kernels=1 nxn=0 mma=1/1
+prefix64,64,2048,fwd,flex_fp32,1,0.1707,3.15,1.52e-03,
+prefix64,64,2048,fwd,flex_bf16,1,0.0894,6.01,5.25e-03,
+prefix64,64,2048,fwd,fa2_bf16,1,,,,unsupported
+prefix64,64,2048,fwdbwd,tang,1,0.5560,3.38,1.05e-03,kernels=9 nxn=2 mma=6/6
+prefix64,64,2048,fwdbwd,flex_fp32,1,0.4151,4.53,3.27e-03,
+prefix64,64,2048,fwdbwd,flex_bf16,1,0.1996,9.43,6.48e-03,
+prefix64,64,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,64,2048,fwd,tang,1,0.0609,17.63,4.35e-04,kernels=1 nxn=0 mma=1/1
+bidirectional,64,2048,fwd,flex_fp32,1,0.1677,6.40,1.73e-03,
+bidirectional,64,2048,fwd,flex_bf16,1,0.0885,12.13,3.93e-03,
+bidirectional,64,2048,fwd,fa2_bf16,1,0.0337,31.90,5.53e-03,
+bidirectional,64,2048,fwdbwd,tang,1,0.4985,7.54,7.91e-04,kernels=9 nxn=2 mma=6/6
+bidirectional,64,2048,fwdbwd,flex_fp32,1,0.4469,8.41,2.94e-03,
+bidirectional,64,2048,fwdbwd,flex_bf16,1,0.1992,18.86,7.00e-03,
+bidirectional,64,2048,fwdbwd,fa2_bf16,1,0.2413,15.58,7.00e-03,
+causal,64,4096,fwd,tang,1,0.2265,9.48,4.18e-04,kernels=1 nxn=0 mma=1/1
+causal,64,4096,fwd,flex_fp32,1,0.3400,6.32,1.21e-03,
+causal,64,4096,fwd,flex_bf16,1,0.1772,12.13,4.38e-03,
+causal,64,4096,fwd,fa2_bf16,1,0.0650,33.03,4.38e-03,
+causal,64,4096,fwdbwd,tang,1,1.8095,4.15,6.14e-04,kernels=9 nxn=2 mma=6/6
+causal,64,4096,fwdbwd,flex_fp32,1,0.9681,7.77,2.15e-03,
+causal,64,4096,fwdbwd,flex_bf16,1,0.4202,17.89,8.11e-03,
+causal,64,4096,fwdbwd,fa2_bf16,1,0.4686,16.04,8.11e-03,
+sliding128,64,4096,fwd,tang,1,0.2338,0.57,5.77e-04,kernels=1 nxn=0 mma=1/1
+sliding128,64,4096,fwd,flex_fp32,1,0.0343,3.85,1.38e-03,
+sliding128,64,4096,fwd,flex_bf16,1,0.0347,3.81,5.40e-03,
+sliding128,64,4096,fwd,fa2_bf16,1,,,,unsupported
+sliding128,64,4096,fwdbwd,tang,1,1.9006,0.24,5.17e-04,kernels=9 nxn=2 mma=6/6
+sliding128,64,4096,fwdbwd,flex_fp32,1,0.1612,2.87,2.21e-03,
+sliding128,64,4096,fwdbwd,flex_bf16,1,0.1479,3.13,6.29e-03,
+sliding128,64,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,64,4096,fwd,tang,1,0.2283,9.41,6.26e-04,kernels=1 nxn=0 mma=1/1
+alibi,64,4096,fwd,flex_fp32,1,0.3401,6.32,1.52e-03,
+alibi,64,4096,fwd,flex_bf16,1,0.1852,11.60,6.36e-03,
+alibi,64,4096,fwd,fa2_bf16,1,,,,unsupported
+alibi,64,4096,fwdbwd,tang,1,1.8092,4.16,4.85e-04,kernels=9 nxn=2 mma=6/6
+alibi,64,4096,fwdbwd,flex_fp32,1,0.9651,7.79,2.34e-03,
+alibi,64,4096,fwdbwd,flex_bf16,1,0.4405,17.07,5.12e-03,
+alibi,64,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,64,4096,fwd,tang,1,0.2871,7.48,3.79e-04,kernels=1 nxn=0 mma=1/1
+softcap,64,4096,fwd,flex_fp32,1,0.5035,4.27,9.20e-04,
+softcap,64,4096,fwd,flex_bf16,1,0.3405,6.31,5.03e-03,
+softcap,64,4096,fwd,fa2_bf16,1,,,,unsupported
+softcap,64,4096,fwdbwd,tang,1,2.8770,2.61,4.68e-04,kernels=9 nxn=2 mma=6/6
+softcap,64,4096,fwdbwd,flex_fp32,1,1.1743,6.40,1.52e-03,
+softcap,64,4096,fwdbwd,flex_bf16,1,0.6650,11.31,6.58e-03,
+softcap,64,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,64,4096,fwd,tang,1,0.2381,9.02,4.57e-04,kernels=1 nxn=0 mma=1/1
+prefix64,64,4096,fwd,flex_fp32,1,0.3384,6.35,1.48e-03,
+prefix64,64,4096,fwd,flex_bf16,1,0.1785,12.04,5.34e-03,
+prefix64,64,4096,fwd,fa2_bf16,1,,,,unsupported
+prefix64,64,4096,fwdbwd,tang,1,1.8119,4.15,6.23e-04,kernels=9 nxn=2 mma=6/6
+prefix64,64,4096,fwdbwd,flex_fp32,1,0.9633,7.81,2.14e-03,
+prefix64,64,4096,fwdbwd,flex_bf16,1,0.4232,17.77,8.08e-03,
+prefix64,64,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,64,4096,fwd,tang,1,0.2312,18.58,3.98e-04,kernels=1 nxn=0 mma=1/1
+bidirectional,64,4096,fwd,flex_fp32,1,0.3325,12.92,1.83e-03,
+bidirectional,64,4096,fwd,flex_bf16,1,0.1721,24.95,7.50e-03,
+bidirectional,64,4096,fwd,fa2_bf16,1,0.0973,44.15,7.50e-03,
+bidirectional,64,4096,fwdbwd,tang,1,1.5804,9.51,3.86e-04,kernels=9 nxn=2 mma=6/6
+bidirectional,64,4096,fwdbwd,flex_fp32,1,1.2385,12.14,2.84e-03,
+bidirectional,64,4096,fwdbwd,flex_bf16,1,0.4982,30.17,5.97e-03,
+bidirectional,64,4096,fwdbwd,fa2_bf16,1,0.5055,29.73,5.97e-03,
+causal,64,8192,fwd,tang,1,0.8878,9.68,5.52e-04,kernels=1 nxn=0 mma=1/1
+causal,64,8192,fwd,flex_fp32,1,0.6352,13.53,1.34e-03,
+causal,64,8192,fwd,flex_bf16,1,0.3262,26.33,5.54e-03,
+causal,64,8192,fwd,fa2_bf16,1,0.1769,48.55,5.54e-03,
+causal,64,8192,fwdbwd,tang,1,6.7574,4.45,5.66e-04,kernels=9 nxn=2 mma=6/6
+causal,64,8192,fwdbwd,flex_fp32,1,2.5444,11.82,1.96e-03,
+causal,64,8192,fwdbwd,flex_bf16,1,0.9645,31.17,6.38e-03,
+causal,64,8192,fwdbwd,fa2_bf16,1,0.9256,32.49,6.38e-03,
+sliding128,64,8192,fwd,tang,1,0.9106,0.29,6.29e-04,kernels=1 nxn=0 mma=1/1
+sliding128,64,8192,fwd,flex_fp32,1,0.0365,7.31,1.23e-03,
+sliding128,64,8192,fwd,flex_bf16,1,0.0343,7.76,6.05e-03,
+sliding128,64,8192,fwd,fa2_bf16,1,,,,unsupported
+sliding128,64,8192,fwdbwd,tang,1,7.3367,0.13,4.78e-04,kernels=9 nxn=2 mma=6/6
+sliding128,64,8192,fwdbwd,flex_fp32,1,0.1670,5.58,2.55e-03,
+sliding128,64,8192,fwdbwd,flex_bf16,1,0.1482,6.29,4.70e-03,
+sliding128,64,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,64,8192,fwd,tang,1,0.8887,9.67,7.37e-04,kernels=1 nxn=0 mma=1/1
+alibi,64,8192,fwd,flex_fp32,1,0.6769,12.69,1.36e-03,
+alibi,64,8192,fwd,flex_bf16,1,0.3887,22.10,6.94e-03,
+alibi,64,8192,fwd,fa2_bf16,1,,,,unsupported
+alibi,64,8192,fwdbwd,tang,1,6.8336,4.40,3.95e-04,kernels=9 nxn=2 mma=6/6
+alibi,64,8192,fwdbwd,flex_fp32,1,2.5690,11.70,2.14e-03,
+alibi,64,8192,fwdbwd,flex_bf16,1,1.1131,27.01,4.04e-03,
+alibi,64,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,64,8192,fwd,tang,1,1.1246,7.64,4.84e-04,kernels=1 nxn=0 mma=1/1
+softcap,64,8192,fwd,flex_fp32,1,0.9488,9.05,7.54e-04,
+softcap,64,8192,fwd,flex_bf16,1,0.7002,12.27,4.65e-03,
+softcap,64,8192,fwd,fa2_bf16,1,,,,unsupported
+softcap,64,8192,fwdbwd,tang,1,11.3014,2.66,5.02e-04,kernels=9 nxn=2 mma=6/6
+softcap,64,8192,fwdbwd,flex_fp32,1,2.9677,10.13,1.45e-03,
+softcap,64,8192,fwdbwd,flex_bf16,1,1.5560,19.32,4.62e-03,
+softcap,64,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,64,8192,fwd,tang,1,0.9276,9.26,6.92e-04,kernels=1 nxn=0 mma=1/1
+prefix64,64,8192,fwd,flex_fp32,1,0.6571,13.07,1.70e-03,
+prefix64,64,8192,fwd,flex_bf16,1,0.3526,24.37,6.13e-03,
+prefix64,64,8192,fwd,fa2_bf16,1,,,,unsupported
+prefix64,64,8192,fwdbwd,tang,1,7.0099,4.29,5.82e-04,kernels=9 nxn=2 mma=6/6
+prefix64,64,8192,fwdbwd,flex_fp32,1,2.5418,11.83,1.96e-03,
+prefix64,64,8192,fwdbwd,flex_bf16,1,0.9803,30.68,6.38e-03,
+prefix64,64,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,64,8192,fwd,tang,1,0.9004,19.08,4.41e-04,kernels=1 nxn=0 mma=1/1
+bidirectional,64,8192,fwd,flex_fp32,1,0.6175,27.82,1.74e-03,
+bidirectional,64,8192,fwd,flex_bf16,1,0.3143,54.67,5.32e-03,
+bidirectional,64,8192,fwd,fa2_bf16,1,0.2960,58.03,5.32e-03,
+bidirectional,64,8192,fwdbwd,tang,1,6.7216,8.95,8.07e-04,kernels=9 nxn=2 mma=6/6
+bidirectional,64,8192,fwdbwd,flex_fp32,1,3.9860,15.09,3.02e-03,
+bidirectional,64,8192,fwdbwd,flex_bf16,1,1.3850,43.41,7.00e-03,
+bidirectional,64,8192,fwdbwd,fa2_bf16,1,1.0668,56.36,7.00e-03,
+causal,128,1024,fwd,tang,1,1.2754,0.21,1.68e-06,kernels=1 nxn=0 mma=0/0
+causal,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,1024,fwd,flex_bf16,1,0.0839,3.20,4.98e-03,
+causal,128,1024,fwd,fa2_bf16,1,0.0233,11.53,4.98e-03,
+causal,128,1024,fwdbwd,tang,1,0.8220,1.14,5.99e-04,kernels=9 nxn=2 mma=5/5
+causal,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,1024,fwdbwd,flex_bf16,1,0.3582,2.63,4.75e-03,
+causal,128,1024,fwdbwd,fa2_bf16,1,0.1772,5.31,4.75e-03,
+sliding128,128,1024,fwd,tang,1,1.2706,0.05,1.93e-06,kernels=1 nxn=0 mma=0/0
+sliding128,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,1024,fwd,flex_bf16,1,0.1409,0.45,6.05e-03,
+sliding128,128,1024,fwd,fa2_bf16,1,,,,unsupported
+sliding128,128,1024,fwdbwd,tang,1,0.8054,0.27,7.51e-04,kernels=9 nxn=2 mma=5/5
+sliding128,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,1024,fwdbwd,flex_bf16,1,0.7432,0.30,4.79e-03,
+sliding128,128,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,128,1024,fwd,tang,1,1.2684,0.21,1.92e-06,kernels=1 nxn=0 mma=0/0
+alibi,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,1024,fwd,flex_bf16,1,0.0914,2.94,5.97e-03,
+alibi,128,1024,fwd,fa2_bf16,1,,,,unsupported
+alibi,128,1024,fwdbwd,tang,1,0.8128,1.16,7.06e-04,kernels=9 nxn=2 mma=5/5
+alibi,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,1024,fwdbwd,flex_bf16,1,0.5190,1.81,4.94e-03,
+alibi,128,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,128,1024,fwd,tang,1,1.3384,0.20,1.08e-06,kernels=1 nxn=0 mma=0/0
+softcap,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,1024,fwd,flex_bf16,1,0.1012,2.66,4.84e-03,
+softcap,128,1024,fwd,fa2_bf16,1,,,,unsupported
+softcap,128,1024,fwdbwd,tang,1,1.0864,0.87,5.29e-04,kernels=9 nxn=2 mma=5/5
+softcap,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,1024,fwdbwd,flex_bf16,1,0.2576,3.65,5.07e-03,
+softcap,128,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,128,1024,fwd,tang,1,1.2702,0.21,2.15e-06,kernels=1 nxn=0 mma=0/0
+prefix64,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,1024,fwd,flex_bf16,1,0.0848,3.18,6.32e-03,
+prefix64,128,1024,fwd,fa2_bf16,1,,,,unsupported
+prefix64,128,1024,fwdbwd,tang,1,0.7557,1.25,5.99e-04,kernels=9 nxn=2 mma=5/5
+prefix64,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,1024,fwdbwd,flex_bf16,1,0.5285,1.79,4.75e-03,
+prefix64,128,1024,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,128,1024,fwd,tang,1,1.2777,0.42,2.85e-06,kernels=1 nxn=0 mma=0/0
+bidirectional,128,1024,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,1024,fwd,flex_bf16,1,0.0796,6.75,5.82e-03,
+bidirectional,128,1024,fwd,fa2_bf16,1,0.0250,21.49,5.82e-03,
+bidirectional,128,1024,fwdbwd,tang,1,0.7166,2.62,5.91e-04,kernels=9 nxn=2 mma=5/5
+bidirectional,128,1024,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,1024,fwdbwd,flex_bf16,1,0.3056,6.15,4.67e-03,
+bidirectional,128,1024,fwdbwd,fa2_bf16,1,0.1404,13.38,4.67e-03,
+causal,128,2048,fwd,tang,1,4.4610,0.24,2.34e-06,kernels=1 nxn=0 mma=0/0
+causal,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,2048,fwd,flex_bf16,1,0.1628,6.60,5.43e-03,
+causal,128,2048,fwd,fa2_bf16,1,0.0421,25.53,5.43e-03,
+causal,128,2048,fwdbwd,tang,1,1.7482,2.15,4.89e-04,kernels=9 nxn=2 mma=5/5
+causal,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,2048,fwdbwd,flex_bf16,1,0.3555,10.58,4.78e-03,
+causal,128,2048,fwdbwd,fa2_bf16,1,0.4887,7.69,4.78e-03,
+sliding128,128,2048,fwd,tang,1,4.5167,0.03,2.34e-06,kernels=1 nxn=0 mma=0/0
+sliding128,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,2048,fwd,flex_bf16,1,0.0244,5.33,5.43e-03,
+sliding128,128,2048,fwd,fa2_bf16,1,,,,unsupported
+sliding128,128,2048,fwdbwd,tang,1,1.7223,0.26,3.26e-04,kernels=9 nxn=2 mma=5/5
+sliding128,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,2048,fwdbwd,flex_bf16,1,0.0578,7.88,3.40e-03,
+sliding128,128,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,128,2048,fwd,tang,1,4.5124,0.24,2.45e-06,kernels=1 nxn=0 mma=0/0
+alibi,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,2048,fwd,flex_bf16,1,0.5126,2.10,6.11e-03,
+alibi,128,2048,fwd,fa2_bf16,1,,,,unsupported
+alibi,128,2048,fwdbwd,tang,1,1.7449,2.15,4.54e-04,kernels=9 nxn=2 mma=5/5
+alibi,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,2048,fwdbwd,flex_bf16,1,0.7168,5.25,3.76e-03,
+alibi,128,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,128,2048,fwd,tang,1,4.6949,0.23,2.09e-06,kernels=1 nxn=0 mma=0/0
+softcap,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,2048,fwd,flex_bf16,1,0.2065,5.20,4.78e-03,
+softcap,128,2048,fwd,fa2_bf16,1,,,,unsupported
+softcap,128,2048,fwdbwd,tang,1,2.3462,1.60,6.13e-04,kernels=9 nxn=2 mma=5/5
+softcap,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,2048,fwdbwd,flex_bf16,1,0.4836,7.78,5.00e-03,
+softcap,128,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,128,2048,fwd,tang,1,4.5144,0.24,2.17e-06,kernels=1 nxn=0 mma=0/0
+prefix64,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,2048,fwd,flex_bf16,1,0.1512,7.11,6.28e-03,
+prefix64,128,2048,fwd,fa2_bf16,1,,,,unsupported
+prefix64,128,2048,fwdbwd,tang,1,1.6386,2.30,4.89e-04,kernels=9 nxn=2 mma=5/5
+prefix64,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,2048,fwdbwd,flex_bf16,1,0.3740,10.06,4.78e-03,
+prefix64,128,2048,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,128,2048,fwd,tang,1,4.5264,0.47,2.59e-06,kernels=1 nxn=0 mma=0/0
+bidirectional,128,2048,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,2048,fwd,flex_bf16,1,0.1586,13.54,5.21e-03,
+bidirectional,128,2048,fwd,fa2_bf16,1,0.0568,37.81,5.21e-03,
+bidirectional,128,2048,fwdbwd,tang,1,1.5776,4.76,3.32e-04,kernels=9 nxn=2 mma=5/5
+bidirectional,128,2048,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,2048,fwdbwd,flex_bf16,1,0.3685,20.39,3.26e-03,
+bidirectional,128,2048,fwdbwd,fa2_bf16,1,0.2631,28.56,3.26e-03,
+causal,128,4096,fwd,tang,1,17.1497,0.25,2.09e-06,kernels=1 nxn=0 mma=0/0
+causal,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,4096,fwd,flex_bf16,1,0.3180,13.51,5.08e-03,
+causal,128,4096,fwd,fa2_bf16,1,0.1117,38.45,5.08e-03,
+causal,128,4096,fwdbwd,tang,1,5.6516,2.66,5.13e-04,kernels=9 nxn=2 mma=5/5
+causal,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,4096,fwdbwd,flex_bf16,1,0.7844,19.17,4.89e-03,
+causal,128,4096,fwdbwd,fa2_bf16,1,0.5268,28.54,4.89e-03,
+sliding128,128,4096,fwd,tang,1,17.2728,0.02,1.98e-06,kernels=1 nxn=0 mma=0/0
+sliding128,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,4096,fwd,flex_bf16,1,0.0345,7.66,5.56e-03,
+sliding128,128,4096,fwd,fa2_bf16,1,,,,unsupported
+sliding128,128,4096,fwdbwd,tang,1,5.8859,0.16,4.50e-04,kernels=9 nxn=2 mma=5/5
+sliding128,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,4096,fwdbwd,flex_bf16,1,0.1508,6.13,5.45e-03,
+sliding128,128,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,128,4096,fwd,tang,1,17.2905,0.25,2.32e-06,kernels=1 nxn=0 mma=0/0
+alibi,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,4096,fwd,flex_bf16,1,0.3291,13.05,5.93e-03,
+alibi,128,4096,fwd,fa2_bf16,1,,,,unsupported
+alibi,128,4096,fwdbwd,tang,1,5.8361,2.58,3.72e-04,kernels=9 nxn=2 mma=5/5
+alibi,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,4096,fwdbwd,flex_bf16,1,0.8063,18.65,4.89e-03,
+alibi,128,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,128,4096,fwd,tang,1,17.9986,0.24,1.97e-06,kernels=1 nxn=0 mma=0/0
+softcap,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,4096,fwd,flex_bf16,1,0.4052,10.60,4.67e-03,
+softcap,128,4096,fwd,fa2_bf16,1,,,,unsupported
+softcap,128,4096,fwdbwd,tang,1,7.5350,2.00,4.15e-04,kernels=9 nxn=2 mma=5/5
+softcap,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,4096,fwdbwd,flex_bf16,1,1.0074,14.93,4.02e-03,
+softcap,128,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,128,4096,fwd,tang,1,17.2525,0.25,2.68e-06,kernels=1 nxn=0 mma=0/0
+prefix64,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,4096,fwd,flex_bf16,1,0.2989,14.38,5.50e-03,
+prefix64,128,4096,fwd,fa2_bf16,1,,,,unsupported
+prefix64,128,4096,fwdbwd,tang,1,5.5171,2.73,5.13e-04,kernels=9 nxn=2 mma=5/5
+prefix64,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,4096,fwdbwd,flex_bf16,1,0.7860,19.13,4.89e-03,
+prefix64,128,4096,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,128,4096,fwd,tang,1,17.3378,0.50,4.87e-06,kernels=1 nxn=0 mma=0/0
+bidirectional,128,4096,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,4096,fwd,flex_bf16,1,0.2970,28.93,4.34e-03,
+bidirectional,128,4096,fwd,fa2_bf16,1,0.1669,51.46,4.34e-03,
+bidirectional,128,4096,fwdbwd,tang,1,5.2262,5.75,5.22e-04,kernels=9 nxn=2 mma=5/5
+bidirectional,128,4096,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,4096,fwdbwd,flex_bf16,1,1.0035,29.96,6.67e-03,
+bidirectional,128,4096,fwdbwd,fa2_bf16,1,0.5787,51.96,6.67e-03,
+causal,128,8192,fwd,tang,1,68.5328,0.25,2.92e-06,kernels=1 nxn=0 mma=0/0
+causal,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,8192,fwd,flex_bf16,1,0.5924,29.00,5.05e-03,
+causal,128,8192,fwd,fa2_bf16,1,0.3276,52.45,5.05e-03,
+causal,128,8192,fwdbwd,tang,1,21.7599,2.76,7.41e-04,kernels=9 nxn=2 mma=5/5
+causal,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+causal,128,8192,fwdbwd,flex_bf16,1,2.0911,28.76,7.19e-03,
+causal,128,8192,fwdbwd,fa2_bf16,1,1.0970,54.82,7.19e-03,
+sliding128,128,8192,fwd,tang,1,69.0259,0.01,2.22e-06,kernels=1 nxn=0 mma=0/0
+sliding128,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,8192,fwd,flex_bf16,1,0.0351,15.17,6.60e-03,
+sliding128,128,8192,fwd,fa2_bf16,1,,,,unsupported
+sliding128,128,8192,fwdbwd,tang,1,22.3967,0.08,6.72e-04,kernels=9 nxn=2 mma=5/5
+sliding128,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+sliding128,128,8192,fwdbwd,flex_bf16,1,0.2087,8.93,5.17e-03,
+sliding128,128,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+alibi,128,8192,fwd,tang,1,68.8638,0.25,2.89e-06,kernels=1 nxn=0 mma=0/0
+alibi,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,8192,fwd,flex_bf16,1,0.6536,26.29,5.94e-03,
+alibi,128,8192,fwd,fa2_bf16,1,,,,unsupported
+alibi,128,8192,fwdbwd,tang,1,22.4309,2.68,7.21e-04,kernels=9 nxn=2 mma=5/5
+alibi,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+alibi,128,8192,fwdbwd,flex_bf16,1,2.1677,27.74,4.97e-03,
+alibi,128,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+softcap,128,8192,fwd,tang,1,72.3847,0.24,3.21e-06,kernels=1 nxn=0 mma=0/0
+softcap,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,8192,fwd,flex_bf16,1,0.8190,20.98,4.62e-03,
+softcap,128,8192,fwd,fa2_bf16,1,,,,unsupported
+softcap,128,8192,fwdbwd,tang,1,28.9459,2.08,4.41e-04,kernels=9 nxn=2 mma=5/5
+softcap,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+softcap,128,8192,fwdbwd,flex_bf16,1,2.7120,22.17,5.81e-03,
+softcap,128,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+prefix64,128,8192,fwd,tang,1,69.1472,0.25,3.55e-06,kernels=1 nxn=0 mma=0/0
+prefix64,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,8192,fwd,flex_bf16,1,0.6284,27.34,5.71e-03,
+prefix64,128,8192,fwd,fa2_bf16,1,,,,unsupported
+prefix64,128,8192,fwdbwd,tang,1,21.2195,2.83,7.41e-04,kernels=9 nxn=2 mma=5/5
+prefix64,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+prefix64,128,8192,fwdbwd,flex_bf16,1,2.0899,28.78,7.19e-03,
+prefix64,128,8192,fwdbwd,fa2_bf16,1,,,,unsupported
+bidirectional,128,8192,fwd,tang,1,69.0286,0.50,6.04e-06,kernels=1 nxn=0 mma=0/0
+bidirectional,128,8192,fwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,8192,fwd,flex_bf16,1,0.5816,59.07,4.14e-03,
+bidirectional,128,8192,fwd,fa2_bf16,1,0.5453,63.01,4.14e-03,
+bidirectional,128,8192,fwdbwd,tang,1,20.1239,5.98,7.63e-04,kernels=9 nxn=2 mma=5/5
+bidirectional,128,8192,fwdbwd,flex_fp32,1,,,,error: InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton
+bidirectional,128,8192,fwdbwd,flex_bf16,1,3.0921,38.89,6.92e-03,
+bidirectional,128,8192,fwdbwd,fa2_bf16,1,2.0044,60.00,6.92e-03,
