@@ -725,6 +725,24 @@ fn arg_read_with(g: &TensorGraph, c: &Comp, a: &super::Arg, pts: &str) -> String
             format!("({})", terms.join(" + "))
         })
         .collect();
+    // a gather adds `coef · index`, the index arg's value rounded to an
+    // integer (index tensors are f32; exact below 2^24)
+    let signed = match &a.view.gather {
+        None => signed,
+        Some(gt) => {
+            let index = arg_read_with(g, c, &c.args[gt.arg], pts);
+            let iv = format!("i32(round({index}))");
+            signed
+                .into_iter()
+                .zip(&gt.coefs)
+                .map(|(e, &coef)| match coef {
+                    0 => e,
+                    1 => format!("({e} + {iv})"),
+                    _ => format!("({e} + {coef} * {iv})"),
+                })
+                .collect()
+        }
+    };
     let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
     let read = format!("read_{}({})", a.src.n(), idx.join(", "));
     if !a.view.guard {
