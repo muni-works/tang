@@ -603,6 +603,35 @@ fn model(args: &[String]) {
                 "decode step at len {l}: {best:.3} ms device ({:.1} tok/s)",
                 1e3 / best
             );
+            // TANG_TRACE_OUT=prefix: per-phase ns of the megakernel (min
+            // over 20 runs), or every kernel's ms alone, at this length
+            if let Ok(pre) = std::env::var("TANG_TRACE_OUT") {
+                #[cfg(feature = "cuda")]
+                let v: Vec<f64> = if env("TANG_MEGA") == 1 {
+                    let mut m: Vec<f64> = Vec::new();
+                    for _ in 0..20 {
+                        dec.prog.run(&rt);
+                        rt.sync();
+                        let t = dec.prog.mega_trace(&rt);
+                        m = if m.is_empty() {
+                            t
+                        } else {
+                            m.iter().zip(&t).map(|(a, b)| a.min(*b)).collect()
+                        };
+                    }
+                    m
+                } else {
+                    let p = &dec.prog;
+                    p.order()
+                        .iter()
+                        .map(|&i| 1e6 * p.time_kernel(&rt, i, 3))
+                        .collect()
+                };
+                #[cfg(not(feature = "cuda"))]
+                let v: Vec<f64> = Vec::new();
+                let s: Vec<String> = v.iter().map(|x| format!("{x:.0}")).collect();
+                std::fs::write(format!("{pre}_{l}.txt"), s.join("\n")).unwrap();
+            }
         }
     }
     if args.iter().any(|a| a == "--profile") {

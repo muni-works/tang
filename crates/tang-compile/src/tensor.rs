@@ -48,6 +48,9 @@ pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
 #[path = "tensor_cuda_int8.rs"]
 mod cuda_int8;
+/// A whole program as one persistent CUDA kernel (no kernel boundaries).
+#[path = "tensor_cuda_mega.rs"]
+pub mod cuda_mega;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
@@ -3506,8 +3509,8 @@ impl TensorGraph {
         g.eliminate_dead(outputs)
     }
 
-    /// Schedule (split-K): cut the single reduce axis of comp `t` (length
-    /// `K`) into `parts` contiguous chunks computed in parallel, then fold
+    /// Schedule (split-K): cut the (outermost) reduce axis of comp `t`
+    /// (length `K`) into `parts` contiguous chunks computed in parallel, then fold
     /// the chunks' partial states with the monoid's own combine. `t` is
     /// rewritten in place to the combine, so every reader is unchanged:
     ///
@@ -3548,8 +3551,10 @@ impl TensorGraph {
         let Some(m) = c.monoid.clone() else {
             return err("split_reduction: not a reduction");
         };
-        if c.red.len() != 1 || c.tuple > 1 {
-            return err("split_reduction: one reduce axis, at most one tuple dim");
+        // several reduce axes (a grouped 4-bit GEMV's groups × 64): the
+        // outermost one is cut, the inner ones stay in the partial
+        if c.red.is_empty() || c.tuple > 1 {
+            return err("split_reduction: a reduce axis, at most one tuple dim");
         }
         let total = c.red[0].n();
         if parts < 2 || total % parts != 0 {
@@ -3586,10 +3591,12 @@ impl TensorGraph {
             .collect();
         let mut out: Vec<Dim> = vec![Dim::Fixed(parts)];
         out.extend_from_slice(&c.out);
+        let mut red = vec![Dim::Fixed(per)];
+        red.extend_from_slice(&c.red[1..]);
         let partial = self.push_comp(Comp {
             out,
             tuple: c.tuple,
-            red: vec![Dim::Fixed(per)],
+            red,
             args,
             body: c.body.clone(),
             body_outs: c.body_outs.clone(),
