@@ -4,6 +4,7 @@ FlashAttention-3 and PyTorch SDPA.
 
     python scripts/hopper_attention.py gen DIR N D CAUSAL   # inputs + reference
     python scripts/hopper_attention.py bench DIR            # FA3 and SDPA
+    python scripts/hopper_attention.py matmul [MxKxN,...]   # cuBLAS bf16
 
 16k tokens per config (batch = 16384 / N) and 2048 hidden (heads = 2048 / D),
 FlashAttention's benchmark convention. q, k, v, dO ~ N(0, 1) in bf16, layout
@@ -147,11 +148,27 @@ def bench(out):
             print(f"fa3-fp8 fwd {tag}: unavailable ({type(ex).__name__}: {ex})")
 
 
+def matmul(cases):
+    """cuBLAS (torch bf16 matmul, fp32 accumulation) on the shapes of
+    `examples/hopper_matmul.rs`, both B layouts."""
+    for m, k, n in cases:
+        for weight in (False, True):
+            a = torch.randn(m, k, device="cuda").bfloat16()
+            b = torch.randn(n, k, device="cuda").bfloat16() if weight else torch.randn(k, n, device="cuda").bfloat16()
+            f = (lambda: a @ b.t()) if weight else (lambda: a @ b)
+            t = best_ms(f)
+            lay = "[n,k]" if weight else "[k,n]"
+            print(f"cublas matmul {m}x{k}x{n} b={lay}: {t:.4f} ms {2 * m * k * n / t / 1e9:.1f} TFLOP/s")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "gen":
         gen(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
     elif cmd == "bench":
         bench(sys.argv[2])
+    elif cmd == "matmul":
+        spec = sys.argv[2] if len(sys.argv) > 2 else "1024x1024x1024,2048x2048x2048,4096x4096x4096,8192x8192x8192,16384x2048x2048,16384x2048x8192,16384x8192x2048"
+        matmul([tuple(map(int, c.split("x"))) for c in spec.split(",")])
     else:
         sys.exit(__doc__)

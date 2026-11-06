@@ -1622,7 +1622,9 @@ pub fn spec_batch_check(args: &[String]) -> Result<()> {
         .filter(|x| !x.is_empty())
         .collect();
     // One run: `None` = budget 0 through decode_batch; else the mode.
-    let mut run = |e: &mut super::coder::Coder, mode: Option<Mode>| -> Result<(Vec<Vec<u32>>, f64, usize, usize, usize)> {
+    let mut run = |e: &mut super::coder::Coder,
+                   mode: Option<Mode>|
+     -> Result<(Vec<Vec<u32>>, f64, usize, usize, usize)> {
         let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
         let mut cur = Vec::new();
         for (i, &s) in slots.iter().enumerate() {
@@ -1638,12 +1640,18 @@ pub fn spec_batch_check(args: &[String]) -> Result<()> {
                 .iter()
                 .map(|&i| {
                     let room = steps - got[i].len() - 1;
-                    e.slot_drafts(slots[i]).iter().take(room).map(|x| x.1).collect()
+                    e.slot_drafts(slots[i])
+                        .iter()
+                        .take(room)
+                        .map(|x| x.1)
+                        .collect()
                 })
                 .collect();
             let room = rows.saturating_sub(live.len());
             let choice = tuner.as_mut().map(|t| t.choose(&conf, room));
-            let give = choice.as_ref().map_or(vec![0; live.len()], |c| c.drafts.clone());
+            let give = choice
+                .as_ref()
+                .map_or(vec![0; live.len()], |c| c.drafts.clone());
             e.slot_mtp = choice.as_ref().is_none_or(|c| c.mtp);
             let items: Vec<(usize, u32, Vec<u32>)> = live
                 .iter()
@@ -1693,7 +1701,9 @@ pub fn spec_batch_check(args: &[String]) -> Result<()> {
         let (got, dt, w, d, acc) = run(&mut e, Some(mode))?;
         let (mut same, mut tot, mut ident) = (0, 0, 0);
         for i in 0..nb {
-            let first = (0..steps).find(|&k| got[i][k] != base[i][k]).unwrap_or(steps);
+            let first = (0..steps)
+                .find(|&k| got[i][k] != base[i][k])
+                .unwrap_or(steps);
             same += first;
             tot += steps;
             ident += usize::from(first == steps);
@@ -1783,7 +1793,8 @@ pub fn batch_check(args: &[String]) -> Result<()> {
                 if it == 4 {
                     e.prof_reset();
                 }
-                let rows: Vec<(usize, u32)> = slots.iter().copied().zip(next.iter().copied()).collect();
+                let rows: Vec<(usize, u32)> =
+                    slots.iter().copied().zip(next.iter().copied()).collect();
                 let t0 = std::time::Instant::now();
                 next = e.decode_batch(&rows)?;
                 if it >= 4 {
@@ -1842,7 +1853,8 @@ pub fn batch_check(args: &[String]) -> Result<()> {
         let mut ok = true;
         // Tolerance (batch windows past MAX_T may use tensor-core kernels): logits compared
         // while a sequence's tokens still agree, tokens position by position.
-        let (mut dmax, mut dsum, mut dn, mut tagree, mut ttot) = (0f64, 0f64, 0usize, 0usize, 0usize);
+        let (mut dmax, mut dsum, mut dn, mut tagree, mut ttot) =
+            (0f64, 0f64, 0usize, 0usize, 0usize);
         for i in 0..nb {
             let first = (0..steps)
                 .find(|&k| alone[i].0[k] != got[i].0[k])
@@ -1855,7 +1867,8 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             }
             // Greedy agreement given the same history: steps up to (and including) the first
             // divergence; the rest have different inputs and aren't counted.
-            tagree += first - usize::from(first <= steps && alone[i].0[first - 1] != got[i].0[first - 1]);
+            tagree +=
+                first - usize::from(first <= steps && alone[i].0[first - 1] != got[i].0[first - 1]);
             ttot += first;
         }
         let agree = tagree as f64 / ttot as f64;
@@ -2537,7 +2550,11 @@ fn tree_check_one(e: &mut Coder, ids: &[u32], n: usize) -> Result<bool> {
         let at = out.len();
         let k = 1 + (rand() % 3) as usize;
         let mut chains: Vec<Vec<u32>> = (0..k)
-            .map(|_| (0..1 + rand() % 3).map(|_| (rand() % vocab) as u32).collect())
+            .map(|_| {
+                (0..1 + rand() % 3)
+                    .map(|_| (rand() % vocab) as u32)
+                    .collect()
+            })
             .collect();
         if rand() % 2 == 0 && at < greedy.len() {
             let len = 1 + (rand() % 4) as usize;
@@ -2559,7 +2576,11 @@ fn tree_check_one(e: &mut Coder, ids: &[u32], n: usize) -> Result<bool> {
     println!(
         "tree-check: {} ({n} tokens in {windows} windows, {moved} won by a later chain; first \
          difference {first_bad:?})",
-        if ok { "PASS (tokens identical)" } else { "FAIL" }
+        if ok {
+            "PASS (tokens identical)"
+        } else {
+            "FAIL"
+        }
     );
     // Speed: none / suffix chain / suffix forest.
     let cfg = DraftConfig::new(COST_CUDA);
@@ -2653,9 +2674,27 @@ pub fn sample_check(args: &[String]) -> Result<()> {
         let seed = 0x1000 + 7919 * i as u32;
         match i % 4 {
             0 => RowSampling::greedy(),
-            1 => RowSampling { temperature: 0.8, top_k: 20, top_p: 0.95, seed, presence: 0.0 },
-            2 => RowSampling { temperature: 1.0, top_k: 0, top_p: 1.0, seed, presence: 0.0 },
-            _ => RowSampling { temperature: 0.7, top_k: 20, top_p: 0.8, seed, presence: 1.5 },
+            1 => RowSampling {
+                temperature: 0.8,
+                top_k: 20,
+                top_p: 0.95,
+                seed,
+                presence: 0.0,
+            },
+            2 => RowSampling {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed,
+                presence: 0.0,
+            },
+            _ => RowSampling {
+                temperature: 0.7,
+                top_k: 20,
+                top_p: 0.8,
+                seed,
+                presence: 1.5,
+            },
         }
     };
     // One sequence alone (one-row windows).
@@ -2673,38 +2712,39 @@ pub fn sample_check(args: &[String]) -> Result<()> {
     };
     // All together.
     // All together (`pick`: which sequences, in which row order; results in that order).
-    let batched_of = |e: &mut Coder, cfgs: &[RowSampling], pick: &[usize]| -> Result<Vec<Vec<u32>>> {
-        let nb = pick.len();
-        let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
-        let mut next = Vec::new();
-        for (i, &q) in pick.iter().enumerate() {
-            e.set_slot_sampling(slots[i], cfgs[q])?;
-            next.push(e.prefill_slot(slots[i], &seqs[q])?);
-        }
-        let mut got: Vec<Vec<u32>> = next.iter().map(|&k| vec![k]).collect();
-        let t0 = Instant::now();
-        for step in 1..steps {
-            let order: Vec<usize> = if step % 2 == 0 {
-                (0..nb).collect()
-            } else {
-                (0..nb).rev().collect()
-            };
-            let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
-            let out = e.decode_batch(&rows)?;
-            for (r, &i) in order.iter().enumerate() {
-                next[i] = out[r];
-                got[i].push(out[r]);
+    let batched_of =
+        |e: &mut Coder, cfgs: &[RowSampling], pick: &[usize]| -> Result<Vec<Vec<u32>>> {
+            let nb = pick.len();
+            let slots: Vec<usize> = (0..nb).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
+            let mut next = Vec::new();
+            for (i, &q) in pick.iter().enumerate() {
+                e.set_slot_sampling(slots[i], cfgs[q])?;
+                next.push(e.prefill_slot(slots[i], &seqs[q])?);
             }
-        }
-        eprintln!(
-            "batch of {nb}: {:.2} ms a step",
-            t0.elapsed().as_secs_f64() * 1e3 / (steps - 1) as f64
-        );
-        for &s in &slots {
-            e.free_slot(s);
-        }
-        Ok(got)
-    };
+            let mut got: Vec<Vec<u32>> = next.iter().map(|&k| vec![k]).collect();
+            let t0 = Instant::now();
+            for step in 1..steps {
+                let order: Vec<usize> = if step % 2 == 0 {
+                    (0..nb).collect()
+                } else {
+                    (0..nb).rev().collect()
+                };
+                let rows: Vec<(usize, u32)> = order.iter().map(|&i| (slots[i], next[i])).collect();
+                let out = e.decode_batch(&rows)?;
+                for (r, &i) in order.iter().enumerate() {
+                    next[i] = out[r];
+                    got[i].push(out[r]);
+                }
+            }
+            eprintln!(
+                "batch of {nb}: {:.2} ms a step",
+                t0.elapsed().as_secs_f64() * 1e3 / (steps - 1) as f64
+            );
+            for &s in &slots {
+                e.free_slot(s);
+            }
+            Ok(got)
+        };
     let all: Vec<usize> = (0..nb).collect();
     let batched = |e: &mut Coder, cfgs: &[RowSampling]| batched_of(e, cfgs, &all);
     let cfgs: Vec<RowSampling> = (0..nb).map(cfg).collect();
@@ -2736,7 +2776,10 @@ pub fn sample_check(args: &[String]) -> Result<()> {
         println!(
             "seq {i} ({}): alone vs batched {}",
             if cfgs[i].sampled() {
-                format!("T {} k {} p {} pres {}", cfgs[i].temperature, cfgs[i].top_k, cfgs[i].top_p, cfgs[i].presence)
+                format!(
+                    "T {} k {} p {} pres {}",
+                    cfgs[i].temperature, cfgs[i].top_k, cfgs[i].top_p, cfgs[i].presence
+                )
             } else {
                 "greedy".into()
             },
@@ -2760,7 +2803,11 @@ pub fn sample_check(args: &[String]) -> Result<()> {
         if nb > super::coder::MAX_T { "INFO" } else if det_ok { "PASS" } else { "FAIL" }
     );
     all_ok &= det_ok;
-    let comp_same = pick.iter().zip(&other).filter(|(&q, o)| mixed[q] == **o).count();
+    let comp_same = pick
+        .iter()
+        .zip(&other)
+        .filter(|(&q, o)| mixed[q] == **o)
+        .count();
     let comp_ok = comp_same == pick.len();
     println!(
         "batch-composition independence ({} of the {nb} in another batch of {}, other rows and order): {comp_same}/{} identical: {}",
@@ -2771,9 +2818,14 @@ pub fn sample_check(args: &[String]) -> Result<()> {
     );
     all_ok &= comp_ok;
     let rep_ok = mixed == again;
-    println!("reproducible (batch run twice): {}", if rep_ok { "PASS" } else { "FAIL" });
+    println!(
+        "reproducible (batch run twice): {}",
+        if rep_ok { "PASS" } else { "FAIL" }
+    );
     all_ok &= rep_ok;
-    let gr_ok = (0..nb).filter(|&i| !cfgs[i].sampled()).all(|i| mixed[i] == plain[i]);
+    let gr_ok = (0..nb)
+        .filter(|&i| !cfgs[i].sampled())
+        .all(|i| mixed[i] == plain[i]);
     println!(
         "greedy rows in a mixed batch == an all-greedy batch: {}",
         if gr_ok { "PASS" } else { "FAIL" }
@@ -2784,15 +2836,30 @@ pub fn sample_check(args: &[String]) -> Result<()> {
     let k1 = alone(
         &mut e,
         &seqs[0],
-        RowSampling { temperature: 1.0, top_k: 1, top_p: 1.0, seed: 99, presence: 0.0 },
+        RowSampling {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            seed: 99,
+            presence: 0.0,
+        },
     )?;
-    let hot = |seed| RowSampling { temperature: 1.5, top_k: 0, top_p: 1.0, seed, presence: 0.0 };
+    let hot = |seed| RowSampling {
+        temperature: 1.5,
+        top_k: 0,
+        top_p: 1.0,
+        seed,
+        presence: 0.0,
+    };
     let h1 = alone(&mut e, &seqs[0], hot(1))?;
     let h2 = alone(&mut e, &seqs[0], hot(2))?;
     let h1b = alone(&mut e, &seqs[0], hot(1))?;
     let k1_ok = k1 == g;
     let hot_ok = h1 != g && h1 != h2 && h1 == h1b;
-    println!("T 1, top-k 1 == greedy: {}", if k1_ok { "PASS" } else { "FAIL" });
+    println!(
+        "T 1, top-k 1 == greedy: {}",
+        if k1_ok { "PASS" } else { "FAIL" }
+    );
     println!(
         "T 1.5 differs from greedy ({} of {steps} tokens differ), seeds 1 and 2 differ, seed 1 twice equal: {}",
         h1.iter().zip(&g).filter(|(x, y)| x != y).count(),
@@ -2829,7 +2896,12 @@ pub fn state_kl(args: &[String]) -> Result<()> {
             let mut f = std::io::BufReader::new(std::fs::File::open(p)?);
             let mut b = vec![0u8; 4 * steps];
             f.read_exact(&mut b)?;
-            Some((b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(), f))
+            Some((
+                b.chunks(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+                f,
+            ))
         }
         None => None,
     };
@@ -2854,9 +2926,17 @@ pub fn state_kl(args: &[String]) -> Result<()> {
             }
             Some((ft, f)) => {
                 f.read_exact(&mut rl)?;
-                let r: Vec<f32> = rl.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                let r: Vec<f32> = rl
+                    .chunks(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
                 let (p, q) = (lsm(&r), lsm(&lg));
-                kls.push(p.iter().zip(&q).map(|(x, y)| x.exp() * (x - y)).sum::<f64>());
+                kls.push(
+                    p.iter()
+                        .zip(&q)
+                        .map(|(x, y)| x.exp() * (x - y))
+                        .sum::<f64>(),
+                );
                 agree.push(got == ft[i]);
                 next = ft[i];
             }
@@ -2870,11 +2950,21 @@ pub fn state_kl(args: &[String]) -> Result<()> {
         for x in &lgs {
             f.write_all(&x.to_le_bytes())?;
         }
-        println!("state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}", ids.len(), p.display());
+        println!(
+            "state-kl: wrote {steps} tokens + logits (prompt {} tokens) to {}",
+            ids.len(),
+            p.display()
+        );
         return Ok(());
     }
-    println!("state-kl: prompt {} tokens, {steps} teacher-forced steps", ids.len());
-    println!("{:>11} {:>10} {:>10} {:>9}", "positions", "mean KL", "max KL", "top-1");
+    println!(
+        "state-kl: prompt {} tokens, {steps} teacher-forced steps",
+        ids.len()
+    );
+    println!(
+        "{:>11} {:>10} {:>10} {:>9}",
+        "positions", "mean KL", "max KL", "top-1"
+    );
     for b in (0..steps).step_by(512) {
         let e2 = (b + 512).min(steps);
         let k = &kls[b..e2];

@@ -514,6 +514,67 @@ schedule per target is not just as good as hand kernels, it is the only
 way to be right on every chip at once. A hand kernel is one point in the
 schedule space; the compiler searches it.
 
+## Hopper: asynchrony as schedule fields
+
+On sm_90 the flash forward has a second lowering, chosen by the schedule
+and not by an attention API. `FlashShape` gained one field,
+`sm90: Option<Sm90Flash { consumers, producer_regs, consumer_regs }>`;
+`SM90_FLASH_SHAPES` lists four candidates (64 or 128 keys per step, 2 or 3
+ring stages, 1 or 2 consumer warpgroups), and `Program::tuned` adds them
+as variants after `MMA_SHAPES` when the device reports sm_90 (nvrtc then
+targets `sm_90a`). The comp recognized is the same one `cuda_flash_kernel`
+already lowers; what changes is how its pieces map onto the machine:
+
+- **Warp specialization.** Warpgroup 0 is a producer: it gives up
+  registers (`setmaxnreg.dec`) and only moves data. The consumers
+  (`setmaxnreg.inc`) each own 64 query rows. A ring of `stages` K/V
+  buffers is guarded by two mbarriers per slot (full: 128 producer
+  arrivals; empty: every consumer thread), so copies for chunk c + 1
+  overlap math on chunk c without a block-wide barrier.
+- **Staging.** The producer issues 16-byte `cp.async` into tiles laid out
+  `[cols/64][rows][64]` with the 128-byte swizzle (chunk `c ^ (row % 8)`),
+  waits on its own group, fences the async proxy
+  (`fence.proxy.async.shared::cta`), and arrives on the full barrier. The
+  address of every copy is the operand's affine view, so the layout
+  generality of the `mma.sync` path is kept (any head-dim-contiguous K,
+  V, Q). TMA (`cp.async.bulk.tensor`) would need a host-encoded tensor
+  map per operand; it is not done (see below).
+- **`wgmma`.** S = Q·Kᵀ is `wgmma.m64nBNk16` with both operands from
+  shared-memory descriptors (K-major, SBO 1024, advancing 32 bytes per
+  k16 step inside a swizzle atom). The mask and the online softmax run on
+  the accumulator registers exactly as on `mma.sync` (same C layout per
+  n8 group), in exp2 with the max kept in log2 units. P is packed to bf16
+  straight from those registers into `wgmma`'s A-register fragments (the
+  accumulator's n8 groups 2k, 2k + 1 are the A fragment of keys
+  16k..16k + 15), and O += P·V is `wgmma.m64nDk16` with B = V from an
+  MN-major descriptor (`imm-trans-b`, LBO = one 64-column block).
+- The 1/√d scale is no longer required to be outside the score: both
+  `flash_tile` and `bilinear_tile` accept a literal factor on the
+  products and apply it to the accumulator.
+
+The flash backward needed three generic fixes to reach tensor cores in a
+plain attention graph (the transformer block had hidden them):
+`schedule_nested_contractions` counts an inline reduction under a tiled
+epilogue map as a tile reader, so S and dP nest instead of being written
+as n×n tensors; `bilinear_tile` takes the scale factor as above; and the
+nested-GEMM register budget is 192 (`TANG_NEST_REGS`; the tuner still
+times each variant, so a tile that spills loses).
+
+Not done, and what it costs (BENCHMARKS.md, "Flash attention on Hopper"):
+- TMA copies and FP8 (e4m3) storage. FP8 needs a `Format` variant, `wgmma`
+  k32 fragments and V transposed in shared memory (`wgmma` has no
+  transpose for 8-bit operands).
+- `wgmma` for the GEMM tiles, so the backward's dQ/dK/dV tiles (with S
+  and dP nested) still run on `mma.sync`.
+- Intra-warpgroup overlap (issuing the next S before this softmax) and
+  ping-pong between consumer warpgroups. These are the two FA3
+  scheduling tricks the derived kernel lacks; short causal rows show it.
+- One fused backward kernel: tang's backward is separate dV, dK and dQ
+  tiles, each recomputing S (and dK, dQ also dP). FlashAttention computes
+  dK and dV in one pass over queries and dQ with atomics. Deriving that
+  needs a merge of sibling reductions that read the same nested
+  contractions but reduce over different axes.
+
 ## Not yet
 
 - Fragments for attention on Metal (QKᵀ and PV under the online-softmax

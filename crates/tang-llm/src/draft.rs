@@ -817,7 +817,13 @@ impl Drafter {
     /// Branches for a draft tree: up to `k` chains of at most `room` tokens, each starting
     /// with a different token, from the local and global matches (most frequent first).
     /// Each chain is the child token followed by that child's greedy continuation.
-    pub fn branches(&self, cfg: &DraftConfig, global: &Global, k: usize, room: usize) -> Vec<Draft> {
+    pub fn branches(
+        &self,
+        cfg: &DraftConfig,
+        global: &Global,
+        k: usize,
+        room: usize,
+    ) -> Vec<Draft> {
         let (ls, ln) = self.local.self_match(cfg.max_depth);
         let mut cands: Vec<(f32, Draft)> = Vec::new();
         for (sam, s, n) in [(&self.local, ls, ln), (&global.sam, self.gm.s, self.gm.n)] {

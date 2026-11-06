@@ -332,8 +332,18 @@ impl RowSampling {
             return [0; ROW_WORDS];
         }
         let full = self.top_k == 0 && !(self.top_p > 0.0 && self.top_p < 1.0);
-        let k = if full { 0 } else if self.top_k == 0 { MAX_K } else { self.top_k.min(MAX_K) };
-        let p = if self.top_p > 0.0 && self.top_p <= 1.0 { self.top_p } else { 1.0 };
+        let k = if full {
+            0
+        } else if self.top_k == 0 {
+            MAX_K
+        } else {
+            self.top_k.min(MAX_K)
+        };
+        let p = if self.top_p > 0.0 && self.top_p <= 1.0 {
+            self.top_p
+        } else {
+            1.0
+        };
         [
             1,
             slot as u32,
@@ -503,7 +513,13 @@ pub struct RowSampler {
 }
 
 impl RowSampler {
-    pub fn new(gpu: &Gpu, dev: &CudaComputeDevice, vocab: usize, rows: usize, slots: usize) -> Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        dev: &CudaComputeDevice,
+        vocab: usize,
+        rows: usize,
+        slots: usize,
+    ) -> Result<Self> {
         let m = gpu.module(ROW_SRC).map_err(|e| anyhow!("{e}"))?;
         let k1 = m.func("rs_pass1").map_err(|e| anyhow!("{e}"))?;
         let k2 = m.func("rs_pass2").map_err(|e| anyhow!("{e}"))?;
@@ -534,13 +550,20 @@ impl RowSampler {
     pub fn clear_slot(&self, dev: &CudaComputeDevice, slot: usize) -> Result<()> {
         let addr = dev.buffer_addr(&self.seen) + (slot * self.words * 4) as u64;
         let r = unsafe { cudarc::driver::sys::cuMemsetD32_v2(addr, 0, self.words) };
-        ensure!(r == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemsetD32: {r:?}");
+        ensure!(
+            r == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "cuMemsetD32: {r:?}"
+        );
         Ok(())
     }
 
     /// The window's per-row words (`ROW_WORDS` each, `t` rows); the device must be idle.
     pub fn stage(&self, dev: &CudaComputeDevice, words: &[u32]) -> Result<()> {
-        ensure!(words.len() <= self.rows * ROW_WORDS, "{} row words", words.len());
+        ensure!(
+            words.len() <= self.rows * ROW_WORDS,
+            "{} row words",
+            words.len()
+        );
         let b: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
         htod(dev.buffer_addr(&self.params), &b)
     }

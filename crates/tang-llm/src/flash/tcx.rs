@@ -29,7 +29,10 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
-        ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+        (
+            (q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -43,7 +46,11 @@ fn decode_sb(q5: bool, b: &[u8]) -> (u16, u16, [u8; 8], [u8; 8], [u8; 256]) {
         (s[j], m[j]) = scale_min_k4(j, sc);
     }
     let mut q = [0u8; 256];
-    let (qh, qs) = if q5 { (&b[16..48], &b[48..176]) } else { (&b[0..0], &b[16..144]) };
+    let (qh, qs) = if q5 {
+        (&b[16..48], &b[48..176])
+    } else {
+        (&b[0..0], &b[16..144])
+    };
     for j64 in 0..4 {
         for l in 0..32 {
             let v = qs[32 * j64 + l];
@@ -63,13 +70,23 @@ fn decode_sb(q5: bool, b: &[u8]) -> (u16, u16, [u8; 8], [u8; 8], [u8; 256]) {
 pub fn repack(q5: bool, src: &[u8], ne: usize, rows: usize, k: usize) -> Result<Vec<u8>> {
     let bb = if q5 { 176 } else { 144 };
     let nsb = k / 256;
-    ensure!(rows % 16 == 0 && k % 256 == 0, "tcx: {rows} x {k} isn't 16 x 256 tiled");
-    ensure!(src.len() == ne * rows * nsb * bb, "tcx: {} bytes, want {}", src.len(), ne * rows * nsb * bb);
+    ensure!(
+        rows % 16 == 0 && k % 256 == 0,
+        "tcx: {rows} x {k} isn't 16 x 256 tiled"
+    );
+    ensure!(
+        src.len() == ne * rows * nsb * bb,
+        "tcx: {} bytes, want {}",
+        src.len(),
+        ne * rows * nsb * bb
+    );
     let tb = tile_bytes(q5);
     let per = (rows / 16) * nsb * tb;
     let mut out = vec![0u8; ne * per];
     // Experts in parallel (one chunk of experts a thread).
-    let nt = std::thread::available_parallelism().map_or(8, |n| n.get()).min(ne.max(1));
+    let nt = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(ne.max(1));
     let chunk = ne.div_ceil(nt);
     std::thread::scope(|sc| {
         for (ci, oc) in out.chunks_mut(chunk * per).enumerate() {
@@ -104,7 +121,8 @@ fn repack_into(q5: bool, src: &[u8], e0: usize, out: &mut [u8], rows: usize, k: 
                                 let col = |s: usize| 32 * s + 16 * (c >> 1) + 4 * tig + b;
                                 let lo = dec[row].4[col(2 * qp)];
                                 let hi = dec[row].4[col(2 * qp + 1)];
-                                t[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig + b] = (lo & 15) | ((hi & 15) << 4);
+                                t[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig + b] =
+                                    (lo & 15) | ((hi & 15) << 4);
                             }
                         }
                     }
@@ -144,18 +162,32 @@ pub fn dequant(q5: bool, t: &[u8], ne: usize, rows: usize, k: usize) -> Vec<f32>
                     for qp in 0..4 {
                         for c in 0..4 {
                             let row = g + 8 * (c & 1);
-                            let w = u32::from_le_bytes(tl[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig..][..4].try_into().unwrap());
-                            for (s, word) in [(2 * qp, w & 0x0F0F0F0F), (2 * qp + 1, (w >> 4) & 0x0F0F0F0F)] {
+                            let w = u32::from_le_bytes(
+                                tl[(qp * 16 + row) * 32 + 16 * (c >> 1) + 4 * tig..][..4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            for (s, word) in [
+                                (2 * qp, w & 0x0F0F0F0F),
+                                (2 * qp + 1, (w >> 4) & 0x0F0F0F0F),
+                            ] {
                                 // qh bytes l = 16 (c >> 1) + 4 tig + b, bit s (the kernel's word load).
                                 let hw = if q5 {
-                                    u32::from_le_bytes(tl[2048 + row * 32 + 16 * (c >> 1) + 4 * tig..][..4].try_into().unwrap())
+                                    u32::from_le_bytes(
+                                        tl[2048 + row * 32 + 16 * (c >> 1) + 4 * tig..][..4]
+                                            .try_into()
+                                            .unwrap(),
+                                    )
                                 } else {
                                     0
                                 };
                                 let word = word | ((hw >> s) & 0x01010101) << 4;
-                                let dw = u32::from_le_bytes(tl[so + row * 4..][..4].try_into().unwrap());
-                                let (d, dm) = (f16_to_f32(dw as u16), f16_to_f32((dw >> 16) as u16));
-                                let (sj, mj) = (tl[so + 64 + row * 16 + s], tl[so + 64 + row * 16 + 8 + s]);
+                                let dw =
+                                    u32::from_le_bytes(tl[so + row * 4..][..4].try_into().unwrap());
+                                let (d, dm) =
+                                    (f16_to_f32(dw as u16), f16_to_f32((dw >> 16) as u16));
+                                let (sj, mj) =
+                                    (tl[so + 64 + row * 16 + s], tl[so + 64 + row * 16 + 8 + s]);
                                 for b in 0..4 {
                                     let q = (word >> (8 * b)) & 0xFF;
                                     let col = sb * 256 + 32 * s + 16 * (c >> 1) + 4 * tig + b;
@@ -202,7 +234,12 @@ mod tests {
             let (ne, rows, k) = (2, 32, 512);
             let src = blocks(q5, ne * rows * k / 256, 0x9e3779b97f4a7c15 + q5 as u64);
             let mut want = vec![0f32; ne * rows * k];
-            dequantize(if q5 { GgmlType::Q5K } else { GgmlType::Q4K }, &src, &mut want).unwrap();
+            dequantize(
+                if q5 { GgmlType::Q5K } else { GgmlType::Q4K },
+                &src,
+                &mut want,
+            )
+            .unwrap();
             let t = repack(q5, &src, ne, rows, k).unwrap();
             assert_eq!(t.len(), ne * rows / 16 * k / 256 * tile_bytes(q5));
             // The per-row dot's view: words (q, c, 4g ..) are the GGUF qs bytes as they are.
@@ -223,7 +260,13 @@ mod tests {
             }
             let got = dequant(q5, &t, ne, rows, k);
             for i in 0..want.len() {
-                assert_eq!(got[i].to_bits(), want[i].to_bits(), "q5={q5} at {i}: {} vs {}", got[i], want[i]);
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "q5={q5} at {i}: {} vs {}",
+                    got[i],
+                    want[i]
+                );
             }
         }
     }

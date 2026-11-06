@@ -37,6 +37,10 @@ pub struct MmaShape {
     pub chunk: usize,
     pub stages: usize,
     pub split_target: usize,
+    /// Hopper (sm_90a): the block's warpgroups (four warps each, stacked
+    /// along m) issue `wgmma` m64n`bn`k16 from 128-byte-swizzled stages
+    /// instead of `mma.sync` fragments. Half operands only.
+    pub wgmma: bool,
 }
 
 impl MmaShape {
@@ -49,7 +53,12 @@ impl MmaShape {
             chunk: 32,
             stages: 3,
             split_target: 100,
+            wgmma: false,
         }
+    }
+    const fn wg(mut self) -> Self {
+        self.wgmma = true;
+        self
     }
     const fn with(mut self, chunk: usize, stages: usize, split_target: usize) -> Self {
         self.chunk = chunk;
@@ -88,6 +97,17 @@ pub const MMA_SHAPES: [MmaShape; 7] = [
     // 32 rows on two warps: twice the blocks where tiles are few (the
     // attention-backward tiles at short sequences)
     MmaShape::new(32, 64, 1, 2),
+];
+
+/// Hopper contraction tiles (`wgmma`): `Program::tuned` tries these past
+/// [`MMA_SHAPES`] on an sm_90a device. A tile that cannot take one
+/// (f32 operands, a ragged block) falls back to the `mma.sync` shape.
+pub const SM90_MMA_SHAPES: [MmaShape; 5] = [
+    MmaShape::new(128, 128, 8, 1).with(32, 4, 100).wg(),
+    MmaShape::new(128, 256, 8, 1).with(32, 3, 100).wg(),
+    MmaShape::new(64, 128, 4, 1).with(32, 4, 100).wg(),
+    MmaShape::new(128, 64, 8, 1).with(32, 4, 100).wg(),
+    MmaShape::new(64, 64, 4, 1).with(32, 4, 246).wg(),
 ];
 
 /// A flash-attention tile's shape: `bi` queries per folded head per
@@ -321,6 +341,23 @@ fn sm90_wgmma(ty: &str, n: usize, rs: bool) -> String {
     }
 }
 
+/// `wgmma` m64n`n`k16, A and B from shared-memory descriptors, with the
+/// transpose immediates (`ta`: A MN-major, `tb`: B MN-major):
+/// `tang_wg_ss{n}_{ta}{tb}`, accumulating.
+fn sm90_wgmma_ss(ty: &str, n: usize, ta: bool, tb: bool) -> String {
+    let regs = n / 2;
+    let outs: Vec<String> = (0..regs).map(|i| format!("%{i}")).collect();
+    let cons: Vec<String> = (0..regs).map(|i| format!("\"+f\"(d[{i}])")).collect();
+    let (ta, tb) = (ta as u8, tb as u8);
+    format!(
+        "static __device__ __forceinline__ void tang_wg_ss{n}_{ta}{tb}(float* d, unsigned long long a, unsigned long long b) {{\n    asm volatile(\"wgmma.mma_async.sync.aligned.m64n{n}k16.f32.{ty}.{ty} {{{}}}, %{}, %{}, 1, 1, 1, {ta}, {tb};\"\n        : {}\n        : \"l\"(a), \"l\"(b));\n}}\n",
+        outs.join(", "),
+        regs,
+        regs + 1,
+        cons.join(", ")
+    )
+}
+
 impl TensorGraph {
     /// CUDA source for `root` as a tensor-core tile in the default block
     /// shape, or `None` when it is not matmul-shaped.
@@ -378,9 +415,29 @@ impl TensorGraph {
                 "unsigned short"
             }
         };
-        // per warp: fm × fn fragments of 16×8
-        let (wtm, wtn) = (bm / sh.warps_m, bn / sh.warps_n);
-        let (fm, fnn) = (wtm / 16, wtn / 8);
+        // per warp: fm × fn fragments of 16×8 (wgmma: per warpgroup, fm
+        // m64 blocks of bn columns)
+        let wg = sh.wgmma;
+        let n_wg = (sh.warps_m * sh.warps_n) / 4;
+        let (wtm, wtn) = if wg {
+            (bm / n_wg.max(1), bn)
+        } else {
+            (bm / sh.warps_m, bn / sh.warps_n)
+        };
+        let (fm, fnn) = if wg {
+            (wtm / 64, bn / 8)
+        } else {
+            (wtm / 16, wtn / 8)
+        };
+        if wg
+            && (n_wg == 0
+                || (sh.warps_m * sh.warps_n) % 4 != 0
+                || bm % (64 * n_wg) != 0
+                || bn % 8 != 0
+                || bn > 256)
+        {
+            return None;
+        }
         if fm == 0 || wtm % 16 != 0 || wtn % 16 != 0 || chunk % 8 != 0 {
             return None;
         }
@@ -430,8 +487,25 @@ impl TensorGraph {
             .copied()
             .filter(|&f| f != super::Format::F32)
             .collect();
+        // no half plain operand, but the maps read half buffers (dV =
+        // P̃ᵀ·(dO/l) beside bf16 Q, K, dO): the tile runs in that format,
+        // the f32 operands rounded while staging (TANG_HALF_MAPS=0: TF32)
+        let map_half = || {
+            if std::env::var("TANG_HALF_MAPS").ok().as_deref() == Some("0")
+                || !a_stages.iter().chain(&b_stages).any(|st| st.2.is_some())
+            {
+                return None;
+            }
+            let fs: Vec<super::Format> = reads
+                .iter()
+                .map(|&j| fmt(j))
+                .filter(|&f| f != super::Format::F32)
+                .collect();
+            let f = *fs.first()?;
+            fs.iter().all(|&g| g == f).then_some(f)
+        };
         let half = match halves.first() {
-            None => None,
+            None => map_half(),
             Some(&f) if halves.iter().any(|&g| g != f) => return None,
             Some(&f) => Some(f),
         };
@@ -450,6 +524,9 @@ impl TensorGraph {
             None => chunk,
         };
         if half.is_some() && !chunk.is_multiple_of(16) {
+            return None;
+        }
+        if wg && (half.is_none() || !chunk.is_multiple_of(64)) {
             return None;
         }
         let esz = if half.is_some() { 2 } else { 4 };
@@ -481,6 +558,10 @@ impl TensorGraph {
         let ldbt = chunk + 8;
         // accumulators: n_outs × fm × fnn × 4 floats per thread
         if n_outs * fm * fnn * 4 > 128 {
+            return None;
+        }
+        // wgmma: an MN-major operand is staged in 64-wide column groups
+        if wg && ((a_pair && bm % 64 != 0) || (!b_col && bn % 64 != 0)) {
             return None;
         }
         // contractions nested in a map operand (S = Q·Kᵀ in dS): per
@@ -525,12 +606,30 @@ impl TensorGraph {
         let splits = split_k(n_base, k_total, chunk, sh.split_target);
         let n_tiles = n_base * splits;
         let w_out = c.width();
-        let a_floats = if a_pair { chunk * ldat } else { bm * lda };
-        let b_floats = if b_col { bn * ldbt } else { chunk * ldb };
+        // wgmma stages are unpadded (the swizzle spreads the banks)
+        let a_floats = if wg {
+            bm * chunk
+        } else if a_pair {
+            chunk * ldat
+        } else {
+            bm * lda
+        };
+        let b_floats = if wg {
+            bn * chunk
+        } else if b_col {
+            bn * ldbt
+        } else {
+            chunk * ldb
+        };
         let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
         let smem_floats = sh.stages * stage_floats;
-        // dynamic shared memory, within the 3090's 99 KB per block
-        if smem_floats * esz > 99 * 1024 {
+        if wg && sh.stages < 2 {
+            return None;
+        }
+        // dynamic shared memory, within the 3090's 99 KB per block (a
+        // Hopper block: 227 KB, less the 1 KB swizzle alignment)
+        let smem_cap = if wg { 226 * 1024 } else { 99 * 1024 };
+        if smem_floats * esz > smem_cap {
             // Many distinct operands (a multi-output, multi-term tile such
             // as the gate/up backward): shrink the ring, then the chunk,
             // rather than leave the shape without a lowering.
@@ -546,10 +645,12 @@ impl TensorGraph {
         }
 
         let mut s = String::new();
-        let kind = match half {
-            None => "TF32",
-            Some(super::Format::BF16) => "BF16",
-            Some(_) => "F16",
+        let kind = match (half, wg) {
+            (None, _) => "TF32",
+            (Some(super::Format::BF16), false) => "BF16",
+            (Some(_), false) => "F16",
+            (Some(super::Format::BF16), true) => "BF16 wgmma",
+            (Some(_), true) => "F16 wgmma",
         };
         writeln!(s, "// Auto-generated by tang-compile: mma ({kind}) tile").unwrap();
         writeln!(
@@ -560,7 +661,12 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
         writeln!(s, "#define TANG_THREADS {threads}").unwrap();
-        writeln!(s, "#define TANG_SMEM {}", smem_floats * esz).unwrap();
+        writeln!(
+            s,
+            "#define TANG_SMEM {}",
+            smem_floats * esz + if wg { 1024 } else { 0 }
+        )
+        .unwrap();
         writeln!(s, "#define TANG_OUT_LEN {}", numel_pts(&pts) * w_out).unwrap();
         writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
         s.push_str(MMA_PRELUDE);
@@ -569,6 +675,15 @@ impl TensorGraph {
         }
         if let Some(f) = half {
             s.push_str(&mma16_prelude(f));
+            if wg {
+                s.push_str(SM90_PRELUDE);
+                let ty = if f == super::Format::BF16 {
+                    "bf16"
+                } else {
+                    "f16"
+                };
+                s.push_str(&sm90_wgmma_ss(ty, bn, a_pair, !b_col));
+            }
         }
         if splits > 1 {
             // per-split partial blocks, and an arrival counter per output
@@ -596,6 +711,10 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "    (void)count;").unwrap();
         writeln!(s, "    extern __shared__ __align__(16) float smem[];").unwrap();
+        if wg {
+            // 128-byte swizzle atoms are 1 KB aligned
+            writeln!(s, "    unsigned short* smem_h = (unsigned short*)(((size_t)smem + 1023) & ~(size_t)1023);").unwrap();
+        }
         writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
         let per_split = k_total.div_ceil(chunk).div_ceil(splits) * chunk;
@@ -779,7 +898,13 @@ impl TensorGraph {
         // staging of one chunk into buffer `buf`, walking the global
         // buffer in address order
         writeln!(s, "    auto load = [&](unsigned buf, unsigned k0) {{").unwrap();
-        if half.is_some() {
+        if wg {
+            writeln!(
+                s,
+                "        unsigned short* st = smem_h + buf * {stage_floats}u;"
+            )
+            .unwrap();
+        } else if half.is_some() {
             writeln!(
                 s,
                 "        unsigned short* st = (unsigned short*)smem + buf * {stage_floats}u;"
@@ -803,7 +928,14 @@ impl TensorGraph {
                      ldst: usize| {
             let (cp, ck) = (addr.coefs[pdim], addr.coefs[kdim]);
             let slot = |pt: &str, kk: &str| {
-                if row_major {
+                // wgmma: 64-element rows of 128 bytes along the staged
+                // row (k when K-major, the block when MN-major), 16-byte
+                // chunks XOR-swizzled by the row index mod 8
+                if wg && row_major {
+                    format!("st + {off}u + (({kk}) / 64u) * {}u + ({pt}) * 64u + (((({kk}) % 64u) / 8u ^ (({pt}) % 8u)) * 8u) + ({kk}) % 8u", block * 64)
+                } else if wg {
+                    format!("st + {off}u + (({pt}) / 64u) * {}u + ({kk}) * 64u + (((({pt}) % 64u) / 8u ^ (({kk}) % 8u)) * 8u) + ({pt}) % 8u", chunk * 64)
+                } else if row_major {
                     format!("st + {off}u + {pt} * {ldst}u + {kk}")
                 } else {
                     format!("st + {off}u + {kk} * {ldst}u + {pt}")
@@ -1258,7 +1390,96 @@ impl TensorGraph {
         // k per mma step
         let kstep = if half.is_some() { 16 } else { 8 };
         let steps = chunk / kstep;
-        if sh.stages >= 2 {
+        if wg {
+            // Hopper: chunk c's wgmma are issued asynchronously, then the
+            // staging of chunk c + P runs (copies, or the maps and nested
+            // contractions computed into their stage) while they execute.
+            // With one wgmma group left in flight (ring ≥ 3), after the
+            // barrier of iteration c everyone's chunk c - 2 is done, so
+            // chunks c - 1 … c + P - 1 hold P + 1 buffers and c + P takes
+            // the last: P = stages - 2 (stages 2: P = 1, no group left in
+            // flight).
+            let st = sh.stages;
+            // TANG_WG_SYNC=1 (or nested contractions, whose registers
+            // would make ptxas serialize the wgmma anyway): stage the
+            // chunk ahead before issuing, and drain the group at once
+            let has_nested = nested.iter().any(|p| !p.is_empty());
+            let sync = match std::env::var("TANG_WG_SYNC").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => has_nested,
+            };
+            let (pf, wgw) = if sync {
+                (st - 1, 0)
+            } else if st >= 3 {
+                (st - 2, 1)
+            } else {
+                (1, 0)
+            };
+            let wpm = bm / n_wg;
+            let bytes = stage_floats * 2;
+            writeln!(
+                s,
+                "    unsigned sbase = (unsigned)__cvta_generic_to_shared(smem_h);"
+            )
+            .unwrap();
+            writeln!(s, "    unsigned wgi = warp / 4u;").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < {pf}u; c++) {{ if (c < n_chunks) load(c, k_begin + c * {chunk}u); else tang_cp_commit(); }}").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "        tang_cp_wait<{}>();", pf - 1).unwrap();
+            writeln!(s, "        tang_fence_async();").unwrap();
+            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "        unsigned so = sbase + (c % {st}u) * {bytes}u;").unwrap();
+            let ahead = format!("        if (c + {pf}u < n_chunks) load((c + {pf}u) % {st}u, k_begin + (c + {pf}u) * {chunk}u); else tang_cp_commit();");
+            if sync {
+                writeln!(s, "{ahead}").unwrap();
+            }
+            writeln!(s, "        tang_wg_fence();").unwrap();
+            let ta = a_pair as u8;
+            let tb = (!b_col) as u8;
+            for (w, u) in uses.iter().enumerate() {
+                for &(ai, bi) in u {
+                    let a_off = ai * a_floats * 2;
+                    let b_off = (n_a * a_floats + bi * b_floats) * 2;
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {fm}; i++) {{").unwrap();
+                    writeln!(s, "            unsigned mb = wgi * {wpm}u + 64u * i;").unwrap();
+                    writeln!(s, "            #pragma unroll").unwrap();
+                    writeln!(
+                        s,
+                        "            for (unsigned kb = 0u; kb < {chunk}u; kb += 16u) {{"
+                    )
+                    .unwrap();
+                    if a_pair {
+                        // [bm/64][chunk][64], MN-major
+                        writeln!(s, "                unsigned long long da = tang_desc(so + {a_off}u + (mb / 64u) * {}u + kb * 128u, {}u, 1024u);", chunk * 128, chunk * 128).unwrap();
+                    } else {
+                        // [chunk/64][bm][64], K-major
+                        writeln!(s, "                unsigned long long da = tang_desc(so + {a_off}u + (kb / 64u) * {}u + mb * 128u + (kb % 64u) * 2u, 16u, 1024u);", bm * 128).unwrap();
+                    }
+                    if b_col {
+                        writeln!(s, "                unsigned long long db = tang_desc(so + {b_off}u + (kb / 64u) * {}u + (kb % 64u) * 2u, 16u, 1024u);", bn * 128).unwrap();
+                    } else {
+                        writeln!(s, "                unsigned long long db = tang_desc(so + {b_off}u + kb * 128u, {}u, 1024u);", chunk * 128).unwrap();
+                    }
+                    writeln!(
+                        s,
+                        "                tang_wg_ss{bn}_{ta}{tb}(&acc[{w}][i][0][0], da, db);"
+                    )
+                    .unwrap();
+                    writeln!(s, "            }}").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                }
+            }
+            writeln!(s, "        tang_wg_commit();").unwrap();
+            if !sync {
+                writeln!(s, "{ahead}").unwrap();
+            }
+            writeln!(s, "        tang_wg_wait<{wgw}>();").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    tang_wg_wait<0>();").unwrap();
+        } else if sh.stages >= 2 {
             // a ring of `stages` buffers, chunk c + stages - 1 in flight
             // while chunk c is multiplied; the fragments of the next k step
             // load while this one's mma issue (across the chunk boundary
@@ -1325,12 +1546,18 @@ impl TensorGraph {
             writeln!(s, "    for (int j = 0; j < {fnn}; j++)").unwrap();
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
-            if a_pair {
+            if wg {
+                // wgmma m64nN: warp w of the group holds rows 16w + gq
+                // (+ 8), each n8 group laid out as an mma.sync C fragment
+                writeln!(s, "        unsigned lr = (warp / 4u) * {}u + 64u * i + 16u * (warp % 4u) + gq + 8u * (r / 2);", bm / n_wg.max(1)).unwrap();
+                writeln!(s, "        unsigned lc = 8u * j + 2u * tq + (r % 2);").unwrap();
+            } else if a_pair {
                 writeln!(s, "        unsigned lr = wr + 16u * i + 2u * gq + (r / 2);").unwrap();
             } else {
                 writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
             }
-            if b_col {
+            if wg {
+            } else if b_col {
                 writeln!(s, "        unsigned lc = wc + 8u * j + 2u * tq + (r % 2);").unwrap();
             } else {
                 writeln!(
@@ -1717,12 +1944,26 @@ impl TensorGraph {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             let native = match variant {
-                Some(v) if self.nodes[root].tile.0 > 0 => self
-                    .cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v % MMA_SHAPES.len()])
+                Some(v) if self.nodes[root].tile.0 > 0 => v
+                    .checked_sub(MMA_SHAPES.len())
+                    .and_then(|h| {
+                        // variants past MMA_SHAPES: the Hopper wgmma tiles
+                        self.cuda_mma_kernel_shaped(
+                            root,
+                            &reads,
+                            SM90_MMA_SHAPES[h % SM90_MMA_SHAPES.len()],
+                        )
+                    })
+                    .or_else(|| {
+                        self.cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v % MMA_SHAPES.len()])
+                    })
                     .or_else(|| {
                         // variants past MMA_SHAPES: the Hopper flash shapes
                         let fs = match v.checked_sub(MMA_SHAPES.len()) {
-                            Some(h) => SM90_FLASH_SHAPES[h % SM90_FLASH_SHAPES.len()],
+                            Some(h) => {
+                                SM90_FLASH_SHAPES
+                                    [(h / SM90_MMA_SHAPES.len()) % SM90_FLASH_SHAPES.len()]
+                            }
                             None => FLASH_SHAPES[v % FLASH_SHAPES.len()],
                         };
                         self.cuda_flash_kernel_shaped(root, &reads, fs)

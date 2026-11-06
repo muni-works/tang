@@ -1073,13 +1073,14 @@ impl Program {
             }
             #[cfg(feature = "cuda")]
             Runtime::Cuda(_) => {
-                use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES};
+                use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
                 // variant 0: every kernel transpiled; 1 + v: the
                 // tensor-core tiles in block shape MMA_SHAPES[v]; on
-                // Hopper, then the flash tiles in SM90_FLASH_SHAPES
+                // Hopper, then every pairing of a wgmma tile shape
+                // (SM90_MMA_SHAPES) with a flash shape (SM90_FLASH_SHAPES)
                 let n = MMA_SHAPES.len()
                     + if matches!(rt, Runtime::Cuda(d) if d.arch == "sm_90a") {
-                        SM90_FLASH_SHAPES.len()
+                        SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
                     } else {
                         0
                     };
