@@ -3189,29 +3189,67 @@ GEMVKB_T(8, 8) GEMVKB_T(8, 16) GEMVKB_T(8, 32)
 
 #ifdef CX_KV8
 // int8 K/V cache (`TANG_CODER_KV=int8`): position p of a layer's K (or V) cache is one CX_KVROW-byte
-// row, CX_NKV heads of CX_HD int8 codes, then the heads' f32 scales (absmax / 127), zero padding to
-// 16 bytes. Value = code * scale.
+// row, CX_NKV heads of CX_HD int8 codes, then an f16 scale (absmax / 127) for each group of KV8_G
+// dims of each head, zero padding to 16 bytes. Value = code * scale of its group.
+#define KV8_G 64
+#define KV8_NG (CX_HD / KV8_G)
+__device__ __forceinline__ float kv8_h2f(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ unsigned short kv8_f2h(float f) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
 #define KV8_Q(base, p, g) ((const signed char*)(base) + (size_t)(p) * CX_KVROW + (g) * CX_HD)
-#define KV8_S(base, p, g) (*(const float*)((const unsigned char*)(base) + (size_t)(p) * CX_KVROW + CX_NKV * CX_HD + (g) * 4))
-static_assert(CX_KVROW % 16 == 0 && CX_HD % 16 == 0, "int8 K/V rows stay 16-byte aligned");
-// Max over a block (blockDim.x a multiple of 32), of non-negative values; every thread gets it.
-__device__ float cx_bmax(float v, float* sh) {
+// The scale of dim d of head g at position p.
+#define KV8_S(base, p, g, d) kv8_h2f(((const unsigned short*)((const unsigned char*)(base) + (size_t)(p) * CX_KVROW + CX_NKV * CX_HD))[(g) * KV8_NG + (d) / KV8_G])
+static_assert(CX_KVROW % 16 == 0 && CX_HD % KV8_G == 0 && KV8_G % 32 == 0, "int8 K/V rows stay 16-byte aligned");
+// Max over this thread's group of KV8_G threads (whole warps), of non-negative values.
+__device__ float kv8_gmax(float v, float* sh) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     __syncthreads();
     if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
     __syncthreads();
+    const int w0 = (threadIdx.x / KV8_G) * (KV8_G / 32);
     float m = 0.f;
-    for (int i = 0; i < (int)(blockDim.x >> 5); i++) m = fmaxf(m, sh[i]);
+    for (int i = 0; i < KV8_G / 32; i++) m = fmaxf(m, sh[w0 + i]);
     return m;
 }
-// One head's value x (this thread's dim d) as an int8 code into the row at `row`, the head's
-// scale by thread 0.
+// Q, K and V heads are rotated before K/V are quantized: y = H D x / sqrt(CX_HD), D a fixed +-1
+// diagonal and H the Sylvester Hadamard matrix (QuaRot, arXiv 2404.00456). q.k is unchanged
+// (the rotation is orthogonal), and outlier channels are spread over the head, so a per-head
+// absmax scale wastes far fewer codes. Attention then produces H D o; cx_attn_merge undoes it
+// (o = D H y / sqrt(CX_HD)). Block = CX_HD threads, thread d owns dim d; s is CX_HD floats.
+static_assert((CX_HD & (CX_HD - 1)) == 0, "int8 K/V rotation: head dim a power of two");
+__device__ __forceinline__ float kv8_sign(int d) {
+    return ((0x5A3C96E1u >> (d & 31)) ^ (unsigned)(d >> 5) ^ (unsigned)(d >> 7)) & 1u ? -1.f : 1.f;
+}
+__device__ float kv8_wht(float x, int d, float* s) {
+    __syncthreads();
+    s[d] = x;
+    __syncthreads();
+    for (int h = 1; h < CX_HD; h <<= 1) {
+        const float a = s[d], b = s[d ^ h];
+        __syncthreads();
+        s[d] = (d & h) ? b - a : a + b;
+        __syncthreads();
+    }
+    return s[d] * rsqrtf((float)CX_HD);
+}
+__device__ __forceinline__ float kv8_rot(float x, int d, float* s) { return kv8_wht(x * kv8_sign(d), d, s); }
+__device__ __forceinline__ float kv8_unrot(float y, int d, float* s) { return kv8_wht(y, d, s) * kv8_sign(d); }
+// One head's value x (this thread's dim d) as an int8 code into the row at `row`, each group's
+// scale by its first thread.
+// Codes are rounded against the stored (f16) scale, so code * scale is what the readers see.
 __device__ __forceinline__ void kv8_put(unsigned char* row, int g, int d, float x, float* sh) {
-    const float amax = cx_bmax(fabsf(x), sh);
-    const float inv = amax > 0.f ? 127.0f / amax : 0.f;
+    const unsigned short sh16 = kv8_f2h(kv8_gmax(fabsf(x), sh) / 127.0f);
+    const float sc = kv8_h2f(sh16), inv = sc > 0.f ? 1.0f / sc : 0.f;
     const int q = max(-127, min(127, __float2int_rn(x * inv)));
     row[g * CX_HD + d] = (unsigned char)(signed char)q;
-    if (d == 0) *(float*)(row + CX_NKV * CX_HD + g * 4) = amax / 127.0f;
+    if (d % KV8_G == 0) ((unsigned short*)(row + CX_NKV * CX_HD))[g * KV8_NG + d / KV8_G] = sh16;
 }
 #endif
 
@@ -3242,12 +3280,15 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
         x = d < half ? sx[d] * c - sx[d + half] * s : sx[d - half] * s + sx[d] * c;
     }
     if (isq) {
+#ifdef CX_KV8
+        x = kv8_rot(x, d, sx);
+#endif
         q[((size_t)t * CX_NH + h) * CX_HD + d] = x;
     } else {
 #ifdef CX_KV8
         const size_t pr = (size_t)CX_OFF(rows, t, (int)pos) * CX_KVROW;
-        kv8_put((unsigned char*)kc + pr, g, d, x, sh);
-        kv8_put((unsigned char*)vc + pr, g, d, row[CX_QV + g * CX_HD + d], sh);
+        kv8_put((unsigned char*)kc + pr, g, d, kv8_rot(x, d, sx), sh);
+        kv8_put((unsigned char*)vc + pr, g, d, kv8_rot(row[CX_QV + g * CX_HD + d], d, sx), sh);
 #else
         const size_t o = ((size_t)CX_OFF(rows, t, (int)pos) * CX_NKV + g) * CX_HD + d;
         kc[o] = f2bf(x);
@@ -3261,7 +3302,7 @@ extern "C" __global__ void cx_attn_prep(const float* proj, int stride, const flo
 // head (m, l, acc[HD]) to part[c][g][j][G][HD + 2]. Chunks past the token's position write l = 0.
 #define CX_DL (CX_HD / 32)
 #ifdef CX_KV8
-static_assert(CX_DL % 8 == 0, "int8 split-K: whole 8-byte code groups a lane");
+static_assert(CX_DL % 8 == 0 && KV8_G % CX_DL == 0, "int8 split-K: a lane's codes, whole 8-byte words in one scale group");
 #endif
 extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, const unsigned long long* ktab,
                                                                const unsigned long long* vtab, const unsigned* rows,
@@ -3296,7 +3337,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, c
         float kv[CX_DL], vv[CX_DL];
 #ifdef CX_KV8
         // A lane's CX_DL codes are 8-byte aligned (rows and heads are 16-byte aligned).
-        const float ks = KV8_S(kc, pc, g), vs = KV8_S(vc, pc, g);
+        const float ks = KV8_S(kc, pc, g, lane * CX_DL), vs = KV8_S(vc, pc, g, lane * CX_DL);
         const uint2* kr = (const uint2*)(KV8_Q(kc, pc, g) + lane * CX_DL);
         const uint2* vr = (const uint2*)(KV8_Q(vc, pc, g) + lane * CX_DL);
         #pragma unroll
@@ -3368,7 +3409,12 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 #ifdef CX_JITTER
     o *= 1.f + CX_JITTER * (float)((c * 131 + h * 7 + d) % 17 - 8) / 8.f;
 #endif
+#ifdef CX_KV8
+    __shared__ float su[CX_HD];
+    out[((size_t)c * CX_NH + h) * CX_HD + d] = kv8_unrot(o / L, d, su) * sigm_f(gt);
+#else
     out[((size_t)c * CX_NH + h) * CX_HD + d] = (o / L) * sigm_f(gt);
+#endif
 }
 // ---- FA2-style tensor-core prefill attention (wide windows, `TANG_CODER_ATTN=fa2`) ----
 //
@@ -3543,7 +3589,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
         for (int e = tid; e < 2 * FA_BN * (CX_HD / 8); e += 128) {
             const int r = e / (CX_HD / 8), d = (e % (CX_HD / 8)) * 8, isv = r >= FA_BN, p = r - isv * FA_BN;
             const int key = kbase + p;
-            const float sc = key < k1 ? KV8_S(isv ? vc : kc, key, g) : 0.f;
+            const float sc = key < k1 ? KV8_S(isv ? vc : kc, key, g, d) : 0.f;
             const uint2 x = *(const uint2*)(s8 + ((2 * b + isv) * FA_BN + p) * CX_HD + d);
             auto h2 = [&](unsigned w, int i) {
                 return fa_pack((float)(signed char)(w >> (8 * i)) * sc, (float)(signed char)(w >> (8 * i + 8)) * sc);

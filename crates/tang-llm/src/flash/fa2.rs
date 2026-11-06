@@ -24,9 +24,11 @@ pub fn fa2_smem_as(int8: bool, head_dim: usize) -> usize {
 
 /// The attention K/V cache format (`TANG_CODER_KV=bf16|int8`, read once at first use; default
 /// bf16). `int8` stores each position's K (and V) as one row of `n_kv` heads of `head_dim` int8
-/// codes followed by the heads' f32 absmax scales ([`kv_row_bytes`]): about half the bytes of a
-/// bf16 row, so twice the sequence slots at a long `--ctx`. `cx_attn_prep` quantizes as it
-/// writes; the split-K and FA2 attention kernels dequantize as they load.
+/// codes followed by an f16 absmax scale per [`KV8_G`] dims of each head ([`kv_row_bytes`]):
+/// about half the bytes of a bf16 row, so twice the sequence slots at a long `--ctx`. Q, K and V
+/// heads are rotated first ([`kv8_rotate`]) so outlier channels don't eat a group's range.
+/// `cx_attn_prep` rotates and quantizes as it writes; the split-K and FA2 attention kernels
+/// dequantize as they load; `cx_attn_merge` rotates the output back.
 pub fn kv8() -> bool {
     static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *M.get_or_init(|| match std::env::var("TANG_CODER_KV").as_deref() {
@@ -36,36 +38,83 @@ pub fn kv8() -> bool {
     })
 }
 
+/// Dims a scale of the int8 cache covers (`KV8_G`).
+pub const KV8_G: usize = 64;
+
 /// Bytes one position of a layer's K (or V) cache takes: `n_kv * head_dim` bf16, or under
-/// [`kv8`] `n_kv * head_dim` int8 codes, `n_kv` f32 scales, padded to 16 bytes (so every row,
-/// and every head's codes in it, stay aligned for `cp.async`).
+/// [`kv8`] `n_kv * head_dim` int8 codes and `n_kv * head_dim / KV8_G` f16 scales, padded to 16
+/// bytes (so every row, and every head's codes in it, stay aligned for `cp.async`). 528 at
+/// Coder-Next's 2 × 256 (the scales fit the padding a f32-per-head layout would have had).
 pub fn kv_row_bytes(n_kv: usize, head_dim: usize) -> usize {
     kv_row_bytes_as(kv8(), n_kv, head_dim)
 }
 
 pub fn kv_row_bytes_as(int8: bool, n_kv: usize, head_dim: usize) -> usize {
     if int8 {
-        (n_kv * head_dim + n_kv * 4).next_multiple_of(16)
+        (n_kv * head_dim + n_kv * (head_dim / KV8_G) * 2).next_multiple_of(16)
     } else {
         n_kv * head_dim * 2
     }
 }
 
-/// The int8 rule of `cx_attn_prep` for one head's `head_dim` values: codes and the scale
-/// (absmax / 127; a zero head gets scale 0 and zero codes). Dequantized value = code * scale.
-pub fn kv8_quant(x: &[f32]) -> (Vec<i8>, f32) {
-    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let (s, inv) = if amax > 0.0 {
-        (amax / 127.0, 127.0 / amax)
+/// f32 through f16 and back, round to nearest even (normal range; `cvt.rn.f16.f32`).
+fn f16_round(x: f32) -> f32 {
+    let b = x.to_bits();
+    if x.abs() < 6.104e-5 {
+        // f16 subnormals: multiples of 2^-24.
+        return (x * 16_777_216.0).round_ties_even() / 16_777_216.0;
+    }
+    f32::from_bits((b + 0xfff + ((b >> 13) & 1)) & !0x1fff)
+}
+
+/// The int8 rule of `cx_attn_prep` for one (rotated) head: per group of [`KV8_G`] values, the
+/// f16 scale absmax / 127 and codes rounded half-to-even against that stored scale (a zero group:
+/// scale 0, zero codes). Dequantized value = code * its group's scale.
+pub fn kv8_quant(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let (mut q, mut sc) = (Vec::new(), Vec::new());
+    for grp in x.chunks(KV8_G) {
+        let amax = grp.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let s = f16_round(amax / 127.0);
+        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+        q.extend(
+            grp.iter()
+                .map(|v| (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8),
+        );
+        sc.push(s);
+    }
+    (q, sc)
+}
+
+/// The fixed sign of dim `d` in the int8 cache's rotation (`kv8_sign` in the kernels).
+pub fn kv8_sign(d: usize) -> f32 {
+    if ((0x5A3C_96E1u32 >> (d & 31)) ^ (d >> 5) as u32 ^ (d >> 7) as u32) & 1 == 1 {
+        -1.0
     } else {
-        (0.0, 0.0)
-    };
-    // __float2int_rn: round half to even.
-    let q = x
-        .iter()
-        .map(|v| (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8)
+        1.0
+    }
+}
+
+/// The int8 cache's rotation of one head (`kv8_rot`): `H D x / sqrt(len)`, Sylvester Hadamard
+/// `H`, `D` = diag([`kv8_sign`]). Orthogonal; `inverse` applies `D H y / sqrt(len)`.
+pub fn kv8_rotate(x: &[f32], inverse: bool) -> Vec<f32> {
+    let n = x.len();
+    assert!(n.is_power_of_two());
+    let mut s: Vec<f32> = (0..n)
+        .map(|d| if inverse { x[d] } else { x[d] * kv8_sign(d) })
         .collect();
-    (q, s)
+    let mut h = 1;
+    while h < n {
+        let old = s.clone();
+        for d in 0..n {
+            let (a, b) = (old[d], old[d ^ h]);
+            s[d] = if d & h != 0 { b - a } else { a + b };
+        }
+        h <<= 1;
+    }
+    let r = 1.0 / (n as f32).sqrt();
+    (0..n)
+        .map(|d| s[d] * r * if inverse { kv8_sign(d) } else { 1.0 })
+        .collect()
 }
 
 /// Key splits for an FA2 window: enough blocks (`tiles` query tiles × kv groups, times the
@@ -280,7 +329,10 @@ mod tests {
         x.chunks(hd)
             .flat_map(|h| {
                 let (q, s) = super::kv8_quant(h);
-                q.into_iter().map(move |c| c as f32 * s).collect::<Vec<_>>()
+                q.into_iter()
+                    .enumerate()
+                    .map(|(i, c)| c as f32 * s[i / super::KV8_G])
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -288,15 +340,38 @@ mod tests {
     #[test]
     fn kv8_quant_rule() {
         use super::kv8_quant;
-        let (q, s) = kv8_quant(&[0.0; 8]);
-        assert_eq!((q, s), (vec![0; 8], 0.0));
-        let x = [2.0f32, -1.0, 0.01, -2.0, 0.0];
+        let (q, s) = kv8_quant(&[0.0; 64]);
+        assert_eq!((q, s), (vec![0; 64], vec![0.0]));
+        // Two groups: the second's spike doesn't coarsen the first.
+        let mut x = vec![0f32; 128];
+        x[..5].copy_from_slice(&[2.0, -1.0, 0.01, -2.0, 0.0]);
+        x[64] = 100.0;
         let (q, s) = kv8_quant(&x);
-        assert_eq!((q[0], q[3], q[4]), (127, -127, 0));
-        assert_eq!(s, 2.0 / 127.0);
-        for (&c, &v) in q.iter().zip(&x) {
-            assert!((c as f32 * s - v).abs() <= s / 2.0 + 1e-7);
+        assert_eq!((q[0], q[3], q[4], q[64]), (127, -127, 0, 127));
+        assert_eq!(s.len(), 2);
+        assert!((s[0] - 2.0 / 127.0).abs() < 2e-5 && (s[1] - 100.0 / 127.0).abs() < 1e-3);
+        for (i, (&c, &v)) in q.iter().zip(&x).enumerate() {
+            let sc = s[i / 64];
+            assert!((c as f32 * sc - v).abs() <= sc * 0.51 + 1e-3 * v.abs());
         }
+    }
+
+    #[test]
+    fn kv8_rotation_is_orthogonal() {
+        let x: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let y = super::kv8_rotate(&x, false);
+        let z = super::kv8_rotate(&y, true);
+        let (nx, ny): (f32, f32) = (x.iter().map(|v| v * v).sum(), y.iter().map(|v| v * v).sum());
+        assert!((nx - ny).abs() < 1e-3 * nx);
+        assert!(x.iter().zip(&z).all(|(a, b)| (a - b).abs() < 1e-4));
+        // A one-channel spike spreads evenly: every |y| = |x| / 16.
+        let mut e = vec![0f32; 256];
+        e[3] = 16.0;
+        assert!(super::kv8_rotate(&e, false)
+            .iter()
+            .all(|v| (v.abs() - 1.0).abs() < 1e-6));
     }
 
     #[test]
@@ -305,7 +380,7 @@ mod tests {
         // Qwen3-Coder-Next: 2 kv heads of 256; 12 attention layers + the MTP layer hold K/V.
         assert_eq!(kv_row_bytes_as(false, 2, 256), 1024);
         assert_eq!(kv_row_bytes_as(true, 2, 256), 528);
-        assert_eq!(kv_row_bytes_as(true, 1, 16), 32);
+        assert_eq!(kv_row_bytes_as(true, 1, 64), 80);
         let ctx = 131072;
         // 36 GDN layers: f32 state (32 v heads of 128 x 128) and the conv history.
         let gdn = 36 * (32 * 128 * 128 * 4 + 3 * (2 * 16 * 128 + 32 * 128) * 4);
@@ -363,9 +438,35 @@ mod tests {
         let vb: Vec<f32> = v.iter().map(|&x| bf16(x)).collect();
         let (bw, bm) = err(&kb, &vb);
         let (iw, im) = err(&kv8_round(&k, hd), &kv8_round(&v, hd));
-        eprintln!("bf16 K/V: max {bw:.2e} mean {bm:.2e}; int8 K/V: max {iw:.2e} mean {im:.2e}");
-        // Measured: bf16 max 6.9e-3 mean 7.2e-4, int8 max 4.4e-2 mean 4.7e-3 (sharp synthetic
-        // softmax, 4x outlier channels in K). The GPU gates (flash-batch-check, flash-wide-check,
+        // The kernels' rule: Q, K, V rotated per head, K/V quantized, the output rotated back.
+        let rot = |x: &[f32], inv: bool| -> Vec<f32> {
+            x.chunks(hd)
+                .flat_map(|h| super::kv8_rotate(h, inv))
+                .collect()
+        };
+        let (qr, kr, vr) = (rot(&q, false), rot(&k, false), rot(&v, false));
+        let got = fa2_model(
+            &sh(),
+            &qr,
+            &kv8_round(&kr, hd),
+            &kv8_round(&vr, hd),
+            t,
+            pos0,
+            nsplit,
+        );
+        let got = rot(&got, true);
+        let (mut rw, mut rm) = (0f64, 0f64);
+        for (&a, &b) in got.iter().zip(&want) {
+            rw = rw.max((a as f64 - b).abs());
+            rm += (a as f64 - b).abs();
+        }
+        rm /= want.len() as f64;
+        eprintln!("bf16 K/V: max {bw:.2e} mean {bm:.2e}; int8 K/V: max {iw:.2e} mean {im:.2e}; rotated int8: max {rw:.2e} mean {rm:.2e}");
+        assert!(rm < 10.0 * bm, "rotated int8 K/V: mean {rm:.3e}");
+        // Measured: bf16 max 6.9e-3 mean 7.2e-4; per-64 f16-scaled int8 max 2.8e-2 mean 2.6e-3,
+        // rotated the same (uniform synthetic values are the rotation's no-gain case; one f32
+        // scale per head was 4.4e-2 / 4.7e-3). A sharp synthetic softmax, 4x outlier channels
+        // in K. The GPU gates (flash-batch-check, flash-wide-check,
         // the needle, greedy prefixes) judge the model; this pins the rule's order of magnitude.
         assert!(
             iw < 10.0 * bw && im < 10.0 * bm,
