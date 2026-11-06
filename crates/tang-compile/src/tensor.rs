@@ -81,6 +81,7 @@ mod tile;
 pub mod wgsl;
 pub use grad::BackwardOptions;
 pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
+pub use wgsl::WgslCaps;
 
 // ---------------------------------------------------------------------------
 // Views
@@ -597,6 +598,13 @@ pub struct TNode {
     /// in registers from a block format. See [`IntMma`]. Backends without
     /// the lowering ignore it (and then reject the block formats).
     pub int_mma: Option<IntMma>,
+    /// Schedule: combine a `split` reduction's per-thread partials with
+    /// subgroup operations (WGSL `subgroupAdd`/`subgroupShuffleXor`, MSL
+    /// `simd_sum`/`simd_shuffle_xor`) instead of a workgroup-memory tree:
+    /// one barrier instead of log₂(split). Honoured where the target has
+    /// subgroups ([`WgslCaps::subgroups`](crate::tensor::WgslCaps); always
+    /// on Metal), ignored elsewhere.
+    pub subgroup: bool,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -779,6 +787,10 @@ impl TensorGraph {
     /// Schedule: recompute `t` inside its consumers (`true`) or write it
     /// to a buffer. `schedule_inline` decides this by rule; this is the
     /// manual override, e.g. to fuse a reduction under its epilogue map.
+    pub fn set_subgroup(&mut self, t: TensorId, on: bool) {
+        self.nodes[t.n()].subgroup = on;
+    }
+
     pub fn set_inline(&mut self, t: TensorId, inline: bool) {
         self.nodes[t.n()].inline = inline;
     }
@@ -860,6 +872,7 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            subgroup: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -877,6 +890,7 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            subgroup: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -909,6 +923,7 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            subgroup: false,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1053,6 +1068,7 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            subgroup: false,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1568,6 +1584,7 @@ impl TensorGraph {
                 reg: node.reg,
                 fragment: node.fragment,
                 int_mma: node.int_mma,
+                subgroup: node.subgroup,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -2392,6 +2409,8 @@ impl TensorGraph {
                 self.nodes[i].reg = reg;
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
+                // subgroup combine where the target has it (ignored elsewhere)
+                self.nodes[i].subgroup = true;
             }
             if self.nodes[i].tile.0 > 0 {
                 self.unfuse_heavy_epilogue(i);
@@ -2801,6 +2820,7 @@ impl TensorGraph {
                 reg: (1, 1),
                 fragment: false,
                 int_mma: None,
+                subgroup: false,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3397,6 +3417,7 @@ impl TensorGraph {
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
                     int_mma: None,
+                    subgroup: false,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),

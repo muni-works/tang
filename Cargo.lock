@@ -6226,6 +6226,7 @@ name = "tang-compile"
 version = "0.1.0"
 dependencies = [
  "half",
+ "naga",
  "tang",
  "tang-expr",
 ]
