@@ -1160,6 +1160,9 @@ impl TensorGraph {
     /// single-value comp).
     fn affine_address(&self, c: &super::Comp, which: usize) -> Option<(i64, Vec<i64>)> {
         let a = &c.args[which];
+        if a.view.is_gather() {
+            return None;
+        }
         let src = a.src.n();
         let storage = self.storage(a.src).n();
         match &self.nodes[storage].op {
@@ -1442,6 +1445,7 @@ impl TensorGraph {
         let inner = super::View {
             forms: inner,
             guard: ra.view.guard,
+            gather: None,
         };
         let comp = |a: &super::Arg| super::Arg {
             src: a.src,

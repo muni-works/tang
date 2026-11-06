@@ -16,6 +16,7 @@ fn arg(src: tang_compile::tensor::TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
         view: View {
+            gather: None,
             guard: false,
             forms,
         },
