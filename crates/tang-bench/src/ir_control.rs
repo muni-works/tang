@@ -70,18 +70,22 @@ pub fn gru_fused(batch: usize, obs: usize, hidden: usize) -> (TensorGraph, Vec<T
         ..Form::unit(3, d)
     };
     let xv = || View {
+        gather: None,
         forms: vec![Form::unit(3, 0), Form::unit(3, 2)],
         guard: true,
     };
     let hv = || View {
+        gather: None,
         forms: vec![Form::unit(3, 0), shifted(2)],
         guard: true,
     };
     let wiv = || View {
+        gather: None,
         forms: vec![Form::unit(3, 2), Form::unit(3, 1)],
         guard: true,
     };
     let whv = || View {
+        gather: None,
         forms: vec![shifted(2), Form::unit(3, 1)],
         guard: true,
     };

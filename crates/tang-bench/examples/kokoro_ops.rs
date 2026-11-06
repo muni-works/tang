@@ -64,7 +64,11 @@ fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
 }
 
 fn view(forms: Vec<Form>, guard: bool) -> View {
-    View { forms, guard }
+    View {
+        gather: None,
+        forms,
+        guard,
+    }
 }
 
 fn arg(src: TensorId, view: View) -> Arg {
@@ -1153,6 +1157,9 @@ fn fmt_prec(p: Precision) -> String {
         Format::E4M3(_) => "e4m3",
         Format::E5M2(_) => "e5m2",
         Format::Fp8Accum => "fp8acc",
+        Format::Q4K => "q4k",
+        Format::Q5K => "q5k",
+        Format::Q8x32 => "q8x32",
     };
     if p.accum == Format::F32 {
         f(p.storage).to_string()

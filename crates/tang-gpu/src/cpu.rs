@@ -133,6 +133,9 @@ impl CpuProgram {
                     let h: Vec<u16> = data.iter().map(|x| bf16(*x)).collect();
                     std::ptr::copy_nonoverlapping(h.as_ptr(), p as *mut u16, len)
                 }
+                Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                    panic!("block formats run only on the CUDA int8 lowering")
+                }
                 _ => panic!("fp8 storage lowers only on sm90 CUDA"),
             }
         }
@@ -155,6 +158,9 @@ impl CpuProgram {
                 Format::F16 => {
                     let words = std::slice::from_raw_parts(p as *const f32, b.len.div_ceil(2));
                     unpack_f16(words, b.len)
+                }
+                Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                    panic!("block formats run only on the CUDA int8 lowering")
                 }
                 Format::BF16 => std::slice::from_raw_parts(p as *const u16, b.len)
                     .iter()

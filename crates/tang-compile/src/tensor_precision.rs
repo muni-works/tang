@@ -41,6 +41,20 @@ pub enum Format {
     /// whole reduction in the tensor cores; with `F32` the tile promotes
     /// its partial sum into an f32 register every 128 elements.
     Fp8Accum,
+    /// GGUF Q4_K: super-blocks of 256 along the last dim, 144 bytes each
+    /// (f16 `d`, `dmin`, 12 bytes of 6-bit sub-block scales and mins, 128
+    /// bytes of 4-bit codes). Input storage only: the graph's values are the
+    /// dequantized weights, the buffer holds the GGUF bytes as they are.
+    Q4K,
+    /// GGUF Q5_K: as [`Format::Q4K`] plus 32 bytes of fifth bits, 176 bytes
+    /// a super-block.
+    Q5K,
+    /// int8 codes with one f32 scale a 32 along the last dim (`d = amax /
+    /// 127`, codes `round(v / d)`), the scale's companion `d · Σ codes`
+    /// beside it: what an integer MMA reads as its activation operand. A
+    /// buffer is `[codes: n bytes][(d, d·Σc): n / 32 × 8 bytes]`. The writer
+    /// quantizes; [`TensorGraph::eval_emulated`] rounds the same way.
+    Q8x32,
 }
 
 /// Softmax weights rounded to an 8-bit operand format are first scaled by
@@ -75,6 +89,26 @@ impl Format {
             Format::F16 | Format::BF16 => 2,
             Format::E4M3(_) | Format::E5M2(_) => 1,
             Format::Fp8Accum => 4,
+            Format::Q4K | Format::Q5K | Format::Q8x32 => 1,
+        }
+    }
+
+    /// Whether this is a block format (its rounding is per block, not per
+    /// element, and its buffer is not an array of one element type).
+    pub fn is_block(self) -> bool {
+        matches!(self, Format::Q4K | Format::Q5K | Format::Q8x32)
+    }
+
+    /// 32-bit words a buffer of `len` elements takes.
+    pub fn words(self, len: usize) -> usize {
+        match self {
+            Format::F32 => len,
+            Format::F16 | Format::BF16 => len.div_ceil(2),
+            Format::Q4K => len / 256 * 36,
+            Format::Q5K => len / 256 * 44,
+            Format::Q8x32 => len / 4 + len / 32 * 2,
+            f @ (Format::E4M3(_) | Format::E5M2(_)) => f.buffer_bytes(len).div_ceil(4),
+            Format::Fp8Accum => len,
         }
     }
 
@@ -100,6 +134,7 @@ impl Format {
             Format::BF16 => f32::from_bits(0x7f7f_0000) as f64,
             Format::E4M3(_) => 448.0,
             Format::E5M2(_) => 57344.0,
+            Format::Q4K | Format::Q5K | Format::Q8x32 => f32::MAX as f64,
         }
     }
 
@@ -108,6 +143,7 @@ impl Format {
     pub fn buffer_bytes(self, n: usize) -> usize {
         match self.block(n) {
             Some(b) => n.next_multiple_of(16) + 4 * n.div_ceil(b),
+            None if self.is_block() => self.words(n) * 4,
             None => n * self.bytes(),
         }
     }
@@ -162,6 +198,32 @@ impl Format {
             Format::E4M3(_) => sat(round_to(x, 3, -6, f64::INFINITY), 448.0),
             Format::E5M2(_) => sat(round_to(x, 2, -14, f64::INFINITY), 57344.0),
             Format::Fp8Accum => truncate_to(x as f32 as f64, FP8_ACCUM_BITS),
+            // per block: see `round_blocks`
+            Format::Q4K | Format::Q5K | Format::Q8x32 => x,
+        }
+    }
+}
+
+impl Format {
+    /// Round a row-major buffer to this format block by block (identity
+    /// for element formats, which [`Format::round`] covers). Q8x32 rounds
+    /// each 32 of the last dim to `d · round(v / d)`, `d = amax / 127`, as
+    /// f32 arithmetic does it on a GPU. Q4K / Q5K inputs are taken as
+    /// already representable (they are dequantized GGUF values).
+    pub fn round_blocks(self, buf: &mut [f64]) {
+        if self != Format::Q8x32 {
+            return;
+        }
+        for blk in buf.chunks_mut(32) {
+            let amax = blk.iter().fold(0f32, |a, &v| a.max((v as f32).abs()));
+            let d = amax / 127.0;
+            for v in blk.iter_mut() {
+                *v = if d == 0.0 {
+                    0.0
+                } else {
+                    ((*v as f32 / d).round().clamp(-127.0, 127.0) * d) as f64
+                };
+            }
         }
     }
 }
@@ -461,7 +523,9 @@ mod tests {
         assert_eq!(Format::E4M3(0).round(2f64.powi(-9)), 2f64.powi(-9)); // min subnormal
         assert_eq!(Format::E5M2(0).round(1.0 + 1.0 / 8.0), 1.0);
         // block scales: each block's largest magnitude maps to 448
-        let x: Vec<f64> = (0..256).map(|i| ((i * 37 % 101) as f64 - 50.0) * if i < 128 { 1e-3 } else { 10.0 }).collect();
+        let x: Vec<f64> = (0..256)
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) * if i < 128 { 1e-3 } else { 10.0 })
+            .collect();
         let mut r = x.clone();
         Format::E4M3(128).round_buf(&mut r);
         for (blk, (a, b)) in x.chunks(128).zip(r.chunks(128)).enumerate() {

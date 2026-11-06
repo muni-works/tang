@@ -141,6 +141,7 @@ pub fn train_step(dims: &BlockDims, layers: usize, adam: AdamW) -> TrainStep {
         let bcv = |k: i64| Arg {
             src: bc,
             view: View {
+                gather: None,
                 guard: false,
                 forms: vec![Form {
                     coefs: vec![0; rank],

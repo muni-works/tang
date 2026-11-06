@@ -112,7 +112,10 @@ fn main() {
             r.base_ms,
             r.ms,
             r.error.max_rel,
-            r.assignment.iter().map(|(t, p)| (t.index(), p.storage)).collect::<Vec<_>>()
+            r.assignment
+                .iter()
+                .map(|(t, p)| (t.index(), p.storage))
+                .collect::<Vec<_>>()
         );
         return;
     }
@@ -142,7 +145,14 @@ fn main() {
             } else {
                 Format::F32
             };
-            g.set_precision(c, Precision { storage: out_f, accum, operand: Format::F32 });
+            g.set_precision(
+                c,
+                Precision {
+                    storage: out_f,
+                    accum,
+                    operand: Format::F32,
+                },
+            );
             (g, a, b, c)
         };
         let (g, a, b, c) = build(fp8);
@@ -160,7 +170,11 @@ fn main() {
                 for _ in 0..k {
                     // MM_BIAS=1: all-positive-mean entries (accumulations
                     // grow linearly in k)
-                    let bias = if std::env::var("MM_BIAS").is_ok() { 1.5 } else { 0.0 };
+                    let bias = if std::env::var("MM_BIAS").is_ok() {
+                        1.5
+                    } else {
+                        0.0
+                    };
                     v.push((rng.f32() + rng.f32() + rng.f32() + bias) * mag);
                 }
             }
@@ -181,7 +195,10 @@ fn main() {
         let dot = |x: &[f64], y: &[f64], i: usize, j: usize| -> f64 {
             (0..k).map(|kk| x[i * k + kk] * y[j * k + kk]).sum()
         };
-        let exact: Vec<f64> = samples.iter().map(|&(i, j)| dot(&a64, &b64, i, j)).collect();
+        let exact: Vec<f64> = samples
+            .iter()
+            .map(|&(i, j)| dot(&a64, &b64, i, j))
+            .collect();
         // the emulator's accumulation: the running sum rounded to the
         // reduction's accum format after every addition
         let acc_f = g.precision(c).accum;
@@ -198,7 +215,11 @@ fn main() {
             "case {m}x{k}x{n} {fp8:?}: predicted rel_err {:.2e} (max_abs {:.2e}) — {}",
             predicted.max_rel,
             predicted.max_abs,
-            if budget.admits(&predicted) { "within budget" } else { "OVER budget, skipped" }
+            if budget.admits(&predicted) {
+                "within budget"
+            } else {
+                "OVER budget, skipped"
+            }
         );
         if !budget.admits(&predicted) {
             continue;
@@ -220,7 +241,9 @@ fn main() {
             );
         }
         let mut best = (f64::INFINITY, 0usize);
-        let only: Option<usize> = std::env::var("MM_VARIANT").ok().and_then(|v| v.parse().ok());
+        let only: Option<usize> = std::env::var("MM_VARIANT")
+            .ok()
+            .and_then(|v| v.parse().ok());
         for v in (0..SM90_FP8_SHAPES.len()).filter(|v| only.is_none_or(|o| o == *v)) {
             let prog = g.to_cuda_variant(&[c], Some(v));
             let src = prog.kernels[0].source.clone();
@@ -230,7 +253,10 @@ fn main() {
             let p = Program::new(rt, prog, &[&av, &bv]);
             p.run(rt);
             let got = p.read(rt, c);
-            let gs: Vec<f64> = samples.iter().map(|&(i, j)| got[i * n + j] as f64).collect();
+            let gs: Vec<f64> = samples
+                .iter()
+                .map(|&(i, j)| got[i * n + j] as f64)
+                .collect();
             let e64 = ErrorStats::compare(&[gs.clone()], &[exact.clone()]);
             let eemu = ErrorStats::compare(&[gs.clone()], &[emu.clone()]);
             if acc_f == Format::Fp8Accum && v == 0 {
@@ -254,7 +280,9 @@ fn main() {
                         .iter()
                         .map(|&(i, j)| {
                             (0..k).step_by(32).fold(0.0, |s, k0| {
-                                let part: f64 = (k0..(k0 + 32).min(k)).map(|kk| aq[i * k + kk] * bq[j * k + kk]).sum();
+                                let part: f64 = (k0..(k0 + 32).min(k))
+                                    .map(|kk| aq[i * k + kk] * bq[j * k + kk])
+                                    .sum();
                                 tr(s + part)
                             })
                         })
@@ -303,7 +331,10 @@ fn main() {
                 bb = bb.min(p.time_kernel(rt, 0, 20));
             }
             if bb.is_finite() {
-                println!("tang bf16 {m}x{k}x{n}: {bb:.4} ms {:.1} TFLOP/s", flop / bb / 1e9);
+                println!(
+                    "tang bf16 {m}x{k}x{n}: {bb:.4} ms {:.1} TFLOP/s",
+                    flop / bb / 1e9
+                );
             }
         }
     }

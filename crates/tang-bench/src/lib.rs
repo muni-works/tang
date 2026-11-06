@@ -304,9 +304,9 @@ pub mod ir_gpu {
     /// default everywhere.
     pub fn program_for(device: &GpuDevice, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-            g.to_msl_mma(outputs)
+            g.to_msl_mma_caps(outputs, device.wgsl_caps())
         } else {
-            g.to_wgsl(outputs)
+            g.to_wgsl_caps(outputs, device.wgsl_caps())
         }
     }
 
@@ -1022,6 +1022,7 @@ pub mod ir_gpu {
         let v = g.input(&[n]);
         let bc = g.input(&[2]);
         let bc_view = |k: i64| View {
+            gather: None,
             guard: false,
             forms: vec![Form {
                 coefs: vec![0],
@@ -1188,6 +1189,160 @@ pub mod ir_gpu {
         use tang_gpu::kv_attention_fused;
         use tang_gpu::GpuTensor;
 
+        /// Subgroup-combined splits (sum, max, argmax, online softmax) and
+        /// native f16 storage agree with the portable lowering and the
+        /// CPU evaluator, on whatever caps the device has.
+        #[test]
+        fn subgroup_and_f16_lowerings_match_eval() {
+            use tang_compile::tensor::{Format, Monoid, Precision, WgslCaps};
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let caps = device.wgsl_caps();
+            eprintln!("{} {caps:?}", device.name);
+            let mut cache = KernelCache::new();
+            let (rows, len) = (13, 1000);
+            let mut rng = crate::Rng::new(9);
+            let x: Vec<f32> = (0..rows * len).map(|_| rng.f32() * 4.0 - 2.0).collect();
+            let x64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            for (name, m) in [
+                ("sum", Monoid::sum()),
+                ("max", Monoid::max()),
+                ("argmax", Monoid::argmax()),
+                ("softmax", Monoid::online_softmax(1)),
+            ] {
+                for f16 in [false, true] {
+                    let mut g = tang_compile::tensor::TensorGraph::new();
+                    let xi = g.input(&[rows, len]);
+                    let w = m.width;
+                    use tang_compile::tensor::{Arg, View};
+                    let y = if w == 1 {
+                        g.comp(
+                            &[rows],
+                            &[len],
+                            vec![Arg {
+                                src: xi,
+                                view: View::identity(2, 2),
+                            }],
+                            Some(m.clone()),
+                            |v| vec![v[0]],
+                        )
+                    } else {
+                        g.comp_tuple(
+                            &[rows, w],
+                            &[len],
+                            vec![Arg {
+                                src: xi,
+                                view: View::identity(2, 2),
+                            }],
+                            Some(m.clone()),
+                            |v| {
+                                (0..w)
+                                    .map(|k| if k == 0 { v[0] } else { v[0] * v[0] })
+                                    .collect()
+                            },
+                        )
+                    }
+                    .unwrap();
+                    if f16 {
+                        g.set_precision(
+                            xi,
+                            Precision {
+                                storage: Format::F16,
+                                accum: Format::F32,
+                            },
+                        );
+                    }
+                    let want = g.eval(std::slice::from_ref(&x64), &[y]).remove(0);
+                    #[cfg(feature = "metal")]
+                    if let Some(dev) = crate::ir_msl::MslDevice::new() {
+                        for sg in [false, true] {
+                            let mut g = g.clone();
+                            g.set_schedule(y, 256, (0, 0, 0), (1, 1));
+                            g.set_subgroup(y, sg);
+                            let prog = g.to_msl(&[y]);
+                            assert_eq!(prog.kernels[0].source.contains("simd_"), sg);
+                            let exe = crate::ir_msl::Executable::new(&dev, prog, &[&x]);
+                            exe.run(&dev);
+                            let got = exe.read(y);
+                            let tol = if f16 { 0.05 } else { 1e-3 };
+                            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                                let scale = 1.0f64.max(b.abs());
+                                assert!(
+                                    ((*a as f64) - b).abs() / scale < tol,
+                                    "msl {name} f16={f16} sg={sg}[{i}]: {a} vs {b}"
+                                );
+                            }
+                        }
+                    }
+                    for (tag, sg, c) in [
+                        ("portable", false, WgslCaps::default()),
+                        ("caps", true, caps),
+                    ] {
+                        let mut g = g.clone();
+                        g.set_schedule(y, 256, (0, 0, 0), (1, 1));
+                        g.set_subgroup(y, sg);
+                        let exe = Executable::new(&device, g.to_wgsl_caps(&[y], c), &[&x]);
+                        exe.run(&device, &mut cache);
+                        cache.flush(&device);
+                        let got = exe.read(&device, y);
+                        assert_eq!(got.len(), want.len());
+                        let tol = if f16 { 0.05 } else { 1e-3 };
+                        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                            let scale = 1.0f64.max(b.abs());
+                            assert!(
+                                ((*a as f64) - b).abs() / scale < tol,
+                                "{name} f16={f16} {tag}[{i}]: {a} vs {b}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// wgpu on Metal: `fragment` attention runs the spliced native
+        /// simdgroup-matrix kernel and agrees with the f32 WGSL schedule.
+        #[test]
+        fn fragment_kernels_splice_into_wgpu_programs() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            if !device.msl_passthrough {
+                eprintln!("no MSL passthrough, skipping");
+                return;
+            }
+            let mut cache = KernelCache::new();
+            let (h, n, d) = (2, 256, 64);
+            let mut rng = crate::Rng::new(3);
+            let mut r = || {
+                (0..h * n * d)
+                    .map(|_| rng.f32() * 2.0 - 1.0)
+                    .collect::<Vec<f32>>()
+            };
+            let (q, k, v) = (r(), r(), r());
+            for causal in [false, true] {
+                let (ga, y) = flash_attention_heads_auto(h, 1, n, d, d, causal);
+                let (gf, yf) = flash_attention_heads_fragment(h, 1, n, d, d, causal);
+                let pf = gf.to_msl_mma(&[yf]);
+                assert!(pf
+                    .kernels
+                    .iter()
+                    .any(|k| k.source.contains("simdgroup_half8x8")));
+                let ea = Executable::new(&device, ga.to_wgsl(&[y]), &[&q, &k, &v]);
+                let ef = Executable::new(&device, pf, &[&q, &k, &v]);
+                ea.run(&device, &mut cache);
+                ef.run(&device, &mut cache);
+                cache.flush(&device);
+                let (a, b) = (ea.read(&device, y), ef.read(&device, yf));
+                assert_eq!(a.len(), b.len());
+                for (i, (x, z)) in a.iter().zip(&b).enumerate() {
+                    assert!((x - z).abs() < 1e-2, "causal={causal} [{i}]: {x} vs {z}");
+                }
+            }
+        }
+
         #[test]
         fn derived_rmsnorm_and_swiglu_match_hand_kernels_on_gpu() {
             let Ok(device) = GpuDevice::new_sync() else {
@@ -1322,6 +1477,7 @@ pub mod ir_gpu {
             let x = g.input(&[ci, t]);
             let w = g.input(&[co, ci, k]);
             let xv = View {
+                gather: None,
                 forms: vec![
                     Form::unit(4, 2),
                     Form {
@@ -1650,7 +1806,11 @@ pub mod ir_gpu {
                         vec![
                             Arg {
                                 src: x,
-                                view: View { forms, guard: true },
+                                view: View {
+                                    gather: None,
+                                    forms,
+                                    guard: true,
+                                },
                             },
                             Arg {
                                 src: w,
@@ -1818,10 +1978,12 @@ pub mod ir_gpu {
                 f
             };
             let xv = View {
+                gather: None,
                 forms: vec![f(&[(4, 1)]), f(&[(1, 1), (3, -1)])],
                 guard: true,
             };
             let wv = View {
+                gather: None,
                 forms: vec![f(&[(0, 1)]), f(&[(4, 1)]), f(&[(2, 1), (3, s as i64)])],
                 guard: false,
             };
@@ -2081,6 +2243,7 @@ pub mod ir_block {
             Arg {
                 src: b,
                 view: View {
+                    gather: None,
                     guard: false,
                     forms: vec![unit(rank, 1)],
                 },
@@ -2125,10 +2288,12 @@ pub mod ir_block {
         // which is what makes the block differentiable through rope.
         let x = g.reshape(x, &[seq, heads, half, 2]).unwrap();
         let xv = |parity: i64| View {
+            gather: None,
             guard: false,
             forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
         };
         let tv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(3, 0), unit(3, 2)],
         };
@@ -2265,6 +2430,7 @@ pub mod ir_block {
                 let k4 = g.reshape(k_cache, &[kv_len, n_kv_heads, half, 2]).unwrap();
                 let halves = [0i64, 1].map(|parity| {
                     let view = View {
+                        gather: None,
                         guard: false,
                         forms: vec![unit(3, 0), unit(3, 1), unit(3, 2), form(3, &[], parity)],
                     };
@@ -2294,10 +2460,12 @@ pub mod ir_block {
         let qe = g.reshape(qe, &[seq, groups, per_group, half]).unwrap();
         let qo = g.reshape(qo, &[seq, groups, per_group, half]).unwrap();
         let qv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(r5, 2), unit(r5, 0), unit(r5, 1), unit(r5, 4)],
         };
         let kv = View {
+            gather: None,
             guard: false,
             forms: vec![unit(r5, 3), unit(r5, 0), unit(r5, 4)],
         };
@@ -2336,6 +2504,7 @@ pub mod ir_block {
                     Arg {
                         src: mask,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(r4, 2), unit(r4, 3)],
                         },
@@ -2360,6 +2529,7 @@ pub mod ir_block {
                     Arg {
                         src: p,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)],
                         },
@@ -2367,6 +2537,7 @@ pub mod ir_block {
                     Arg {
                         src: v3,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 4), unit(5, 0), unit(5, 3)],
                         },
@@ -2383,6 +2554,7 @@ pub mod ir_block {
                 vec![Arg {
                     src: l,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![
                             unit(4, 0),
@@ -2414,6 +2586,7 @@ pub mod ir_block {
                     Arg {
                         src: y,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 2), unit(5, 3), unit(5, 0), unit(5, 4)],
                         },
@@ -2421,6 +2594,7 @@ pub mod ir_block {
                     Arg {
                         src: wo4,
                         view: View {
+                            gather: None,
                             guard: false,
                             forms: vec![unit(5, 1), unit(5, 2), unit(5, 3), unit(5, 4)],
                         },
@@ -2474,6 +2648,7 @@ pub mod ir_block {
                 Arg {
                     src: b,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![unit(2, 1)],
                     },
@@ -3243,6 +3418,62 @@ pub mod ir_block_gpu {
                     .fold(0.0f32, f32::max);
                 eprintln!("grad {k}: max err {err} (scale {scale})");
                 assert!(err < 2e-3 * scale.max(1.0), "grad {k} diverges");
+            }
+        }
+
+        /// The derived attention forward + backward with S = Q·Kᵀ and
+        /// dP = dO·Vᵀ nested in the dQ/dK/dV tiles (`to_wgsl`'s default)
+        /// writes no n×n buffer and matches the f64 interpreter.
+        #[test]
+        fn derived_attention_backward_nested_on_gpu() {
+            let Ok(device) = GpuDevice::new_sync() else {
+                eprintln!("no GPU, skipping");
+                return;
+            };
+            let mut cache = KernelCache::new();
+            let (n, d) = (256, 32);
+            for (score, mask) in [
+                ("s", "j <= i"),
+                ("30*tanh(s/30)", "j <= i || j < 16"),
+                ("s", ""),
+            ] {
+                let v = tang_derive_wasm::parse_variant(score, mask).unwrap();
+                let (g, outs) = tang_derive_wasm::naive_graph(&v, n, d, true).unwrap();
+                let mut rng = crate::Rng::new(53);
+                let inputs: Vec<Vec<f32>> = (0..4)
+                    .map(|_| (0..n * d).map(|_| rng.f32() * 2.0 - 1.0).collect())
+                    .collect();
+                let f64_inputs: Vec<Vec<f64>> = inputs
+                    .iter()
+                    .map(|v| v.iter().map(|x| *x as f64).collect())
+                    .collect();
+                let want = g.eval(&f64_inputs, &outs);
+                let (dg, douts) = tang_derive_wasm::derive_graph(&g, &outs);
+                let program = dg.to_wgsl(&douts);
+                let nxn = program
+                    .buffers
+                    .iter()
+                    .filter(|b| b.input.is_none() && b.len >= n * n)
+                    .count();
+                assert_eq!(nxn, 0, "{score} / {mask}: backward writes n×n");
+                let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+                let exe = Executable::new(&device, program, &ins);
+                exe.run(&device, &mut cache);
+                cache.flush(&device);
+                for (k, (o, w)) in douts.iter().zip(&want).enumerate() {
+                    let got = exe.read(&device, *o);
+                    let scale = w.iter().fold(0.0f64, |m, v| m.max(v.abs())) as f32;
+                    let err = got
+                        .iter()
+                        .zip(w)
+                        .map(|(a, b)| (a - *b as f32).abs())
+                        .fold(0.0f32, f32::max);
+                    eprintln!("{score} / {mask}: grad {k} max err {err} (scale {scale})");
+                    assert!(
+                        err < 2e-3 * scale.max(1.0),
+                        "{score} / {mask}: grad {k} diverges"
+                    );
+                }
             }
         }
 

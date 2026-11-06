@@ -132,7 +132,29 @@ impl TensorGraph {
     /// Lower to MSL. Same kernels and buffers as [`to_wgsl`](Self::to_wgsl);
     /// nodes scheduled `fragment` (and eligible, see
     /// [`fragment_plan`](Self::fragment_plan)) run on matrix fragments.
+    ///
+    /// Short contractions read only by tiles are nested in them, as in
+    /// [`to_wgsl`](Self::to_wgsl).
     pub fn to_msl_for(&self, outputs: &[TensorId], target: &FragmentTarget) -> MslProgram {
+        self.to_msl_with(outputs, target, true)
+    }
+
+    /// [`to_msl_for`](Self::to_msl_for), nesting short contractions or not.
+    pub fn to_msl_with(
+        &self,
+        outputs: &[TensorId],
+        target: &FragmentTarget,
+        nested: bool,
+    ) -> MslProgram {
+        if !nested {
+            return self.to_msl_scheduled(outputs, target);
+        }
+        let mut g = self.clone();
+        g.schedule_nested_contractions_scalar(outputs);
+        g.to_msl_scheduled(outputs, target)
+    }
+
+    fn to_msl_scheduled(&self, outputs: &[TensorId], target: &FragmentTarget) -> MslProgram {
         with_dialect(Dialect::Msl, || {
             let w = self.to_program_numbered(outputs, super::wgsl::Target::Wgsl);
             let kernels: Vec<MslKernel> = w
@@ -1160,6 +1182,9 @@ impl TensorGraph {
     /// single-value comp).
     fn affine_address(&self, c: &super::Comp, which: usize) -> Option<(i64, Vec<i64>)> {
         let a = &c.args[which];
+        if a.view.is_gather() {
+            return None;
+        }
         let src = a.src.n();
         let storage = self.storage(a.src).n();
         match &self.nodes[storage].op {
@@ -1442,6 +1467,7 @@ impl TensorGraph {
         let inner = super::View {
             forms: inner,
             guard: ra.view.guard,
+            gather: None,
         };
         let comp = |a: &super::Arg| super::Arg {
             src: a.src,
@@ -1628,9 +1654,15 @@ impl TensorGraph {
         let (dr, dc) = (plan.dr, plan.dc);
         let (nq, nc, nk, dk) = (pts[dr], pts[dc], plan.nk, plan.dk);
         let others: Vec<usize> = (0..pk).filter(|&d| d != dr && d != dc).collect();
-        let rf = ATT_RF;
-        let (bq, bk) = (32 * rf, ATT_BK);
-        let bc = nc.next_multiple_of(8).min(ATT_BC);
+        // geometry: the node's `frag_cfg` where set, else the defaults
+        let cfg = self.nodes[root].frag_cfg;
+        let pick = |v: u8, d: usize| if v == 0 { d } else { v as usize };
+        let rf = pick(cfg[0], ATT_RF);
+        let bk = 8 * pick(cfg[1], ATT_BK / 8);
+        let nsg = pick(cfg[3], 4);
+        let threads = 32 * nsg;
+        let bq = 8 * rf * nsg;
+        let bc = nc.next_multiple_of(8).min(8 * pick(cfg[2], ATT_BC / 8));
         let d8 = dk.next_multiple_of(8);
         let (ldq, ldk, ldv) = (d8 + 8, d8 + 8, bc + 8);
         // halves: Q staging, then K|V tiles
@@ -1735,11 +1767,12 @@ impl TensorGraph {
                 "smem",
                 ldq,
                 "    ",
+                threads,
             );
         if !q_direct {
             writeln!(
                 s,
-                "    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                "    for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                 bq * d8
             )
             .unwrap();
@@ -1855,11 +1888,12 @@ impl TensorGraph {
                     "Ks",
                     ldk,
                     "        ",
+                    threads,
                 );
             if !k_direct {
                 writeln!(
                     s,
-                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                     bk * d8
                 )
                 .unwrap();
@@ -1895,11 +1929,12 @@ impl TensorGraph {
                 "Vs",
                 ldv,
                 "        ",
+                threads,
             );
             if !v_direct {
                 writeln!(
                     s,
-                    "        for (uint idx = tid; idx < {}u; idx += 128u) {{",
+                    "        for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
                     bk * bc
                 )
                 .unwrap();
@@ -2201,7 +2236,7 @@ impl TensorGraph {
             reads: reads.iter().map(|&j| TensorId(j as u32)).collect(),
             points: points as u32,
             groups: grid(n_tiles),
-            threads: 128,
+            threads: threads as u32,
             fragment: true,
         }
     }
@@ -2222,6 +2257,7 @@ fn stage_direct(
     dst: &str,
     ld: usize,
     pad: &str,
+    threads: usize,
 ) -> bool {
     let Some((buf, flat)) = direct else {
         return false;
@@ -2251,7 +2287,7 @@ fn stage_direct(
     writeln!(s, "{pad}    const int base = {base};").unwrap();
     writeln!(
         s,
-        "{pad}    for (uint idx = tid; idx < {}u; idx += 128u) {{",
+        "{pad}    for (uint idx = tid; idx < {}u; idx += {threads}u) {{",
         rows * c4
     )
     .unwrap();
@@ -2371,7 +2407,12 @@ fn msl_ty(f: Format) -> &'static str {
         Format::F32 => "float",
         Format::F16 => "half",
         Format::BF16 => "bfloat",
-        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -2448,7 +2489,7 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (Strin
         if t.starts_with("fn main(") {
             writeln!(
                 body,
-                "kernel void k_main({params}uint3 gid [[thread_position_in_grid]], uint3 wid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {{"
+                "kernel void k_main({params}uint3 gid [[thread_position_in_grid]], uint3 wid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]], uint sg_size [[threads_per_simdgroup]], uint sg_lane [[thread_index_in_simdgroup]]) {{"
             )
             .unwrap();
             for d in &shared {
@@ -2467,7 +2508,10 @@ fn translate(g: &TensorGraph, src: &str, reads: &[usize], root: usize) -> (Strin
         }
         let line = line
             .replace("KERNEL_PARAMS ", &params)
-            .replace("BUFS_INIT", &bufs_init);
+            .replace("BUFS_INIT", &bufs_init)
+            .replace("subgroupAdd(", "simd_sum(")
+            .replace("subgroupMax(", "simd_max(")
+            .replace("subgroupShuffleXor(", "simd_shuffle_xor(");
         writeln!(body, "{}", statement(&line)).unwrap();
     }
     out.push_str(&body);

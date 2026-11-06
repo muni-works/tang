@@ -21,12 +21,12 @@
 //! Every case has 16k tokens (bh = 16384·16 / n / ... see `cases`); the
 //! FLOP count is FlashAttention's 4·n²·d per head (half when causal).
 //! `scripts/hopper_attention.py fp8attn` times FA3 FP8 on the same shapes.
+use tang::Scalar;
 use tang_compile::tensor::cuda::SM90_FP8_FLASH_SHAPES;
 use tang_compile::tensor::{
-    Arg, ErrorBudget, ErrorStats, Format, Monoid, MonoidKind, Op, Precision, TensorGraph,
-    TensorId, View,
+    Arg, ErrorBudget, ErrorStats, Format, Monoid, MonoidKind, Op, Precision, TensorGraph, TensorId,
+    View,
 };
-use tang::Scalar;
 use tang_expr::ExprId;
 use tang_gpu::program::{Program, Runtime};
 
@@ -119,7 +119,9 @@ fn fp8_schedule(g: &mut TensorGraph, outs: &[TensorId], fmt: Format, out: Format
         match &n.op {
             Op::Input(_) => g.set_precision(t, Precision::storage(fmt)),
             Op::Comp(c)
-                if c.monoid.as_ref().is_some_and(|m| m.kind() == MonoidKind::OnlineSoftmax) =>
+                if c.monoid
+                    .as_ref()
+                    .is_some_and(|m| m.kind() == MonoidKind::OnlineSoftmax) =>
             {
                 let mut p = g.precision(t);
                 p.operand = Format::E4M3(0);
@@ -136,7 +138,15 @@ fn fp8_schedule(g: &mut TensorGraph, outs: &[TensorId], fmt: Format, out: Format
 /// One head's attention in f64: `round_p` rounds each softmax weight
 /// (relative to the running max, as `eval_emulated` does) before it
 /// multiplies v and joins the row sum.
-fn head(q: &[f64], k: &[f64], vt: &[f64], n: usize, d: usize, causal: bool, round_p: Option<Format>) -> Vec<f64> {
+fn head(
+    q: &[f64],
+    k: &[f64],
+    vt: &[f64],
+    n: usize,
+    d: usize,
+    causal: bool,
+    round_p: Option<Format>,
+) -> Vec<f64> {
     let scale = 1.0 / (d as f64).sqrt();
     let mut o = vec![0.0; n * d];
     for i in 0..n {
@@ -148,7 +158,11 @@ fn head(q: &[f64], k: &[f64], vt: &[f64], n: usize, d: usize, causal: bool, roun
                 sv -= 1e30;
             }
             let mx = m.max(sv);
-            let sa = if m == f64::NEG_INFINITY { 0.0 } else { (m - mx).exp() };
+            let sa = if m == f64::NEG_INFINITY {
+                0.0
+            } else {
+                (m - mx).exp()
+            };
             let mut se = (sv - mx).exp();
             if let Some(f) = round_p {
                 se = tang_compile::tensor::precision::round_weight(f, se);
@@ -188,7 +202,11 @@ fn main() {
         let (bh, n, d) = (2, 512, 128);
         let mut rng = tang_bench::Rng::new(11);
         let ins: Vec<Vec<f64>> = (0..3)
-            .map(|_| (0..bh * n * d).map(|_| ((rng.f32() + rng.f32() + rng.f32() + rng.f32()) * 0.866) as f64).collect())
+            .map(|_| {
+                (0..bh * n * d)
+                    .map(|_| ((rng.f32() + rng.f32() + rng.f32() + rng.f32()) * 0.866) as f64)
+                    .collect()
+            })
             .collect();
         for (name, inp, op) in [
             ("inputs only", fmt, Format::F32),
@@ -207,7 +225,10 @@ fn main() {
                 }
             }
             let e = g.precision_error(&ins, &outs);
-            println!("{name:12}: max_rel {:.2e} mean_rel {:.2e}", e.max_rel, e.mean_rel);
+            println!(
+                "{name:12}: max_rel {:.2e} mean_rel {:.2e}",
+                e.max_rel, e.mean_rel
+            );
         }
         return;
     }
@@ -226,7 +247,13 @@ fn main() {
                 (x[0], x[1])
             })
             .collect(),
-        Err(_) => vec![(1024, 128), (2048, 128), (4096, 128), (8192, 128), (16384, 128)],
+        Err(_) => vec![
+            (1024, 128),
+            (2048, 128),
+            (4096, 128),
+            (8192, 128),
+            (16384, 128),
+        ],
     };
     let mut rng = tang_bench::Rng::new(11);
     let mut gauss = |len: usize| -> Vec<f32> {
@@ -243,7 +270,10 @@ fn main() {
         let (mut g, outs) = passes(g, &[y]);
         fp8_schedule(&mut g, &outs, fmt, Format::F32);
         let ins: Vec<Vec<f32>> = vec![gauss(bh * n * d), gauss(bh * n * d), gauss(bh * n * d)];
-        let ins64: Vec<Vec<f64>> = ins.iter().map(|v| v.iter().map(|&x| x as f64).collect()).collect();
+        let ins64: Vec<Vec<f64>> = ins
+            .iter()
+            .map(|v| v.iter().map(|&x| x as f64).collect())
+            .collect();
         let e_pred = g.precision_error(&ins64, &outs);
         let emu = g.eval_emulated(&ins64, &outs);
         let want = g.eval(&ins64, &outs);
@@ -281,14 +311,38 @@ fn main() {
         let mut exact = Vec::new();
         let mut emu = Vec::new();
         for &h in &heads {
-            exact.push(head(&sl(&q64, h), &sl(&k64, h), &sl(&v64, h), n, d, causal, None));
-            emu.push(head(&sl(&qq, h), &sl(&kq, h), &sl(&vq, h), n, d, causal, Some(Format::E4M3(0))));
+            exact.push(head(
+                &sl(&q64, h),
+                &sl(&k64, h),
+                &sl(&v64, h),
+                n,
+                d,
+                causal,
+                None,
+            ));
+            emu.push(head(
+                &sl(&qq, h),
+                &sl(&kq, h),
+                &sl(&vq, h),
+                n,
+                d,
+                causal,
+                Some(Format::E4M3(0)),
+            ));
         }
         let predicted = ErrorStats::compare(&emu, &exact);
         if std::env::var("ATT_DECOMP").is_ok() {
             let h = heads[0];
             let inp = head(&sl(&qq, h), &sl(&kq, h), &sl(&vq, h), n, d, causal, None);
-            let pon = head(&sl(&q64, h), &sl(&k64, h), &sl(&v64, h), n, d, causal, Some(Format::E4M3(0)));
+            let pon = head(
+                &sl(&q64, h),
+                &sl(&k64, h),
+                &sl(&v64, h),
+                n,
+                d,
+                causal,
+                Some(Format::E4M3(0)),
+            );
             let ex = &exact[0];
             let e_in = ErrorStats::compare(&[inp], std::slice::from_ref(ex));
             let e_p = ErrorStats::compare(&[pon], std::slice::from_ref(ex));
@@ -312,7 +366,11 @@ fn main() {
         let mut best = (f64::INFINITY, 0usize);
         for v in 0..SM90_FP8_FLASH_SHAPES.len() {
             let prog = g.to_cuda_variant(&outs, Some(v));
-            if !prog.kernels.iter().any(|k| k.source.contains("flash attention on wgmma (FP8)")) {
+            if !prog
+                .kernels
+                .iter()
+                .any(|k| k.source.contains("flash attention on wgmma (FP8)"))
+            {
                 continue;
             }
             let p = Program::new(&rt, prog, &[&q, &k, &vt]);
@@ -320,12 +378,19 @@ fn main() {
             let got = p.read(&rt, outs[0]);
             let gh: Vec<Vec<f64>> = heads
                 .iter()
-                .map(|&h| got[h * per..(h + 1) * per].iter().map(|&x| x as f64).collect())
+                .map(|&h| {
+                    got[h * per..(h + 1) * per]
+                        .iter()
+                        .map(|&x| x as f64)
+                        .collect()
+                })
                 .collect();
             let e64 = ErrorStats::compare(&gh, &exact);
             let eemu = ErrorStats::compare(&gh, &emu);
             rt.sync();
-            let t = (0..5).map(|_| p.time(&rt, 20)).fold(f64::INFINITY, f64::min);
+            let t = (0..5)
+                .map(|_| p.time(&rt, 20))
+                .fold(f64::INFINITY, f64::min);
             let fs = SM90_FP8_FLASH_SHAPES[v];
             println!(
                 "  fp8 flash {}x{} s{}: {:.3} ms {:.1} TFLOP/s  vs f64 max {:.2e} mean {:.2e}  vs emu max {:.2e} mean {:.2e}",

@@ -180,7 +180,7 @@ impl TensorGraph {
                 match dep.get(&a.src.n()) {
                     None => arg_deg.push(Deg::Hom(0.0)),
                     Some((d, f)) => {
-                        if a.view.guard && matches!(d, Deg::Lin(_)) {
+                        if (a.view.guard && matches!(d, Deg::Lin(_))) || a.view.is_gather() {
                             return false;
                         }
                         let fv = f.compose(&a.view, rank);
@@ -231,6 +231,7 @@ impl TensorGraph {
                     View {
                         guard: false,
                         forms,
+                        gather: None,
                     },
                 ),
             );
@@ -277,8 +278,17 @@ impl TensorGraph {
         // `[coord == form(...)]`, with the form's coords reduced over.
         let mut rename: Vec<Option<usize>> = vec![None; old_rank];
         let mut scatter: Vec<usize> = Vec::new();
+        // A gathered dim is always a scatter dim: its coordinate is data,
+        // so the gate compares against `form + coef · index`, the index
+        // read through the renamed index arg (a scatter-add written as a
+        // dense gated sum — see docs/tensor-ir.md for what this costs).
+        let gathered = |d: usize| arg.view.gather.as_ref().is_some_and(|g| g.coefs[d] != 0);
         for (d, f) in arg.view.forms.iter().enumerate() {
             let zero = f.coefs.iter().all(|&x| x == 0) && f.offset == 0;
+            if gathered(d) {
+                scatter.push(d);
+                continue;
+            }
             match f.as_unit() {
                 Some(coord) if rename[coord].is_none() => rename[coord] = Some(d),
                 // size-1 dim read at 0: nothing to gate
@@ -295,6 +305,9 @@ impl TensorGraph {
         let mut elim: Vec<Option<usize>> = vec![None; old_rank];
         if arg.view.guard {
             scatter.retain(|&d| {
+                if gathered(d) {
+                    return true;
+                }
                 let f = &arg.view.forms[d];
                 let pick = (0..n_points).find(|&x| {
                     f.coefs[x].abs() == 1
@@ -359,16 +372,23 @@ impl TensorGraph {
         let subst_view = View {
             guard: false,
             forms: subst.clone(),
+            gather: None,
         };
+        let base = if online { 2 * c.width() } else { 1 };
         let rename_view = |v: &View| {
             let mut r = v.compose(&subst_view, new_rank);
             r.guard = v.guard || guard_all;
+            // the index arg moves with every other arg, `base` slots on
+            if let Some(g) = &mut r.gather {
+                g.arg += base;
+            }
             r
         };
         // dy is indexed by the old out coords (plus a slot for tuple comps)
         let w = c.width();
         let dy_view = |slot: Option<i64>| View {
             guard: guard_all,
+            gather: None,
             forms: (0..c.points().len())
                 .map(|x| subst[x].clone())
                 .chain(slot.map(|s| Form::constant(new_rank, s)))
@@ -394,7 +414,7 @@ impl TensorGraph {
                 view: dy_view(None),
             });
         }
-        let base = args.len();
+        debug_assert_eq!(base, args.len());
         args.extend(c.args.iter().map(|x| Arg {
             src: x.src,
             view: rename_view(&x.view),
@@ -465,10 +485,16 @@ impl TensorGraph {
                 let f = rename_view(&View {
                     guard: false,
                     forms: vec![arg.view.forms[d].clone()],
+                    gather: None,
                 })
                 .forms
                 .remove(0);
                 let mut target = body.lit(f.offset as f64);
+                if let Some(g) = arg.view.gather.as_ref().filter(|g| g.coefs[d] != 0) {
+                    let cl = body.lit(g.coefs[d] as f64);
+                    let t = body.mul(cl, vars[base + g.arg]);
+                    target = body.add(target, t);
+                }
                 for (k, &coef) in f.coefs.iter().enumerate() {
                     if coef != 0 {
                         let v = coord_var(k, &mut body, &mut args);
@@ -743,6 +769,7 @@ mod tests {
                 vec![Arg {
                     src: r,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![
                             Form::unit(2, 0),
@@ -945,6 +972,7 @@ mod tests {
         let x = g.input(&[ci, t]);
         let w = g.input(&[co, ci, k]);
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(4, 2),
                 Form {
@@ -989,6 +1017,7 @@ mod tests {
         let w = g.input(&[co, ci, s * taps]);
         // space: (o, q, r, j, c)
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(5, 4),
                 Form {
@@ -999,6 +1028,7 @@ mod tests {
             guard: true,
         };
         let wv = View {
+            gather: None,
             forms: vec![
                 Form::unit(5, 0),
                 Form::unit(5, 4),
@@ -1041,6 +1071,7 @@ mod tests {
         let mut g = TensorGraph::new();
         let x = g.input(&[7]);
         let v = View {
+            gather: None,
             forms: vec![Form {
                 coefs: vec![1],
                 offset: -2,

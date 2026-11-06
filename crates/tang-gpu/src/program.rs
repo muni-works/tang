@@ -180,15 +180,21 @@ impl Runtime {
         }
     }
 
-    /// `g`'s program for this backend. wgpu: WGSL, or native MSL tiles
-    /// with `TANG_NATIVE=1` on Metal. CUDA: `to_cuda` (tensor cores on).
+    /// `g`'s program for this backend. wgpu: WGSL with the device's caps
+    /// (subgroups, native f16), `fragment` nodes as Metal simdgroup-matrix
+    /// kernels under MSL passthrough, or native MSL tiles for everything
+    /// with `TANG_NATIVE=1`. CUDA: `to_cuda` (tensor cores on).
     pub fn lower(&self, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         match self {
             Self::Wgpu { device, .. } => {
+                let caps = device.wgsl_caps();
                 if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-                    g.to_msl_mma(outputs)
+                    g.to_msl_mma_caps(outputs, caps)
+                } else if device.msl_passthrough {
+                    // `fragment` nodes run their simdgroup-matrix kernel
+                    g.to_wgsl_fragments(outputs, caps)
                 } else {
-                    g.to_wgsl(outputs)
+                    g.to_wgsl_caps(outputs, caps)
                 }
             }
             #[cfg(feature = "cuda")]
@@ -256,13 +262,20 @@ impl From<&MemoryPlan> for BufferPlan {
 /// f32 words a buffer needs (f16 and bf16 pack two per word, element
 /// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
 /// buffers share the layout).
+///
+/// Block formats (Q4K, Q5K, Q8x32) are passed in and read back as their
+/// raw device words, except that reading a Q8x32 buffer dequantizes it.
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
-    match b.format {
-        Format::F16 | Format::BF16 => b.len.div_ceil(2),
-        f if f.is_fp8() => f.buffer_bytes(b.len).div_ceil(4),
-        _ => b.len,
+    b.format.words(b.len).max(1)
+}
+
+/// Host length of an input: elements, or raw words for a block format.
+fn host_len(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
+    if b.format.is_block() {
+        words(b)
+    } else {
+        b.len
     }
-    .max(1)
 }
 
 fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, shared: &[usize]) {
@@ -277,7 +290,7 @@ fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, share
         assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
         if let Some(k) = b.input.filter(|k| !shared.contains(k)) {
             assert!(
-                inputs[k].is_empty() || inputs[k].len() == b.len,
+                inputs[k].is_empty() || inputs[k].len() == host_len(b),
                 "input {k} has wrong length"
             );
         }
@@ -536,6 +549,10 @@ impl Program {
             let fresh = match b.format {
                 Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
                 Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
+                Format::BF16 => unreachable!("bf16 is interpreter-only"),
+                Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                    panic!("block formats run only on the CUDA int8 lowering")
+                }
                 _ => unreachable!("bf16 and fp8 are not wgpu formats"),
             };
             if fresh.len() == plan.slot_len[s] {
@@ -1034,6 +1051,112 @@ impl Program {
             }
         })
     }
+    /// GPU-clock times (ms) of `n` launches of kernel `i` after `warmup`
+    /// untimed ones: wgpu timestamp queries around each compute pass, CUDA
+    /// events around each launch, OpenCL profiling events. Unlike
+    /// [`time_kernel`](Self::time_kernel) nothing host-side (submission,
+    /// polling, a busy CPU) lands in the number. `None` where the backend
+    /// has no GPU timer (a wgpu adapter without `TIMESTAMP_QUERY`). The
+    /// kernel's inputs must already be computed.
+    pub fn kernel_samples(
+        &self,
+        rt: &Runtime,
+        i: usize,
+        warmup: usize,
+        n: usize,
+    ) -> Option<Vec<f64>> {
+        self.gpu_samples(rt, &[i], warmup, n)
+    }
+
+    /// [`kernel_samples`](Self::kernel_samples) for one whole run (every
+    /// kernel in plan order, gaps between them included).
+    pub fn program_samples(&self, rt: &Runtime, warmup: usize, n: usize) -> Option<Vec<f64>> {
+        let order = self.order.clone();
+        self.gpu_samples(rt, &order, warmup, n)
+    }
+
+    fn gpu_samples(&self, rt: &Runtime, ks: &[usize], warmup: usize, n: usize) -> Option<Vec<f64>> {
+        match rt {
+            Runtime::Wgpu { device, cache } => {
+                if !device.timestamps {
+                    return None;
+                }
+                #[allow(irrefutable_let_patterns)]
+                let Storage::Wgpu(slots) = &self.storage
+                else {
+                    panic!("program and runtime are on different backends")
+                };
+                let mut cache = cache.borrow_mut();
+                cache.flush(device);
+                #[allow(irrefutable_let_patterns)]
+                let passes: Vec<_> = ks
+                    .iter()
+                    .map(|&i| {
+                        let k = &self.program.kernels[i];
+                        let bufs: Vec<&GpuBuffer> =
+                            self.args[i].iter().map(|&s| &slots[s]).collect();
+                        let (pipe, layout) = cache.pipeline(
+                            device,
+                            &k.source,
+                            bufs.len(),
+                            &[bufs.len() - 1],
+                            k.workgroup_size,
+                        );
+                        let bind = cache.bind(device, &layout, &bufs, &[k.points, 0, 0, 0]);
+                        let groups = k.count.div_ceil(k.workgroup_size);
+                        (pipe, bind, groups.min(65535), groups.div_ceil(65535))
+                    })
+                    .collect();
+                Some(wgpu_pass_times(device, &passes, warmup, n))
+            }
+            #[cfg(feature = "cuda")]
+            Runtime::Cuda(dev) => {
+                use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                for _ in 0..warmup {
+                    for &i in ks {
+                        self.run_cuda(dev, i);
+                    }
+                }
+                let evs: Vec<_> = (0..n)
+                    .map(|_| {
+                        let a = dev
+                            .stream
+                            .record_event(Some(CU_EVENT_DEFAULT))
+                            .expect("event");
+                        for &i in ks {
+                            self.run_cuda(dev, i);
+                        }
+                        let b = dev
+                            .stream
+                            .record_event(Some(CU_EVENT_DEFAULT))
+                            .expect("event");
+                        (a, b)
+                    })
+                    .collect();
+                dev.sync();
+                Some(
+                    evs.iter()
+                        .map(|(a, b)| a.elapsed_ms(b).expect("elapsed") as f64)
+                        .collect(),
+                )
+            }
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(d) => {
+                for _ in 0..warmup {
+                    for &i in ks {
+                        self.run_opencl(d, i, false);
+                    }
+                }
+                d.sync();
+                Some(
+                    (0..n)
+                        .map(|_| ks.iter().map(|&i| self.run_opencl(d, i, true)).sum())
+                        .collect(),
+                )
+            }
+        }
+    }
+
     /// Lower `g` and tune it for `rt`: per kernel, the backend-native
     /// lowering is timed against the portable one and the faster kept.
     ///
@@ -1219,6 +1342,121 @@ impl Program {
     }
 }
 
+/// `warmup + n` back-to-back compute passes, each running `passes` (one
+/// dispatch per entry); the last `n` are bracketed by timestamp writes.
+/// Returns their GPU times in ms. Passes go in submissions of at most
+/// [`PASSES_PER_SUBMIT`]: wgpu's Metal backend opens a command buffer per
+/// pass and a Metal queue has 64, so thousands of passes in one encoder
+/// would wait forever for a buffer that is only freed once submitted.
+fn wgpu_pass_times(
+    device: &GpuDevice,
+    passes: &[(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)],
+    warmup: usize,
+    n: usize,
+) -> Vec<f64> {
+    const PASSES_PER_SUBMIT: usize = 32;
+    // one query set holds at most 4096 timestamps: chunk long runs
+    const PER_SET: usize = 2048;
+    let period = device.queue.get_timestamp_period() as f64;
+    let new_enc = || {
+        device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+    };
+    let record = |enc: &mut wgpu::CommandEncoder, tw: Option<wgpu::ComputePassTimestampWrites>| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tang-gpu timed"),
+            timestamp_writes: tw,
+        });
+        for (pipe, bind, x, y) in passes {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(*x, *y, 1);
+        }
+    };
+    let mut left = warmup;
+    while left > 0 {
+        let m = left.min(PASSES_PER_SUBMIT);
+        left -= m;
+        let mut enc = new_enc();
+        for _ in 0..m {
+            record(&mut enc, None);
+        }
+        device.queue.submit(std::iter::once(enc.finish()));
+        // short waits: wgpu gives up on one long one
+        if device.device.poll(wgpu::PollType::Wait).is_err() {
+            return Vec::new();
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let m = left.min(PER_SET);
+        left -= m;
+        let qs = device.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("tang-gpu timer"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2 * m as u32,
+        });
+        let bytes = (2 * m * 8) as u64;
+        let resolve = device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tang-gpu timer resolve"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tang-gpu timer read"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut r = 0;
+        while r < m {
+            let mut enc = new_enc();
+            let stop = (r + PASSES_PER_SUBMIT).min(m);
+            for q in r..stop {
+                record(
+                    &mut enc,
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &qs,
+                        beginning_of_pass_write_index: Some(2 * q as u32),
+                        end_of_pass_write_index: Some(2 * q as u32 + 1),
+                    }),
+                );
+            }
+            r = stop;
+            if r == m {
+                enc.resolve_query_set(&qs, 0..2 * m as u32, &resolve, 0);
+                enc.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+            }
+            device.queue.submit(std::iter::once(enc.finish()));
+            if device.device.poll(wgpu::PollType::Wait).is_err() {
+                return Vec::new();
+            }
+        }
+        let slice = read.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.is_ok());
+        });
+        if device.device.poll(wgpu::PollType::Wait).is_err() || rx.try_recv() != Ok(true) {
+            // a kernel that faulted or hung: no times, so it never wins
+            return Vec::new();
+        }
+        {
+            let data = slice.get_mapped_range();
+            let ticks: &[u64] = bytemuck::cast_slice(&data);
+            for q in 0..m {
+                let dt = ticks[2 * q + 1].saturating_sub(ticks[2 * q]) as f64;
+                out.push(dt * period * 1e-6);
+            }
+        }
+        read.unmap();
+    }
+    out
+}
+
 fn time_with(rt: &Runtime, iters: usize, f: impl Fn()) -> f64 {
     for _ in 0..3 {
         f();
@@ -1283,6 +1521,7 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
     }
     match format {
         Format::F32 => std::borrow::Cow::Borrowed(data),
+        f if f.is_block() => std::borrow::Cow::Borrowed(data),
         _ => data
             .chunks(2)
             .map(|p| f32::from_bits(bits(p[0]) | p.get(1).map_or(0, |&x| bits(x) << 16)))
@@ -1295,6 +1534,14 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
 fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),
+        Format::Q8x32 => {
+            let bytes: &[u8] = bytemuck::cast_slice(words);
+            let sc: &[f32] = bytemuck::cast_slice(&bytes[n..n + n / 32 * 8]);
+            (0..n)
+                .map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2])
+                .collect()
+        }
+        Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
         Format::F16 => unpack_f16(words, n),
         f if f.is_fp8() => {
             let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();

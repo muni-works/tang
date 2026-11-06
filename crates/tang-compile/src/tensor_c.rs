@@ -91,6 +91,10 @@ impl TensorGraph {
     /// The graph must be bound.
     pub fn to_c(&self, outputs: &[TensorId]) -> CProgram {
         assert!(self.is_bound(), "to_c needs a bound graph");
+        assert!(
+            (0..self.nodes.len()).all(|i| self.comp_at(i).is_none_or(|c| !c.has_gather())),
+            "to_c: gather views are not lowered to C yet (WGSL, CUDA, MSL, OpenCL are)"
+        );
         // An inlined reduction is recomputed at every read. GPU tiles
         // stage it per chunk; a CPU loop nest would redo the whole sum per
         // point (per reduce step, inside another reduction), so every
@@ -816,7 +820,12 @@ fn elem_ty(f: Format) -> &'static str {
         Format::F32 => "float",
         Format::F16 => "tang_f16",
         Format::BF16 => "uint16_t",
-        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -825,7 +834,12 @@ fn load(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(float){e}"),
         Format::BF16 => format!("tang_b2f({e})"),
-        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -834,7 +848,12 @@ fn store(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(tang_f16)({e})"),
         Format::BF16 => format!("tang_f2b({e})"),
-        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -988,6 +1007,9 @@ fn c_unit(
         Format::F32 => 0,
         Format::F16 => 1,
         Format::BF16 => 2,
+        Format::Q4K | Format::Q5K | Format::Q8x32 => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
         _ => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     };
     let mut inputs: Vec<(usize, usize)> = prog
