@@ -152,7 +152,7 @@ class GPT(nn.Module):
         for b in self.blocks:
             x = b(x)
         logits = F.linear(self.norm(x), self.emb.weight).float()
-        return F.cross_entropy(logits.view(-1, logits.size(-1)), tgt.view(-1))
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
 
 
 train = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
