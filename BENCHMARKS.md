@@ -3510,3 +3510,17 @@ reference on the same int8-rounded activations (err ≤ 1.3e-7 everywhere):
 
 T=1/2 on the LM head is 92% of the 3090's 936 GB/s. T=8 is compute/register-bound (next step in
 the plan). No H200 or end-to-end numbers yet: nothing here is wired into the engine.
+
+Update (same day): prod decodes at T≈8–45 (`serve --batch 45` + MTP), so T ≥ 2 now runs on int8
+tensor cores. `Format::Q8_0` on the `IntMma` MMA stage: a block holds 16 rows × `pos_tile` positions
+(all T up to 64, one weight read), each warp stages its 16 rows × 136-byte unit through shared memory
+with coalesced 8-byte loads, ksplit 2. Same 3090, same reference check (err ≤ 3.8e-7):
+
+| rows × k | T=1 (dp4a) | T=2 | T=8 | T=16 | T=48 |
+|---|---|---|---|---|---|
+| 4096 × 2048 | 17.7 µs | 18.2 | 18.4 (485 GB/s) | 23.0 | 45.2 |
+| 2048 × 4096 | 21.0 | 25.8 | 26.2 (340) | 37.6 | 76.8 |
+| 151936 × 2048 (LM head) | 383 (862) | 487 (679) | 459 (720) | 426 (775) | 834 (396) |
+
+Before this, T=8 on the LM head took 1189 µs (278 GB/s); T=48 took 26.5 ms on the GEMV path. At T=48
+the B fragments (one global load a tile a block step) are now the limit — next: stage x per unit too.
