@@ -785,42 +785,74 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
             }
             a
         };
-        let m =
-            b.g.comp(
-                &[seq, kvh, per],
-                &[kctx],
-                s_args(None),
-                Some(Monoid::max()),
-                |v| {
-                    let c = visible(v[3], v[1], v[2]);
-                    vec![select(c, v[0], lit(-1e30))]
-                },
-            )
-            .unwrap();
-        let lsum =
-            b.g.comp(
-                &[seq, kvh, per],
-                &[kctx],
-                s_args(Some(m)),
-                Some(Monoid::sum()),
-                |v| {
-                    let c = visible(v[3], v[1], v[2]);
-                    vec![select(c, (v[0] - v[4]).exp(), lit(0.0))]
-                },
-            )
-            .unwrap();
+        // (m, l): the max and the sum of exp(s − m), as two reductions, or
+        // (TANG_ONLINE_ML=1, decode) one online-softmax reduction with
+        // state (m, l) — one pass over the scores instead of two
+        let online = seq == 1 && std::env::var("TANG_ONLINE_ML").as_deref() == Ok("1");
+        let (m, lsum, m_slot, l_slot) = if online {
+            let mut mono = Monoid::online_softmax(1);
+            // a finite identity: two empty states combine to (−1e30, 0),
+            // not −inf − −inf
+            mono.identity[0] = -1e30;
+            let ml =
+                b.g.comp_tuple(
+                    &[seq, kvh, per, 2],
+                    &[kctx],
+                    s_args(None),
+                    Some(mono),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, v[0], lit(-1e30)), select(c, lit(1.0), lit(0.0))]
+                    },
+                )
+                .unwrap();
+            (ml, ml, Some(0), Some(1))
+        } else {
+            let m =
+                b.g.comp(
+                    &[seq, kvh, per],
+                    &[kctx],
+                    s_args(None),
+                    Some(Monoid::max()),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, v[0], lit(-1e30))]
+                    },
+                )
+                .unwrap();
+            let lsum =
+                b.g.comp(
+                    &[seq, kvh, per],
+                    &[kctx],
+                    s_args(Some(m)),
+                    Some(Monoid::sum()),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, (v[0] - v[4]).exp(), lit(0.0))]
+                    },
+                )
+                .unwrap();
+            (m, lsum, None, None)
+        };
         // attn[t, kvh, r, c] = Σ_j p·v / l: space (t, kvh, r, c, j)
         let sp = [seq, kvh, per, hd, kctx];
         let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
         let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
+        let at = |slot: Option<i64>| {
+            let mut f = mlv.clone();
+            if let Some(k) = slot {
+                f.push(Form::constant(5, k));
+            }
+            f
+        };
         let attn =
             b.g.comp(
                 &[seq, kvh, per, hd],
                 &[kctx],
                 vec![
                     arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
-                    arg(m, mlv.clone()),
-                    arg(lsum, mlv),
+                    arg(m, at(m_slot)),
+                    arg(lsum, at(l_slot)),
                     arg(v_new, vec![unit(5, 1), unit(5, 3), unit(5, 4)]),
                     arg(to, ident(5)),
                     arg(jo, ident(5)),
@@ -1109,6 +1141,12 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // TANG_SPLIT_ATTN_MIN_POINTS: only reductions with at least this
+        // many points (1024: P.V, not the softmax statistics)
+        let min_pts: usize = std::env::var("TANG_SPLIT_ATTN_MIN_POINTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         if attn > 1 {
             let next = |g: &TensorGraph| {
                 (0..g.nodes().len()).find(|&i| {
@@ -1118,7 +1156,9 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
                             && c.red.len() == 1
                             && c.red[0].n() >= 4096
                             && c.red[0].n() % attn == 0
-                            && g.nodes()[i].shape.iter().map(|d| d.n()).product::<usize>() < 65536
+                            && (min_pts..65536).contains(
+                                &g.nodes()[i].shape.iter().map(|d| d.n()).product::<usize>(),
+                            )
                     })
                 })
             };

@@ -3087,3 +3087,10 @@ chunks (6.3 µs; `TANG_SPLIT_WIDE=0` keeps it whole). llama.cpp Q4_0 149.4 / 145
 At 4k, attention is ~46 µs per layer (scores 17.9, max 3.0, sum 2.2, P·V 22.5) against ~19 µs to read K and V once:
 a fused split-KV attention (one pass, online softmax) is the next step there. Splitting more warps per group
 (`TANG_KS_GROUPS`) or splitting attention K is slower.
+
+Attention experiments (all opt-in, none kept as default; 64 / 1024 / 4096, default 6.72 / 7.08 / 8.07 ms):
+P·V-only split-K ×4 (`TANG_SPLIT_ATTN=4 TANG_SPLIT_ATTN_MIN_POINTS=1024`) 6.80 / 7.17 / 7.97 (P·V 22.5 → 18.4 + 1.8 µs);
+16-byte f16 loads (`TANG_DECODE_VEC=8`) 6.75 / 7.10 / 8.12; max and Σexp as one online-softmax `(m, l)` reduction
+(`TANG_ONLINE_ML=1`, 31/31) 6.76 / 7.07 / 7.99. The scores and P·V kernels are each near 480–500 GB/s: what is
+left at long context is one pass that computes q·k once per key and shares it across the 128 output dims
+(scores in shared memory, online softmax, P·V), which the warp-reduction emitter cannot express yet.

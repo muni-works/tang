@@ -909,7 +909,24 @@ impl Lowering<'_> {
         {
             32
         } else if ri.is_multiple_of(4) && leaves.iter().any(|l| unit(l) && l.pack.is_none()) {
-            4
+            // wider (TANG_DECODE_VEC=8: 16-byte loads of f16, two float4
+            // of f32) when every unit-stride leaf allows it
+            let wide: usize = std::env::var("TANG_DECODE_VEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4);
+            if wide > 4
+                && wide.is_power_of_two()
+                && ri.is_multiple_of(wide)
+                && leaves
+                    .iter()
+                    .filter(|l| unit(l) && l.pack != Some(Packing::U4))
+                    .all(|l| aligned(l, 4))
+            {
+                wide
+            } else {
+                4
+            }
         } else {
             1
         };
