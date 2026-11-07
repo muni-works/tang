@@ -1,0 +1,17 @@
+BUILD_DONE
+tang matmul 1024x1024x1024 b=[k,n]:  mma.sync 0.0192 ms 111.8 TFLOP/s (variant 4, rel_err 3.2e-3)  wgmma 0.0146 ms 147.5 TFLOP/s (variant 10, rel_err 3.2e-3)
+tang matmul 1024x1024x1024 b=[n,k]:  mma.sync 0.0191 ms 112.6 TFLOP/s (variant 4, rel_err 3.2e-3)  wgmma 0.0143 ms 149.8 TFLOP/s (variant 9, rel_err 3.2e-3)
+tang matmul 2048x2048x2048 b=[k,n]:  mma.sync 0.0811 ms 212.0 TFLOP/s (variant 5, rel_err 3.4e-3)  wgmma 0.0517 ms 332.4 TFLOP/s (variant 9, rel_err 3.4e-3)
+tang matmul 2048x2048x2048 b=[n,k]:  mma.sync 0.0826 ms 208.0 TFLOP/s (variant 5, rel_err 3.4e-3)  wgmma 0.0508 ms 338.5 TFLOP/s (variant 8, rel_err 3.4e-3)
+tang matmul 4096x4096x4096 b=[k,n]:  mma.sync 0.5983 ms 229.7 TFLOP/s (variant 5, rel_err 3.6e-3)  wgmma 0.3429 ms 400.8 TFLOP/s (variant 7, rel_err 3.6e-3)
+tang matmul 4096x4096x4096 b=[n,k]:  mma.sync 0.6014 ms 228.5 TFLOP/s (variant 4, rel_err 3.6e-3)  wgmma 0.3438 ms 399.8 TFLOP/s (variant 7, rel_err 3.6e-3)
+tang matmul 8192x8192x8192 b=[k,n]:  mma.sync 4.5844 ms 239.8 TFLOP/s (variant 4, rel_err 3.7e-3)  wgmma 2.5362 ms 433.5 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 8192x8192x8192 b=[n,k]:  mma.sync 4.5936 ms 239.4 TFLOP/s (variant 4, rel_err 3.7e-3)  wgmma 2.5343 ms 433.8 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 16384x2048x2048 b=[k,n]:  mma.sync 0.5926 ms 231.9 TFLOP/s (variant 5, rel_err 3.6e-3)  wgmma 0.3579 ms 384.0 TFLOP/s (variant 8, rel_err 3.6e-3)
+tang matmul 16384x2048x2048 b=[n,k]:  mma.sync 0.5879 ms 233.8 TFLOP/s (variant 5, rel_err 3.3e-3)  wgmma 0.3305 ms 415.8 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x2048x8192 b=[k,n]:  mma.sync 2.3307 ms 235.9 TFLOP/s (variant 4, rel_err 3.3e-3)  wgmma 1.4633 ms 375.7 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x2048x8192 b=[n,k]:  mma.sync 2.3156 ms 237.4 TFLOP/s (variant 4, rel_err 3.3e-3)  wgmma 1.3650 ms 402.7 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x8192x2048 b=[k,n]:  mma.sync 2.2062 ms 249.2 TFLOP/s (variant 5, rel_err 3.7e-3)  wgmma 1.1665 ms 471.3 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 16384x8192x2048 b=[n,k]:  mma.sync 2.2258 ms 247.0 TFLOP/s (variant 4, rel_err 3.6e-3)  wgmma 1.0997 ms 499.9 TFLOP/s (variant 7, rel_err 3.6e-3)
+
+[exited with code 0]

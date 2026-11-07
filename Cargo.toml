@@ -68,10 +68,10 @@ authors = ["Cam Pedersen <cam@campedersen.com>"]
 tang = { version = "0.2", path = "crates/tang" }
 tang-la = { version = "0.1", path = "crates/tang-la" }
 tang-ad = { version = "0.1", path = "crates/tang-ad" }
-tang-sparse = { version = "0.1", path = "crates/tang-sparse" }
+tang-sparse = { version = "0.1.1", path = "crates/tang-sparse" }
 tang-gpu = { version = "0.1", path = "crates/tang-gpu" }
 tang-tensor = { version = "0.1", path = "crates/tang-tensor" }
-tang-optim = { version = "0.1", path = "crates/tang-optim" }
+tang-optim = { version = "0.2", path = "crates/tang-optim" }
 tang-train = { version = "0.1", path = "crates/tang-train" }
 tang-safetensors = { version = "0.1", path = "crates/tang-safetensors" }
 tang-hub = { version = "0.1", path = "crates/tang-hub" }

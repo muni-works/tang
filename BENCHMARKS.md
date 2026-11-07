@@ -3017,6 +3017,105 @@ TANG_LOAD_LANES=1 flock ~/tang-gpu.lock ./target/release/examples/split_k prefil
 flock ~/tang-gpu.lock python3 bench/split_k_sdpa.py
 ```
 
+## Flash attention and matmul on Hopper (H200 SXM, bf16, kernel-only)
+
+GPU: one H200 SXM (141 GB HBM3e, same GH100 die and SM count as the H100 SXM, so
+FA3's published H100 numbers are comparable — the H200 adds bandwidth, not
+tensor throughput). RunPod community pod, idle except for the benchmark, one
+process at a time. CUDA 12.x, PyTorch SDPA (cuDNN/flash backend), FlashAttention-3
+built from `flash-attention/hopper` (`flash_attn_interface`).
+
+Method: 16k tokens per config (batch = 16384/N), 2048 hidden (heads = 2048/d),
+q/k/v/dO ~ N(0,1) in bf16. Each library: best of 5 samples of 20 launches (CUDA
+events). Every output is checked against an f64 forward/backward of the same bf16
+inputs on two heads; all three libraries land at rel_err 1.6–5e-3. TFLOP/s:
+forward 4·N²·d per head (halved when causal), backward 2.5× that. tang's backward
+is the whole derived fwd+bwd program (9 kernels, includes the forward recompute
+of L) timed end to end, reported in the same backward-equivalent units, so it
+slightly flatters tang. Scripts: `examples/hopper_attention.rs`,
+`examples/hopper_matmul.rs`, `scripts/hopper_attention.py`. Raw logs:
+`docs/bench/hopper-h200-*.log`.
+
+### Forward (TFLOP/s)
+
+| d | causal | N | tang | SDPA | FA3 | tang / FA3 |
+|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 231 | 292 | 384 | 0.60 |
+| 64 | false | 2048 | 261 | 302 | 500 | 0.52 |
+| 64 | false | 4096 | 279 | 310 | 528 | 0.53 |
+| 64 | false | 8192 | 289 | 313 | 574 | 0.50 |
+| 64 | false | 16384 | 294 | 315 | 567 | 0.52 |
+| 64 | true | 1024 | 154 | 222 | 300 | 0.51 |
+| 64 | true | 2048 | 191 | 263 | 427 | 0.45 |
+| 64 | true | 4096 | 216 | 283 | 488 | 0.44 |
+| 64 | true | 8192 | 231 | 297 | 550 | 0.42 |
+| 64 | true | 16384 | 246 | 303 | 574 | 0.43 |
+| 128 | false | 1024 | 308 | 334 | 636 | 0.48 |
+| 128 | false | 2048 | 361 | 347 | 692 | 0.52 |
+| 128 | false | 4096 | 392 | 355 | 718 | 0.55 |
+| 128 | false | 8192 | 408 | 358 | 737 | 0.55 |
+| 128 | false | 16384 | 416 | 359 | 729 | 0.57 |
+| 128 | true | 1024 | 212 | 251 | 489 | 0.43 |
+| 128 | true | 2048 | 272 | 284 | 612 | 0.45 |
+| 128 | true | 4096 | 315 | 306 | 692 | 0.46 |
+| 128 | true | 8192 | 346 | 321 | 735 | 0.47 |
+| 128 | true | 16384 | 378 | 327 | 750 | 0.50 |
+
+### Backward (TFLOP/s)
+
+| d | causal | N | tang | SDPA | FA3 | tang / FA3 |
+|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 22 | 215 | 426 | 0.05 |
+| 64 | false | 2048 | 22 | 247 | 488 | 0.05 |
+| 64 | false | 4096 | 25 | 269 | 527 | 0.05 |
+| 64 | false | 8192 | 24 | 280 | 538 | 0.05 |
+| 64 | false | 16384 | – | 286 | 541 | – |
+| 64 | true | 1024 | 17 | 154 | 299 | 0.06 |
+| 64 | true | 2048 | 20 | 199 | 410 | 0.05 |
+| 64 | true | 4096 | 22 | 233 | 502 | 0.04 |
+| 64 | true | 8192 | 23 | 256 | 535 | 0.04 |
+| 64 | true | 16384 | – | 274 | 556 | – |
+| 128 | false | 1024 | 16 | 227 | 491 | 0.03 |
+| 128 | false | 2048 | 17 | 264 | 574 | 0.03 |
+| 128 | false | 4096 | 18 | 286 | 597 | 0.03 |
+| 128 | false | 8192 | 18 | 297 | 611 | 0.03 |
+| 128 | false | 16384 | – | 303 | 615 | – |
+| 128 | true | 1024 | 13 | 168 | 356 | 0.04 |
+| 128 | true | 2048 | 16 | 216 | 483 | 0.03 |
+| 128 | true | 4096 | 19 | 253 | 548 | 0.03 |
+| 128 | true | 8192 | 20 | 279 | 596 | 0.03 |
+| 128 | true | 16384 | – | 307 | 607 | – |
+
+16k backward was not run for tang (the 9-kernel program at 8k already takes 60–150 ms).
+FA3's FP8 forward (in the logs) reaches 300–930 TFLOP/s at rel_err 3–11e-2.
+
+### bf16 matmul vs cuBLAS (TFLOP/s, best variant per family, rel_err 3–4e-3)
+
+| M×K×N | B layout | tang mma.sync | tang wgmma | cuBLAS | wgmma / cuBLAS |
+|---|---|---|---|---|---|
+| 1k³ | [k,n] | 112 | 148 | 223 | 0.66 |
+| 2k³ | [k,n] | 212 | 332 | 696 | 0.48 |
+| 4k³ | [k,n] | 230 | 401 | 803 | 0.50 |
+| 8k³ | [k,n] | 240 | 434 | 760 | 0.57 |
+| 16k×2k×2k | [n,k] | 234 | 416 | 675 | 0.62 |
+| 16k×2k×8k | [n,k] | 237 | 403 | 686 | 0.59 |
+| 16k×8k×2k | [n,k] | 247 | 500 | 723 | 0.69 |
+
+### Where the gap is
+
+- **Forward**: the derived flash kernel (wgmma, warp-specialized producer) is at
+  0.42–0.60× FA3; it beats SDPA at d=128 from 2k up (416 vs 359 at 16k). Missing vs FA3:
+  intra-warpgroup softmax/GEMM ping-pong and TMA loads.
+- **Backward**: 13–25 TFLOP/s, 20–30× behind FA3. The derived backward is 9
+  kernels (two flash-style tiles, two plain contraction tiles, five elementwise),
+  re-materializing P/dS through global memory; per-kernel at 1k d64 causal the
+  three contraction tiles are 1.7, 2.7 and 3.7 ms. `TANG_WG_SYNC` makes no
+  difference (9.98 ms both). Fix: fuse dK/dV (and atomic dQ) into one kernel,
+  FA3-style — a recognizer for the backward pattern, not a tile tweak.
+- **Matmul**: wgmma doubled mma.sync but sits at 0.5–0.69× cuBLAS. Next: TMA
+  (multicast across a cluster) instead of cp.async, two consumer warpgroups
+  ping-ponging with a producer, and a persistent tile scheduler.
+
 ### Follow-up: where the 10 ms went, and llama.cpp on the same 3090
 
 Per-kernel times showed the four big GEMVs per layer at ~222 µs (8 of the 10 ms, ~46% of 936
@@ -3122,3 +3221,49 @@ length 64 it is still ~50 µs with only a few live blocks: each block walks its 
 dependent loads, and the split-KV combine alone (32 chunks × 4096 outputs × 3 slots) costs what the old
 short-context attention did. What it needs next: chunks sized to the live length (split chosen per step, not
 per capacity), more independent loads in flight per round, and the combine folded into the finalize map.
+
+## Fused attention backward on Hopper (H200 SXM, bf16, kernel-only)
+
+The derived backward as one kernel per key block (`tensor_cuda_attn_bwd.rs`).
+The kernel is recognized from the graph `backward` produces, not hand-written for attention.
+- **Pattern:** the tuple reduction over queries `(dV, dK)` whose operands are pointwise maps of two short contractions (S = q·kᵀ, dP = (dO/l)·vᵀ), plus the dQ reduction reading the same map.
+- **Inside the kernel:** S and dP run on bf16 `mma.sync`, and the maps' own bodies run on the accumulators. dV/dK stay in registers. dQ goes into a zero-filled f32 buffer, by atomics before Hopper and by a bulk async reduce (`cp.reduce.async.bulk`) per chunk on Hopper.
+- **Tuning:** the autotuner picks 64- or 128-key blocks. Query chunks are double-buffered with `cp.async`, and chunks the causal mask zeroes are skipped.
+
+Same method, inputs and f64 check as the section above. All results are at rel_err 2–6e-3.
+- **Columns:**
+  - "before" is the 9-kernel derived program measured earlier.
+  - "fused program" is the whole tang program. It also recomputes the forward softmax state and rowsum(dO·O), which SDPA and FA3 take from their forward pass.
+  - "kernel only" is the fused kernel's own time.
+- **Units:** TFLOP/s in FlashAttention's backward convention (2.5× the forward FLOPs).
+- **Baselines:** SDPA and FA3 come from `docs/bench/hopper-h200-baselines.log`; SDPA was rerun on this pod type and lands within 1%.
+
+| d | causal | N | before (9 kernels) | fused program | fused kernel only | SDPA bwd | FA3 bwd |
+|---|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 22 | 81 | 169 | 216 | 426 |
+| 64 | false | 2048 | 22 | 105 | 178 | 249 | 488 |
+| 64 | false | 4096 | 25 | 123 | 182 | 269 | 527 |
+| 64 | false | 8192 | 24 | 134 | 184 | 280 | 538 |
+| 64 | false | 16384 | – | 141 | 184 | 287 | 541 |
+| 64 | true | 1024 | 17 | 53 | 142 | 155 | 299 |
+| 64 | true | 2048 | 20 | 77 | 159 | 200 | 410 |
+| 64 | true | 4096 | 22 | 99 | 169 | 233 | 502 |
+| 64 | true | 8192 | 23 | 118 | 180 | 256 | 535 |
+| 64 | true | 16384 | – | 130 | 185 | 274 | 556 |
+| 128 | false | 1024 | 16 | 84 | 174 | 227 | 491 |
+| 128 | false | 2048 | 17 | 113 | 187 | 264 | 574 |
+| 128 | false | 4096 | 18 | 134 | 194 | 286 | 597 |
+| 128 | false | 8192 | 18 | 148 | 196 | 298 | 611 |
+| 128 | false | 16384 | – | 155 | 195 | 304 | 615 |
+| 128 | true | 1024 | 13 | 56 | 151 | 169 | 356 |
+| 128 | true | 2048 | 16 | 85 | 172 | 217 | 483 |
+| 128 | true | 4096 | 19 | 113 | 187 | 254 | 548 |
+| 128 | true | 8192 | 20 | 137 | 200 | 280 | 596 |
+| 128 | true | 16384 | – | 157 | 215 | 308 | 607 |
+
+The fused program is 4–8× faster than the 9-kernel one.
+- **Fused kernel vs SDPA:** 0.6–0.9× (169–215 vs 155–308 TFLOP/s). The whole program is at 0.35–0.55×.
+- **Fused kernel vs FA3:** about 0.35×.
+- **Why the gap:** `mma.sync` m16n8k16 tops out well below Hopper's `wgmma`. FA3's backward uses `wgmma` with warp-specialized TMA producers. The next step is moving the same recognized kernel onto `wgmma`.
+
+Raw logs: `docs/bench/hopper-h200-attn-bwd-fused*.log`.

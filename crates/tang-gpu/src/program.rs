@@ -577,6 +577,7 @@ impl Program {
                 Format::Q4K | Format::Q5K | Format::Q8x32 => {
                     panic!("block formats run only on the CUDA int8 lowering")
                 }
+                _ => unreachable!("bf16 and fp8 are not wgpu formats"),
             };
             if fresh.len() == plan.slot_len[s] {
                 slots[s] = fresh;
@@ -1409,11 +1410,19 @@ impl Program {
             }
             #[cfg(feature = "cuda")]
             Runtime::Cuda(_) => {
-                use tang_compile::tensor::cuda::MMA_SHAPES;
+                use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
                 // variant 0: every kernel transpiled; 1 + v: the
-                // tensor-core tiles in block shape MMA_SHAPES[v]
+                // tensor-core tiles in block shape MMA_SHAPES[v]; on
+                // Hopper, then every pairing of a wgmma tile shape
+                // (SM90_MMA_SHAPES) with a flash shape (SM90_FLASH_SHAPES)
+                let n = MMA_SHAPES.len()
+                    + if matches!(rt, Runtime::Cuda(d) if d.arch == "sm_90a") {
+                        SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
+                    } else {
+                        0
+                    };
                 let variants: Vec<WgslProgram> = std::iter::once(None)
-                    .chain((0..MMA_SHAPES.len()).map(Some))
+                    .chain((0..n).map(Some))
                     .map(|v| g.to_cuda_variant(outputs, v))
                     .collect();
                 Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)
@@ -1716,6 +1725,13 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
         Format::BF16 => bf16_bits(x as f64) as u32,
         _ => f16_bits(x as f64) as u32,
     };
+    if format.is_fp8() {
+        let x: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+        return tang_compile::tensor::precision::pack_fp8(format, &x)
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+    }
     match format {
         Format::F32 => std::borrow::Cow::Borrowed(data),
         f if f.is_block() => std::borrow::Cow::Borrowed(data),
@@ -1740,7 +1756,14 @@ fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
         }
         Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
         Format::F16 => unpack_f16(words, n),
-        Format::BF16 => words
+        f if f.is_fp8() => {
+            let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();
+            tang_compile::tensor::precision::unpack_fp8(f, &w, n)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        }
+        _ => words
             .iter()
             .flat_map(|w| {
                 let b = w.to_bits();
@@ -1921,6 +1944,7 @@ mod tests {
             let full = Precision {
                 storage: f,
                 accum: f,
+                operand: Format::F32,
             };
             for t in [a, b] {
                 g.set_precision(t, Precision::storage(f));

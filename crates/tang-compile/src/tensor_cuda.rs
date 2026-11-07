@@ -21,6 +21,13 @@ use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
 
+#[path = "tensor_cuda_attn_bwd.rs"]
+mod attn_bwd;
+#[path = "tensor_cuda_fp8.rs"]
+mod fp8;
+pub use fp8::SM90_FP8_SHAPES;
+use fp8::{Fp8FlashCtx, FP8_FLASH_PRELUDE};
+
 /// A tensor-core tile's block shape: a `bm × bn` output block per thread
 /// block of `warps_m × warps_n` warps (each a `bm/warps_m × bn/warps_n`
 /// warp tile of 16×8 `mma` fragments), the reduction staged `chunk` at a
@@ -37,6 +44,10 @@ pub struct MmaShape {
     pub chunk: usize,
     pub stages: usize,
     pub split_target: usize,
+    /// Hopper (sm_90a): the block's warpgroups (four warps each, stacked
+    /// along m) issue `wgmma` m64n`bn`k16 from 128-byte-swizzled stages
+    /// instead of `mma.sync` fragments. Half operands only.
+    pub wgmma: bool,
 }
 
 impl MmaShape {
@@ -49,7 +60,12 @@ impl MmaShape {
             chunk: 32,
             stages: 3,
             split_target: 100,
+            wgmma: false,
         }
+    }
+    const fn wg(mut self) -> Self {
+        self.wgmma = true;
+        self
     }
     const fn with(mut self, chunk: usize, stages: usize, split_target: usize) -> Self {
         self.chunk = chunk;
@@ -90,6 +106,17 @@ pub const MMA_SHAPES: [MmaShape; 7] = [
     MmaShape::new(32, 64, 1, 2),
 ];
 
+/// Hopper contraction tiles (`wgmma`): `Program::tuned` tries these past
+/// [`MMA_SHAPES`] on an sm_90a device. A tile that cannot take one
+/// (f32 operands, a ragged block) falls back to the `mma.sync` shape.
+pub const SM90_MMA_SHAPES: [MmaShape; 5] = [
+    MmaShape::new(128, 128, 8, 1).with(32, 4, 100).wg(),
+    MmaShape::new(128, 256, 8, 1).with(32, 3, 100).wg(),
+    MmaShape::new(64, 128, 4, 1).with(32, 4, 100).wg(),
+    MmaShape::new(128, 64, 8, 1).with(32, 4, 100).wg(),
+    MmaShape::new(64, 64, 4, 1).with(32, 4, 246).wg(),
+];
+
 /// A flash-attention tile's shape: `bi` queries per folded head per
 /// block (0: chosen from the problem so the device fills), `bj` keys per
 /// warp group per pipeline step, a `cp.async` ring of `stages` key/value
@@ -101,6 +128,20 @@ pub struct FlashShape {
     pub bj: usize,
     pub stages: usize,
     pub kw: usize,
+    /// Hopper schedule: warp-specialized `wgmma` (`None`: `mma.sync`).
+    pub sm90: Option<Sm90Flash>,
+}
+
+/// The Hopper flash schedule: one producer warpgroup staging Q, K and V
+/// into 128-byte-swizzled shared memory (16-byte `cp.async`, a ring of
+/// mbarriers) and `consumers` warpgroups of 64 query rows each on `wgmma`
+/// m64nNk16, registers rebalanced with `setmaxnreg`. Half-precision
+/// operands only (bf16 or f16); the keys per step are the shape's `bj`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sm90Flash {
+    pub consumers: usize,
+    pub producer_regs: usize,
+    pub consumer_regs: usize,
 }
 
 /// The flash shapes a tuner chooses between, paired with [`MMA_SHAPES`]
@@ -111,41 +152,115 @@ pub const FLASH_SHAPES: [FlashShape; 6] = [
         bj: 32,
         stages: 2,
         kw: 2,
+        sm90: None,
     },
     FlashShape {
         bi: 0,
         bj: 64,
         stages: 2,
         kw: 1,
+        sm90: None,
     },
     FlashShape {
         bi: 0,
         bj: 16,
         stages: 3,
         kw: 2,
+        sm90: None,
     },
     FlashShape {
         bi: 0,
         bj: 16,
         stages: 2,
         kw: 4,
+        sm90: None,
     },
     FlashShape {
         bi: 32,
         bj: 32,
         stages: 2,
         kw: 2,
+        sm90: None,
     },
     FlashShape {
         bi: 0,
         bj: 32,
         stages: 3,
         kw: 1,
+        sm90: None,
+    },
+];
+
+/// Hopper flash shapes (sm_90a): `Program::tuned` adds these as
+/// variants after [`MMA_SHAPES`] on a Hopper device.
+pub const SM90_FLASH_SHAPES: [FlashShape; 4] = [
+    FlashShape {
+        bi: 0,
+        bj: 128,
+        stages: 2,
+        kw: 1,
+        sm90: Some(Sm90Flash {
+            consumers: 2,
+            producer_regs: 40,
+            consumer_regs: 232,
+        }),
+    },
+    FlashShape {
+        bi: 0,
+        bj: 64,
+        stages: 3,
+        kw: 1,
+        sm90: Some(Sm90Flash {
+            consumers: 2,
+            producer_regs: 40,
+            consumer_regs: 232,
+        }),
+    },
+    FlashShape {
+        bi: 0,
+        bj: 128,
+        stages: 2,
+        kw: 1,
+        sm90: Some(Sm90Flash {
+            consumers: 1,
+            producer_regs: 40,
+            consumer_regs: 232,
+        }),
+    },
+    FlashShape {
+        bi: 0,
+        bj: 64,
+        stages: 2,
+        kw: 1,
+        sm90: Some(Sm90Flash {
+            consumers: 2,
+            producer_regs: 40,
+            consumer_regs: 232,
+        }),
     },
 ];
 
 /// The PTX helpers the tensor-core kernels share: TF32 rounding, `mma`
 /// m16n8k8, and `cp.async` (zero-filling when the source is out of range).
+/// Hopper FP8 flash shapes (128 keys per step: one 128-byte row of Vᵀ
+/// and of P per row).
+pub const SM90_FP8_FLASH_SHAPES: [FlashShape; 4] = {
+    const fn sh(consumers: usize, stages: usize) -> FlashShape {
+        FlashShape {
+            bi: 0,
+            bj: 128,
+            stages,
+            kw: 1,
+            sm90: Some(Sm90Flash {
+                consumers,
+                producer_regs: 40,
+                consumer_regs: 232,
+            }),
+        }
+    }
+    [sh(2, 2), sh(2, 3), sh(2, 4), sh(1, 4)]
+};
+
 const MMA_PRELUDE: &str = r#"static __device__ __forceinline__ unsigned tang_tf32(float x) {
     // round to nearest, ties away (cvt.rna): the mma reads only the top
     // 19 bits, so adding half a TF32 ulp is the whole conversion
@@ -192,6 +307,83 @@ static __device__ __forceinline__ void tang_cp16h(unsigned short* dst, const uns
     )
 }
 
+/// `x` as a C float literal body (append `f`).
+fn f32_lit(x: f64) -> String {
+    format!("{:e}", x as f32)
+}
+
+/// Hopper (sm_90a) helpers (`.b64` is split into string pieces: the
+/// program's canonical renaming would take `b64` for a buffer): mbarriers, the async-proxy fence, register
+/// reallocation between warpgroups, `cp.async` to a shared address, and
+/// `wgmma` shared-memory descriptors (128-byte swizzle).
+const SM90_PRELUDE: &str = r#"static __device__ __forceinline__ void tang_bar_init(unsigned a, unsigned n) { asm volatile("mbarrier.init.shared::cta." "b" "64 [%0], %1;" :: "r"(a), "r"(n) : "memory"); }
+static __device__ __forceinline__ void tang_bar_arrive(unsigned a) { asm volatile("{ .reg ." "b" "64 st; mbarrier.arrive.shared::cta." "b" "64 st, [%0]; }" :: "r"(a) : "memory"); }
+static __device__ __forceinline__ void tang_bar_wait(unsigned a, unsigned ph) {
+    asm volatile("{ .reg .pred p; LAB_WAIT: mbarrier.try_wait.parity.shared::cta." "b" "64 p, [%0], %1; @!p bra LAB_WAIT; }" :: "r"(a), "r"(ph) : "memory");
+}
+static __device__ __forceinline__ void tang_fence_async() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+template <int N> static __device__ __forceinline__ void tang_setmaxnreg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(N)); }
+template <int N> static __device__ __forceinline__ void tang_setmaxnreg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(N)); }
+static __device__ __forceinline__ void tang_cp16s(unsigned d, const void* src, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0) : "memory");
+}
+static __device__ __forceinline__ void tang_wg_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
+static __device__ __forceinline__ void tang_wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+template <int N> static __device__ __forceinline__ void tang_wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;" :: "n"(N) : "memory"); }
+static __device__ __forceinline__ unsigned long long tang_desc(unsigned addr, unsigned lbo, unsigned sbo) {
+    return (unsigned long long)((addr & 0x3FFFFu) >> 4) | ((unsigned long long)(lbo >> 4) << 16)
+        | ((unsigned long long)(sbo >> 4) << 32) | (1ull << 62);
+}
+"#;
+
+/// `wgmma` m64n`n`k16 with f32 accumulators: `tang_wg_ss{n}` (A and B
+/// from shared-memory descriptors, both K-major; `acc` false zeroes the
+/// accumulator) and `tang_wg_rs{n}` (A from four registers, B MN-major).
+fn sm90_wgmma(ty: &str, n: usize, rs: bool) -> String {
+    let regs = n / 2;
+    let outs: Vec<String> = (0..regs).map(|i| format!("%{i}")).collect();
+    let cons: Vec<String> = (0..regs).map(|i| format!("\"+f\"(d[{i}])")).collect();
+    if rs {
+        format!(
+            "static __device__ __forceinline__ void tang_wg_rs{n}(float* d, const unsigned* a, unsigned long long b) {{\n    asm volatile(\"{{ .reg .pred p; setp.ne.s32 p, %{}, 0; wgmma.mma_async.sync.aligned.m64n{n}k16.f32.{ty}.{ty} {{{}}}, {{%{}, %{}, %{}, %{}}}, %{}, p, 1, 1, 1; }}\"\n        : {}\n        : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"l\"(b), \"r\"(1));\n}}\n",
+            regs + 5,
+            outs.join(", "),
+            regs,
+            regs + 1,
+            regs + 2,
+            regs + 3,
+            regs + 4,
+            cons.join(", ")
+        )
+    } else {
+        format!(
+            "static __device__ __forceinline__ void tang_wg_ss{n}(float* d, unsigned long long a, unsigned long long b, bool acc) {{\n    asm volatile(\"{{ .reg .pred p; setp.ne.s32 p, %{}, 0; wgmma.mma_async.sync.aligned.m64n{n}k16.f32.{ty}.{ty} {{{}}}, %{}, %{}, p, 1, 1, 0, 0; }}\"\n        : {}\n        : \"l\"(a), \"l\"(b), \"r\"((int)acc));\n}}\n",
+            regs + 2,
+            outs.join(", "),
+            regs,
+            regs + 1,
+            cons.join(", ")
+        )
+    }
+}
+
+/// `wgmma` m64n`n`k16, A and B from shared-memory descriptors, with the
+/// transpose immediates (`ta`: A MN-major, `tb`: B MN-major):
+/// `tang_wg_ss{n}_{ta}{tb}`, accumulating.
+fn sm90_wgmma_ss(ty: &str, n: usize, ta: bool, tb: bool) -> String {
+    let regs = n / 2;
+    let outs: Vec<String> = (0..regs).map(|i| format!("%{i}")).collect();
+    let cons: Vec<String> = (0..regs).map(|i| format!("\"+f\"(d[{i}])")).collect();
+    let (ta, tb) = (ta as u8, tb as u8);
+    format!(
+        "static __device__ __forceinline__ void tang_wg_ss{n}_{ta}{tb}(float* d, unsigned long long a, unsigned long long b) {{\n    asm volatile(\"wgmma.mma_async.sync.aligned.m64n{n}k16.f32.{ty}.{ty} {{{}}}, %{}, %{}, 1, 1, 1, {ta}, {tb};\"\n        : {}\n        : \"l\"(a), \"l\"(b));\n}}\n",
+        outs.join(", "),
+        regs,
+        regs + 1,
+        cons.join(", ")
+    )
+}
+
 impl TensorGraph {
     /// CUDA source for `root` as a tensor-core tile in the default block
     /// shape, or `None` when it is not matmul-shaped.
@@ -224,6 +416,7 @@ impl TensorGraph {
             n,
             k_total,
             kdim,
+            scales,
             ..
         } = self.bilinear_tile(root, reads)?;
         let (bm, bn, chunk) = (sh.bm, sh.bn, sh.chunk);
@@ -233,6 +426,10 @@ impl TensorGraph {
             return None;
         }
         let fmt = |j: usize| self.nodes[j].precision.storage;
+        // fp8 operands have their own tile (tensor_cuda_fp8)
+        if reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
+            return None;
+        }
         // buffer j's element at `idx`, as f32
         let ld = |j: usize, idx: &str| -> String {
             match fmt(j) {
@@ -242,6 +439,7 @@ impl TensorGraph {
                 super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
+                _ => unreachable!("fp8 has its own tile"),
             }
         };
         let elem = |f: super::Format| {
@@ -251,9 +449,29 @@ impl TensorGraph {
                 "unsigned short"
             }
         };
-        // per warp: fm × fn fragments of 16×8
-        let (wtm, wtn) = (bm / sh.warps_m, bn / sh.warps_n);
-        let (fm, fnn) = (wtm / 16, wtn / 8);
+        // per warp: fm × fn fragments of 16×8 (wgmma: per warpgroup, fm
+        // m64 blocks of bn columns)
+        let wg = sh.wgmma;
+        let n_wg = (sh.warps_m * sh.warps_n) / 4;
+        let (wtm, wtn) = if wg {
+            (bm / n_wg.max(1), bn)
+        } else {
+            (bm / sh.warps_m, bn / sh.warps_n)
+        };
+        let (fm, fnn) = if wg {
+            (wtm / 64, bn / 8)
+        } else {
+            (wtm / 16, wtn / 8)
+        };
+        if wg
+            && (n_wg == 0
+                || !(sh.warps_m * sh.warps_n).is_multiple_of(4)
+                || bm % (64 * n_wg) != 0
+                || bn % 8 != 0
+                || bn > 256)
+        {
+            return None;
+        }
         if fm == 0 || wtm % 16 != 0 || wtn % 16 != 0 || chunk % 8 != 0 {
             return None;
         }
@@ -303,8 +521,25 @@ impl TensorGraph {
             .copied()
             .filter(|&f| f != super::Format::F32)
             .collect();
+        // no half plain operand, but the maps read half buffers (dV =
+        // P̃ᵀ·(dO/l) beside bf16 Q, K, dO): the tile runs in that format,
+        // the f32 operands rounded while staging (TANG_HALF_MAPS=0: TF32)
+        let map_half = || {
+            if std::env::var("TANG_HALF_MAPS").ok().as_deref() == Some("0")
+                || !a_stages.iter().chain(&b_stages).any(|st| st.2.is_some())
+            {
+                return None;
+            }
+            let fs: Vec<super::Format> = reads
+                .iter()
+                .map(|&j| fmt(j))
+                .filter(|&f| f != super::Format::F32)
+                .collect();
+            let f = *fs.first()?;
+            fs.iter().all(|&g| g == f).then_some(f)
+        };
         let half = match halves.first() {
-            None => None,
+            None => map_half(),
             Some(&f) if halves.iter().any(|&g| g != f) => return None,
             Some(&f) => Some(f),
         };
@@ -323,6 +558,9 @@ impl TensorGraph {
             None => chunk,
         };
         if half.is_some() && !chunk.is_multiple_of(16) {
+            return None;
+        }
+        if wg && (half.is_none() || !chunk.is_multiple_of(64)) {
             return None;
         }
         let esz = if half.is_some() { 2 } else { 4 };
@@ -356,6 +594,10 @@ impl TensorGraph {
         if n_outs * fm * fnn * 4 > 128 {
             return None;
         }
+        // wgmma: an MN-major operand is staged in 64-wide column groups
+        if wg && ((a_pair && bm % 64 != 0) || (!b_col && bn % 64 != 0)) {
+            return None;
+        }
         // contractions nested in a map operand (S = Q·Kᵀ in dS): per
         // staged operand, A stages first, then B
         let rc = self.comp_at(red_node)?;
@@ -383,7 +625,12 @@ impl TensorGraph {
                 nested.push(plan);
             }
         }
-        if nest_regs > 96 {
+        if nest_regs
+            > std::env::var("TANG_NEST_REGS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(192)
+        {
             return None;
         }
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
@@ -393,12 +640,30 @@ impl TensorGraph {
         let splits = split_k(n_base, k_total, chunk, sh.split_target);
         let n_tiles = n_base * splits;
         let w_out = c.width();
-        let a_floats = if a_pair { chunk * ldat } else { bm * lda };
-        let b_floats = if b_col { bn * ldbt } else { chunk * ldb };
+        // wgmma stages are unpadded (the swizzle spreads the banks)
+        let a_floats = if wg {
+            bm * chunk
+        } else if a_pair {
+            chunk * ldat
+        } else {
+            bm * lda
+        };
+        let b_floats = if wg {
+            bn * chunk
+        } else if b_col {
+            bn * ldbt
+        } else {
+            chunk * ldb
+        };
         let stage_floats = a_stages.len() * a_floats + b_stages.len() * b_floats;
         let smem_floats = sh.stages * stage_floats;
-        // dynamic shared memory, within the 3090's 99 KB per block
-        if smem_floats * esz > 99 * 1024 {
+        if wg && sh.stages < 2 {
+            return None;
+        }
+        // dynamic shared memory, within the 3090's 99 KB per block (a
+        // Hopper block: 227 KB, less the 1 KB swizzle alignment)
+        let smem_cap = if wg { 226 * 1024 } else { 99 * 1024 };
+        if smem_floats * esz > smem_cap {
             // Many distinct operands (a multi-output, multi-term tile such
             // as the gate/up backward): shrink the ring, then the chunk,
             // rather than leave the shape without a lowering.
@@ -414,10 +679,12 @@ impl TensorGraph {
         }
 
         let mut s = String::new();
-        let kind = match half {
-            None => "TF32",
-            Some(super::Format::BF16) => "BF16",
-            Some(_) => "F16",
+        let kind = match (half, wg) {
+            (None, _) => "TF32",
+            (Some(super::Format::BF16), false) => "BF16",
+            (Some(_), false) => "F16",
+            (Some(super::Format::BF16), true) => "BF16 wgmma",
+            (Some(_), true) => "F16 wgmma",
         };
         writeln!(s, "// Auto-generated by tang-compile: mma ({kind}) tile").unwrap();
         writeln!(
@@ -428,7 +695,12 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "#define TANG_TILES {n_tiles}").unwrap();
         writeln!(s, "#define TANG_THREADS {threads}").unwrap();
-        writeln!(s, "#define TANG_SMEM {}", smem_floats * esz).unwrap();
+        writeln!(
+            s,
+            "#define TANG_SMEM {}",
+            smem_floats * esz + if wg { 1024 } else { 0 }
+        )
+        .unwrap();
         writeln!(s, "#define TANG_OUT_LEN {}", numel_pts(&pts) * w_out).unwrap();
         writeln!(s, "#define select(f, t, c) ((c) ? (t) : (f))").unwrap();
         s.push_str(MMA_PRELUDE);
@@ -437,6 +709,15 @@ impl TensorGraph {
         }
         if let Some(f) = half {
             s.push_str(&mma16_prelude(f));
+            if wg {
+                s.push_str(SM90_PRELUDE);
+                let ty = if f == super::Format::BF16 {
+                    "bf16"
+                } else {
+                    "f16"
+                };
+                s.push_str(&sm90_wgmma_ss(ty, bn, a_pair, !b_col));
+            }
         }
         if splits > 1 {
             // per-split partial blocks, and an arrival counter per output
@@ -464,6 +745,10 @@ impl TensorGraph {
         .unwrap();
         writeln!(s, "    (void)count;").unwrap();
         writeln!(s, "    extern __shared__ __align__(16) float smem[];").unwrap();
+        if wg {
+            // 128-byte swizzle atoms are 1 KB aligned
+            writeln!(s, "    unsigned short* smem_h = (unsigned short*)(((size_t)smem + 1023) & ~(size_t)1023);").unwrap();
+        }
         writeln!(s, "    unsigned tile = blockIdx.x;").unwrap();
         writeln!(s, "    if (tile >= {n_tiles}u) return;").unwrap();
         let per_split = k_total.div_ceil(chunk).div_ceil(splits) * chunk;
@@ -647,7 +932,13 @@ impl TensorGraph {
         // staging of one chunk into buffer `buf`, walking the global
         // buffer in address order
         writeln!(s, "    auto load = [&](unsigned buf, unsigned k0) {{").unwrap();
-        if half.is_some() {
+        if wg {
+            writeln!(
+                s,
+                "        unsigned short* st = smem_h + buf * {stage_floats}u;"
+            )
+            .unwrap();
+        } else if half.is_some() {
             writeln!(
                 s,
                 "        unsigned short* st = (unsigned short*)smem + buf * {stage_floats}u;"
@@ -671,7 +962,14 @@ impl TensorGraph {
                      ldst: usize| {
             let (cp, ck) = (addr.coefs[pdim], addr.coefs[kdim]);
             let slot = |pt: &str, kk: &str| {
-                if row_major {
+                // wgmma: 64-element rows of 128 bytes along the staged
+                // row (k when K-major, the block when MN-major), 16-byte
+                // chunks XOR-swizzled by the row index mod 8
+                if wg && row_major {
+                    format!("st + {off}u + (({kk}) / 64u) * {}u + ({pt}) * 64u + (((({kk}) % 64u) / 8u ^ (({pt}) % 8u)) * 8u) + ({kk}) % 8u", block * 64)
+                } else if wg {
+                    format!("st + {off}u + (({pt}) / 64u) * {}u + ({kk}) * 64u + (((({pt}) % 64u) / 8u ^ (({kk}) % 8u)) * 8u) + ({pt}) % 8u", chunk * 64)
+                } else if row_major {
                     format!("st + {off}u + {pt} * {ldst}u + {kk}")
                 } else {
                     format!("st + {off}u + {kk} * {ldst}u + {pt}")
@@ -813,6 +1111,7 @@ impl TensorGraph {
                             super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                                 unreachable!("block formats lower only through the int8 MMA kernel")
                             }
+                            _ => unreachable!("fp8 has its own tile"),
                         };
                         writeln!(s, "            unsigned kf[2] = {{tang_tf32(ok ? {s0} : 0.0f), tang_tf32(ok ? {s1} : 0.0f)}};").unwrap();
                         writeln!(s, "            #pragma unroll").unwrap();
@@ -1129,7 +1428,96 @@ impl TensorGraph {
         // k per mma step
         let kstep = if half.is_some() { 16 } else { 8 };
         let steps = chunk / kstep;
-        if sh.stages >= 2 {
+        if wg {
+            // Hopper: chunk c's wgmma are issued asynchronously, then the
+            // staging of chunk c + P runs (copies, or the maps and nested
+            // contractions computed into their stage) while they execute.
+            // With one wgmma group left in flight (ring ≥ 3), after the
+            // barrier of iteration c everyone's chunk c - 2 is done, so
+            // chunks c - 1 … c + P - 1 hold P + 1 buffers and c + P takes
+            // the last: P = stages - 2 (stages 2: P = 1, no group left in
+            // flight).
+            let st = sh.stages;
+            // TANG_WG_SYNC=1 (or nested contractions, whose registers
+            // would make ptxas serialize the wgmma anyway): stage the
+            // chunk ahead before issuing, and drain the group at once
+            let has_nested = nested.iter().any(|p| !p.is_empty());
+            let sync = match std::env::var("TANG_WG_SYNC").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => has_nested,
+            };
+            let (pf, wgw) = if sync {
+                (st - 1, 0)
+            } else if st >= 3 {
+                (st - 2, 1)
+            } else {
+                (1, 0)
+            };
+            let wpm = bm / n_wg;
+            let bytes = stage_floats * 2;
+            writeln!(
+                s,
+                "    unsigned sbase = (unsigned)__cvta_generic_to_shared(smem_h);"
+            )
+            .unwrap();
+            writeln!(s, "    unsigned wgi = warp / 4u;").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < {pf}u; c++) {{ if (c < n_chunks) load(c, k_begin + c * {chunk}u); else tang_cp_commit(); }}").unwrap();
+            writeln!(s, "    for (unsigned c = 0u; c < n_chunks; c++) {{").unwrap();
+            writeln!(s, "        tang_cp_wait<{}>();", pf - 1).unwrap();
+            writeln!(s, "        tang_fence_async();").unwrap();
+            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "        unsigned so = sbase + (c % {st}u) * {bytes}u;").unwrap();
+            let ahead = format!("        if (c + {pf}u < n_chunks) load((c + {pf}u) % {st}u, k_begin + (c + {pf}u) * {chunk}u); else tang_cp_commit();");
+            if sync {
+                writeln!(s, "{ahead}").unwrap();
+            }
+            writeln!(s, "        tang_wg_fence();").unwrap();
+            let ta = a_pair as u8;
+            let tb = (!b_col) as u8;
+            for (w, u) in uses.iter().enumerate() {
+                for &(ai, bi) in u {
+                    let a_off = ai * a_floats * 2;
+                    let b_off = (n_a * a_floats + bi * b_floats) * 2;
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int i = 0; i < {fm}; i++) {{").unwrap();
+                    writeln!(s, "            unsigned mb = wgi * {wpm}u + 64u * i;").unwrap();
+                    writeln!(s, "            #pragma unroll").unwrap();
+                    writeln!(
+                        s,
+                        "            for (unsigned kb = 0u; kb < {chunk}u; kb += 16u) {{"
+                    )
+                    .unwrap();
+                    if a_pair {
+                        // [bm/64][chunk][64], MN-major
+                        writeln!(s, "                unsigned long long da = tang_desc(so + {a_off}u + (mb / 64u) * {}u + kb * 128u, {}u, 1024u);", chunk * 128, chunk * 128).unwrap();
+                    } else {
+                        // [chunk/64][bm][64], K-major
+                        writeln!(s, "                unsigned long long da = tang_desc(so + {a_off}u + (kb / 64u) * {}u + mb * 128u + (kb % 64u) * 2u, 16u, 1024u);", bm * 128).unwrap();
+                    }
+                    if b_col {
+                        writeln!(s, "                unsigned long long db = tang_desc(so + {b_off}u + (kb / 64u) * {}u + (kb % 64u) * 2u, 16u, 1024u);", bn * 128).unwrap();
+                    } else {
+                        writeln!(s, "                unsigned long long db = tang_desc(so + {b_off}u + kb * 128u, {}u, 1024u);", chunk * 128).unwrap();
+                    }
+                    writeln!(
+                        s,
+                        "                tang_wg_ss{bn}_{ta}{tb}(&acc[{w}][i][0][0], da, db);"
+                    )
+                    .unwrap();
+                    writeln!(s, "            }}").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                }
+            }
+            writeln!(s, "        tang_wg_commit();").unwrap();
+            if !sync {
+                writeln!(s, "{ahead}").unwrap();
+            }
+            writeln!(s, "        tang_wg_wait<{wgw}>();").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    tang_wg_wait<0>();").unwrap();
+        } else if sh.stages >= 2 {
             // a ring of `stages` buffers, chunk c + stages - 1 in flight
             // while chunk c is multiplied; the fragments of the next k step
             // load while this one's mma issue (across the chunk boundary
@@ -1196,12 +1584,18 @@ impl TensorGraph {
             writeln!(s, "    for (int j = 0; j < {fnn}; j++)").unwrap();
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
-            if a_pair {
+            if wg {
+                // wgmma m64nN: warp w of the group holds rows 16w + gq
+                // (+ 8), each n8 group laid out as an mma.sync C fragment
+                writeln!(s, "        unsigned lr = (warp / 4u) * {}u + 64u * i + 16u * (warp % 4u) + gq + 8u * (r / 2);", bm / n_wg.max(1)).unwrap();
+                writeln!(s, "        unsigned lc = 8u * j + 2u * tq + (r % 2);").unwrap();
+            } else if a_pair {
                 writeln!(s, "        unsigned lr = wr + 16u * i + 2u * gq + (r / 2);").unwrap();
             } else {
                 writeln!(s, "        unsigned lr = wr + 16u * i + gq + 8u * (r / 2);").unwrap();
             }
-            if b_col {
+            if wg {
+            } else if b_col {
                 writeln!(s, "        unsigned lc = wc + 8u * j + 2u * tq + (r % 2);").unwrap();
             } else {
                 writeln!(
@@ -1248,6 +1642,9 @@ impl TensorGraph {
                 writeln!(s, "            for (unsigned sp = 0u; sp < {splits}u; sp++) red{w} += __ldcg(tang_partial + (sp * {n_base}u + tile) * {}u + {}u + lr * {bn}u + lc);", n_outs * bb, w * bb).unwrap();
             } else {
                 writeln!(s, "            float red{w} = acc[{w}][i][j][r];").unwrap();
+            }
+            if scales[w] != 1.0 {
+                writeln!(s, "            red{w} *= {}f;", f32_lit(scales[w])).unwrap();
             }
         }
         let vals: Vec<String> = if epilogue {
@@ -1296,6 +1693,7 @@ impl TensorGraph {
                 super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
+                _ => unreachable!("fp8 has its own tile"),
             };
             writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
         }
@@ -1574,6 +1972,16 @@ impl TensorGraph {
     pub fn to_cuda_variant(&self, outputs: &[TensorId], variant: Option<usize>) -> WgslProgram {
         let mut nested = self.clone();
         nested.schedule_nested_contractions(outputs);
+        // the attention backward as one kernel per key block, in every
+        // variant alike (its dQ half is a zero fill the kernel adds to)
+        if let Some(plan) = nested.attn_bwd_plan(outputs) {
+            let mut fused = nested.clone();
+            fused.attn_bwd_schedule(&plan);
+            let mut program = fused.to_cuda_variant_scheduled(outputs, variant);
+            if fused.attn_bwd_patch(&plan, &mut program, variant) {
+                return program.canonical();
+            }
+        }
         nested.to_cuda_variant_scheduled(outputs, variant)
     }
 
@@ -1624,15 +2032,61 @@ impl TensorGraph {
                     .unwrap_or_else(|| panic!("node {root}: a Q8x32 store needs a one-thread-per-point kernel over a multiple of 32 points"));
                 continue;
             }
+            // FP8 operands: only the sm90 FP8 tile reads them (variant v
+            // picks its shape)
+            let fp8 = reads
+                .iter()
+                .any(|&j| self.nodes[j].precision.storage.is_fp8());
             let native = match variant {
-                Some(v) if self.nodes[root].tile.0 > 0 => self
-                    .cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v])
-                    .or_else(|| {
-                        self.cuda_flash_kernel_shaped(
+                _ if fp8 => {
+                    let v = variant.unwrap_or(0);
+                    let sh = SM90_FP8_SHAPES[v % SM90_FP8_SHAPES.len()];
+                    let fs = SM90_FP8_FLASH_SHAPES[v % SM90_FP8_FLASH_SHAPES.len()];
+                    Some(
+                        self.cuda_fp8_kernel_shaped(root, &reads, sh)
+                            .or_else(|| {
+                                self.cuda_fp8_kernel_shaped(root, &reads, SM90_FP8_SHAPES[0])
+                            })
+                            .or_else(|| self.cuda_flash_kernel_shaped(root, &reads, fs))
+                            .or_else(|| {
+                                self.cuda_flash_kernel_shaped(
+                                    root,
+                                    &reads,
+                                    SM90_FP8_FLASH_SHAPES[0],
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "kernel {root} reads FP8 storage but is not an FP8 tile \
+                                     (a contraction of two FP8 operands contiguous along k, \
+                                     or attention with FP8 Q, K, Vᵀ and an E4M3 operand format)"
+                                )
+                            }),
+                    )
+                }
+                Some(v) if self.nodes[root].tile.0 > 0 => v
+                    .checked_sub(MMA_SHAPES.len())
+                    .and_then(|h| {
+                        // variants past MMA_SHAPES: the Hopper wgmma tiles
+                        self.cuda_mma_kernel_shaped(
                             root,
                             &reads,
-                            FLASH_SHAPES[v % FLASH_SHAPES.len()],
+                            SM90_MMA_SHAPES[h % SM90_MMA_SHAPES.len()],
                         )
+                    })
+                    .or_else(|| {
+                        self.cuda_mma_kernel_shaped(root, &reads, MMA_SHAPES[v % MMA_SHAPES.len()])
+                    })
+                    .or_else(|| {
+                        // variants past MMA_SHAPES: the Hopper flash shapes
+                        let fs = match v.checked_sub(MMA_SHAPES.len()) {
+                            Some(h) => {
+                                SM90_FLASH_SHAPES
+                                    [(h / SM90_MMA_SHAPES.len()) % SM90_FLASH_SHAPES.len()]
+                            }
+                            None => FLASH_SHAPES[v % FLASH_SHAPES.len()],
+                        };
+                        self.cuda_flash_kernel_shaped(root, &reads, fs)
                     }),
                 _ => None,
             };
@@ -1654,6 +2108,70 @@ impl TensorGraph {
 }
 
 impl TensorGraph {
+    /// Whether every kernel of the CUDA program for `outputs` that reads
+    /// an FP8 buffer lowers to an FP8 tile (a contraction of two FP8
+    /// operands contiguous along k, or FP8 attention). A precision search
+    /// skips FP8 candidates that do not: no other kernel reads FP8.
+    pub fn cuda_fp8_lowers(&self, outputs: &[TensorId]) -> bool {
+        // FP8 is an operand format: inputs only (no kernel writes it)
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.precision.storage.is_fp8() && !matches!(n.op, Op::Input(_)))
+        {
+            return false;
+        }
+        let mut g = self.clone();
+        g.schedule_nested_contractions(outputs);
+        let program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
+            g.to_program_numbered(outputs, Target::Wgsl)
+        });
+        program.kernels.iter().all(|k| {
+            let root = k.node.index();
+            let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            !reads.iter().any(|&j| g.nodes[j].precision.storage.is_fp8())
+                || g.cuda_fp8_kernel_shaped(root, &reads, SM90_FP8_SHAPES[0])
+                    .is_some()
+                || g.cuda_flash_kernel_shaped(root, &reads, SM90_FP8_FLASH_SHAPES[0])
+                    .is_some()
+        })
+    }
+
+    /// The online-softmax reductions of the attention kernels in the CUDA
+    /// program for `outputs`, with the buffers each stages as plain
+    /// operands (Q, K, V): where an FP8 precision move sets the
+    /// reduction's `operand` format.
+    pub fn cuda_flash_reductions(&self, outputs: &[TensorId]) -> Vec<(TensorId, Vec<TensorId>)> {
+        let mut g = self.clone();
+        g.schedule_nested_contractions(outputs);
+        let program = super::wgsl::with_dialect(super::wgsl::Dialect::Cuda, || {
+            g.to_program_numbered(outputs, Target::Wgsl)
+        });
+        program
+            .kernels
+            .iter()
+            .filter_map(|k| {
+                let root = k.node.index();
+                if g.nodes[root].tile.0 == 0 {
+                    return None;
+                }
+                let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+                let f = g.flash_tile(root, &reads)?;
+                let rc = g.comp_at(f.red_node)?;
+                let mut bufs: Vec<TensorId> = f
+                    .terms
+                    .iter()
+                    .flat_map(|(qb, _, kb, _)| [*qb, *kb])
+                    .map(|b| TensorId(b as u32))
+                    .collect();
+                if let ENode::Var(v) = rc.body.nodes_slice()[rc.body_outs[2].index() as usize] {
+                    bufs.push(TensorId(g.storage(rc.args[v as usize].src).n() as u32));
+                }
+                Some((TensorId(f.red_node as u32), bufs))
+            })
+            .collect()
+    }
+
     /// The tensor-core kernels of [`to_cuda`](Self::to_cuda) and, for
     /// each, the buffers its tiles stage as plain operands (a matmul's two
     /// factors, attention's Q, K and V): stored in f16 (bf16) together,
@@ -2115,6 +2633,9 @@ struct Flash {
     n_keys: usize,
     d_lanes: usize,
     kd: usize,
+    /// a constant factor on every product of the score (the 1/√d the
+    /// query map folds into the score body)
+    scale: f64,
 }
 
 use super::msl_mma::Addr;
@@ -2141,7 +2662,7 @@ impl TensorGraph {
         let dy = super::tile::largest_other(&pts, dx)?;
         let others: Vec<usize> = (0..pts.len()).filter(|&d| d != dx && d != dy).collect();
         let d_lanes = pts[dx];
-        if !d_lanes.is_multiple_of(16) || d_lanes > 64 {
+        if !d_lanes.is_multiple_of(16) || d_lanes > 256 {
             return None;
         }
         // body outs: (score + mask, 1, value)
@@ -2232,6 +2753,7 @@ impl TensorGraph {
                 d_lanes,
                 kd: 8,
                 pts,
+                scale: 1.0,
             });
         }
         // the score comp: Σ_d of products, each q-like × k-like
@@ -2263,24 +2785,54 @@ impl TensorGraph {
         let sd = srank - 1;
         let mut pairs = Vec::new();
         let snodes = sc.body.nodes_slice();
-        fn products(nodes: &[ENode], e: tang_expr::ExprId, out: &mut Vec<(usize, usize)>) -> bool {
+        // a product of two vars and any literals: (p, q, Π literals)
+        fn factors(
+            nodes: &[ENode],
+            e: tang_expr::ExprId,
+            vars: &mut Vec<usize>,
+            k: &mut f64,
+        ) -> bool {
+            match nodes[e.index() as usize] {
+                ENode::Mul(a, b) => factors(nodes, a, vars, k) && factors(nodes, b, vars, k),
+                ENode::Var(p) => {
+                    vars.push(p as usize);
+                    true
+                }
+                ENode::Lit(b) => {
+                    *k *= f64::from_bits(b);
+                    true
+                }
+                _ => false,
+            }
+        }
+        fn products(
+            nodes: &[ENode],
+            e: tang_expr::ExprId,
+            out: &mut Vec<(usize, usize, f64)>,
+        ) -> bool {
             match nodes[e.index() as usize] {
                 ENode::Add(a, b) => products(nodes, a, out) && products(nodes, b, out),
-                ENode::Mul(a, b) => match (nodes[a.index() as usize], nodes[b.index() as usize]) {
-                    (ENode::Var(p), ENode::Var(q)) => {
-                        out.push((p as usize, q as usize));
-                        true
+                ENode::Mul(..) => {
+                    let (mut vars, mut k) = (Vec::new(), 1.0);
+                    if !factors(nodes, e, &mut vars, &mut k) || vars.len() != 2 {
+                        return false;
                     }
-                    _ => false,
-                },
+                    out.push((vars[0], vars[1], k));
+                    true
+                }
                 _ => false,
             }
         }
         if !products(snodes, sc.body_outs[0], &mut pairs) {
             return None;
         }
+        // one scale for every term (it multiplies the summed score)
+        let scale = pairs.first().map_or(1.0, |t| t.2);
+        if pairs.iter().any(|t| t.2 != scale) {
+            return None;
+        }
         let mut terms = Vec::new();
-        for (p, q) in pairs {
+        for (p, q, _) in pairs {
             let (ap, aq) = (&sc.args[p], &sc.args[q]);
             if !is_buffer(ap.src.n()) || !is_buffer(aq.src.n()) {
                 return None;
@@ -2318,6 +2870,7 @@ impl TensorGraph {
             score_buf: None,
             epilogue,
             score_to_red,
+            scale,
             dy,
             dx,
             others,
@@ -2395,11 +2948,16 @@ impl TensorGraph {
                 super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
+                // FP8 operands are staged by the tile; a stray scalar read
+                // fails to compile
+                _ => format!("tang_fp8_scalar_read(b{j}[{idx}])"),
             }
         };
         let elem = |f: super::Format| {
             if f == super::Format::F32 {
                 "float"
+            } else if f.is_fp8() {
+                "unsigned char"
             } else {
                 "unsigned short"
             }
@@ -2412,13 +2970,24 @@ impl TensorGraph {
             Ok(v) => {
                 let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
                 match p[..] {
-                    [bi, bj, stages, kw] => FlashShape { bi, bj, stages, kw },
+                    [bi, bj, stages, kw] => FlashShape {
+                        bi,
+                        bj,
+                        stages,
+                        kw,
+                        sm90: None,
+                    },
                     _ => sh,
                 }
             }
             Err(_) => sh,
         };
-        let (bj, kw) = (sh.bj, sh.kw);
+        let hop = sh.sm90;
+        // FP8 operands: the Hopper schedule only
+        if hop.is_none() && reads.iter().chain([&root]).any(|&j| fmt(j).is_fp8()) {
+            return None;
+        }
+        let (bj, kw) = (sh.bj, if hop.is_some() { 1 } else { sh.kw });
         // keys per pipeline step, over all warp groups
         let bjs = bj * kw;
         if !bj.is_multiple_of(8) || sh.stages < 2 || kw == 0 {
@@ -2429,12 +2998,16 @@ impl TensorGraph {
         // heads sharing a grouped K/V head) folds into the block's rows:
         // K and V are staged once for all of them
         let fold = self.flash_fold(&f, rc);
+        if hop.is_some() && fold.is_some() {
+            return None;
+        }
         let nf = fold.map_or(1, |fd| f.pts[fd]);
         let bi = match std::env::var("TANG_FLASH_BI")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             Some(b) => b,
+            None if hop.is_some() => 64 * hop.unwrap().consumers,
             None if sh.bi > 0 => sh.bi,
             None if fold.is_some() => {
                 // the largest query slice that still fills the device
@@ -2455,7 +3028,10 @@ impl TensorGraph {
         }
         let row_warps = R / 16;
         #[allow(non_snake_case)]
-        let T = 32 * row_warps * kw;
+        let T = match hop {
+            Some(h) => 128 * (h.consumers + 1),
+            None => 32 * row_warps * kw,
+        };
         if T > 1024 {
             return None;
         }
@@ -2487,7 +3063,14 @@ impl TensorGraph {
         if let Some((vb, _)) = &plain_v {
             plain.push(fmt(*vb));
         }
+        // FP8 Q, K and V (each with its own block scales): the Hopper
+        // FP8 schedule below
+        let fp8 = !plain.is_empty() && plain.iter().all(|f| f.is_fp8());
+        if !fp8 && plain.iter().any(|f| f.is_fp8()) {
+            return None;
+        }
         let half = match plain.first() {
+            _ if fp8 => None,
             None => None,
             Some(&g) if plain.iter().any(|&x| x != g) => return None,
             Some(&super::Format::F32) => None,
@@ -2498,7 +3081,7 @@ impl TensorGraph {
         }
         let esz = if half.is_some() { 2 } else { 4 };
         // fragments in registers: Q (n_terms × nq × 4), S (bj/8 × 4), O (d/8 × 4)
-        if n_terms * nq * 4 + bj / 2 + d / 2 > 160 {
+        if hop.is_none() && n_terms * nq * 4 + bj / 2 + d / 2 > 160 {
             return None;
         }
         // row strides: K rows are read 8 keys × 4 float2 per half warp
@@ -2524,9 +3107,58 @@ impl TensorGraph {
         let smem_bytes = (sh.stages * stage_floats * esz)
             .max(q_floats * esz)
             .max(merge_floats * 4);
-        if smem_bytes > 99 * 1024 {
+        if hop.is_none() && smem_bytes > 99 * 1024 {
             return None;
         }
+        let fp8_plan = match hop {
+            Some(h) if fp8 => {
+                Some(self.fp8_flash_plan(&f, rc, plain_v.as_ref()?, h, bj, kd, d, sh.stages)?)
+            }
+            _ => None,
+        };
+        let smem_bytes = match hop {
+            None => smem_bytes,
+            Some(_) if fp8 => fp8_plan.as_ref()?.smem,
+            Some(h) => {
+                // Q, the K/V ring, the mbarriers; 1024 bytes of alignment slack
+                let ok = half.is_some()
+                    && has_k
+                    && n_terms == 1
+                    && kd.is_multiple_of(64)
+                    && d.is_multiple_of(64)
+                    && d <= 256
+                    && bj.is_multiple_of(16)
+                    && bj <= 256
+                    && plain_v.as_ref().is_some_and(|(_, va)| {
+                        va.coefs[f.dx] == 1
+                            && va.offset % 8 == 0
+                            && va
+                                .coefs
+                                .iter()
+                                .enumerate()
+                                .all(|(k, &c)| k == f.dx || c % 8 == 0)
+                    })
+                    && f.terms.iter().all(|(_, qa, _, ka)| {
+                        [qa, ka].iter().all(|a| {
+                            let inner = f.score_to_red.len();
+                            a.coefs[inner] == 1
+                                && a.offset % 8 == 0
+                                && a.coefs
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(k, &c)| k == inner || c % 8 == 0)
+                        })
+                    });
+                let b = 64 * h.consumers * kd * 2
+                    + sh.stages * bj * (kd + d) * 2
+                    + 16 * sh.stages
+                    + 1024;
+                if !ok || b > 227 * 1024 {
+                    return None;
+                }
+                b
+            }
+        };
         let tiles_i = f.m.div_ceil(BI);
         let n_tiles = tiles_i * lead / nf;
         let n_chunks = f.n_keys.div_ceil(bjs);
@@ -2629,13 +3261,15 @@ impl TensorGraph {
 
         let mut s = String::new();
         let kind = match half {
+            _ if fp8 => "FP8",
             None => "TF32",
             Some(super::Format::BF16) => "BF16",
             Some(_) => "F16",
         };
         writeln!(
             s,
-            "// Auto-generated by tang-compile: flash attention on mma ({kind})"
+            "// Auto-generated by tang-compile: flash attention on {} ({kind})",
+            if hop.is_some() { "wgmma" } else { "mma" }
         )
         .unwrap();
         writeln!(
@@ -2652,8 +3286,34 @@ impl TensorGraph {
         if typed {
             s.push_str(HALF_PRELUDE);
         }
+        if let Some(pl) = &fp8_plan {
+            s.push_str(SM90_PRELUDE);
+            s.push_str(&fp8::wgmma_fp8_named(
+                "tang_wgs",
+                fp8::ptx_ty(pl.fq),
+                fp8::ptx_ty(pl.fk),
+                bj,
+            ));
+            s.push_str(&fp8::wgmma_fp8_named(
+                "tang_wgo",
+                "e4m3",
+                fp8::ptx_ty(pl.fv),
+                d,
+            ));
+            s.push_str(FP8_FLASH_PRELUDE);
+        }
         if let Some(hf) = half {
             s.push_str(&mma16_prelude(hf));
+            if hop.is_some() {
+                let ty = if hf == super::Format::BF16 {
+                    "bf16"
+                } else {
+                    "f16"
+                };
+                s.push_str(SM90_PRELUDE);
+                s.push_str(&sm90_wgmma(ty, bj, false));
+                s.push_str(&sm90_wgmma(ty, d, true));
+            }
         }
         let mut params: Vec<String> = reads
             .iter()
@@ -2663,7 +3323,8 @@ impl TensorGraph {
         params.push("unsigned count".into());
         writeln!(
             s,
-            "extern \"C\" __global__ void __launch_bounds__({T}) main0({}) {{",
+            "extern \"C\" __global__ void __launch_bounds__({T}{}) main0({}) {{",
+            if hop.is_some() { ", 1" } else { "" },
             params.join(", ")
         )
         .unwrap();
@@ -2684,9 +3345,11 @@ impl TensorGraph {
         writeln!(s, "    unsigned lane = tid % 32u;").unwrap();
         writeln!(s, "    unsigned gq = lane / 4u, tq = lane % 4u;").unwrap();
         // warp group (which keys of a chunk) and the warp's first row
-        writeln!(s, "    unsigned wg = warp / {row_warps}u;").unwrap();
-        writeln!(s, "    unsigned wrow = (warp % {row_warps}u) * 16u;").unwrap();
-        writeln!(s, "    unsigned kbase = wg * {bj}u;").unwrap();
+        if hop.is_none() {
+            writeln!(s, "    unsigned wg = warp / {row_warps}u;").unwrap();
+            writeln!(s, "    unsigned wrow = (warp % {row_warps}u) * 16u;").unwrap();
+            writeln!(s, "    unsigned kbase = wg * {bj}u;").unwrap();
+        }
 
         // the key-chunk range: chunks the affine mask covers entirely
         // (block-uniform) are left out at either end
@@ -2728,25 +3391,313 @@ impl TensorGraph {
             writeln!(s, "    }}").unwrap();
         }
 
-        // Q fragments, staged once through shared memory and kept as TF32
-        // (the head-dim pair 2tq, 2tq + 1 in mma k slots tq, tq + 4)
-        if has_k {
-            writeln!(s, "    unsigned qf[{n_terms}][{nq}][4];").unwrap();
-            for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
+        let nsf = bj / 8;
+        let nof = d / 8;
+        if let (Some(h), Some(pl)) = (hop, &fp8_plan) {
+            self.fp8_flash_body(
+                &mut s,
+                &f,
+                rc,
+                pl,
+                h,
+                Fp8FlashCtx {
+                    bj,
+                    d,
+                    stages: sh.stages,
+                    threads: T,
+                    nsf,
+                    nof,
+                },
+                &row_coords,
+                &arg_value,
+                &emit_body,
+                &coord,
+                &score_coord,
+                &addr_expr,
+            );
+        } else if let Some(h) = hop {
+            // Hopper: one producer warpgroup stages Q, K and V with 16-byte
+            // `cp.async` into 128-byte-swizzled tiles and signals a ring of
+            // mbarriers; `h.consumers` warpgroups of 64 rows each run
+            // S = Q·Kᵀ and O += P·V as `wgmma` (Q, K, V from shared-memory
+            // descriptors, P from the score registers).
+            let (qb, qa, kb, ka) = &f.terms[0];
+            let (vb, va) = plain_v.clone()?;
+            let cw = h.consumers;
+            let bm = 64 * cw;
+            let q_bytes = bm * kd * 2;
+            let k_bytes = bj * kd * 2;
+            let stage_bytes = k_bytes + bj * d * 2;
+            let bar_off = q_bytes + sh.stages * stage_bytes;
+            // one swizzled 16-byte chunk of a `[cols/64][rows][64]` tile
+            let swz = |rows: usize, r: &str, c8: &str| {
+                format!(
+                    "(({c8}) / 8u) * {}u + ({r}) * 128u + (((({c8}) % 8u) ^ (({r}) % 8u)) * 16u)",
+                    rows * 128
+                )
+            };
+            writeln!(
+                s,
+                "    unsigned sbase = ((unsigned)__cvta_generic_to_shared(smem) + 1023u) & ~1023u;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "    unsigned bar_f = sbase + {bar_off}u, bar_e = bar_f + {}u;",
+                8 * sh.stages
+            )
+            .unwrap();
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+            writeln!(s, "        for (unsigned q = 0u; q < {}u; q++) {{ tang_bar_init(bar_f + 8u * q, 128u); tang_bar_init(bar_e + 8u * q, {}u); }}", sh.stages, 128 * cw).unwrap();
+            writeln!(
+                s,
+                "        asm volatile(\"fence.mbarrier_init.release.cluster;\" ::: \"memory\");"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            // Q, by every thread, before the roles split
+            writeln!(
+                s,
+                "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                bm * kd / 8
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "        unsigned r = idx / {}u, c8 = idx % {}u, dd = c8 * 8u, ii = i0 + r;",
+                kd / 8,
+                kd / 8
+            )
+            .unwrap();
+            writeln!(s, "        bool ok = ii < {}u;", f.m).unwrap();
+            writeln!(
+                s,
+                "        tang_cp16s(sbase + {}, b{qb} + (ok ? (unsigned)({}) : 0u), ok);",
+                swz(bm, "r", "c8"),
+                addr_expr(qa, &score_coord)
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(
+                s,
+                "    tang_cp_commit(); tang_cp_wait<0>(); tang_fence_async();"
+            )
+            .unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+            // producer
+            writeln!(s, "    if (warp < 4u) {{").unwrap();
+            writeln!(s, "        tang_setmaxnreg_dec<{}>();", h.producer_regs).unwrap();
+            writeln!(s, "        unsigned it = 0u;").unwrap();
+            writeln!(s, "        for (unsigned c = c_lo; c < c_hi; c++, it++) {{").unwrap();
+            writeln!(s, "            unsigned q = it % {}u;", sh.stages).unwrap();
+            writeln!(
+                s,
+                "            tang_bar_wait(bar_e + 8u * q, ((it / {}u) & 1u) ^ 1u);",
+                sh.stages
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            unsigned st = sbase + {q_bytes}u + q * {stage_bytes}u;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            for (unsigned idx = tid; idx < {}u; idx += 128u) {{",
+                bj * kd / 8
+            )
+            .unwrap();
+            writeln!(s, "                unsigned r = idx / {}u, c8 = idx % {}u, dd = c8 * 8u, jj = c * {bj}u + r;", kd / 8, kd / 8).unwrap();
+            writeln!(s, "                bool ok = jj < {}u;", f.n_keys).unwrap();
+            writeln!(
+                s,
+                "                tang_cp16s(st + {}, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
+                swz(bj, "r", "c8"),
+                addr_expr(ka, &score_coord)
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(
+                s,
+                "            for (unsigned idx = tid; idx < {}u; idx += 128u) {{",
+                bj * d / 8
+            )
+            .unwrap();
+            writeln!(s, "                unsigned r = idx / {}u, c8 = idx % {}u, nn = c8 * 8u, jj = c * {bj}u + r;", d / 8, d / 8).unwrap();
+            writeln!(s, "                bool ok = jj < {}u;", f.n_keys).unwrap();
+            writeln!(
+                s,
+                "                tang_cp16s(st + {k_bytes}u + {}, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
+                swz(bj, "r", "c8"),
+                addr_expr(&va, &coord)
+            )
+            .unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(s, "            tang_cp_commit();").unwrap();
+            writeln!(s, "            if (c > c_lo) {{ tang_cp_wait<1>(); tang_fence_async(); tang_bar_arrive(bar_f + 8u * ((it - 1u) % {}u)); }}", sh.stages).unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        if (c_hi > c_lo) {{ tang_cp_wait<0>(); tang_fence_async(); tang_bar_arrive(bar_f + 8u * ((it - 1u) % {}u)); }}", sh.stages).unwrap();
+            writeln!(s, "        return;").unwrap();
+            writeln!(s, "    }}").unwrap();
+            // consumers
+            writeln!(s, "    tang_setmaxnreg_inc<{}>();", h.consumer_regs).unwrap();
+            writeln!(s, "    unsigned cwi = warp / 4u - 1u;").unwrap();
+            writeln!(s, "    unsigned wrow = cwi * 64u + (warp % 4u) * 16u;").unwrap();
+            writeln!(s, "    unsigned qaddr = sbase + cwi * {}u;", 64 * 128).unwrap();
+            writeln!(s, "    float o[{nof}][4];").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(
+                s,
+                "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"
+            )
+            .unwrap();
+            // the row max in log2 units (exp2 below)
+            writeln!(s, "    float m_row[2] = {{-1.0e30f, -1.0e30f}};").unwrap();
+            writeln!(s, "    float l_row[2] = {{0.0f, 0.0f}};").unwrap();
+            writeln!(s, "    unsigned it = 0u;").unwrap();
+            writeln!(s, "    for (unsigned c = c_lo; c < c_hi; c++, it++) {{").unwrap();
+            writeln!(s, "        unsigned q = it % {}u;", sh.stages).unwrap();
+            writeln!(
+                s,
+                "        tang_bar_wait(bar_f + 8u * q, (it / {}u) & 1u);",
+                sh.stages
+            )
+            .unwrap();
+            writeln!(s, "        unsigned kaddr = sbase + {q_bytes}u + q * {stage_bytes}u, vaddr = kaddr + {k_bytes}u;").unwrap();
+            writeln!(s, "        float sc[{nsf}][4];").unwrap();
+            writeln!(s, "        tang_wg_fence();").unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int kk = 0; kk < {}; kk++) {{", kd / 16).unwrap();
+            writeln!(s, "            unsigned long long da = tang_desc(qaddr + (kk / 4) * {}u + (kk % 4) * 32u, 16u, 1024u);", bm * 128).unwrap();
+            writeln!(s, "            unsigned long long db = tang_desc(kaddr + (kk / 4) * {}u + (kk % 4) * 32u, 16u, 1024u);", bj * 128).unwrap();
+            writeln!(s, "            tang_wg_ss{bj}(&sc[0][0], da, db, kk > 0);").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        tang_wg_commit(); tang_wg_wait<0>();").unwrap();
+            writeln!(s, "        unsigned j0 = c * {bj}u;").unwrap();
+            // mask and online softmax per row half, as the mma path
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int h = 0; h < 2; h++) {{").unwrap();
+            row_coords(&mut s, "            ", "wrow + gq + 8u * h");
+            writeln!(s, "            float mloc = -1.0e30f;").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
+            writeln!(
+                s,
+                "                unsigned jj = j0 + 8u * j + 2u * tq + e;"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "                float sval = sc[j][2 * h + e] * {}f;",
+                f32_lit(f.scale)
+            )
+            .unwrap();
+            {
+                let vals: Vec<String> = rc
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        if k == f.score_arg {
+                            "sval".to_string()
+                        } else {
+                            arg_value(a)
+                        }
+                    })
+                    .collect();
+                let o = emit_body(
+                    &mut s,
+                    "                ",
+                    &rc.body,
+                    &[rc.body_outs[0]],
+                    "s0_",
+                    &vals,
+                );
                 writeln!(
                     s,
-                    "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                    R * kd
+                    "                float v = (jj < {}u) ? ({}) * 1.4426950408889634f : -1.0e30f;",
+                    f.n_keys, o[0]
                 )
                 .unwrap();
-                writeln!(
-                    s,
-                    "        unsigned r = idx / {kd}u; unsigned dd = idx % {kd}u;"
-                )
-                .unwrap();
-                row_coords(&mut s, "        ", "r");
-                if half.is_some() {
+            }
+            writeln!(s, "                sc[j][2 * h + e] = v;").unwrap();
+            writeln!(s, "                mloc = fmaxf(mloc, v);").unwrap();
+            writeln!(s, "            }}").unwrap();
+            writeln!(
+                s,
+                "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));"
+            )
+            .unwrap();
+            writeln!(s, "            float m_new = fmaxf(m_row[h], mloc);").unwrap();
+            writeln!(s, "            float alpha = exp2f(m_row[h] - m_new);").unwrap();
+            writeln!(s, "            float lsum = 0.0f;").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int e = 0; e < 2; e++) {{ float p = exp2f(sc[j][2 * h + e] - m_new); sc[j][2 * h + e] = p; lsum += p; }}").unwrap();
+            writeln!(
+                s,
+                "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;"
+            )
+            .unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int j = 0; j < {nof}; j++) {{ o[j][2 * h] *= alpha; o[j][2 * h + 1] *= alpha; }}").unwrap();
+            writeln!(s, "        }}").unwrap();
+            // P as wgmma A fragments: keys 16kb.. are score groups 2kb, 2kb + 1
+            writeln!(s, "        unsigned pf[{}][4];", bj / 16).unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int kb = 0; kb < {}; kb++) {{", bj / 16).unwrap();
+            writeln!(s, "            pf[kb][0] = tang_pack2(sc[2 * kb][0], sc[2 * kb][1]); pf[kb][1] = tang_pack2(sc[2 * kb][2], sc[2 * kb][3]);").unwrap();
+            writeln!(s, "            pf[kb][2] = tang_pack2(sc[2 * kb + 1][0], sc[2 * kb + 1][1]); pf[kb][3] = tang_pack2(sc[2 * kb + 1][2], sc[2 * kb + 1][3]);").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        tang_wg_fence();").unwrap();
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int kb = 0; kb < {}; kb++) {{", bj / 16).unwrap();
+            // V is MN-major (head dim contiguous): 64-wide column blocks
+            // `bj · 128` bytes apart, 8 keys per 1024 bytes
+            writeln!(
+                s,
+                "            unsigned long long dv = tang_desc(vaddr + kb * 2048u, {}u, 1024u);",
+                bj * 128
+            )
+            .unwrap();
+            writeln!(s, "            tang_wg_rs{d}(&o[0][0], pf[kb], dv);").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        tang_wg_commit(); tang_wg_wait<0>();").unwrap();
+            writeln!(s, "        tang_bar_arrive(bar_e + 8u * q);").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(
+                s,
+                "    m_row[0] *= 0.6931471805599453f; m_row[1] *= 0.6931471805599453f;"
+            )
+            .unwrap();
+        } else {
+            // Q fragments, staged once through shared memory and kept as TF32
+            // (the head-dim pair 2tq, 2tq + 1 in mma k slots tq, tq + 4)
+            if has_k {
+                writeln!(s, "    unsigned qf[{n_terms}][{nq}][4];").unwrap();
+                for (t, (qb, qa, _, _)) in f.terms.iter().enumerate() {
                     writeln!(
+                        s,
+                        "    for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                        R * kd
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "        unsigned r = idx / {kd}u; unsigned dd = idx % {kd}u;"
+                    )
+                    .unwrap();
+                    row_coords(&mut s, "        ", "r");
+                    if half.is_some() {
+                        writeln!(
                         s,
                         "        ((unsigned short*)smem)[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : (unsigned short)0;",
                         t * R * ldk,
@@ -2754,8 +3705,8 @@ impl TensorGraph {
                         addr_expr(qa, &score_coord)
                     )
                     .unwrap();
-                } else {
-                    writeln!(
+                    } else {
+                        writeln!(
                         s,
                         "        smem[{}u + r * {ldk}u + dd] = ii < {}u ? b{qb}[(unsigned)({})] : 0.0f;",
                         t * R * ldk,
@@ -2763,472 +3714,480 @@ impl TensorGraph {
                         addr_expr(qa, &score_coord)
                     )
                     .unwrap();
+                    }
+                    writeln!(s, "    }}").unwrap();
                 }
-                writeln!(s, "    }}").unwrap();
-            }
-            writeln!(s, "    __syncthreads();").unwrap();
-            writeln!(s, "    #pragma unroll").unwrap();
-            writeln!(s, "    for (int t = 0; t < {n_terms}; t++)").unwrap();
-            writeln!(s, "    #pragma unroll").unwrap();
-            if half.is_some() {
-                // m16n8k16 A: (row gq | gq + 8) × (dd 2tq.. | 2tq + 8..)
-                writeln!(s, "    for (int q = 0; q < {}; q++) {{", kd / 16).unwrap();
-                writeln!(
+                writeln!(s, "    __syncthreads();").unwrap();
+                writeln!(s, "    #pragma unroll").unwrap();
+                writeln!(s, "    for (int t = 0; t < {n_terms}; t++)").unwrap();
+                writeln!(s, "    #pragma unroll").unwrap();
+                if half.is_some() {
+                    // m16n8k16 A: (row gq | gq + 8) × (dd 2tq.. | 2tq + 8..)
+                    writeln!(s, "    for (int q = 0; q < {}; q++) {{", kd / 16).unwrap();
+                    writeln!(
                     s,
                     "        const unsigned short* p = (const unsigned short*)smem + t * {}u + (wrow + gq) * {ldk}u + q * 16u + 2u * tq;",
                     R * ldk
                 )
                 .unwrap();
-                writeln!(
+                    writeln!(
                     s,
                     "        qf[t][q][0] = *(const unsigned*)p; qf[t][q][1] = *(const unsigned*)(p + {}u);",
                     8 * ldk
                 )
                 .unwrap();
-                writeln!(
+                    writeln!(
                     s,
                     "        qf[t][q][2] = *(const unsigned*)(p + 8u); qf[t][q][3] = *(const unsigned*)(p + {}u);",
                     8 * ldk + 8
                 )
                 .unwrap();
-                writeln!(s, "    }}").unwrap();
-                writeln!(s, "    __syncthreads();").unwrap();
-            } else {
-                writeln!(s, "    for (int q = 0; q < {nq}; q++) {{").unwrap();
-                writeln!(
+                    writeln!(s, "    }}").unwrap();
+                    writeln!(s, "    __syncthreads();").unwrap();
+                } else {
+                    writeln!(s, "    for (int q = 0; q < {nq}; q++) {{").unwrap();
+                    writeln!(
                 s,
                 "        const float* p = smem + t * {}u + (wrow + gq) * {ldk}u + q * 8u + 2u * tq;",
                 R * ldk
             )
             .unwrap();
-                writeln!(
-                    s,
-                    "        float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
-                    8 * ldk
-                )
-                .unwrap();
-                writeln!(
-                    s,
-                    "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
-                )
-                .unwrap();
-                writeln!(
-                    s,
-                    "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
-                )
-                .unwrap();
-                writeln!(s, "    }}").unwrap();
-                writeln!(s, "    __syncthreads();").unwrap();
-            }
-        }
-
-        // staging of one key chunk (K terms, then V) into buffer `buf`
-        writeln!(s, "    auto load = [&](unsigned buf, unsigned j0) {{").unwrap();
-        if half.is_some() {
-            writeln!(
-                s,
-                "        unsigned short* st = (unsigned short*)smem + buf * {stage_floats}u;"
-            )
-            .unwrap();
-        } else {
-            writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
-        }
-        let cp16 = if half.is_some() {
-            "tang_cp16h"
-        } else {
-            "tang_cp16"
-        };
-        if has_k {
-            for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
-                let off = t * bjs * ldk;
-                if vec4(ka, f.score_to_red.len(), kd) {
                     writeln!(
                         s,
-                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * kd / wv
+                        "        float2 lo = *(const float2*)p, hi = *(const float2*)(p + {}u);",
+                        8 * ldk
                     )
                     .unwrap();
                     writeln!(
+                        s,
+                        "        qf[t][q][0] = tang_tf32(lo.x); qf[t][q][1] = tang_tf32(hi.x);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "        qf[t][q][2] = tang_tf32(lo.y); qf[t][q][3] = tang_tf32(hi.y);"
+                    )
+                    .unwrap();
+                    writeln!(s, "    }}").unwrap();
+                    writeln!(s, "    __syncthreads();").unwrap();
+                }
+            }
+
+            // staging of one key chunk (K terms, then V) into buffer `buf`
+            writeln!(s, "    auto load = [&](unsigned buf, unsigned j0) {{").unwrap();
+            if half.is_some() {
+                writeln!(
+                    s,
+                    "        unsigned short* st = (unsigned short*)smem + buf * {stage_floats}u;"
+                )
+                .unwrap();
+            } else {
+                writeln!(s, "        float* st = smem + buf * {stage_floats}u;").unwrap();
+            }
+            let cp16 = if half.is_some() {
+                "tang_cp16h"
+            } else {
+                "tang_cp16"
+            };
+            if has_k {
+                for (t, (_, _, kb, ka)) in f.terms.iter().enumerate() {
+                    let off = t * bjs * ldk;
+                    if vec4(ka, f.score_to_red.len(), kd) {
+                        writeln!(
+                            s,
+                            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                            bjs * kd / wv
+                        )
+                        .unwrap();
+                        writeln!(
                         s,
                         "            unsigned r = idx / {}u; unsigned dd = (idx % {}u) * {wv}u; unsigned jj = j0 + r;",
                         kd / wv,
                         kd / wv
                     )
                     .unwrap();
-                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    writeln!(
+                        writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                        writeln!(
                         s,
                         "            {cp16}(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
                         addr_expr(ka, &score_coord)
                     )
                     .unwrap();
-                } else {
-                    writeln!(
-                        s,
-                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * kd
-                    )
-                    .unwrap();
-                    writeln!(
+                    } else {
+                        writeln!(
+                            s,
+                            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                            bjs * kd
+                        )
+                        .unwrap();
+                        writeln!(
                         s,
                         "            unsigned r = idx / {kd}u; unsigned dd = idx % {kd}u; unsigned jj = j0 + r;"
                     )
                     .unwrap();
-                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    if half.is_some() {
-                        writeln!(
+                        writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                        if half.is_some() {
+                            writeln!(
                             s,
                             "            st[{off}u + r * {ldk}u + dd] = ok ? b{kb}[(unsigned)({})] : (unsigned short)0;",
                             addr_expr(ka, &score_coord)
                         )
                         .unwrap();
-                    } else {
-                        writeln!(
+                        } else {
+                            writeln!(
                             s,
                             "            tang_cp4(st + {off}u + r * {ldk}u + dd, b{kb} + (ok ? (unsigned)({}) : 0u), ok);",
                             addr_expr(ka, &score_coord)
                         )
                         .unwrap();
+                        }
                     }
+                    writeln!(s, "        }}").unwrap();
                 }
-                writeln!(s, "        }}").unwrap();
             }
-        }
-        {
-            // the value: a plain read stages asynchronously; any other
-            // expression is evaluated while staging
-            match plain_v.clone() {
-                Some((vb, va)) if vec4(&va, f.dx, d) => {
-                    writeln!(
-                        s,
-                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * d / wv
-                    )
-                    .unwrap();
-                    writeln!(
+            {
+                // the value: a plain read stages asynchronously; any other
+                // expression is evaluated while staging
+                match plain_v.clone() {
+                    Some((vb, va)) if vec4(&va, f.dx, d) => {
+                        writeln!(
+                            s,
+                            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                            bjs * d / wv
+                        )
+                        .unwrap();
+                        writeln!(
                         s,
                         "            unsigned r = idx / {}u; unsigned nn = (idx % {}u) * {wv}u; unsigned jj = j0 + r;",
                         d / wv,
                         d / wv
                     )
                     .unwrap();
-                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    writeln!(
+                        writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                        writeln!(
                         s,
                         "            {cp16}(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
                         addr_expr(&va, &coord)
                     )
                     .unwrap();
-                }
-                Some((vb, va)) => {
-                    writeln!(
-                        s,
-                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * d
-                    )
-                    .unwrap();
-                    writeln!(
+                    }
+                    Some((vb, va)) => {
+                        writeln!(
+                            s,
+                            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                            bjs * d
+                        )
+                        .unwrap();
+                        writeln!(
                         s,
                         "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
                     )
                     .unwrap();
-                    writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
-                    if half.is_some() {
-                        writeln!(
+                        writeln!(s, "            bool ok = jj < {}u;", f.n_keys).unwrap();
+                        if half.is_some() {
+                            writeln!(
                             s,
                             "            st[{k_floats}u + r * {ldv}u + nn] = ok ? b{vb}[(unsigned)({})] : (unsigned short)0;",
                             addr_expr(&va, &coord)
                         )
                         .unwrap();
-                    } else {
-                        writeln!(
+                        } else {
+                            writeln!(
                             s,
                             "            tang_cp4(st + {k_floats}u + r * {ldv}u + nn, b{vb} + (ok ? (unsigned)({}) : 0u), ok);",
                             addr_expr(&va, &coord)
                         )
                         .unwrap();
+                        }
                     }
-                }
-                None => {
-                    writeln!(
-                        s,
-                        "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
-                        bjs * d
-                    )
-                    .unwrap();
-                    writeln!(
+                    None => {
+                        writeln!(
+                            s,
+                            "        for (unsigned idx = tid; idx < {}u; idx += {T}u) {{",
+                            bjs * d
+                        )
+                        .unwrap();
+                        writeln!(
                         s,
                         "            unsigned r = idx / {d}u; unsigned nn = idx % {d}u; unsigned jj = j0 + r;"
                     )
                     .unwrap();
-                    writeln!(s, "            float v = 0.0f;").unwrap();
-                    writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
-                    let vals: Vec<String> = rc.args.iter().map(arg_value).collect();
-                    let o = emit_body(&mut s, "                ", &rc.body, &[e_v], "v0_", &vals);
-                    writeln!(s, "                v = {};", o[0]).unwrap();
-                    writeln!(s, "            }}").unwrap();
-                    let v = match half {
-                        Some(super::Format::BF16) => "tang_f2b(v)",
-                        Some(_) => "tang_f2h(v)",
-                        None => "v",
-                    };
-                    writeln!(s, "            st[{k_floats}u + r * {ldv}u + nn] = {v};").unwrap();
+                        writeln!(s, "            float v = 0.0f;").unwrap();
+                        writeln!(s, "            if (jj < {}u) {{", f.n_keys).unwrap();
+                        let vals: Vec<String> = rc.args.iter().map(arg_value).collect();
+                        let o =
+                            emit_body(&mut s, "                ", &rc.body, &[e_v], "v0_", &vals);
+                        writeln!(s, "                v = {};", o[0]).unwrap();
+                        writeln!(s, "            }}").unwrap();
+                        let v = match half {
+                            Some(super::Format::BF16) => "tang_f2b(v)",
+                            Some(_) => "tang_f2h(v)",
+                            None => "v",
+                        };
+                        writeln!(s, "            st[{k_floats}u + r * {ldv}u + nn] = {v};")
+                            .unwrap();
+                    }
                 }
+                writeln!(s, "        }}").unwrap();
             }
-            writeln!(s, "        }}").unwrap();
-        }
-        writeln!(s, "        tang_cp_commit();").unwrap();
-        writeln!(s, "    }};").unwrap();
+            writeln!(s, "        tang_cp_commit();").unwrap();
+            writeln!(s, "    }};").unwrap();
 
-        // per thread: rows wrow + gq and wrow + gq + 8 (h = 0, 1)
-        let nsf = bj / 8;
-        let nof = d / 8;
-        writeln!(s, "    float o[{nof}][4];").unwrap();
-        writeln!(s, "    #pragma unroll").unwrap();
-        writeln!(
-            s,
-            "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"
-        )
-        .unwrap();
-        writeln!(s, "    float m_row[2] = {{-3.0e38f, -3.0e38f}};").unwrap();
-        // per-thread partial row sums (the quad's are summed at the end)
-        writeln!(s, "    float l_row[2] = {{0.0f, 0.0f}};").unwrap();
-        let st = sh.stages;
-        writeln!(s, "    #pragma unroll").unwrap();
-        writeln!(
+            // per thread: rows wrow + gq and wrow + gq + 8 (h = 0, 1)
+            let nsf = bj / 8;
+            let nof = d / 8;
+            writeln!(s, "    float o[{nof}][4];").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(
+                s,
+                "    for (int j = 0; j < {nof}; j++) for (int r = 0; r < 4; r++) o[j][r] = 0.0f;"
+            )
+            .unwrap();
+            writeln!(s, "    float m_row[2] = {{-3.0e38f, -3.0e38f}};").unwrap();
+            // per-thread partial row sums (the quad's are summed at the end)
+            writeln!(s, "    float l_row[2] = {{0.0f, 0.0f}};").unwrap();
+            let st = sh.stages;
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(
             s,
             "    for (unsigned c = 0u; c < {}u; c++) {{ if (c_lo + c < c_hi) load((c_lo + c) % {st}u, (c_lo + c) * {bjs}u); else tang_cp_commit(); }}",
             st - 1
         )
         .unwrap();
-        writeln!(s, "    for (unsigned c = c_lo; c < c_hi; c++) {{").unwrap();
-        writeln!(s, "        tang_cp_wait<{}>();", st - 2).unwrap();
-        writeln!(s, "        __syncthreads();").unwrap();
-        writeln!(s, "        {{").unwrap();
-        writeln!(s, "            unsigned nc = c + {}u;", st - 1).unwrap();
-        writeln!(
-            s,
-            "            if (nc < c_hi) load(nc % {st}u, nc * {bjs}u); else tang_cp_commit();"
-        )
-        .unwrap();
-        writeln!(s, "        }}").unwrap();
-        if half.is_some() {
+            writeln!(s, "    for (unsigned c = c_lo; c < c_hi; c++) {{").unwrap();
+            writeln!(s, "        tang_cp_wait<{}>();", st - 2).unwrap();
+            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "        {{").unwrap();
+            writeln!(s, "            unsigned nc = c + {}u;", st - 1).unwrap();
             writeln!(
+                s,
+                "            if (nc < c_hi) load(nc % {st}u, nc * {bjs}u); else tang_cp_commit();"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            if half.is_some() {
+                writeln!(
                 s,
                 "        const unsigned short* st = (const unsigned short*)smem + (c % {st}u) * {stage_floats}u;"
             )
             .unwrap();
-        } else {
-            writeln!(
-                s,
-                "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
-            )
-            .unwrap();
-        }
-        writeln!(s, "        unsigned j0 = c * {bjs}u + kbase;").unwrap();
-        writeln!(s, "        float sc[{nsf}][4];").unwrap();
-        if has_k {
-            // S = Σ_t Q_t · K_tᵀ: key fragment j holds keys 8j .. 8j + 7
-            writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int j = 0; j < {nsf}; j++) for (int r = 0; r < 4; r++) sc[j][r] = 0.0f;").unwrap();
-            writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int t = 0; t < {n_terms}; t++)").unwrap();
-            writeln!(s, "        #pragma unroll").unwrap();
-            if half.is_some() {
-                // m16n8k16 B: key 8j + gq, dd (2tq.. | 2tq + 8..)
-                writeln!(s, "        for (int q = 0; q < {}; q++)", kd / 16).unwrap();
-                writeln!(s, "        #pragma unroll").unwrap();
-                writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+            } else {
                 writeln!(
+                    s,
+                    "        const float* st = smem + (c % {st}u) * {stage_floats}u;"
+                )
+                .unwrap();
+            }
+            writeln!(s, "        unsigned j0 = c * {bjs}u + kbase;").unwrap();
+            writeln!(s, "        float sc[{nsf}][4];").unwrap();
+            if has_k {
+                // S = Σ_t Q_t · K_tᵀ: key fragment j holds keys 8j .. 8j + 7
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nsf}; j++) for (int r = 0; r < 4; r++) sc[j][r] = 0.0f;").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int t = 0; t < {n_terms}; t++)").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                if half.is_some() {
+                    // m16n8k16 B: key 8j + gq, dd (2tq.. | 2tq + 8..)
+                    writeln!(s, "        for (int q = 0; q < {}; q++)", kd / 16).unwrap();
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+                    writeln!(
                     s,
                     "            const unsigned short* kp = st + t * {}u + (kbase + 8u * j + gq) * {ldk}u + 16u * q + 2u * tq;",
                     bjs * ldk
                 )
                 .unwrap();
-                writeln!(
+                    writeln!(
                     s,
                     "            unsigned kf[2] = {{*(const unsigned*)kp, *(const unsigned*)(kp + 8u)}};"
                 )
                 .unwrap();
-                writeln!(s, "            tang_mma16(sc[j], qf[t][q], kf);").unwrap();
-                writeln!(s, "        }}").unwrap();
-            } else {
-                writeln!(s, "        for (int q = 0; q < {nq}; q++)").unwrap();
-                writeln!(s, "        #pragma unroll").unwrap();
-                writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
-                writeln!(
+                    writeln!(s, "            tang_mma16(sc[j], qf[t][q], kf);").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                } else {
+                    writeln!(s, "        for (int q = 0; q < {nq}; q++)").unwrap();
+                    writeln!(s, "        #pragma unroll").unwrap();
+                    writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+                    writeln!(
                 s,
                 "            float2 kv = *(const float2*)(st + t * {}u + (kbase + 8u * j + gq) * {ldk}u + 8u * q + 2u * tq);",
                 bjs * ldk
             )
             .unwrap();
+                    writeln!(
+                        s,
+                        "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
+                    )
+                    .unwrap();
+                    writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                }
+            }
+            // the comp's score expression (mask) on each element, then the
+            // online softmax per row half
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int h = 0; h < 2; h++) {{").unwrap();
+            row_coords(&mut s, "            ", "wrow + gq + 8u * h");
+            writeln!(s, "            float mloc = -3.0e38f;").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
+            writeln!(
+                s,
+                "                unsigned jj = j0 + 8u * j + 2u * tq + e;"
+            )
+            .unwrap();
+            if let Some((sb, sa)) = &f.score_buf {
                 writeln!(
                     s,
-                    "            unsigned kf[2] = {{tang_tf32(kv.x), tang_tf32(kv.y)}};"
+                    "                float sval = (ii < {}u && jj < {}u) ? {} : 0.0f;",
+                    f.m,
+                    f.n_keys,
+                    ld(*sb, &format!("(unsigned)({})", addr_expr(sa, &coord)))
                 )
                 .unwrap();
-                writeln!(s, "            tang_mma(sc[j], qf[t][q], kf);").unwrap();
-                writeln!(s, "        }}").unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "                float sval = sc[j][2 * h + e] * {}f;",
+                    f32_lit(f.scale)
+                )
+                .unwrap();
             }
-        }
-        // the comp's score expression (mask) on each element, then the
-        // online softmax per row half
-        writeln!(s, "        #pragma unroll").unwrap();
-        writeln!(s, "        for (int h = 0; h < 2; h++) {{").unwrap();
-        row_coords(&mut s, "            ", "wrow + gq + 8u * h");
-        writeln!(s, "            float mloc = -3.0e38f;").unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
-        writeln!(
-            s,
-            "                unsigned jj = j0 + 8u * j + 2u * tq + e;"
-        )
-        .unwrap();
-        if let Some((sb, sa)) = &f.score_buf {
+            {
+                let vals: Vec<String> = rc
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        if k == f.score_arg {
+                            "sval".to_string()
+                        } else {
+                            arg_value(a)
+                        }
+                    })
+                    .collect();
+                let o = emit_body(
+                    &mut s,
+                    "                ",
+                    &rc.body,
+                    &[rc.body_outs[0]],
+                    "s0_",
+                    &vals,
+                );
+                writeln!(
+                    s,
+                    "                float v = (jj < {}u) ? ({}) : -3.0e38f;",
+                    f.n_keys, o[0]
+                )
+                .unwrap();
+            }
+            writeln!(s, "                sc[j][2 * h + e] = v;").unwrap();
+            writeln!(s, "                mloc = fmaxf(mloc, v);").unwrap();
+            writeln!(s, "            }}").unwrap();
             writeln!(
                 s,
-                "                float sval = (ii < {}u && jj < {}u) ? {} : 0.0f;",
-                f.m,
-                f.n_keys,
-                ld(*sb, &format!("(unsigned)({})", addr_expr(sa, &coord)))
+                "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));"
             )
             .unwrap();
-        } else {
-            writeln!(s, "                float sval = sc[j][2 * h + e];").unwrap();
-        }
-        {
-            let vals: Vec<String> = rc
-                .args
-                .iter()
-                .enumerate()
-                .map(|(k, a)| {
-                    if k == f.score_arg {
-                        "sval".to_string()
-                    } else {
-                        arg_value(a)
-                    }
-                })
-                .collect();
-            let o = emit_body(
-                &mut s,
-                "                ",
-                &rc.body,
-                &[rc.body_outs[0]],
-                "s0_",
-                &vals,
-            );
             writeln!(
                 s,
-                "                float v = (jj < {}u) ? ({}) : -3.0e38f;",
-                f.n_keys, o[0]
+                "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));"
             )
             .unwrap();
-        }
-        writeln!(s, "                sc[j][2 * h + e] = v;").unwrap();
-        writeln!(s, "                mloc = fmaxf(mloc, v);").unwrap();
-        writeln!(s, "            }}").unwrap();
-        writeln!(
-            s,
-            "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "            mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));"
-        )
-        .unwrap();
-        writeln!(s, "            float m_new = fmaxf(m_row[h], mloc);").unwrap();
-        writeln!(s, "            float alpha = expf(m_row[h] - m_new);").unwrap();
-        writeln!(s, "            float lsum = 0.0f;").unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
-        writeln!(
+            writeln!(s, "            float m_new = fmaxf(m_row[h], mloc);").unwrap();
+            writeln!(s, "            float alpha = expf(m_row[h] - m_new);").unwrap();
+            writeln!(s, "            float lsum = 0.0f;").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int j = 0; j < {nsf}; j++)").unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(s, "            for (int e = 0; e < 2; e++) {{").unwrap();
+            writeln!(
             s,
             "                float p = expf(sc[j][2 * h + e] - m_new); sc[j][2 * h + e] = p; lsum += p;"
         )
         .unwrap();
-        writeln!(s, "            }}").unwrap();
-        writeln!(
-            s,
-            "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;"
-        )
-        .unwrap();
-        writeln!(s, "            #pragma unroll").unwrap();
-        writeln!(
+            writeln!(s, "            }}").unwrap();
+            writeln!(
+                s,
+                "            l_row[h] = l_row[h] * alpha + lsum; m_row[h] = m_new;"
+            )
+            .unwrap();
+            writeln!(s, "            #pragma unroll").unwrap();
+            writeln!(
             s,
             "            for (int j = 0; j < {nof}; j++) {{ o[j][2 * h] *= alpha; o[j][2 * h + 1] *= alpha; }}"
         )
         .unwrap();
-        writeln!(s, "        }}").unwrap();
-        // O += P · V, P straight from the score registers
-        if half.is_some() {
-            // m16n8k16 A over keys 16jk..: score fragments 2jk, 2jk + 1;
-            // B: V rows 16jk + 2tq, +1 (| +8, +9), column words split
-            // into the fragment pair as in the tiles
-            writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int jk = 0; jk < {}; jk++) {{", nsf / 2).unwrap();
-            writeln!(s, "            unsigned pf[4] = {{tang_pack2(sc[2 * jk][0], sc[2 * jk][1]), tang_pack2(sc[2 * jk][2], sc[2 * jk][3]), tang_pack2(sc[2 * jk + 1][0], sc[2 * jk + 1][1]), tang_pack2(sc[2 * jk + 1][2], sc[2 * jk + 1][3])}};").unwrap();
-            writeln!(s, "            #pragma unroll").unwrap();
-            writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
-            writeln!(
+            writeln!(s, "        }}").unwrap();
+            // O += P · V, P straight from the score registers
+            if half.is_some() {
+                // m16n8k16 A over keys 16jk..: score fragments 2jk, 2jk + 1;
+                // B: V rows 16jk + 2tq, +1 (| +8, +9), column words split
+                // into the fragment pair as in the tiles
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int jk = 0; jk < {}; jk++) {{", nsf / 2).unwrap();
+                writeln!(s, "            unsigned pf[4] = {{tang_pack2(sc[2 * jk][0], sc[2 * jk][1]), tang_pack2(sc[2 * jk][2], sc[2 * jk][3]), tang_pack2(sc[2 * jk + 1][0], sc[2 * jk + 1][1]), tang_pack2(sc[2 * jk + 1][2], sc[2 * jk + 1][3])}};").unwrap();
+                writeln!(s, "            #pragma unroll").unwrap();
+                writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
+                writeln!(
                 s,
                 "                const unsigned short* vp = st + {k_floats}u + (kbase + 16u * jk + 2u * tq) * {ldv}u + 16u * jp + 2u * gq;"
             )
             .unwrap();
-            writeln!(
+                writeln!(
                 s,
                 "                unsigned r0 = *(const unsigned*)vp, r1 = *(const unsigned*)(vp + {ldv}u), r8 = *(const unsigned*)(vp + {}u), r9 = *(const unsigned*)(vp + {}u);",
                 8 * ldv,
                 9 * ldv
             )
             .unwrap();
-            writeln!(s, "                unsigned v0[2] = {{__byte_perm(r0, r1, 0x5410), __byte_perm(r8, r9, 0x5410)}}, v1[2] = {{__byte_perm(r0, r1, 0x7632), __byte_perm(r8, r9, 0x7632)}};").unwrap();
-            writeln!(
+                writeln!(s, "                unsigned v0[2] = {{__byte_perm(r0, r1, 0x5410), __byte_perm(r8, r9, 0x5410)}}, v1[2] = {{__byte_perm(r0, r1, 0x7632), __byte_perm(r8, r9, 0x7632)}};").unwrap();
+                writeln!(
                 s,
                 "                tang_mma16(o[2 * jp], pf, v0); tang_mma16(o[2 * jp + 1], pf, v1);"
             )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "        }}").unwrap();
-        } else {
-            writeln!(s, "        #pragma unroll").unwrap();
-            writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
-            writeln!(
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+            } else {
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(s, "        for (int j = 0; j < {nsf}; j++) {{").unwrap();
+                writeln!(
             s,
             "            unsigned pf[4] = {{tang_tf32(sc[j][0]), tang_tf32(sc[j][2]), tang_tf32(sc[j][1]), tang_tf32(sc[j][3])}};"
         )
         .unwrap();
-            writeln!(s, "            #pragma unroll").unwrap();
-            writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
-            writeln!(
+                writeln!(s, "            #pragma unroll").unwrap();
+                writeln!(s, "            for (int jp = 0; jp < {}; jp++) {{", d / 16).unwrap();
+                writeln!(
             s,
             "                const float* vp = st + {k_floats}u + (kbase + 8u * j + 2u * tq) * {ldv}u + 16u * jp + 2u * gq;"
         )
         .unwrap();
-            writeln!(
+                writeln!(
             s,
             "                float2 r0 = *(const float2*)vp, r1 = *(const float2*)(vp + {ldv}u);"
         )
-            .unwrap();
-            writeln!(
+                .unwrap();
+                writeln!(
             s,
             "                unsigned v0[2] = {{tang_tf32(r0.x), tang_tf32(r1.x)}}, v1[2] = {{tang_tf32(r0.y), tang_tf32(r1.y)}};"
         )
         .unwrap();
-            writeln!(
-                s,
-                "                tang_mma(o[2 * jp], pf, v0); tang_mma(o[2 * jp + 1], pf, v1);"
-            )
-            .unwrap();
-            writeln!(s, "            }}").unwrap();
-            writeln!(s, "        }}").unwrap();
+                writeln!(
+                    s,
+                    "                tang_mma(o[2 * jp], pf, v0); tang_mma(o[2 * jp + 1], pf, v1);"
+                )
+                .unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    tang_cp_wait<0>();").unwrap();
         }
-        writeln!(s, "    }}").unwrap();
-        writeln!(s, "    tang_cp_wait<0>();").unwrap();
         // the quad's partial row sums
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int h = 0; h < 2; h++) {{").unwrap();
@@ -3251,11 +4210,15 @@ impl TensorGraph {
             writeln!(s, "    #pragma unroll").unwrap();
             writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
             writeln!(s, "        unsigned lr = wrow + gq + 8u * (r / 2);").unwrap();
-            writeln!(
-                s,
-                "        unsigned lc = 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
-            )
-            .unwrap();
+            if hop.is_some() {
+                writeln!(s, "        unsigned lc = 8u * j + 2u * tq + (r % 2);").unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "        unsigned lc = 16u * (j / 2) + 4u * tq + 2u * (r % 2) + (j % 2);"
+                )
+                .unwrap();
+            }
         };
         if kw > 1 {
             // groups 1.. hand their (m, l, O) to group 0 through shared memory
@@ -3343,6 +4306,7 @@ impl TensorGraph {
                 super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
+                _ => unreachable!("fp8 has its own tile"),
             };
             writeln!(s, "            out[g * {w_out}u + 0u] = {};", st_v("m_v")).unwrap();
             writeln!(s, "            out[g * {w_out}u + 1u] = {};", st_v("l_v")).unwrap();
@@ -3393,6 +4357,7 @@ impl TensorGraph {
                     super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
                         unreachable!("block formats lower only through the int8 MMA kernel")
                     }
+                    _ => unreachable!("fp8 has its own tile"),
                 };
                 writeln!(s, "            out[g * {w_out}u + {slot}u] = {v};").unwrap();
             }

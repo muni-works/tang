@@ -922,11 +922,11 @@ impl FlashServe {
                     Err(e) => eprintln!("tang-llm: no batch windows ({e}); {MAX_T} rows a window"),
                 }
             }
-            // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 2048; 0: off).
+            // Wide prefill windows for the slots (TANG_SERVE_WIDE rows, default 4096; 0: off).
             let rows: usize = std::env::var("TANG_SERVE_WIDE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2048);
+                .unwrap_or(4096);
             if rows > 0 {
                 let t = Instant::now();
                 match me.e.enable_wide_rows(rows) {
@@ -945,7 +945,7 @@ impl FlashServe {
             let rows: usize = std::env::var("TANG_SERVE_WIDE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2048);
+                .unwrap_or(4096);
             if rows > 0 {
                 let t = Instant::now();
                 match me.e.enable_wide_rows(rows) {

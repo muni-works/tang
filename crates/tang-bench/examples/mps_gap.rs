@@ -80,6 +80,7 @@ fn main() {
         let f16 = Precision {
             storage: Format::F16,
             accum: Format::F32,
+            operand: Format::F32,
         };
         g.set_precision(TensorId::from_index(0), f16);
         g.set_precision(TensorId::from_index(1), f16);

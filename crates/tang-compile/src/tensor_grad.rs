@@ -97,6 +97,27 @@ impl TensorGraph {
                 grads.insert(src.n(), acc);
                 continue;
             }
+            if let Op::Operator(o) = &self.nodes[j].op {
+                let (op, inputs) = (o.op.clone(), o.inputs.clone());
+                let gs = op.backward(self, &inputs, TensorId(j as u32), dy)?;
+                if gs.len() != inputs.len() {
+                    return err(format!(
+                        "operator `{}` returned {} cotangents for {} inputs",
+                        op.name(),
+                        gs.len(),
+                        inputs.len()
+                    ));
+                }
+                for (src, g) in inputs.iter().zip(gs) {
+                    let Some(g) = g else { continue };
+                    let acc = match grads.get(&src.n()) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src.n(), acc);
+                }
+                continue;
+            }
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
             for a in 0..c.args.len() {

@@ -253,6 +253,10 @@ impl TensorGraph {
                 Op::Input(_) => true,
                 Op::Comp(_) => !self.nodes[j].inline,
                 Op::Iota(_) | Op::Reshape(_) => false,
+                Op::Operator(o) => panic!(
+                    "operator node `{}` has no device lowering; evaluate it on the host",
+                    o.op.name()
+                ),
             })
             .map(|j| self.storage(TensorId(j as u32)).n())
             .collect();
@@ -820,6 +824,9 @@ fn elem_ty(f: Format) -> &'static str {
         Format::F32 => "float",
         Format::F16 => "tang_f16",
         Format::BF16 => "uint16_t",
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
         Format::Q4K | Format::Q5K | Format::Q8x32 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
@@ -831,6 +838,9 @@ fn load(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(float){e}"),
         Format::BF16 => format!("tang_b2f({e})"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
         Format::Q4K | Format::Q5K | Format::Q8x32 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
@@ -842,6 +852,9 @@ fn store(f: Format, e: &str) -> String {
         Format::F32 => e.to_string(),
         Format::F16 => format!("(tang_f16)({e})"),
         Format::BF16 => format!("tang_f2b({e})"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
         Format::Q4K | Format::Q5K | Format::Q8x32 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
@@ -1001,6 +1014,7 @@ fn c_unit(
         Format::Q4K | Format::Q5K | Format::Q8x32 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
+        _ => panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles"),
     };
     let mut inputs: Vec<(usize, usize)> = prog
         .buffers

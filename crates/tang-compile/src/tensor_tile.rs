@@ -534,6 +534,10 @@ impl Ctx<'_> {
                 Val::Expr(self.buffer_read(j, addr))
             }
             Op::Iota(d) => Val::Expr(format!("f32({})", coords[*d].wgsl())),
+            Op::Operator(o) => panic!(
+                "operator node `{}` has no device lowering; evaluate it on the host",
+                o.op.name()
+            ),
             Op::Reshape(_) => {
                 // flat index into the storage node's buffer; affine
                 let storage = self.g.storage(TensorId(j as u32)).n();
@@ -700,6 +704,10 @@ impl Ctx<'_> {
                     Op::Input(_) | Op::Reshape(_) => true,
                     Op::Comp(_) => self.reads.contains(&a.src.n()),
                     Op::Iota(_) => false,
+                    Op::Operator(o) => panic!(
+                        "operator node `{}` has no device lowering; evaluate it on the host",
+                        o.op.name()
+                    ),
                 };
                 self.guard = (a.view.guard && direct && pk == src_shape.len())
                     .then(|| (cs.clone(), src_shape.clone()));
@@ -735,7 +743,7 @@ impl Ctx<'_> {
     fn tuple_rank(&self, j: usize) -> usize {
         match &self.g.nodes[j].op {
             Op::Comp(c) => c.tuple,
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => 0,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => 0,
         }
     }
 }

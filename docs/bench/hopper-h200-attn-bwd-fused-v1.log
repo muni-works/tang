@@ -1,0 +1,122 @@
+   Compiling tang-bench v0.1.0 (/work/tang/crates/tang-bench)
+    Finished `release` profile [optimized] target(s) in 30.52s
+BUILD_DONE
+0 %, 0 MiB
+sdpa fwd bh=512 n=1024 d=64 causal=False: 0.467 ms 294.4 TFLOP/s rel_err 3.37e-03
+sdpa bwd bh=512 n=1024 d=64 causal=False: 1.591 ms 216.0 TFLOP/s rel_err dq 3.63e-03 dk 3.25e-03 dv 3.03e-03
+tang fwd+bwd-program bh=512 n=1024 d=64 causal=false: 5.977 ms bwd-equiv 57.5 TFLOP/s rel_err dq 3.63e-3 dk 4.01e-3 dv 3.03e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=256 n=2048 d=64 causal=False: 0.902 ms 304.6 TFLOP/s rel_err 2.76e-03
+sdpa bwd bh=256 n=2048 d=64 causal=False: 2.762 ms 248.8 TFLOP/s rel_err dq 4.58e-03 dk 3.89e-03 dv 2.97e-03
+tang fwd+bwd-program bh=256 n=2048 d=64 causal=false: 9.955 ms bwd-equiv 69.0 TFLOP/s rel_err dq 4.58e-3 dk 4.22e-3 dv 3.22e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=128 n=4096 d=64 causal=False: 1.773 ms 310.0 TFLOP/s rel_err 2.23e-03
+sdpa bwd bh=128 n=4096 d=64 causal=False: 5.106 ms 269.1 TFLOP/s rel_err dq 4.11e-03 dk 4.47e-03 dv 3.13e-03
+tang fwd+bwd-program bh=128 n=4096 d=64 causal=false: 17.569 ms bwd-equiv 78.2 TFLOP/s rel_err dq 4.71e-3 dk 4.47e-3 dv 3.81e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=64 n=8192 d=64 causal=False: 3.521 ms 312.3 TFLOP/s rel_err 2.93e-03
+sdpa bwd bh=64 n=8192 d=64 causal=False: 9.798 ms 280.5 TFLOP/s rel_err dq 3.14e-03 dk 3.05e-03 dv 2.84e-03
+tang fwd+bwd-program bh=64 n=8192 d=64 causal=false: 32.597 ms bwd-equiv 84.3 TFLOP/s rel_err dq 3.56e-3 dk 4.35e-3 dv 3.06e-3 (9 kernels)
+sdpa fwd bh=32 n=16384 d=64 causal=False: 7.049 ms 311.9 TFLOP/s rel_err 3.06e-03
+sdpa bwd bh=32 n=16384 d=64 causal=False: 19.172 ms 286.8 TFLOP/s rel_err dq 3.42e-03 dk 2.75e-03 dv 3.15e-03
+tang fwd+bwd-program bh=32 n=16384 d=64 causal=false: 63.053 ms bwd-equiv 87.2 TFLOP/s rel_err dq 3.79e-3 dk 3.30e-3 dv 3.67e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=512 n=1024 d=64 causal=True: 0.307 ms 223.6 TFLOP/s rel_err 2.64e-03
+sdpa bwd bh=512 n=1024 d=64 causal=True: 1.106 ms 155.4 TFLOP/s rel_err dq 3.73e-03 dk 2.97e-03 dv 2.49e-03
+tang fwd+bwd-program bh=512 n=1024 d=64 causal=true: 4.075 ms bwd-equiv 42.2 TFLOP/s rel_err dq 4.63e-3 dk 2.95e-3 dv 2.55e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=256 n=2048 d=64 causal=True: 0.519 ms 264.8 TFLOP/s rel_err 1.59e-03
+sdpa bwd bh=256 n=2048 d=64 causal=True: 1.721 ms 199.6 TFLOP/s rel_err dq 3.02e-03 dk 3.55e-03 dv 2.67e-03
+tang fwd+bwd-program bh=256 n=2048 d=64 causal=true: 5.999 ms bwd-equiv 57.3 TFLOP/s rel_err dq 3.68e-3 dk 3.67e-3 dv 3.00e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=128 n=4096 d=64 causal=True: 0.965 ms 284.9 TFLOP/s rel_err 2.45e-03
+sdpa bwd bh=128 n=4096 d=64 causal=True: 2.947 ms 233.2 TFLOP/s rel_err dq 4.26e-03 dk 2.69e-03 dv 2.75e-03
+tang fwd+bwd-program bh=128 n=4096 d=64 causal=true: 9.930 ms bwd-equiv 69.2 TFLOP/s rel_err dq 4.23e-3 dk 2.47e-3 dv 2.75e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=64 n=8192 d=64 causal=True: 1.853 ms 296.7 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=64 n=8192 d=64 causal=True: 5.376 ms 255.6 TFLOP/s rel_err dq 2.92e-03 dk 2.36e-03 dv 2.28e-03
+tang fwd+bwd-program bh=64 n=8192 d=64 causal=true: 17.870 ms bwd-equiv 76.9 TFLOP/s rel_err dq 5.67e-3 dk 3.75e-3 dv 2.26e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=32 n=16384 d=64 causal=True: 3.633 ms 302.6 TFLOP/s rel_err 2.38e-03
+sdpa bwd bh=32 n=16384 d=64 causal=True: 10.030 ms 274.1 TFLOP/s rel_err dq 4.78e-03 dk 4.86e-03 dv 2.49e-03
+tang fwd+bwd-program bh=32 n=16384 d=64 causal=true: 33.959 ms bwd-equiv 80.9 TFLOP/s rel_err dq 5.02e-3 dk 6.10e-3 dv 2.48e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=256 n=1024 d=128 causal=False: 0.408 ms 337.0 TFLOP/s rel_err 3.20e-03
+sdpa bwd bh=256 n=1024 d=128 causal=False: 1.513 ms 227.1 TFLOP/s rel_err dq 3.22e-03 dk 3.48e-03 dv 2.87e-03
+tang fwd+bwd-program bh=256 n=1024 d=128 causal=false: 5.877 ms bwd-equiv 58.5 TFLOP/s rel_err dq 3.10e-3 dk 3.74e-3 dv 3.92e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=128 n=2048 d=128 causal=False: 0.784 ms 350.4 TFLOP/s rel_err 2.83e-03
+sdpa bwd bh=128 n=2048 d=128 causal=False: 2.599 ms 264.4 TFLOP/s rel_err dq 2.38e-03 dk 3.25e-03 dv 3.28e-03
+tang fwd+bwd-program bh=128 n=2048 d=128 causal=false: 9.651 ms bwd-equiv 71.2 TFLOP/s rel_err dq 3.36e-3 dk 3.27e-3 dv 3.71e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=64 n=4096 d=128 causal=False: 1.538 ms 357.5 TFLOP/s rel_err 3.68e-03
+sdpa bwd bh=64 n=4096 d=128 causal=False: 4.798 ms 286.5 TFLOP/s rel_err dq 3.08e-03 dk 3.64e-03 dv 3.46e-03
+tang fwd+bwd-program bh=64 n=4096 d=128 causal=false: 17.176 ms bwd-equiv 80.0 TFLOP/s rel_err dq 4.43e-3 dk 4.09e-3 dv 3.10e-3 (9 kernels)
+sdpa fwd bh=32 n=8192 d=128 causal=False: 3.043 ms 361.3 TFLOP/s rel_err 2.57e-03
+sdpa bwd bh=32 n=8192 d=128 causal=False: 9.230 ms 297.8 TFLOP/s rel_err dq 2.41e-03 dk 2.90e-03 dv 2.84e-03
+tang fwd+bwd-program bh=32 n=8192 d=128 causal=false: 32.195 ms bwd-equiv 85.4 TFLOP/s rel_err dq 2.77e-3 dk 3.25e-3 dv 3.35e-3 (9 kernels)
+sdpa fwd bh=16 n=16384 d=128 causal=False: 6.245 ms 352.1 TFLOP/s rel_err 2.78e-03
+sdpa bwd bh=16 n=16384 d=128 causal=False: 18.108 ms 303.6 TFLOP/s rel_err dq 4.05e-03 dk 3.24e-03 dv 3.66e-03
+tang fwd+bwd-program bh=16 n=16384 d=128 causal=false: 66.512 ms bwd-equiv 82.7 TFLOP/s rel_err dq 4.44e-3 dk 3.87e-3 dv 2.67e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=256 n=1024 d=128 causal=True: 0.273 ms 251.8 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=256 n=1024 d=128 causal=True: 1.017 ms 169.0 TFLOP/s rel_err dq 3.19e-03 dk 3.57e-03 dv 2.57e-03
+tang fwd+bwd-program bh=256 n=1024 d=128 causal=true: 3.894 ms bwd-equiv 44.1 TFLOP/s rel_err dq 5.01e-3 dk 4.45e-3 dv 2.57e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=128 n=2048 d=128 causal=True: 0.479 ms 286.8 TFLOP/s rel_err 1.90e-03
+sdpa bwd bh=128 n=2048 d=128 causal=True: 1.584 ms 217.0 TFLOP/s rel_err dq 4.94e-03 dk 4.26e-03 dv 2.54e-03
+tang fwd+bwd-program bh=128 n=2048 d=128 causal=true: 5.583 ms bwd-equiv 61.5 TFLOP/s rel_err dq 4.73e-3 dk 3.54e-3 dv 2.54e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=64 n=4096 d=128 causal=True: 0.891 ms 308.4 TFLOP/s rel_err 1.98e-03
+sdpa bwd bh=64 n=4096 d=128 causal=True: 2.707 ms 253.9 TFLOP/s rel_err dq 4.77e-03 dk 5.11e-03 dv 2.00e-03
+tang fwd+bwd-program bh=64 n=4096 d=128 causal=true: 9.071 ms bwd-equiv 75.8 TFLOP/s rel_err dq 3.30e-3 dk 3.44e-3 dv 3.05e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=32 n=8192 d=128 causal=True: 1.720 ms 319.7 TFLOP/s rel_err 2.17e-03
+sdpa bwd bh=32 n=8192 d=128 causal=True: 4.913 ms 279.7 TFLOP/s rel_err dq 2.40e-03 dk 4.73e-03 dv 3.29e-03
+tang fwd+bwd-program bh=32 n=8192 d=128 causal=true: 16.205 ms bwd-equiv 84.8 TFLOP/s rel_err dq 2.82e-3 dk 4.48e-3 dv 3.06e-3 (9 kernels)
+/usr/local/lib/python3.12/dist-packages/torch/autograd/graph.py:829: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:179.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+sdpa fwd bh=16 n=16384 d=128 causal=True: 3.399 ms 323.5 TFLOP/s rel_err 2.62e-03
+sdpa bwd bh=16 n=16384 d=128 causal=True: 8.922 ms 308.1 TFLOP/s rel_err dq 3.54e-03 dk 3.61e-03 dv 2.40e-03
+tang fwd+bwd-program bh=16 n=16384 d=128 causal=true: 30.698 ms bwd-equiv 89.5 TFLOP/s rel_err dq 3.58e-3 dk 3.19e-3 dv 2.42e-3 (9 kernels)
+SWEEP_DONE
+  tuned: 1 of 1 native kernels kept
+  kernel 0: 0.8904 ms  // Auto-generated by tang-compile: flash attention on wgmma (BF16)
+  kernel 1: 0.3542 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 2: 0.0189 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 3: 0.3430 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 4: 0.0835 ms  // Auto-generated by tang-compile: zero fill (dQ accumulator)
+  kernel 5: 2.0520 ms  // Auto-generated by tang-compile: attention backward (BF16 mma, fused dK/dV/dQ)
+  kernel 6: 0.1071 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 7: 0.1068 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 8: 0.1070 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+tang fwd+bwd-program bh=512 n=1024 d=64 causal=true: 4.075 ms bwd-equiv 42.2 TFLOP/s rel_err dq 4.63e-3 dk 2.95e-3 dv 2.55e-3 (9 kernels)
+  tuned: 1 of 1 native kernels kept
+  kernel 0: 1.9500 ms  // Auto-generated by tang-compile: flash attention on wgmma (BF16)
+  kernel 1: 0.3458 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 2: 0.0081 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 3: 0.3821 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 4: 0.0837 ms  // Auto-generated by tang-compile: zero fill (dQ accumulator)
+  kernel 5: 13.8655 ms  // Auto-generated by tang-compile: attention backward (BF16 mma, fused dK/dV/dQ)
+  kernel 6: 0.1136 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 7: 0.1136 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+  kernel 8: 0.1068 ms  // Auto-generated by tang-compile: WGSL kernel as CUDA C++
+tang fwd+bwd-program bh=64 n=4096 d=128 causal=false: 17.113 ms bwd-equiv 80.3 TFLOP/s rel_err dq 4.43e-3 dk 4.09e-3 dv 3.10e-3 (9 kernels)
+bh=64 n=1024 d=64 causal=true: fused=true (9 kernels) 0.636 ms vs unfused 11.733 ms (10 kernels); dq rel 6.22e-3 dk rel 4.24e-3 dv rel 4.98e-3
+bh=16 n=2048 d=128 causal=false: fused=true (9 kernels) 1.525 ms vs unfused 29.500 ms (10 kernels); dq rel 1.24e-2 dk rel 3.07e-3 dv rel 6.13e-3
+JOB8_DONE

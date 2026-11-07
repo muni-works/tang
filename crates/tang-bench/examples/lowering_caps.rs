@@ -35,6 +35,7 @@ fn time(device: &GpuDevice, cache: &mut KernelCache, exe: &Executable, out: Tens
 const F16: Precision = Precision {
     storage: Format::F16,
     accum: Format::F32,
+    operand: Format::F32,
 };
 
 /// Best-of-ROUNDS ms for `g` lowered with each caps, interleaved; also

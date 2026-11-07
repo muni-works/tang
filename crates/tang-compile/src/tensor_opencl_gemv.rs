@@ -1345,6 +1345,9 @@ impl TensorGraph {
     ) -> Option<super::cuda_gemv::Kernel> {
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
+        if t.scales.iter().any(|&k| k != 1.0) {
+            return None;
+        }
         if t.terms.len() != 1
             || t.outs.len() != 1
             || t.terms[0].map_a.is_some()

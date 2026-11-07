@@ -13,6 +13,7 @@ fn graph(m: Monoid, f16: bool) -> (TensorGraph, tang_compile::tensor::TensorId) 
             Precision {
                 storage: Format::F16,
                 accum: Format::F32,
+                operand: Format::F32,
             },
         );
         g.set_precision(
@@ -20,6 +21,7 @@ fn graph(m: Monoid, f16: bool) -> (TensorGraph, tang_compile::tensor::TensorId) 
             Precision {
                 storage: Format::F16,
                 accum: Format::F32,
+                operand: Format::F32,
             },
         );
     }
