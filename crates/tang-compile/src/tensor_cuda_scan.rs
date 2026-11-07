@@ -1160,10 +1160,18 @@ impl ChunkedScan {
     /// [`kernels`](Self::kernels), the per-chunk kernel also writing `T`
     /// (f32 `[H, T/C, C, C]`, its last argument) for the backward.
     pub fn kernels_saving(&self, bv: usize, save_t: bool) -> [ScanLaunch; 3] {
-        assert!(self.t % CHUNK == 0, "chunked scan: T = {} not a multiple of {CHUNK}", self.t);
-        assert!(self.n % 64 == 0 && self.n <= 128, "chunked scan: n = {}", self.n);
         assert!(
-            self.m % 64 == 0 && self.m % bv == 0 && bv % 16 == 0,
+            self.t.is_multiple_of(CHUNK),
+            "chunked scan: T = {} not a multiple of {CHUNK}",
+            self.t
+        );
+        assert!(
+            self.n.is_multiple_of(64) && self.n <= 128,
+            "chunked scan: n = {}",
+            self.n
+        );
+        assert!(
+            self.m.is_multiple_of(64) && self.m.is_multiple_of(bv) && bv.is_multiple_of(16),
             "chunked scan: m = {}, bv {bv}",
             self.m
         );
@@ -1173,7 +1181,9 @@ impl ChunkedScan {
         let smem2 = (n * (bv + 8) + c * (bv + 8)) * 2 + c * 4 + 4 * 256 * 4;
         let smem3 = (c * (n + 8) + c * (c + 8)) * 2 + c * 4 + 8 * 512 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
-            let x = std::env::var("TANG_SCAN_DEFS").unwrap_or_default().replace(';', "\n");
+            let x = std::env::var("TANG_SCAN_DEFS")
+                .unwrap_or_default()
+                .replace(';', "\n");
             format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{x}\n{extra}{PRELUDE}{body}")
         };
         [
@@ -1206,7 +1216,12 @@ impl ChunkedScan {
     /// `dV'` `[H, T, m]`.
     pub fn backward_scratch(&self) -> [usize; 4] {
         let (rows, chunks) = (self.heads * self.t, self.heads * (self.t / CHUNK));
-        [chunks * CHUNK * CHUNK, rows * CHUNK, chunks * self.n * self.m, rows * self.m]
+        [
+            chunks * CHUNK * CHUNK,
+            rows * CHUNK,
+            chunks * self.n * self.m,
+            rows * self.m,
+        ]
     }
 
     /// The backward: the reverse scan of the state cotangent (derived:
@@ -1217,14 +1232,25 @@ impl ChunkedScan {
     /// with [`kernels_saving`](Self::kernels_saving) (`T`, `A_qk`) and its
     /// `W`, states `S`, `V'`, `γ`, `γ_C`.
     pub fn backward_kernels(&self, bv: usize) -> [ScanLaunch; 2] {
-        assert!(self.n == 128 && self.m == 128, "chunked scan backward: n = m = 128 only");
+        assert!(
+            self.n == 128 && self.m == 128,
+            "chunked scan backward: n = m = 128 only"
+        );
         let d = self.defines(false);
         let c = CHUNK;
         let ldb = bv + 8;
         let smem1 = (self.n * ldb + 2 * c * ldb) * 2 + c * 4 + 4 * 512 * 4;
-        let smem2 = 2 * c * (c + 4) * 4 + c * (c + 8) * 4 + c * (c + 8) * 2 + c * (self.n + 8) * 2 + 4 * c * 4 + 16 + 8 * 256 * 4;
+        let smem2 = 2 * c * (c + 4) * 4
+            + c * (c + 8) * 4
+            + c * (c + 8) * 2
+            + c * (self.n + 8) * 2
+            + 4 * c * 4
+            + 16
+            + 8 * 256 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
-            let x = std::env::var("TANG_SCAN_DEFS").unwrap_or_default().replace(';', "\n");
+            let x = std::env::var("TANG_SCAN_DEFS")
+                .unwrap_or_default()
+                .replace(';', "\n");
             format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{x}\n{extra}{PRELUDE}{body}")
         };
         [

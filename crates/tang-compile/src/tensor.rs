@@ -48,11 +48,11 @@ pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
 #[path = "tensor_cuda_int8.rs"]
 mod cuda_int8;
+#[path = "tensor_cuda_mega.rs"]
+pub mod cuda_mega;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
-#[path = "tensor_cuda_mega.rs"]
-pub mod cuda_mega;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;

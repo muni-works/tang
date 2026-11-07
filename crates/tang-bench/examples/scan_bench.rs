@@ -99,7 +99,11 @@ fn graph(mode: Mode, h: usize, t: usize, n: usize, m: usize) -> (TensorGraph, Te
         Mode::Lin => (None, None, false),
     };
     let s = g.delta_scan(k, v, a, b, 1, delta).unwrap();
-    let scale = if mode == Mode::Ssd { 1.0 } else { 1.0 / (n as f64).sqrt() };
+    let scale = if mode == Mode::Ssd {
+        1.0
+    } else {
+        1.0 / (n as f64).sqrt()
+    };
     let o = g.scan_readout(s, q, scale).unwrap();
     (g, o)
 }
@@ -123,24 +127,49 @@ struct Run {
 
 fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize, dout: Option<&[f64]>) -> Run {
     let s = &dev.stream;
-    let up16 = |x: &[f64]| s.memcpy_stod(&x.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>()).unwrap();
-    let up32 = |x: &[f64]| s.memcpy_stod(&x.iter().map(|&v| v as f32).collect::<Vec<_>>()).unwrap();
+    let up16 = |x: &[f64]| {
+        s.memcpy_stod(&x.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>())
+            .unwrap()
+    };
+    let up32 = |x: &[f64]| {
+        s.memcpy_stod(&x.iter().map(|&v| v as f32).collect::<Vec<_>>())
+            .unwrap()
+    };
     let ins = vec![up16(&d.q), up16(&d.k), up16(&d.v)];
     let gates = vec![up32(&d.alpha), up32(&d.beta)];
     let sz = plan.scratch();
-    let scratch16 = sz[..4].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect();
-    let gf = sz[4..].iter().map(|&n| s.alloc_zeros::<f32>(n).unwrap()).collect();
+    let scratch16 = sz[..4]
+        .iter()
+        .map(|&n| s.alloc_zeros::<u16>(n).unwrap())
+        .collect();
+    let gf = sz[4..]
+        .iter()
+        .map(|&n| s.alloc_zeros::<f32>(n).unwrap())
+        .collect();
     let out = s.alloc_zeros::<u16>(plan.heads * plan.t * plan.m).unwrap();
     let bwd = dout.is_some();
     let bs = plan.backward_scratch();
     let ts = s.alloc_zeros::<f32>(if bwd { bs[0] } else { 1 }).unwrap();
-    let b16 = if bwd { bs[1..].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect() } else { Vec::new() };
+    let b16 = if bwd {
+        bs[1..]
+            .iter()
+            .map(|&n| s.alloc_zeros::<u16>(n).unwrap())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let rows = plan.heads * plan.t;
     let dout = up16(dout.unwrap_or(&[0.0]));
     let (g16, grads) = if bwd {
         (
-            [rows * plan.n, rows * plan.n, rows * plan.m].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect(),
-            [rows, rows].iter().map(|&n| s.alloc_zeros::<f32>(n).unwrap()).collect(),
+            [rows * plan.n, rows * plan.n, rows * plan.m]
+                .iter()
+                .map(|&n| s.alloc_zeros::<u16>(n).unwrap())
+                .collect(),
+            [rows, rows]
+                .iter()
+                .map(|&n| s.alloc_zeros::<f32>(n).unwrap())
+                .collect(),
         )
     } else {
         (Vec::new(), Vec::new())
@@ -199,19 +228,42 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
             b.arg(&sc[0]).arg(&sc[1]).arg(gr).arg(gc).arg(&r.ts);
         }
         1 => {
-            b.arg(&sc[0]).arg(&sc[1]).arg(kk).arg(gr).arg(gc).arg(&sc[2]).arg(&sc[3]);
+            b.arg(&sc[0])
+                .arg(&sc[1])
+                .arg(kk)
+                .arg(gr)
+                .arg(gc)
+                .arg(&sc[2])
+                .arg(&sc[3]);
         }
         2 => {
             b.arg(q).arg(kk).arg(gr).arg(&sc[2]).arg(vn).arg(&r.out);
             b.arg(r.b16.first().unwrap_or(&r.dout));
         }
         3 => {
-            b.arg(q).arg(kk).arg(&sc[0]).arg(&r.b16[0]).arg(&r.dout).arg(gr).arg(gc);
+            b.arg(q)
+                .arg(kk)
+                .arg(&sc[0])
+                .arg(&r.b16[0])
+                .arg(&r.dout)
+                .arg(gr)
+                .arg(gc);
             b.arg(&r.b16[1]).arg(&r.b16[2]);
         }
         _ => {
-            b.arg(q).arg(kk).arg(v).arg(&r.gates[0]).arg(&r.gates[1]).arg(gr).arg(gc);
-            b.arg(&r.ts).arg(&sc[2]).arg(&r.b16[1]).arg(&r.dout).arg(vn).arg(&r.b16[2]);
+            b.arg(q)
+                .arg(kk)
+                .arg(v)
+                .arg(&r.gates[0])
+                .arg(&r.gates[1])
+                .arg(gr)
+                .arg(gc);
+            b.arg(&r.ts)
+                .arg(&sc[2])
+                .arg(&r.b16[1])
+                .arg(&r.dout)
+                .arg(vn)
+                .arg(&r.b16[2]);
             for x in &r.g16 {
                 b.arg(x);
             }
@@ -248,7 +300,13 @@ fn main() {
         _ => panic!("usage: scan_bench gdn|ssd|lin H T [N M BV]"),
     };
     let num = |i: usize, d: usize| a.get(i).map_or(d, |s| s.parse().unwrap());
-    let (h, t, n, m, bv) = (num(2, 32), num(3, 4096), num(4, 128), num(5, 128), num(6, 32));
+    let (h, t, n, m, bv) = (
+        num(2, 32),
+        num(3, 4096),
+        num(4, 128),
+        num(5, 128),
+        num(6, 32),
+    );
     let dev = CudaDevice::new(0).expect("cuda device");
     if a.iter().any(|x| x == "--bwd") {
         return backward(&dev, mode, h, t, n, m, bv);
@@ -260,7 +318,13 @@ fn main() {
     let plan = g.chunked_scan_plan(o).expect("chunked plan");
     let d = data(mode, ch, ct, n, m);
     let want = &g.eval(
-        &[d.q.clone(), d.k.clone(), d.v.clone(), d.alpha.clone(), d.beta.clone()],
+        &[
+            d.q.clone(),
+            d.k.clone(),
+            d.v.clone(),
+            d.alpha.clone(),
+            d.beta.clone(),
+        ],
         &[o],
     )[0];
     let r = setup(&dev, &plan, &d, bv, None);
@@ -334,7 +398,14 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
     let wrt: Vec<TensorId> = (0..5).map(TensorId::from_index).collect();
     let grads = g.backward(loss, &wrt).unwrap();
     let want = g.eval(
-        &[d.q.clone(), d.k.clone(), d.v.clone(), d.alpha.clone(), d.beta.clone(), rr.clone()],
+        &[
+            d.q.clone(),
+            d.k.clone(),
+            d.v.clone(),
+            d.alpha.clone(),
+            d.beta.clone(),
+            rr.clone(),
+        ],
         &grads,
     );
     let r = setup(dev, &plan, &d, bv, Some(&rr));
@@ -348,9 +419,19 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
     let mut errs = Vec::new();
     for i in 0..used {
         let got: Vec<f64> = if i < 3 {
-            dev.stream.memcpy_dtov(&r.g16[i]).unwrap().into_iter().map(bf16_from_bits).collect()
+            dev.stream
+                .memcpy_dtov(&r.g16[i])
+                .unwrap()
+                .into_iter()
+                .map(bf16_from_bits)
+                .collect()
         } else {
-            dev.stream.memcpy_dtov(&r.grads[i - 3]).unwrap().into_iter().map(|x| x as f64).collect()
+            dev.stream
+                .memcpy_dtov(&r.grads[i - 3])
+                .unwrap()
+                .into_iter()
+                .map(|x| x as f64)
+                .collect()
         };
         let (mut e, mut mx) = (0f64, 0f64);
         for (x, y) in got.iter().zip(&want[i]) {
@@ -374,7 +455,9 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
     dev.sync();
     let total = median(dev, || launch(dev, &r));
     let fwd = median(dev, || (0..3).for_each(|k| launch_k(dev, &r, k)));
-    let per: Vec<String> = (3..5).map(|k| format!("{:.3}", median(dev, || launch_k(dev, &r, k)))).collect();
+    let per: Vec<String> = (3..5)
+        .map(|k| format!("{:.3}", median(dev, || launch_k(dev, &r, k))))
+        .collect();
     let name = match mode {
         Mode::Gdn => "gdn",
         Mode::Ssd => "ssd",
