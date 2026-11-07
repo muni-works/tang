@@ -188,6 +188,91 @@ impl TensorGraph {
             .collect()
     }
 
+    /// A staged operand that is itself a materialized pointwise map of
+    /// buffers (dO/l): evaluated while staging instead, from its own args.
+    /// Returns the map's point coords over the kv space + lane (`rank`),
+    /// the address the staging walks in (its largest arg's), and the
+    /// buffers it reads. Opt-in (`TANG_ATTN_MAPSTAGE=1`): its element-wise
+    /// loads are synchronous, so the kernel stalls on them (2.5–3× slower
+    /// on an RTX 3090) where the map's own kernel costs ~0.1 ms.
+    fn map_stage(&self, st: &Stage, red: usize) -> Option<(super::super::View, Addr, Vec<usize>)> {
+        let rank = self.comp_at(red)?.rank();
+        if std::env::var("TANG_ATTN_MAPSTAGE").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let m = st.buf;
+        let mc = self.comp_at(m)?;
+        if mc.monoid.is_some() || !mc.red.is_empty() || mc.tuple != 0 || mc.body_outs.len() != 1 {
+            return None;
+        }
+        let shape = fixed(&self.nodes[m].shape);
+        let mut strides = vec![1i64; shape.len()];
+        for k in (0..shape.len().saturating_sub(1)).rev() {
+            strides[k] = strides[k + 1] * shape[k + 1] as i64;
+        }
+        if st.addr.offset != 0 {
+            return None;
+        }
+        let mut forms: Vec<Option<super::super::Form>> = vec![None; shape.len()];
+        // the kv space's extent-1 dims are always 0
+        let space = self.comp_at(red)?.space();
+        for (dd, &c) in st.addr.coefs.iter().enumerate() {
+            if c == 0 || (dd < rank && space[dd].fixed() == Some(1)) {
+                continue;
+            }
+            let k = (0..shape.len())
+                .find(|&k| shape[k] > 1 && strides[k] == c && forms[k].is_none())?;
+            forms[k] = Some(super::super::Form::unit(rank + 1, dd));
+        }
+        let mut fs = Vec::new();
+        for (k, f) in forms.into_iter().enumerate() {
+            match f {
+                Some(f) => fs.push(f),
+                None if shape[k] == 1 => fs.push(super::super::Form {
+                    offset: 0,
+                    coefs: vec![0; rank + 1],
+                }),
+                None => return None,
+            }
+        }
+        let view = super::super::View {
+            guard: false,
+            gather: None,
+            forms: fs,
+        };
+        let mut bufs = Vec::new();
+        let mut orient: Option<Addr> = None;
+        for a in &mc.args {
+            if a.view.guard || a.view.is_gather() {
+                return None;
+            }
+            match &self.nodes[a.src.n()].op {
+                Op::Iota(_) => {}
+                _ => {
+                    let stn = self.storage(a.src).n();
+                    if self.nodes[stn].inline {
+                        return None;
+                    }
+                    let addr = self.flat_addr(
+                        &Arg {
+                            src: a.src,
+                            view: a.view.compose(&view, rank + 1),
+                        },
+                        rank + 1,
+                    );
+                    let nz = |x: &Addr| x.coefs.iter().filter(|&&c| c != 0).count();
+                    if orient.as_ref().is_none_or(|o| nz(&addr) > nz(o)) {
+                        orient = Some(addr);
+                    }
+                    if !bufs.contains(&stn) {
+                        bufs.push(stn);
+                    }
+                }
+            }
+        }
+        Some((view, orient?, bufs))
+    }
+
     /// Per point dim of epilogue `root`, the point dim of its reduction
     /// `red` it reads at (`None`: a unit dim), when the epilogue reads
     /// the reduction through a pick of its points.
@@ -330,6 +415,29 @@ impl TensorGraph {
             self.nodes[n].tile = (0, 0, 0);
             self.nodes[n].split = 0;
         }
+        // the per-row reductions the kernel reads (rowsum(dO·O)): one
+        // workgroup per row, its threads along the short reduce dim, so
+        // the reads coalesce
+        if std::env::var("TANG_ATTN_NOSPLIT").is_err() {
+            let mut cand = self.kernel_reads(p.root);
+            for j in cand.clone() {
+                if self.comp_at(j).is_some_and(|c| c.monoid.is_none()) {
+                    cand.extend(self.kernel_reads(j));
+                }
+            }
+            for j in cand {
+                let Some(c) = self.comp_at(j) else { continue };
+                let short =
+                    c.red.len() == 1 && c.red[0].fixed().is_some_and(|r| (32..=256).contains(&r));
+                if short
+                    && c.monoid.is_some()
+                    && self.nodes[j].tile.0 == 0
+                    && self.nodes[j].split == 0
+                {
+                    self.nodes[j].split = 32;
+                }
+            }
+        }
     }
 
     /// Replace the kv tile's kernel with the fused one and the dQ
@@ -355,6 +463,23 @@ impl TensorGraph {
             .iter()
             .map(|t| t.index())
             .collect();
+        // staged maps (dO/l) are evaluated from their own buffers: those
+        // join the bindings and the map's kernel goes away
+        let Some(plan) = self.attn_bwd_build(p.root, p.red, p.dq, &reads) else {
+            return false;
+        };
+        let mut reads = reads;
+        let mut gone = Vec::new();
+        for st in &plan.stages {
+            if let Some((_, _, bufs)) = self.map_stage(st, p.red) {
+                for b in bufs {
+                    if !reads.contains(&b) {
+                        reads.push(b);
+                    }
+                }
+                gone.push(st.buf);
+            }
+        }
         let bj = BJS[variant.unwrap_or(0) % BJS.len()];
         // variants past MMA_SHAPES exist only on Hopper (227 KB of shared
         // memory per block); the rest must fit an sm_86's 99 KB
@@ -384,11 +509,22 @@ impl TensorGraph {
         program.kernels.insert(ki, zk);
         let k = &mut program.kernels[ki + 1];
         k.source = src;
+        k.reads = reads.iter().map(|&j| TensorId(j as u32)).collect();
         k.reads.push(TensorId(p.dq as u32));
         let threads = super::src_define(&k.source, "TANG_THREADS");
         k.workgroup_size = threads as u32;
         let tiles = super::src_define(&k.source, "TANG_TILES");
         k.count = (tiles * threads) as u32;
+        // the staged maps' own kernels, unless something else reads them
+        for g in gone {
+            let used = program
+                .kernels
+                .iter()
+                .any(|k| k.node.index() != p.root && k.reads.iter().any(|r| r.index() == g));
+            if !used {
+                program.kernels.retain(|k| k.node.index() != g);
+            }
+        }
         true
     }
 
@@ -756,7 +892,12 @@ impl TensorGraph {
                 tiles[t] = Smem {
                     off,
                     dynb: side_i,
-                    tm: st.addr.coefs[row_dim] == 1 && st.addr.coefs[rank] != 1,
+                    tm: {
+                        let a = self
+                            .map_stage(st, p.red)
+                            .map_or(st.addr.clone(), |(_, o, _)| o);
+                        a.coefs[row_dim] == 1 && a.coefs[rank] != 1
+                    },
                     rows,
                     e: st.e,
                 };
@@ -893,7 +1034,82 @@ impl TensorGraph {
                 })
             };
             writeln!(s, "        {{").unwrap();
-            if vec8 {
+            if let Some((view, _, _)) = self.map_stage(st, p.red) {
+                let mc = self.comp_at(st.buf).unwrap();
+                writeln!(
+                    s,
+                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    inner * outer
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "            unsigned io = idx / {inner}u, ii = idx % {inner}u;"
+                )
+                .unwrap();
+                let (rr, ee) = if tl.tm { ("ii", "io") } else { ("io", "ii") };
+                let cd =
+                    |dd: usize| coord(dd, &format!("{r0} + {rr}"), &format!("{r0} + {rr}"), ee);
+                let vals: Vec<String> = mc
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let v = a.view.compose(&view, rank + 1);
+                        match &self.nodes[a.src.n()].op {
+                            Op::Iota(k) => {
+                                let f = &v.forms[*k];
+                                format!(
+                                    "(float)({})",
+                                    aff(
+                                        &Addr {
+                                            offset: f.offset,
+                                            coefs: f.coefs.clone()
+                                        },
+                                        &cd
+                                    )
+                                )
+                            }
+                            _ => {
+                                let ad = self.flat_addr(
+                                    &Arg {
+                                        src: a.src,
+                                        view: v,
+                                    },
+                                    rank + 1,
+                                );
+                                ld(
+                                    storage(a.src.n()),
+                                    &format!("(unsigned)({})", aff(&ad, &cd)),
+                                )
+                            }
+                        }
+                    })
+                    .collect();
+                let mut body = String::new();
+                let res = emit_scalar(
+                    &mut body,
+                    &mc.body,
+                    &mc.body_outs,
+                    &format!("s{t}_"),
+                    &|x| vals[x as usize].clone(),
+                );
+                for line in body.lines() {
+                    writeln!(
+                        s,
+                        "            {}",
+                        float_literals(&line.replacen("let ", "float ", 1))
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    s,
+                    "            smh[{}] = tang_f2b({});",
+                    tl.at(rr, ee),
+                    res[0]
+                )
+                .unwrap();
+                writeln!(s, "        }}").unwrap();
+            } else if vec8 {
                 let per = inner / 8;
                 writeln!(
                     s,
