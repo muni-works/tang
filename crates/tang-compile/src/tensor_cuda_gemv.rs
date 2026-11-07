@@ -322,6 +322,7 @@ impl TensorGraph {
                 // OpenCL prefill: the register-block kernel, else the tiled WGSL one
                 None if tiles.contains(&root) => mma(),
                 None => mma()
+                    .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.warp_reduction(root))
                     .or_else(|| lw.point_map(root)),
             };
@@ -636,6 +637,21 @@ fn float_literals(s: &str) -> String {
     out
 }
 
+/// Whether value tree `v` reads point dim `d` (a leaf address or an iota
+/// form with a coefficient on it).
+fn val_uses(v: &Val, leaves: &[Leaf], d: usize) -> bool {
+    match v {
+        Val::Leaf(i) => leaves[*i].addr.coefs[d] != 0,
+        Val::Iota(f) => f.coefs[d] != 0,
+        Val::Map { args, .. } => args.iter().any(|a| val_uses(a, leaves, d)),
+        Val::Var(_) => false,
+    }
+}
+
+fn a_guarded(a: &Arg) -> bool {
+    a.view.guard || a.view.gather.is_some()
+}
+
 /// Per-slot combine of a monoid when every slot is a plain sum or max
 /// of its own accumulator and element (`None`: a general combine, which
 /// is emitted from the monoid's graph).
@@ -803,6 +819,660 @@ impl Lowering<'_> {
                     .clone()
             }
         }
+    }
+
+    /// A reduction whose body reads an inlined reduction (the *shared
+    /// producer* `S`) that ignores the comp's last point dim `c`, folded
+    /// with an online-softmax monoid whose slot 0 is `c`-free: decode
+    /// attention written as one reduction over the keys (`q·k` shared by
+    /// every output dim, `V` read once), though nothing here names it.
+    ///
+    /// One block per point group: all of `c` (`vc` consecutive values per
+    /// thread) and all of a *register dim* `r` — a short point dim the
+    /// streamed operands ignore and `S` reads (the query heads of a GQA
+    /// group: one read of K and V serves all of them). Per chunk of keys:
+    ///
+    /// 1. `S` for every (r, key): `S`'s args that ignore the key are
+    ///    evaluated once per block into shared memory (`q`); `lpk` lanes
+    ///    share a (r, key), each over a contiguous, unrolled run of `S`'s
+    ///    reduce space, combined through shuffles;
+    /// 2. slot 0 of the element per (r, key) and its chunk max `m`; then
+    ///    `p = exp(e₀ − m)` in shared memory;
+    /// 3. each thread folds `Σ p·g` for its (r, c) slots ≥ 1 and combines
+    ///    `(m, Σ p·g)` into its state once per chunk (the monoid's own
+    ///    combine).
+    ///
+    /// Keys past a runtime bound shared by every slot are skipped. Split-KV
+    /// is `split_reduction` on the graph (a chunk axis among the points).
+    /// `TANG_SHARED_RED=0` disables it, `TANG_SR_VC` sets `vc` (default 2).
+    fn shared_reduction(&self, root: usize) -> Option<Kernel> {
+        if std::env::var("TANG_SHARED_RED").as_deref() == Ok("0") {
+            return None;
+        }
+        let g = self.g;
+        let rc = g.comp_at(root)?;
+        let monoid = rc.monoid.as_ref()?;
+        if g.nodes[root].inline
+            || rc.red.len() != 1
+            || monoid.kind() != super::MonoidKind::OnlineSoftmax
+        {
+            return None;
+        }
+        let pts = fixed(rc.points());
+        let red = fixed(&rc.red);
+        let (pk, rank) = (pts.len(), pts.len() + 1);
+        let w = rc.width();
+        if monoid.width != w || pk < 2 {
+            return None;
+        }
+        let mut sh = None;
+        for (ai, a) in rc.args.iter().enumerate() {
+            let p = a.src.n();
+            if g.nodes[p].inline && g.comp_at(p).is_some_and(|pc| pc.monoid.is_some()) {
+                if sh.is_some() {
+                    return None;
+                }
+                sh = Some(ai);
+            }
+        }
+        let ai = sh?;
+        let sa = &rc.args[ai];
+        let sc = g.comp_at(sa.src.n())?;
+        let smon = sc.monoid.as_ref()?;
+        if sc.width() != 1 || sc.tuple != 0 || smon.width != 1 || a_guarded(sa) {
+            return None;
+        }
+        let cdim = pk - 1;
+        let nc = pts[cdim];
+        if sa.view.forms.iter().any(|f| f.coefs[cdim] != 0)
+            || !sa.view.forms.iter().any(|f| f.coefs[pk] != 0)
+        {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        let mut args = Vec::with_capacity(rc.args.len());
+        for (i, a) in rc.args.iter().enumerate() {
+            if i == ai {
+                args.push(Val::Var("sv".into()));
+            } else {
+                args.push(self.tree(a, rank, &mut leaves)?);
+            }
+        }
+        let spts = sa.view.forms.len();
+        let sred = fixed(&sc.red);
+        let srank = spts + sred.len();
+        let mut sleaves = Vec::new();
+        let sargs = sc
+            .args
+            .iter()
+            .map(|a| self.tree(a, srank, &mut sleaves))
+            .collect::<Option<Vec<_>>>()?;
+        let nred_s: usize = sred.iter().product();
+        // slot 0 must not read c
+        let uses = |e: ExprId, d: usize| -> bool {
+            let nodes = rc.body.nodes_slice();
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                match nodes[x.index() as usize] {
+                    Node::Var(v) => {
+                        if val_uses(&args[v as usize], &leaves, d) {
+                            return true;
+                        }
+                    }
+                    Node::Lit(_) => {}
+                    Node::Add(a, b) | Node::Mul(a, b) | Node::Atan2(a, b) => stack.extend([a, b]),
+                    Node::Neg(a)
+                    | Node::Recip(a)
+                    | Node::Sqrt(a)
+                    | Node::Sin(a)
+                    | Node::Exp2(a)
+                    | Node::Log2(a) => stack.push(a),
+                    Node::Select(c, a, b) => stack.extend([c, a, b]),
+                }
+            }
+            false
+        };
+        if uses(rc.body_outs[0], cdim) {
+            return None;
+        }
+        // the register dim: S reads it, the leaves of slots >= 1 that vary
+        // along the key do not
+        let streamed: Vec<usize> = (0..leaves.len())
+            .filter(|&i| leaves[i].addr.coefs[pk] != 0)
+            .collect();
+        let rdim = (0..cdim).filter(|&d| (2..=8).contains(&pts[d])).find(|&d| {
+            sa.view.forms.iter().any(|f| f.coefs[d] != 0)
+                && streamed.iter().all(|&i| leaves[i].addr.coefs[d] == 0)
+        });
+        let nr = rdim.map_or(1, |d| pts[d]);
+        // 128 threads; a thread owns `vc` c's (default 8), `ks` lanes split
+        // the keys of a chunk
+        let vc: usize = std::env::var("TANG_SR_VC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let threads = 128usize;
+        if vc == 0
+            || !nc.is_multiple_of(vc)
+            || nc / vc > threads
+            || !threads.is_multiple_of(nc / vc)
+        {
+            return None;
+        }
+        let ks = threads / (nc / vc);
+        if !ks.is_power_of_two() || ks > 32 {
+            return None;
+        }
+        // a key bound shared by every slot
+        let nodes = rc.body.nodes_slice();
+        let mut cond_e: Option<ExprId> = None;
+        for (slot, &o) in rc.body_outs.iter().enumerate() {
+            let Node::Select(c, _, f) = nodes[o.index() as usize] else {
+                cond_e = None;
+                break;
+            };
+            let is_id = nodes[f.index() as usize]
+                .as_f64()
+                .is_some_and(|v| is_identity_lit(monoid, slot, v));
+            if !is_id || cond_e.is_some_and(|e| e != c) {
+                cond_e = None;
+                break;
+            }
+            cond_e = Some(c);
+        }
+        let bound = cond_e
+            .and_then(|c| self.cond(&rc.body, c, &args, &leaves, rank, pk))
+            .filter(|cd| {
+                cd.coefs[pk] < 0.0
+                    && cd.coefs[cdim] == 0.0
+                    && rdim.is_none_or(|d| cd.coefs[d] == 0.0)
+            });
+
+        let gdims: Vec<usize> = (0..cdim).filter(|&d| Some(d) != rdim).collect();
+        let groups: usize = gdims.iter().map(|&d| pts[d]).product();
+        let kc = threads;
+        let warps = threads / 32;
+        let mut s = String::new();
+        writeln!(
+            s,
+            "// Auto-generated by tang-compile: shared-producer reduction (decode)"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "// {groups} groups x {nr} x {nc} points ({vc} per thread), {} reduce, producer reduce {nred_s}",
+            red[0]
+        )
+        .unwrap();
+        writeln!(s, "#define TANG_TILES {groups}").unwrap();
+        writeln!(s, "#define TANG_THREADS {threads}").unwrap();
+        s.push_str(PRELUDE);
+        let mut params: Vec<String> = self
+            .reads
+            .iter()
+            .map(|&j| format!("const float* __restrict__ b{j}"))
+            .collect();
+        params.push("float* __restrict__ out".into());
+        params.push("unsigned count".into());
+        writeln!(
+            s,
+            "extern \"C\" __global__ void __launch_bounds__({threads}) main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;"
+        )
+        .unwrap();
+        writeln!(s, "    const int grp = blockIdx.x;").unwrap();
+        let mut rem = "grp".to_string();
+        for &d in gdims.iter().rev() {
+            writeln!(s, "    const int p{d} = ({rem}) % {};", pts[d]).unwrap();
+            rem = format!("({rem}) / {}", pts[d]);
+        }
+        // coords with r, c and the key as given expressions
+        let mk = |r: &str, c: &str, j: &str| -> Vec<String> {
+            let mut v: Vec<String> = (0..cdim)
+                .map(|d| {
+                    if Some(d) == rdim {
+                        r.to_string()
+                    } else {
+                        format!("p{d}")
+                    }
+                })
+                .collect();
+            v.push(c.to_string());
+            v.push(j.to_string());
+            v
+        };
+        let pt_dims: Vec<usize> = (0..pk).collect();
+        match &bound {
+            Some(cd) => writeln!(
+                s,
+                "    const int hi = min({}, max(0, (int)ceilf(({}) / {})));",
+                red[0],
+                self.cond_base(cd, &leaves, &pt_dims, &mk("0", "0", "0")),
+                flit(-cd.coefs[pk])
+            )
+            .unwrap(),
+            None => writeln!(s, "    const int hi = {};", red[0]).unwrap(),
+        }
+        writeln!(s, "    __shared__ float s_sh[{nr}][{kc}];").unwrap();
+        writeln!(s, "    __shared__ float e_sh[{nr}][{kc}];").unwrap();
+        writeln!(s, "    __shared__ float r_sh[{nr}][{warps}];").unwrap();
+        writeln!(s, "    __shared__ float m_sh[{nr}];").unwrap();
+        writeln!(s, "    float acc[{nr}][{vc}][{w}];").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int r = 0; r < {nr}; r++)").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int u = 0; u < {vc}; u++) {{").unwrap();
+        for (slot, &id) in monoid.identity.iter().enumerate() {
+            writeln!(s, "        acc[r][u][{slot}] = {};", flit(id)).unwrap();
+        }
+        writeln!(s, "    }}").unwrap();
+
+        // S's space coords for (r, key) and a reduce index f
+        let sdecomp = {
+            let mut t = String::new();
+            let mut srem = "f".to_string();
+            for d in (0..sred.len()).rev() {
+                writeln!(t, "            const int q{d} = ({srem}) % {};", sred[d]).unwrap();
+                srem = format!("({srem}) / {}", sred[d]);
+            }
+            t
+        };
+        let scoords_for = |r: &str, j: &str| -> Vec<String> {
+            let pc = mk(r, "0", j);
+            let mut v: Vec<String> = sa
+                .view
+                .forms
+                .iter()
+                .map(|f| format!("({})", form_expr(f, &pc)))
+                .collect();
+            v.extend((0..sred.len()).map(|d| format!("q{d}")));
+            v
+        };
+        let key_dims: Vec<usize> = (0..spts)
+            .filter(|&k| sa.view.forms[k].coefs[pk] != 0)
+            .collect();
+        let hoist: Vec<usize> = (0..sargs.len())
+            .filter(|&i| !key_dims.iter().any(|&d| val_uses(&sargs[i], &sleaves, d)))
+            .collect();
+        let mut ctr = 0usize;
+        // a block with no live key writes the identity states and leaves
+        // (split-KV chunks past the cache length)
+        writeln!(s, "    if (hi <= 0) {{").unwrap();
+        writeln!(s, "        for (int r = 0; r < {nr}; r++)").unwrap();
+        writeln!(
+            s,
+            "        for (int cc = tid; cc < {nc}; cc += {threads}) {{"
+        )
+        .unwrap();
+        {
+            let oc = mk("r", "cc", "0");
+            let mut flat = "0".to_string();
+            for d in 0..pk {
+                flat = format!("({flat}) * {} + ({})", pts[d], oc[d]);
+            }
+            writeln!(s, "            const int o = {flat};").unwrap();
+        }
+        for (slot, &id) in monoid.identity.iter().enumerate() {
+            writeln!(s, "            out[o * {w} + {slot}] = {};", flit(id)).unwrap();
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        return;").unwrap();
+        writeln!(s, "    }}").unwrap();
+        // hoisted producer args, per (r, f)
+        for &i in &hoist {
+            writeln!(s, "    __shared__ float h_sh{i}[{nr}][{nred_s}];").unwrap();
+        }
+        if !hoist.is_empty() {
+            writeln!(
+                s,
+                "    for (int t = tid; t < {}; t += {threads}) {{",
+                nr * nred_s
+            )
+            .unwrap();
+            writeln!(s, "        const int rr = t / {nred_s}, f = t % {nred_s};").unwrap();
+            s.push_str(&sdecomp.replace("            ", "        "));
+            let sc0 = scoords_for("rr", "0");
+            let sel = |i: usize| {
+                let l: &Leaf = &sleaves[i];
+                load(l.buf, l.pack, &addr_expr(&l.addr, &sc0))
+            };
+            for &i in &hoist {
+                let v = self.emit_val(&mut s, &sargs[i], &sc0, "        ", &mut ctr, &sel);
+                writeln!(s, "        h_sh{i}[rr][f] = {v};").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+        }
+        // lanes per (r, key) item: 1 by default (a lane streams its key's
+        // whole producer row; few serial rounds per warp), TANG_SR_LPK
+        let lpk_want: usize = std::env::var("TANG_SR_LPK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let lpk = [32usize, 16, 8, 4, 2, 1]
+            .into_iter()
+            .find(|&l| l <= lpk_want && nred_s.is_multiple_of(l))
+            .unwrap();
+        let kpw = 32 / lpk;
+        let run = nred_s / lpk;
+        writeln!(s, "    for (int j0 = 0; j0 < hi; j0 += {kc}) {{").unwrap();
+        // 1. S per (r, key); several items per warp in flight
+        writeln!(s, "    #pragma unroll 4").unwrap();
+        writeln!(
+            s,
+            "    for (int it = warp * {kpw} + lane / {lpk}; it < {}; it += {}) {{",
+            nr * kc,
+            warps * kpw
+        )
+        .unwrap();
+        writeln!(s, "        const int rr = it / {kc}, kk = it % {kc};").unwrap();
+        writeln!(s, "        const int jk = j0 + kk, sub = lane % {lpk};").unwrap();
+        writeln!(s, "        float sa_ = {};", flit(smon.identity[0])).unwrap();
+        writeln!(s, "        if (jk < hi) {{").unwrap();
+        // leaves contiguous along the producer's innermost reduce dim,
+        // f16 or f32: the lane's run preloaded as 16-byte vectors
+        let sin = srank - 1;
+        let sinner = sred[sred.len() - 1];
+        let vleaf = |l: &Leaf| -> Option<usize> {
+            let per = match l.pack {
+                Some(Packing::F16) | Some(Packing::Bf16) => 8,
+                None => 4,
+                _ => return None,
+            };
+            let aligned = l.addr.offset % per as i64 == 0
+                && l.addr
+                    .coefs
+                    .iter()
+                    .enumerate()
+                    .all(|(d, &c)| d == sin || c % per as i64 == 0);
+            // linear over the flattened reduce index: a run may span dims
+            let mut stride = 1i64;
+            let mut linear = true;
+            for d in (0..sred.len()).rev() {
+                linear &= l.addr.coefs[spts + d] == stride;
+                stride *= sred[d] as i64;
+            }
+            let _ = (sin, sinner);
+            (linear && run.is_multiple_of(per) && aligned).then_some(per)
+        };
+        let vec_leaves: Vec<(usize, usize)> = (0..sleaves.len())
+            .filter_map(|i| vleaf(&sleaves[i]).map(|p| (i, p)))
+            .collect();
+        if !vec_leaves.is_empty() {
+            writeln!(s, "        const int f = sub * {run};").unwrap();
+            s.push_str(&sdecomp.replace("            ", "        "));
+            let scj = scoords_for("rr", "jk");
+            for &(i, per) in &vec_leaves {
+                let l = &sleaves[i];
+                let a = addr_expr(&l.addr, &scj);
+                let ty = if per == 8 { "uint4" } else { "float4" };
+                writeln!(s, "        {ty} pv{i}[{}];", run / per).unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(
+                    s,
+                    "        for (int v = 0; v < {}; v++) pv{i}[v] = __ldg((const {ty}*)(b{}) + (({a}) >> {}) + v);",
+                    run / per,
+                    l.buf,
+                    if per == 8 { 3 } else { 2 }
+                )
+                .unwrap();
+            }
+        }
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int fi = 0; fi < {run}; fi++) {{").unwrap();
+        writeln!(s, "            const int f = sub * {run} + fi;").unwrap();
+        s.push_str(&sdecomp);
+        {
+            let scj = scoords_for("rr", "jk");
+            let sel = |i: usize| {
+                let l: &Leaf = &sleaves[i];
+                match vec_leaves.iter().find(|v| v.0 == i) {
+                    Some(&(_, 8)) => l.pack.unwrap().half(&format!(
+                        "(((&pv{i}[fi >> 3].x)[(fi >> 1) & 3] >> (16 * (fi & 1))) & 0xffffu)"
+                    )),
+                    Some(_) => format!("(&pv{i}[fi >> 2].x)[fi & 3]"),
+                    None => load(l.buf, l.pack, &addr_expr(&l.addr, &scj)),
+                }
+            };
+            let svals: Vec<String> = sargs
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if hoist.contains(&i) {
+                        format!("h_sh{i}[rr][f]")
+                    } else {
+                        self.emit_val(&mut s, a, &scj, "            ", &mut ctr, &sel)
+                    }
+                })
+                .collect();
+            let se = emit(
+                &mut s,
+                &sc.body,
+                &sc.body_outs,
+                "x_",
+                "            ",
+                &|v| svals[v as usize].clone(),
+            );
+            self.combine(&mut s, smon, 1, "            ", |_| "sa_".to_string(), &se);
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(
+            s,
+            "        for (int off = {}; off > 0; off >>= 1) {{",
+            lpk / 2
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            float o0 = __shfl_xor_sync(0xffffffffu, sa_, off);"
+        )
+        .unwrap();
+        self.combine(
+            &mut s,
+            smon,
+            1,
+            "            ",
+            |_| "sa_".to_string(),
+            &["o0".to_string()],
+        );
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        if (sub == 0) s_sh[rr][kk] = sa_;").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        // 2. slot 0 per (r, key), its chunk max, p = exp(e0 - m)
+        writeln!(s, "    {{").unwrap();
+        writeln!(s, "        const int jk = j0 + tid;").unwrap();
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int rr = 0; rr < {nr}; rr++) {{").unwrap();
+        writeln!(s, "            float e0 = {};", flit(monoid.identity[0])).unwrap();
+        writeln!(s, "            if (jk < hi) {{").unwrap();
+        writeln!(s, "                const float sv = s_sh[rr][tid];").unwrap();
+        {
+            let pc = mk("rr", "0", "jk");
+            let el0 = |i: usize| {
+                let l: &Leaf = &leaves[i];
+                load(l.buf, l.pack, &addr_expr(&l.addr, &pc))
+            };
+            let v0: Vec<String> = args
+                .iter()
+                .map(|a| self.emit_val(&mut s, a, &pc, "                ", &mut ctr, &el0))
+                .collect();
+            let y0 = emit(
+                &mut s,
+                &rc.body,
+                &rc.body_outs[..1],
+                "z_",
+                "                ",
+                &|v| v0[v as usize].clone(),
+            );
+            writeln!(s, "                e0 = {};", y0[0]).unwrap();
+        }
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "            e_sh[rr][tid] = e0;").unwrap();
+        writeln!(s, "            float mx = e0;").unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));").unwrap();
+        writeln!(s, "            if (lane == 0) r_sh[rr][warp] = mx;").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        writeln!(s, "    if (tid < {nr}) {{").unwrap();
+        writeln!(s, "        float mx = r_sh[tid][0];").unwrap();
+        writeln!(
+            s,
+            "        for (int k = 1; k < {warps}; k++) mx = fmaxf(mx, r_sh[tid][k]);"
+        )
+        .unwrap();
+        writeln!(s, "        m_sh[tid] = mx;").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int rr = 0; rr < {nr}; rr++) e_sh[rr][tid] = __expf(e_sh[rr][tid] - m_sh[rr]);").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        // 3. Σ p·g per (r, c): a thread owns `vc` consecutive c, `ks`
+        // neighbouring lanes split the chunk's keys and add their partial
+        // sums through shuffles (every term shares the chunk max); one
+        // combine per chunk
+        writeln!(s, "    const int jn = min({kc}, hi - j0);").unwrap();
+        writeln!(s, "    const int kq = tid % {ks}, cg = tid / {ks};").unwrap();
+        writeln!(s, "    float gs[{nr}][{vc}][{}];", w - 1).unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int r = 0; r < {nr}; r++)").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int u = 0; u < {vc}; u++)").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(
+            s,
+            "    for (int k = 0; k < {}; k++) gs[r][u][k] = 0.0f;",
+            w - 1
+        )
+        .unwrap();
+        writeln!(s, "    #pragma unroll 4").unwrap();
+        writeln!(s, "    for (int jj = kq; jj < jn; jj += {ks}) {{").unwrap();
+        writeln!(s, "        const int jk = j0 + jj;").unwrap();
+        // leaves unit-stride along c, f16: one 16-byte load for the vc c's
+        let cvec: Vec<usize> = (0..leaves.len())
+            .filter(|&i| {
+                let l = &leaves[i];
+                vc == 8
+                    && l.pack == Some(Packing::F16)
+                    && l.addr.coefs[cdim] == 1
+                    && l.addr.offset % 8 == 0
+                    && l.addr
+                        .coefs
+                        .iter()
+                        .enumerate()
+                        .all(|(d, &c)| d == cdim || c % 8 == 0)
+            })
+            .collect();
+        {
+            let pc0 = mk("0", &format!("(cg * {vc})"), "jk");
+            for &i in &cvec {
+                let l = &leaves[i];
+                writeln!(
+                    s,
+                    "        const uint4 cv{i} = __ldg((const uint4*)(b{}) + (({}) >> 3));",
+                    l.buf,
+                    addr_expr(&l.addr, &pc0)
+                )
+                .unwrap();
+            }
+        }
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int u = 0; u < {vc}; u++) {{").unwrap();
+        writeln!(s, "        const int cc = cg * {vc} + u;").unwrap();
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int r = 0; r < {nr}; r++) {{").unwrap();
+        writeln!(s, "            const float sv = s_sh[r][jj];").unwrap();
+        writeln!(s, "            const float pj = e_sh[r][jj];").unwrap();
+        {
+            let pc = mk("r", "cc", "jk");
+            let el = |i: usize| {
+                let l: &Leaf = &leaves[i];
+                if cvec.contains(&i) {
+                    Packing::F16.half(&format!(
+                        "(((&cv{i}.x)[u >> 1] >> (16 * (u & 1))) & 0xffffu)"
+                    ))
+                } else {
+                    load(l.buf, l.pack, &addr_expr(&l.addr, &pc))
+                }
+            };
+            let vals: Vec<String> = args
+                .iter()
+                .map(|a| self.emit_val(&mut s, a, &pc, "            ", &mut ctr, &el))
+                .collect();
+            let y = emit(
+                &mut s,
+                &rc.body,
+                &rc.body_outs[1..],
+                "y_",
+                "            ",
+                &|v| vals[v as usize].clone(),
+            );
+            for (k, yk) in y.iter().enumerate() {
+                writeln!(
+                    s,
+                    "            gs[r][u][{k}] = fmaf(pj, {yk}, gs[r][u][{k}]);"
+                )
+                .unwrap();
+            }
+        }
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int r = 0; r < {nr}; r++)").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int u = 0; u < {vc}; u++) {{").unwrap();
+        writeln!(s, "        #pragma unroll").unwrap();
+        writeln!(s, "        for (int k = 0; k < {}; k++) {{", w - 1).unwrap();
+        writeln!(s, "            #pragma unroll").unwrap();
+        writeln!(s, "            for (int off = {}; off > 0; off >>= 1) gs[r][u][k] += __shfl_xor_sync(0xffffffffu, gs[r][u][k], off);", ks / 2).unwrap();
+        writeln!(s, "        }}").unwrap();
+        let mut elem = vec!["m_sh[r]".to_string()];
+        elem.extend((0..w - 1).map(|k| format!("gs[r][u][{k}]")));
+        self.combine(
+            &mut s,
+            monoid,
+            w,
+            "        ",
+            |k| format!("acc[r][u][{k}]"),
+            &elem,
+        );
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    if (tid % {ks} != 0) return;").unwrap();
+        writeln!(s, "    const int cg = tid / {ks};").unwrap();
+        // out: flat point index over (gdims..., r, c) in the comp's order
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int r = 0; r < {nr}; r++)").unwrap();
+        writeln!(s, "    #pragma unroll").unwrap();
+        writeln!(s, "    for (int u = 0; u < {vc}; u++) {{").unwrap();
+        writeln!(s, "        const int cc = cg * {vc} + u;").unwrap();
+        let oc = mk("r", "cc", "0");
+        let mut flat = "0".to_string();
+        for d in 0..pk {
+            flat = format!("({flat}) * {} + ({})", pts[d], oc[d]);
+        }
+        writeln!(s, "        const int o = {flat};").unwrap();
+        for slot in 0..w {
+            writeln!(s, "        out[o * {w} + {slot}] = acc[r][u][{slot}];").unwrap();
+        }
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "}}").unwrap();
+        Some(Kernel {
+            source: s,
+            threads,
+            blocks: groups,
+        })
     }
 
     /// A reduction (or a map that is its epilogue) as warp kernels.

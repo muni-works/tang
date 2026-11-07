@@ -3094,3 +3094,31 @@ P·V-only split-K ×4 (`TANG_SPLIT_ATTN=4 TANG_SPLIT_ATTN_MIN_POINTS=1024`) 6.80
 (`TANG_ONLINE_ML=1`, 31/31) 6.76 / 7.07 / 7.99. The scores and P·V kernels are each near 480–500 GB/s: what is
 left at long context is one pass that computes q·k once per key and shares it across the 128 output dims
 (scores in shared memory, online softmax, P·V), which the warp-reduction emitter cannot express yet.
+
+### Derived single-pass decode attention (`shared_reduction`, opt-in: `TANG_FUSED_ATTN=1 TANG_ATTN_SPLIT=P`)
+
+The builder can write decode attention as one online-softmax reduction over the keys per output (t, kvh, r, c)
+— state (m, Σp·v_c, Σp), element (s, v_c, 1), then acc / l — with the scores a sum reduction it reads. A schedule
+rule inlines a sum read by an online-softmax fold, and a new decode lowering handles any reduction whose
+inlined producer ignores its last point dim: per chunk of keys, the producer once per (register-dim value, key)
+into shared memory (its key-invariant args — q — hoisted per block, rows as 16-byte vectors), the chunk max and
+p = exp(e₀ − m) once per key, then each thread folds Σ p·g for 8 consecutive c (one 16-byte V load per key,
+keys split over 8 lanes, partial sums added by shuffles) with one monoid combine per chunk. The GQA heads are the
+register dim (one K/V read serves all four). Split-KV is `split_reduction` (the online-softmax combine). The V
+cache is key-major under this form. Nothing in the lowering names attention.
+
+Correct: `qwen_decode tiny` (GPU vs interpreter, prefill and decode) 4.8e-5 / 3.3e-4, caches within 1 ulp;
+Qwen3-8B 31/31 argmax, max |err| 3.24e-2. Not faster yet (ms, 64 / 1024 / 4096):
+
+| | 64 | 1024 | 4096 |
+|---|---|---|---|
+| default (4 attention kernels per layer) | 6.73 | 7.07 | 8.05 |
+| fused, split 16 | 7.39 | 8.72 | 9.19–9.92 |
+| fused, split 32 | 7.78 | 8.38–8.55 | 9.33–9.52 |
+| fused, split 64 | 7.88 | 7.90 | 9.40–9.54 |
+
+Per layer at 4k the fused kernel is 85 µs + a 7 µs combine (split 32) against ~40 µs for the four kernels; at
+length 64 it is still ~50 µs with only a few live blocks: each block walks its keys in serial rounds of
+dependent loads, and the split-KV combine alone (32 chunks × 4096 outputs × 3 slots) costs what the old
+short-context attention did. What it needs next: chunks sized to the live length (split chosen per step, not
+per capacity), more independent loads in flight per round, and the combine folded into the finalize map.

@@ -548,7 +548,14 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         let kn = b.input(p("k_norm"), &[hd], None);
         let kv = dims.kv_f16.then_some(Packing::F16);
         let k_cache = b.input(p("k_cache"), &[kvh, ctx, 2, half], kv);
-        let v_cache = b.input(p("v_cache"), &[kvh, hd, ctx], kv);
+        // V cache key-major ([kvh, ctx, hd], like K) under the fused
+        // attention, whose threads walk the head dim: one contiguous row
+        // per key. Otherwise [kvh, hd, ctx]: the P·V warps walk the keys
+        let vt = std::env::var("TANG_FUSED_ATTN").as_deref() == Ok("1");
+        let vc_shape = if vt { [kvh, ctx, hd] } else { [kvh, hd, ctx] };
+        // (d, j) of a V-cache coordinate pair -> its two view slots
+        let vdj = |d: Form, j: Form| if vt { [j, d] } else { [d, j] };
+        let v_cache = b.input(p("v_cache"), &vc_shape, kv);
 
         let normed = b.rms_norm(x, seq, 0, d, ln1, eps);
         let normed = Rows {
@@ -655,7 +662,6 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         // j − p0 — a runtime offset, so a sum over the chunk with one live
         // term (`pick`) that the lowering runs as a one-iteration loop
         let kc_shape = [kvh, ctx, 2, half];
-        let vc_shape = [kvh, hd, ctx];
         let (k_val, v_val) = if seq == 1 {
             (
                 arg(
@@ -664,7 +670,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 ),
                 arg(
                     qkv,
-                    vec![Form::zero(3), form(3, &[(0, hd as i64), (1, 1)], v_off)],
+                    vec![
+                        Form::zero(3),
+                        form(3, &[(0, hd as i64), (if vt { 2 } else { 1 }, 1)], v_off),
+                    ],
                 ),
             )
         } else {
@@ -687,8 +696,12 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     },
                 )
                 .unwrap();
-            let sp = [kvh, hd, ctx, seq];
-            let (j, t) = (b.g.iota(&sp, 2), b.g.iota(&sp, 3));
+            let sp = if vt {
+                [kvh, ctx, hd, seq]
+            } else {
+                [kvh, hd, ctx, seq]
+            };
+            let (j, t) = (b.g.iota(&sp, if vt { 1 } else { 2 }), b.g.iota(&sp, 3));
             let vp =
                 b.g.comp(
                     &vc_shape,
@@ -696,7 +709,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     vec![
                         arg(
                             qkv,
-                            vec![unit(4, 3), form(4, &[(0, hd as i64), (1, 1)], v_off)],
+                            vec![
+                                unit(4, 3),
+                                form(4, &[(0, hd as i64), (if vt { 2 } else { 1 }, 1)], v_off),
+                            ],
                         ),
                         arg(j, ident(4)),
                         arg(t, ident(4)),
@@ -726,7 +742,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 |v| vec![in_step(lenv(v[3]), v[2], v[0], v[1])],
             )
             .unwrap();
-        let jv_iota = b.g.iota(&vc_shape, 2);
+        let jv_iota = b.g.iota(&vc_shape, if vt { 1 } else { 2 });
         let v_new =
             b.g.comp(
                 &vc_shape,
@@ -853,7 +869,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
                     arg(m, at(m_slot)),
                     arg(lsum, at(l_slot)),
-                    arg(v_new, vec![unit(5, 1), unit(5, 3), unit(5, 4)]),
+                    arg(v_new, {
+                        let [a, c] = vdj(unit(5, 3), unit(5, 4));
+                        vec![unit(5, 1), a, c]
+                    }),
                     arg(to, ident(5)),
                     arg(jo, ident(5)),
                     len_at(5),
@@ -866,6 +885,60 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 },
             )
             .unwrap();
+        // TANG_FUSED_ATTN=1 (decode): attention as one online-softmax
+        // reduction over the keys per output (t, kvh, r, c) — state
+        // (m, Σp·v_c, Σp), element (s, v_c, 1) — then acc / l. The scores
+        // stay a reduction the fold reads; the decode lowering computes
+        // them once per key and shares them across c
+        // (`shared_reduction`)
+        let attn = if seq == 1 && std::env::var("TANG_FUSED_ATTN").as_deref() == Ok("1") {
+            let mut mono = Monoid::online_softmax(2);
+            mono.identity[0] = -1e30;
+            let state =
+                b.g.comp_tuple(
+                    &[seq, kvh, per, hd, 3],
+                    &[kctx],
+                    vec![
+                        arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
+                        arg(v_new, {
+                            let [a, c] = vdj(unit(5, 3), unit(5, 4));
+                            vec![unit(5, 1), a, c]
+                        }),
+                        arg(to, ident(5)),
+                        arg(jo, ident(5)),
+                        len_at(5),
+                    ],
+                    Some(mono),
+                    |v| {
+                        let c = visible(v[4], v[2], v[3]);
+                        vec![
+                            select(c, v[0], lit(-1e30)),
+                            select(c, v[1], lit(0.0)),
+                            select(c, lit(1.0), lit(0.0)),
+                        ]
+                    },
+                )
+                .unwrap();
+            let sl = |k: i64| {
+                vec![
+                    unit(4, 0),
+                    unit(4, 1),
+                    unit(4, 2),
+                    unit(4, 3),
+                    Form::constant(4, k),
+                ]
+            };
+            b.g.comp(
+                &[seq, kvh, per, hd],
+                &[],
+                vec![arg(state, sl(1)), arg(state, sl(2))],
+                None,
+                |v| vec![v[0] / v[1]],
+            )
+            .unwrap()
+        } else {
+            attn
+        };
         let attn = b.g.reshape(attn, &[seq, q_rows]).unwrap();
         let attn = Rows {
             src: attn,
@@ -1141,6 +1214,35 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // TANG_ATTN_SPLIT=P: online-softmax reductions over at least 1024
+        // keys (fused attention) split-KV into P chunks; the combine is the
+        // monoid's rescale-and-add
+        let kv_split: usize = std::env::var("TANG_ATTN_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if kv_split > 1 {
+            use tang_compile::tensor::MonoidKind;
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find(|&i| {
+                    g.comp_at(i).is_some_and(|c| {
+                        c.monoid.as_ref().map(|m| m.kind()) == Some(MonoidKind::OnlineSoftmax)
+                            && c.red.len() == 1
+                            && c.red[0].n() >= 1024
+                            && c.red[0].n() % kv_split == 0
+                    })
+                })
+            };
+            while let Some(t) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), kv_split) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
         // TANG_SPLIT_ATTN_MIN_POINTS: only reductions with at least this
         // many points (1024: P.V, not the softmax statistics)
         let min_pts: usize = std::env::var("TANG_SPLIT_ATTN_MIN_POINTS")
@@ -1238,6 +1340,33 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         }
         for i in inl {
             g.set_inline(TensorId::from_index(i), true);
+        }
+    }
+    // a sum reduction read by an online-softmax reduction is recomputed in
+    // it (the shared producer of `shared_reduction`: attention's scores)
+    if dg.seq == 1 {
+        use tang_compile::tensor::MonoidKind;
+        let n = g.nodes().len();
+        for i in 0..n {
+            let Some(c) = g.comp_at(i) else { continue };
+            if c.monoid.as_ref().map(|m| m.kind()) != Some(MonoidKind::OnlineSoftmax) {
+                continue;
+            }
+            let prods: Vec<usize> = c
+                .args
+                .iter()
+                .map(|a| a.src.index())
+                .filter(|&p| {
+                    g.comp_at(p)
+                        .and_then(|pc| pc.monoid.as_ref())
+                        .map(|m| m.kind())
+                        == Some(MonoidKind::Sum)
+                })
+                .collect();
+            for p in prods {
+                g.set_inline(TensorId::from_index(p), true);
+            }
+            g.set_inline(TensorId::from_index(i), false);
         }
     }
     if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
