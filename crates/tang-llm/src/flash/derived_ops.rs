@@ -664,6 +664,10 @@ pub fn moe_block(m: MoeShape) -> Spec {
         };
         let topi = pick_rank(&mut g, None);
         let topv = pick_rank(&mut g, Some(lg));
+        // reductions split across threads (one thread a point would loop over every expert)
+        g.set_schedule(rank, envn("TANG_DMOE_RANK_SPLIT", 32) as u32, (0, 0, 0), (1, 1));
+        g.set_schedule(topi, 256, (0, 0, 0), (1, 1));
+        g.set_schedule(topv, 256, (0, 0, 0), (1, 1));
         (topi, topv)
     };
     // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
