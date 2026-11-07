@@ -119,7 +119,13 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         if (lane == 31) GC[h * NT + c] = s;
     }
 #if DELTA
-    // k kᵀ (two 16×16 tiles a warp), operands from global
+    // k kᵀ from k staged (bf16) over A's space, into T's space as f32
+    bf* kst = (bf*)sa;
+    for (int i = tid; i < C * DK / 8; i += 256) {
+        const int r = i / (DK / 8), x = (i % (DK / 8)) * 8;
+        *(uint4*)&kst[r * LDK + x] = *(const uint4*)&K[(row0 + r) * DK + x];
+    }
+    __syncthreads();
     for (int tt = warp; tt < 16; tt += 8) {
         const int tr = tt >> 2, tc = tt & 3;
         FC acc;
@@ -129,21 +135,22 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             for (int e = 0; e < DK; e += 16) {
                 FA a;
                 FBc b;
-                wmma::load_matrix_sync(a, K + (row0 + tr * 16) * DK + e, DK);
-                wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
+                wmma::load_matrix_sync(a, kst + tr * 16 * LDK + e, LDK);
+                wmma::load_matrix_sync(b, kst + tc * 16 * LDK + e, LDK);
                 wmma::mma_sync(acc, a, b, acc);
             }
         }
-        wmma::store_matrix_sync(sa + tr * 16 * LDF + tc * 16, acc, LDF, wmma::mem_row_major);
-    }
-    for (int i = tid; i < C * C; i += 256) {
-        const int r = i / C, j = i % C;
-        tm[r * LDF + j] = r == j ? 1.0f : 0.0f;
+        wmma::store_matrix_sync(tm + tr * 16 * LDF + tc * 16, acc, LDF, wmma::mem_row_major);
     }
     __syncthreads();
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        sa[r * LDF + j] = j < r ? bet[r] * sa[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f;
+        sa[r * LDF + j] = j < r ? bet[r] * tm[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f;
+    }
+    __syncthreads();
+    for (int i = tid; i < C * C; i += 256) {
+        const int r = i / C, j = i % C;
+        tm[r * LDF + j] = r == j ? 1.0f : 0.0f;
     }
     __syncthreads();
     // T = (I + A)⁻¹ in 16×16 blocks: diagonal blocks by substitution (warp b
@@ -178,18 +185,17 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         }
         __syncthreads();
     }
-    // T' = T·diag(β e^γ), T'' = T·diag(β) as bf16 operands (over A's space)
-    bf* t1 = (bf*)sa;
-    bf* t2 = t1 + C * LDT;
+    // T'' = T·diag(β) as a bf16 operand over A's space (A is done), then
+    // W = T''·(e^γ k) and U = T''·v with k, v staged over T's space
+    bf* t2 = (bf*)sa;
     float* stg = (float*)(t2 + C * LDT) + warp * 256;
+    bf* ost = (bf*)tm;
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        const float t = tm[r * LDF + j];
-        t1[r * LDT + j] = __float2bfloat16(t * bet[j] * __expf(gam[j]));
-        t2[r * LDT + j] = __float2bfloat16(t * bet[j]);
+        t2[r * LDT + j] = __float2bfloat16(tm[r * LDF + j] * bet[j]);
     }
     __syncthreads();
-    auto tri = [&](const bf* tb, const bf* B, int ncols, bf* out) {
+    auto tri = [&](int ld, int ncols, bf* out) {
         for (int tt = warp; tt < 4 * (ncols / 16); tt += 8) {
             const int tr = tt & 3, tcol = tt >> 2;
             FC acc;
@@ -197,8 +203,8 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             for (int e = 0; e <= tr * 16; e += 16) {
                 FA a;
                 FBr b;
-                wmma::load_matrix_sync(a, tb + tr * 16 * LDT + e, LDT);
-                wmma::load_matrix_sync(b, B + (row0 + e) * ncols + tcol * 16, ncols);
+                wmma::load_matrix_sync(a, t2 + tr * 16 * LDT + e, LDT);
+                wmma::load_matrix_sync(b, ost + e * ld + tcol * 16, ld);
                 wmma::mma_sync(acc, a, b, acc);
             }
             wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
@@ -211,8 +217,21 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             __syncwarp();
         }
     };
-    tri(t1, K, DK, Wo);
-    tri(t2, V, DV, Uo);
+    for (int i = tid; i < C * DK / 2; i += 256) {
+        const int r = i / (DK / 2), x = (i % (DK / 2)) * 2;
+        const __nv_bfloat162 v = *(const __nv_bfloat162*)&K[(row0 + r) * DK + x];
+        const float g = __expf(gam[r]);
+        *(__nv_bfloat162*)&ost[r * LDK + x] = __floats2bfloat162_rn(__low2float(v) * g, __high2float(v) * g);
+    }
+    __syncthreads();
+    tri(LDK, DK, Wo);
+    __syncthreads();
+    for (int i = tid; i < C * DV / 8; i += 256) {
+        const int r = i / (DV / 8), x = (i % (DV / 8)) * 8;
+        *(uint4*)&ost[r * LDV + x] = *(const uint4*)&V[(row0 + r) * DV + x];
+    }
+    __syncthreads();
+    tri(LDV, DV, Uo);
 #else
     __syncthreads();
     for (int i = tid; i < C * DV / 2; i += 256) {
