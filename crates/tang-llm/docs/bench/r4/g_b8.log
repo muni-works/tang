@@ -1,0 +1,39 @@
+coder: 8 of 48 layers in VRAM (20 s)
+coder: 16 of 48 layers in VRAM (40 s)
+coder: 24 of 48 layers in VRAM (60 s)
+coder: 32 of 48 layers in VRAM (80 s)
+coder: 40 of 48 layers in VRAM (100 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (120 s)
+coder: no derived MoE for (1, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (2, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (3, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (4, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (5, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (6, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (7, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (8, 8, 13, 14, false) (down type 14); hand kernels
+coder: derived MoE: 8 of 16 shapes built in 7.4 s
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 121 s, kernels 130 s, total 252 s
+coder: 127 sequence slots fit (0.28 GB each, 99.9 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 1 (prompt 1377 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 2 (prompt 1374 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 0 of 9723904 entries
+batch-check: PASS (bitwise) (logits checksum 0e4e4af3f0bb966d)
+batch 1: prefilled to ~1380 tokens in 1.9 s
+batch 1: 5.18 ms a step, 193 tok/s aggregate, 193 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.9 s
+batch 2: 6.00 ms a step, 333 tok/s aggregate, 167 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 7.7 s
+batch 4: 7.64 ms a step, 524 tok/s aggregate, 131 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 15.3 s
+batch 8: 11.42 ms a step, 701 tok/s aggregate, 88 tok/s a stream (context ~1380)
+exit 0

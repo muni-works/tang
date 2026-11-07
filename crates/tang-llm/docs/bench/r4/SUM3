@@ -1,0 +1,49 @@
+batch-check tolerance: tokens agree 98.58% (1942/1970, same history), max |dlogit| 16.2508, mean 1.51e-1 (bar: 99%, mean <= 0.2)
+batch-check: FAIL (logits checksum aa623fd244e5d8d7)
+batch 1: prefilled to ~1380 tokens in 2.0 s
+batch 1: 5.22 ms a step, 192 tok/s aggregate, 192 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.7 s
+batch 2: 5.54 ms a step, 361 tok/s aggregate, 180 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 7.4 s
+batch 4: 7.20 ms a step, 556 tok/s aggregate, 139 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 14.8 s
+batch 8: 11.01 ms a step, 727 tok/s aggregate, 91 tok/s a stream (context ~1380)
+batch 16: prefilled to ~1380 tokens in 29.3 s
+batch 16: 15.90 ms a step, 1006 tok/s aggregate, 63 tok/s a stream (context ~1380)
+batch 32: prefilled to ~1380 tokens in 57.6 s
+batch 32: 23.45 ms a step, 1365 tok/s aggregate, 43 tok/s a stream (context ~1380)
+batch 48: prefilled to ~1380 tokens in 85.8 s
+batch 48: 31.71 ms a step, 1514 tok/s aggregate, 32 tok/s a stream (context ~1380)
+Error: batch-check failed
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+batch-check: PASS (bitwise) (logits checksum 0e4e4af3f0bb966d)
+batch 1: prefilled to ~1380 tokens in 1.9 s
+batch 1: 5.18 ms a step, 193 tok/s aggregate, 193 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.9 s
+batch 2: 6.00 ms a step, 333 tok/s aggregate, 167 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 7.7 s
+batch 4: 7.64 ms a step, 524 tok/s aggregate, 131 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 15.3 s
+batch 8: 11.42 ms a step, 701 tok/s aggregate, 88 tok/s a stream (context ~1380)
+batch-check tolerance: tokens agree 99.00% (2373/2397, same history), max |dlogit| 10.0505, mean 1.42e-1 (bar: 99%, mean <= 0.2)
+batch-check: FAIL (logits checksum 4c1cc97f3193e028)
+batch 1: prefilled to ~1380 tokens in 1.7 s
+batch 1: 4.11 ms a step, 243 tok/s aggregate, 243 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.3 s
+batch 2: 4.82 ms a step, 415 tok/s aggregate, 207 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 6.6 s
+batch 4: 6.58 ms a step, 608 tok/s aggregate, 152 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 13.1 s
+batch 8: 9.91 ms a step, 807 tok/s aggregate, 101 tok/s a stream (context ~1380)
+batch 16: prefilled to ~1380 tokens in 26.0 s
+batch 16: 16.05 ms a step, 997 tok/s aggregate, 62 tok/s a stream (context ~1380)
+batch 32: prefilled to ~1380 tokens in 51.0 s
+batch 32: 23.65 ms a step, 1353 tok/s aggregate, 42 tok/s a stream (context ~1380)
+batch 48: prefilled to ~1380 tokens in 75.2 s
+batch 48: 30.18 ms a step, 1590 tok/s aggregate, 33 tok/s a stream (context ~1380)
+Error: batch-check failed
+  teacher-forced max KL(narrow || wide) over 32 steps: 2.30e-5 (bar 2.0e-4)
+wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861949 of 4861952)
+  teacher-forced max KL(narrow || wide) over 32 steps: 1.28e-5 (bar 3.2e-5)
+wide-check 8000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861948 of 4861952)
+DONE

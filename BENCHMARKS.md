@@ -3630,3 +3630,40 @@ The 3000 KL regression (4.06e-5 on the round-1 build) is new since the first gat
 path changed since then in its reduction orders (the norm's sum of squares split across a block,
 x quantized by a writer kernel). Not bisected yet. The 8000 KL improved. Decode is unchanged within noise.
 Pod ≈ 45 min ($4), terminated.
+
+### Round 4: wide-check regression bisected and fixed (fourth H200, `crates/tang-llm/docs/bench/r4/`)
+
+Each narrow-path change since round 1 was undone one at a time (wide-check 3000, int8 KV). Only one mattered: the rmsnorm sum of squares split into 256-wide blocks.
+
+| variant | wide-check 3000 KL |
+|---|---|
+| round-3 build | 2.81e-4 (FAIL) |
+| shared expert back on MMA | 1.95e-4 |
+| norm sum serial (`SS_SPLIT=0`) | 4.06e-5 |
+| x quantized inline | 2.81e-4 |
+| y kept | 2.81e-4 |
+| all four undone | 9.62e-5 |
+
+KL by sum split width: 0 → 4.06e-5, 64 → 1.84e-4, 128 → 5.86e-5, 256 → 2.81e-4, 512 → 4.40e-4, 1024 → 2.30e-5. KL does not fall steadily with width; it moves with summation order. The new default is 1024, which matches the hand norm's thread count.
+
+Gates with split 1024:
+
+| gate | result |
+|---|---|
+| wide-check 3000 (int8) | PASS, KL 2.30e-5 (bar 2.0e-4; round 1: 4.06e-5) |
+| wide-check 8000 (int8) | PASS, KL 1.28e-5 (bar 3.2e-5) |
+| batch-check N=8 | PASS, bitwise (checksum 0e4e4af3f0bb966d) |
+| batch-check N=48 | 98.58% token agreement, mean \|dlogit\| 0.151: just under the 99% bar |
+
+The N=48 gate is borderline for the hand engine too: in the same run it scored 99.00% and also printed FAIL.
+
+Decode ms a step (context ~1380):
+
+| N | hand | derived |
+|---|---|---|
+| 1 | 4.11 | 5.18 |
+| 8 | 9.91 | 11.42 |
+| 16 | 16.05 | 15.90 |
+| 48 | 30.18 | 31.71 |
+
+Fusing gate|up+SiLU into one weight pass was not attempted this round.
