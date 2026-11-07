@@ -1205,7 +1205,8 @@ impl ChunkedScan {
         let smem1 = (self.n * ldb + 2 * c * ldb) * 2 + c * 4 + 4 * 512 * 4;
         let smem2 = 2 * c * (c + 4) * 4 + c * (c + 8) * 4 + c * (c + 8) * 2 + c * (self.n + 8) * 2 + 4 * c * 4 + 16 + 8 * 256 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
-            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{extra}{PRELUDE}{body}")
+            let x = std::env::var("TANG_SCAN_DEFS").unwrap_or_default().replace(';', "\n");
+            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{x}\n{extra}{PRELUDE}{body}")
         };
         let chunks = ((self.t / c) as u32, self.heads as u32, 1);
         [
