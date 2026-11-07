@@ -613,6 +613,10 @@ pub fn moe_block(m: MoeShape) -> Spec {
         let inner = sel(down, ExprId::ZERO, ExprId::ONE);
         sel(up, ExprId::ZERO, inner)
     };
+    let sorted = t >= envn("TANG_DMOE_SORT_MIN", 16);
+    // `top3 [t, k, 2]`: the top-k monoid's (id, logit) pairs read in place (no column kernels;
+    // unsorted path, `TANG_DMOE_TOPCOL=1` materializes the columns)
+    let mut top3 = None;
     // routing: the top-k ids `topi [t, k]` and logits `topv [t, k]`, best first, ties to the
     // lower id. Default: every expert's rank counted by comparison (all experts in parallel),
     // then the id and logit at each rank; `TANG_DMOE_TOPK=tree`: the top-k monoid (one block a row)
@@ -653,7 +657,12 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        (col(&mut g, 0), col(&mut g, 1))
+        if !sorted && envn("TANG_DMOE_TOPCOL", 0) == 0 {
+            top3 = Some(g.reshape(top, &[t, k, 2]).unwrap());
+            (top, top) // unused below
+        } else {
+            (col(&mut g, 0), col(&mut g, 1))
+        }
     } else {
         // space [t, e | e']: e' ranks above e
         let i3 = g.iota(&[t, ne, ne], 1);
@@ -710,7 +719,10 @@ pub fn moe_block(m: MoeShape) -> Spec {
     // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
     let mut wargs = vec![arg(g.iota(&[t, k], 1), View::identity(2, 2))];
     for j in 0..k {
-        wargs.push(arg(topv, affine(2, &[(&[(0, 1)], 0), (&[], j as i64)])));
+        wargs.push(match top3 {
+            Some(t3) => arg(t3, affine(2, &[(&[(0, 1)], 0), (&[], j as i64), (&[], 1)])),
+            None => arg(topv, affine(2, &[(&[(0, 1)], 0), (&[], j as i64)])),
+        });
     }
     let wts = g
         .comp(&[t, k], &[], wargs, None, move |v| {
@@ -731,12 +743,14 @@ pub fn moe_block(m: MoeShape) -> Spec {
     // routed experts: unsorted (one GEMV a (token, expert) pair, the decode schedule) or, from
     // `TANG_DMOE_SORT_MIN` rows (default 16), pairs sorted by expert so pairs sharing an expert
     // are consecutive positions and share one weight read on the int8 tensor cores
-    let sorted = t >= envn("TANG_DMOE_SORT_MIN", 16);
     let xq = tag(g.map(&[x], |v| v[0]).unwrap(), "xq");
     let silu = |v: &[ExprId]| v[0] / (ExprId::ONE + (-v[0]).exp()) * v[1];
     let (eg, eu, h, dn, rank) = if !sorted {
         // space [t, j, row | col], expert id = top[t, 2j]
-        let id_view = View::pick(4, &[Some(0), Some(1)]);
+        let id_arg = || match top3 {
+            Some(t3) => arg(t3, affine(4, &[(&[(0, 1)], 0), (&[(1, 1)], 0), (&[], 0)])),
+            None => arg(topi, View::pick(4, &[Some(0), Some(1)])),
+        };
         let gx = |g: &mut TensorGraph, w: TensorId| {
             g.comp(
                 &[t, k, ff],
@@ -744,7 +758,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 vec![
                     arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
                     arg(xq, View::pick(4, &[Some(0), Some(3)])),
-                    arg(topi, id_view.clone()),
+                    id_arg(),
                 ],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[1]],
@@ -761,7 +775,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 vec![
                     arg(wd, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
                     arg(h, View::pick(4, &[Some(0), Some(1), Some(3)])),
-                    arg(topi, id_view.clone()),
+                    id_arg(),
                 ],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[1]],
@@ -977,6 +991,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
         g.set_inline(sh, true);
     }
     g.set_schedule(routed, 0, (0, 0, 0), (1, 1));
+    g.set_inline(wts, envn("TANG_DMOE_INLINE_W", 0) == 1);
+    g.set_inline(routed, envn("TANG_DMOE_INLINE_R", 0) == 1);
     Spec {
         g,
         ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo],
