@@ -198,43 +198,74 @@ fn layer_graph(m: Dims) -> Layer {
             |v| vec![v[0] * v[1]],
         )
         .unwrap();
-    // top-k over the routed logits: round j takes the argmax with earlier picks masked
+    // top-k over the routed logits: one reduction with the top-k monoid (the k
+    // best (index, logit) pairs, best first; ties to the smaller index, as k
+    // argmax rounds would pick). `TANG_MOE_ARGMAX_ROUNDS=1`: the k rounds.
     let iota_e = g.iota(&[t, e], 1);
-    let mut picks: Vec<TensorId> = Vec::new();
-    let slot = |j: i64| View {
-        forms: vec![Form::unit(2, 0), Form::constant(2, j)],
+    let col = |c: i64| View {
+        forms: vec![Form::unit(2, 0), Form::constant(2, c)],
         guard: false,
         gather: None,
     };
-    for _ in 0..k {
-        let mut args = vec![
-            arg(logits, View::identity(2, 2)),
-            arg(iota_e, View::identity(2, 2)),
-        ];
-        args.extend(picks.iter().map(|&q| arg(q, slot(0))));
-        let n_prev = picks.len();
-        let masked = g
-            .comp(&[t, e], &[], args, None, |v| {
-                let mut hit = ExprId::ZERO;
-                for j in 0..n_prev {
-                    hit = hit + eq(v[1], v[2 + j]);
-                }
-                vec![v[0] - hit * ExprId::from_f64(1e9)]
-            })
-            .unwrap();
-        let am = g
+    // picks[j] = (tensor, column of its index); its logit is the next column
+    let mut picks: Vec<(TensorId, i64)> = Vec::new();
+    if std::env::var("TANG_MOE_ARGMAX_ROUNDS").as_deref() == Ok("1") {
+        for _ in 0..k {
+            let mut args = vec![
+                arg(logits, View::identity(2, 2)),
+                arg(iota_e, View::identity(2, 2)),
+            ];
+            args.extend(picks.iter().map(|&(q, c)| arg(q, col(c))));
+            let n_prev = picks.len();
+            let masked = g
+                .comp(&[t, e], &[], args, None, |v| {
+                    let mut hit = ExprId::ZERO;
+                    for j in 0..n_prev {
+                        hit = hit + eq(v[1], v[2 + j]);
+                    }
+                    vec![v[0] - hit * ExprId::from_f64(1e9)]
+                })
+                .unwrap();
+            let am = g
+                .comp_tuple(
+                    &[t, 2],
+                    &[e],
+                    vec![
+                        arg(iota_e, View::identity(2, 2)),
+                        arg(masked, View::identity(2, 2)),
+                    ],
+                    Some(Monoid::argmax()),
+                    |v| vec![v[0], v[1]],
+                )
+                .unwrap();
+            g.set_schedule(am, 256, (0, 0, 0), (1, 1));
+            picks.push((am, 0));
+        }
+    } else {
+        let tk = g
             .comp_tuple(
-                &[t, 2],
+                &[t, 2 * k],
                 &[e],
                 vec![
                     arg(iota_e, View::identity(2, 2)),
-                    arg(masked, View::identity(2, 2)),
+                    arg(logits, View::identity(2, 2)),
                 ],
-                Some(Monoid::argmax()),
-                |v| vec![v[0], v[1]],
+                Some(Monoid::topk(k)),
+                |v| {
+                    let mut o = vec![v[0], v[1]];
+                    for _ in 1..k {
+                        o.push(ExprId::ZERO);
+                        o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                    }
+                    o
+                },
             )
             .unwrap();
-        picks.push(am);
+        // a block of threads a row, the subgroup tree (one thread a row would
+        // fold all e elements through the k²/2-select combine serially)
+        let split = std::env::var("TANG_MOE_TOPK_SPLIT").map_or(256, |s| s.parse().unwrap());
+        g.set_schedule(tk, split, (0, 0, 0), (1, 1));
+        picks.extend((0..k).map(|j| (tk, 2 * j as i64)));
     }
     // sel[t, j] (j = k: the shared expert, index e) and the combine weights
     // (softmax renormalized over the top k; the shared expert's sigmoid gate)
@@ -252,7 +283,7 @@ fn layer_graph(m: Dims) -> Layer {
         args.extend(
             picks
                 .iter()
-                .map(|&q| arg(q, slot(if weights { 1 } else { 0 }))),
+                .map(|&(q, c)| arg(q, col(if weights { c + 1 } else { c }))),
         );
         g.comp(&[t, k1], &[], args, None, |v| {
             let mut acc = ExprId::ZERO;
@@ -425,6 +456,12 @@ fn schedule(l: &mut Layer, stage: Stage, ksplit: (u32, u32)) {
             ksplit: ksplit.1,
         }),
     );
+    // the narrow GEMV quantizes its own activations: x → Q8x32 and SwiGLU →
+    // Q8x32 inlined into gate|up and down (`CODER_MOE_FUSE=0`: their own kernels)
+    if stage == Stage::Gemv && std::env::var("CODER_MOE_FUSE").as_deref() != Ok("0") {
+        g.set_inline(l.xq, true);
+        g.set_inline(l.h, true);
+    }
     // the router: a 2048-long dot a point, split across a warp
     g.set_schedule(l.logits, 32, (0, 0, 0), (1, 1));
 }
@@ -650,9 +687,13 @@ mod gpu {
             .split(',')
             .map(|s| s.parse().unwrap())
             .collect();
-        let stage = match std::env::var("CODER_MOE_STAGE").as_deref() {
-            Ok("mma") => Stage::Mma,
-            _ => Stage::Fragment,
+        // CODER_MOE_STAGE=frag|mma|gemv forces one; default: the narrow GEMV
+        // schedule at B <= 4, fragment-order MMA above
+        let forced = match std::env::var("CODER_MOE_STAGE").as_deref() {
+            Ok("mma") => Some(Stage::Mma),
+            Ok("frag") => Some(Stage::Fragment),
+            Ok("gemv") => Some(Stage::Gemv),
+            _ => None,
         };
         let iters = 100;
         // one weight set (the largest B's routing reuses it)
@@ -682,6 +723,7 @@ mod gpu {
                 }
                 Err(_) => (2, 1),
             };
+            let stage = forced.unwrap_or(if b <= 4 { Stage::Gemv } else { Stage::Fragment });
             let mut l = layer_graph(m);
             schedule(&mut l, stage, ks);
             let outs = [l.y, l.sel, l.wts, l.logits, l.gu, l.dn, l.rank];
@@ -725,9 +767,9 @@ mod gpu {
                 let (w, c) = time(&rt, &exe, i, &mut flush, iters);
                 let n = k.node;
                 let name = if n == l.gu {
-                    "gate|up (int8 MMA)"
+                    "gate|up"
                 } else if n == l.dn {
-                    "down (int8 MMA)"
+                    "down"
                 } else if n == l.h {
                     "SwiGLU → Q8x32"
                 } else if n == l.xq {

@@ -446,6 +446,49 @@ impl Monoid {
         })
     }
 
+    /// The `k` best `(index, value)` pairs, best first: state and element
+    /// are both `(i₀, v₀, …, iₖ₋₁, vₖ₋₁)` sorted by value descending, the
+    /// smaller index first on a tie (the order k argmax rounds pick in, so
+    /// the result is the same whatever the combine order). An element of
+    /// one pair is `(j, w)` followed by `k − 1` identity pairs
+    /// `(0, -f32::MAX)`. The combine is the merge-path rule: the r-th best
+    /// of two sorted lists `A`, `B` is the best of `Aᵣ`, `Bᵣ` and
+    /// `min(Aᵢ₋₁, Bᵣ₋ᵢ)` for `i` in `1..=r` (k²/2 compare-selects, no
+    /// sort). One reduction replaces k argmax rounds and their masks.
+    pub fn topk(k: usize) -> Self {
+        assert!(k >= 1, "top-k of k >= 1");
+        let mut id = Vec::with_capacity(2 * k);
+        for _ in 0..k {
+            id.push(0.0);
+            id.push(-(f32::MAX as f64));
+        }
+        Self::build(2 * k, id, |a, e| {
+            let sel = |c, t, f| tang_expr::with_graph(|g| g.select(c, t, f));
+            // > 0 when x ranks above y (larger value, then smaller index)
+            let better = |x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                let d = x.1 - y.1;
+                sel(d, ExprId::ONE, sel(-d, -ExprId::ONE, y.0 - x.0))
+            };
+            let pick = |c: ExprId, x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                (sel(c, x.0, y.0), sel(c, x.1, y.1))
+            };
+            let hi = |x, y| pick(better(x, y), x, y);
+            let lo = |x, y| pick(better(x, y), y, x);
+            let av: Vec<(ExprId, ExprId)> = (0..k).map(|r| (a[2 * r], a[2 * r + 1])).collect();
+            let bv: Vec<(ExprId, ExprId)> = (0..k).map(|r| (e[2 * r], e[2 * r + 1])).collect();
+            let mut out = Vec::with_capacity(2 * k);
+            for r in 0..k {
+                let mut best = hi(av[r], bv[r]);
+                for i in 1..=r {
+                    best = hi(best, lo(av[i - 1], bv[r - i]));
+                }
+                out.push(best.0);
+                out.push(best.1);
+            }
+            out
+        })
+    }
+
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
     /// `m' = max(m, s)`, `accᵢ' = accᵢ·exp(m−m') + gᵢ·exp(s−m')`.
     pub fn online_softmax(k: usize) -> Self {
@@ -629,6 +672,16 @@ pub struct OperatorNode {
     pub inputs: Vec<TensorId>,
 }
 
+/// [`TNode::segment`]: reduce dim `red` (index into the comp's reduce dims)
+/// only contributes where `key[r] == point coord `point``, `key` a sorted
+/// 1-D tensor read by one of the comp's args as `key[r]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub red: usize,
+    pub key: TensorId,
+    pub point: usize,
+}
+
 #[derive(Clone)]
 pub struct TNode {
     pub op: Op,
@@ -655,6 +708,17 @@ pub struct TNode {
     /// in registers from a block format. See [`IntMma`]. Backends without
     /// the lowering ignore it (and then reject the block formats).
     pub int_mma: Option<IntMma>,
+    /// A fact about the data, not a schedule: this 1-D tensor is
+    /// nondecreasing (e.g. MoE pairs sorted by expert). Set by
+    /// [`TensorGraph::set_sorted`]; the backward uses it to give gathered
+    /// contractions a [`Segment`].
+    pub sorted: bool,
+    /// The reduction's contributing range along one reduce dim is the run
+    /// of a sorted key equal to a point coordinate (a segmented sum). Set by
+    /// the backward of a gather through a [`sorted`](Self::sorted) index;
+    /// the body keeps its `[key == coord]` gate, so lowerings that ignore
+    /// it stay correct and the WGSL point loop binary-searches the run.
+    pub segment: Option<Segment>,
     /// Schedule: combine a `split` reduction's per-thread partials with
     /// subgroup operations (WGSL `subgroupAdd`/`subgroupShuffleXor`, MSL
     /// `simd_sum`/`simd_shuffle_xor`) instead of a workgroup-memory tree:
@@ -701,6 +765,12 @@ pub enum Stage {
     /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
     /// and `16 + 4·tig..`), on both operands.
     Mma,
+    /// No MMA: the narrow schedule for few points a weight slice (decode,
+    /// batch 1). Each output `(p, r)` is a dot of one weight row with one
+    /// activation row on `dp4a`, the row's half-super-blocks spread over
+    /// a group of lanes (as many as `k / 128`, at most 32) and summed by
+    /// shuffles; a warp holds `32 / lanes` rows. `ksplit` is ignored.
+    Gemv,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)
@@ -854,6 +924,17 @@ impl TensorGraph {
         self.nodes[t.n()].subgroup = on;
     }
 
+    /// Assert that 1-D `t` is nondecreasing (data, e.g. keys sorted by an
+    /// earlier comp). Gradients of contractions gathered through it then
+    /// reduce over runs found by binary search instead of the whole dim.
+    pub fn set_sorted(&mut self, t: TensorId, sorted: bool) {
+        self.nodes[t.n()].sorted = sorted;
+    }
+
+    pub fn segment(&self, t: TensorId) -> Option<Segment> {
+        self.nodes[t.n()].segment
+    }
+
     pub fn set_inline(&mut self, t: TensorId, inline: bool) {
         self.nodes[t.n()].inline = inline;
     }
@@ -935,6 +1016,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -954,6 +1037,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -988,6 +1073,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1014,6 +1101,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1161,6 +1250,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1696,6 +1787,8 @@ impl TensorGraph {
                 reg: node.reg,
                 fragment: node.fragment,
                 int_mma: node.int_mma,
+                segment: node.segment,
+                sorted: node.sorted,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
                 precision: node.precision,
@@ -2949,6 +3042,8 @@ impl TensorGraph {
                 reg: (1, 1),
                 fragment: false,
                 int_mma: None,
+                segment: None,
+                sorted: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
                 precision: Precision::default(),
@@ -3547,6 +3642,8 @@ impl TensorGraph {
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
                     int_mma: None,
+                    segment: None,
+                    sorted: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
                     inline: false,
@@ -4888,6 +4985,58 @@ mod tests {
         let want = g.eval(&data, &[am]).remove(0);
         let (sg, so) = g.split_reduction(&[am], am, 4).unwrap();
         close(&sg.eval(&data, &so).remove(0), &want);
+
+        // top-k: k argmax rounds in one tuple reduction, ties to the smaller
+        // index, the same result split or not
+        for k in [1usize, 3, 5] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[2, 16]);
+            let i = g.iota(&[2, 16], 1);
+            let tk = g
+                .comp_tuple(
+                    &[2, 2 * k],
+                    &[16],
+                    vec![
+                        Arg {
+                            src: i,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                        Arg {
+                            src: x,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                    ],
+                    Some(Monoid::topk(k)),
+                    |v| {
+                        let mut o = vec![v[0], v[1]];
+                        for _ in 1..k {
+                            o.push(ExprId::ZERO);
+                            o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                        }
+                        o
+                    },
+                )
+                .unwrap();
+            let data = vec![(0..32)
+                .map(|j| ((j * 7) % 5) as f64 + 0.01 * (j % 3) as f64)
+                .collect::<Vec<_>>()];
+            let got = g.eval(&data, &[tk]).remove(0);
+            for row in 0..2 {
+                let mut idx: Vec<usize> = (0..16).collect();
+                let v = &data[0][row * 16..row * 16 + 16];
+                idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap().then(a.cmp(&b)));
+                for r in 0..k {
+                    assert_eq!(
+                        got[row * 2 * k + 2 * r] as usize,
+                        idx[r],
+                        "k {k} row {row} rank {r}"
+                    );
+                    assert_eq!(got[row * 2 * k + 2 * r + 1], v[idx[r]]);
+                }
+            }
+            let (sg, so) = g.split_reduction(&[tk], tk, 4).unwrap();
+            close(&sg.eval(&data, &so).remove(0), &got);
+        }
 
         // the rule: a 2-point, 4096-long sum splits to fill 64 points
         let mut g = TensorGraph::new();

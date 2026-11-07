@@ -257,6 +257,41 @@ impl TensorGraph {
         let w_off = offset_expr(&wa.view, &ws, &names, Some("KEY"));
         let x_off = offset_expr(&xa.view, &xs, &names, xkey.as_ref().map(|_| "XKEY"));
         let x_total: usize = xs.iter().product();
+        // X's writer inlined (its node marked inline): only the GEMV, which
+        // recomputes and quantizes a position's row in shared memory
+        let xn = xa.src.n();
+        let fused = if self.nodes[xn].inline {
+            if s.stage != Stage::Gemv {
+                return Err("an inlined Q8x32 producer needs the Gemv stage".into());
+            }
+            Some(self.gemv_prologue(xn, xa, &names, xkey.is_some(), reads, k)?)
+        } else {
+            None
+        };
+        if s.stage == Stage::Gemv {
+            let wp = param(wi)?;
+            let xp = if fused.is_some() {
+                String::new()
+            } else {
+                param(xi)?
+            };
+            return Ok(gemv_kernel(&GemvShape {
+                reads: reads.len(),
+                npos,
+                rows,
+                k,
+                b,
+                decode: &decode,
+                wkey: &wkey,
+                xkey: xkey.as_deref(),
+                w_off: &w_off,
+                x_off: &x_off,
+                x_total,
+                wp: &wp,
+                xp: &xp,
+                fused: fused.as_deref(),
+            }));
+        }
         let ksplit = s.ksplit as usize;
         if ![1, 2, 4, 8].contains(&ksplit) || (k / 256) % ksplit != 0 {
             return Err(format!("ksplit {ksplit} must divide 8 and k / 256"));
@@ -444,4 +479,247 @@ impl TensorGraph {
         let _ = (wp, x_total);
         Ok((src, 256, npos * row_blocks))
     }
+
+    /// The [`Stage::Gemv`] prologue computing the inlined producer `xn`'s
+    /// row at position `P` (the pointwise comp X is, read through `xa`) and
+    /// quantizing it Q8x32 into shared `tang_sx` / `tang_ss`, as the
+    /// writer's [`Q8X32_STORE`] would. The decoded position names `names`
+    /// and `XKEY` (when `has_key`) are in scope where it is pasted.
+    fn gemv_prologue(
+        &self,
+        xn: usize,
+        xa: &super::Arg,
+        names: &[String],
+        has_key: bool,
+        reads: &[usize],
+        k: usize,
+    ) -> Result<String, String> {
+        let pc = self
+            .comp_at(xn)
+            .ok_or("the inlined producer is not a comp")?;
+        if !pc.red.is_empty() || pc.tuple != 0 || pc.width() != 1 {
+            return Err("the inlined producer must be pointwise with one output".into());
+        }
+        let pl = pc.points().len();
+        // producer coordinates: the leading ones from the position, the last k
+        let mut pnames: Vec<String> = Vec::with_capacity(pl);
+        let mut s = String::new();
+        for (i, f) in xa.view.forms[..pl - 1].iter().enumerate() {
+            let mut t = vec![format!("{}", f.offset)];
+            for (j, &c) in f.coefs.iter().enumerate() {
+                if c != 0 && !names[j].is_empty() {
+                    t.push(format!("{c} * (long long)({})", names[j]));
+                }
+            }
+            if let (Some(g), true) = (&xa.view.gather, has_key) {
+                if g.coefs[i] != 0 {
+                    t.push(format!("{} * XKEY", g.coefs[i]));
+                }
+            }
+            writeln!(s, "      const long long tang_pc{i} = {};", t.join(" + ")).unwrap();
+            pnames.push(format!("tang_pc{i}"));
+        }
+        pnames.push("tang_kk".into());
+        let mut vals = Vec::new();
+        let mut loads = String::new();
+        for (ai, a) in pc.args.iter().enumerate() {
+            let n = a.src.n();
+            if a.view.is_gather() || a.view.guard {
+                return Err("the inlined producer's reads must be affine".into());
+            }
+            let qi = reads
+                .iter()
+                .position(|&r| r == n)
+                .ok_or("an inlined producer read is not a buffer")?;
+            if self.nodes[n].precision.storage != Format::F32 {
+                return Err("the inlined producer must read f32".into());
+            }
+            let shape: Vec<usize> = self.nodes[n].shape.iter().map(|d| d.n()).collect();
+            let off = offset_expr(&a.view, &shape, &pnames, None);
+            writeln!(loads, "          const float tang_a{ai} = q{qi}[{off}];").unwrap();
+            vals.push(format!("tang_a{ai}"));
+        }
+        let mut body = String::new();
+        let outs = super::tile::emit_scalar(&mut body, &pc.body, &pc.body_outs, "tang_e", &|v| {
+            vals[v as usize].clone()
+        });
+        let mut b = String::new();
+        for line in body.lines() {
+            let line = super::cuda::float_literals(&line.replacen("let ", "const float ", 1));
+            writeln!(b, "          {}", line.replace("select(", "tang_select(")).unwrap();
+        }
+        write!(
+            s,
+            r#"      // loads of every step first (independent), then the quantization
+      float tang_v[{steps}];
+      #pragma unroll
+      for (int tang_i = 0; tang_i < {steps}; tang_i++) {{
+          const int tang_kk = threadIdx.x + 256 * tang_i;
+{loads}{b}          tang_v[tang_i] = {out};
+      }}
+      #pragma unroll
+      for (int tang_i = 0; tang_i < {steps}; tang_i++) {{
+          const int tang_kk = threadIdx.x + 256 * tang_i;
+          const float v = tang_v[tang_i];
+          float a = fabsf(v);
+          for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+          const float d = a / 127.0f;
+          const int q = d == 0.f ? 0 : (int)fminf(fmaxf(roundf(v / d), -127.f), 127.f);
+          tang_sx[tang_kk] = (signed char)q;
+          int sq = q;
+          for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+          if ((tang_kk & 31) == 0) tang_ss[tang_kk >> 5] = make_float2(d, d * (float)sq);
+      }}
+"#,
+            out = outs[0],
+            steps = k / 256,
+        )
+        .unwrap();
+        Ok(s)
+    }
+}
+
+/// What [`gemv_kernel`] needs from the validated contraction.
+struct GemvShape<'a> {
+    reads: usize,
+    npos: usize,
+    rows: usize,
+    k: usize,
+    b: Blk,
+    decode: &'a str,
+    wkey: &'a str,
+    xkey: Option<&'a str>,
+    w_off: &'a str,
+    x_off: &'a str,
+    x_total: usize,
+    wp: &'a str,
+    xp: &'a str,
+    /// the inlined producer's prologue ([`TensorGraph::gemv_prologue`])
+    fused: Option<&'a str>,
+}
+
+/// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
+/// half super-block (128 columns: sub-blocks `4h..4h + 4`, qs pairs `2h`
+/// and `2h + 1`) at a time; `lanes` lanes share a row, `32 / lanes` rows a
+/// warp, 8 warps a block, one position a block. Same scaling as the MMA
+/// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
+fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
+    let units = g.k / 128;
+    // half-super-blocks a lane (more loads in flight a lane), then lanes a row
+    let upl: usize = std::env::var("TANG_GEMV_UPL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let (bb, qs) = (g.b.bytes, g.b.qs);
+    let row_bytes = g.k / 256 * bb;
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let (five_load, five) = if g.b.five {
+        (
+            "                const uint4 h4[2] = {__ldg((const uint4*)(bp + 16)), __ldg((const uint4*)(bp + 32))};\n",
+            "                    const unsigned qh = w & 4 ? (&h4[1].x)[w & 3] : (&h4[0].x)[w & 3];\n                    lo |= ((qh >> (2 * jp)) & 0x01010101u) << 4;\n                    hi |= ((qh >> (2 * jp + 1)) & 0x01010101u) << 4;\n",
+        )
+    } else {
+        ("", "")
+    };
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let xsrc = match g.fused {
+        // the row in shared memory, quantized by the whole block
+        Some(pro) => format!(
+            "    __shared__ __align__(16) signed char tang_sx[{k}];\n    __shared__ float2 tang_ss[{kb}];\n    {{ const long long P = pos;\n{decode}{xkey_decl}{pro}    }}\n    __syncthreads();\n    (void)xr;\n    const signed char* xc = tang_sx;\n    const float2* xs = tang_ss;\n",
+            k = g.k,
+            kb = g.k / 32,
+            decode = g.decode,
+        ),
+        None => format!(
+            "    const signed char* xc = (const signed char*)({xp}) + xr;\n    const float2* xs = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;\n",
+            xp = g.xp,
+            x_total = g.x_total,
+        ),
+    };
+    // shared rows are not read through the read-only cache
+    let xld = if g.fused.is_some() { "*" } else { "__ldg" };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    if g.fused.is_some() {
+        src.push_str(
+            "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
+        );
+    }
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (pos >= {npos}) return;
+    const bool live = r < {rows};
+    long long KEY, xr;
+    {{ const long long P = pos;
+{decode}      KEY = {wkey};
+{xkey_decl}      xr = ({x_off}); }}
+    const unsigned char* wbase;
+    {{ const long long P = pos;
+{decode}      wbase = (const unsigned char*)({wp}) + ({w_off}) / 256 * {bb}; }}
+    const unsigned char* wr = wbase + (size_t)(live ? r : 0) * {row_bytes};
+{xsrc}    float acc = 0.f;
+    if (live) {{
+        for (int u = u0; u < {units}; u += {lanes}) {{
+            const int sb = u >> 1, h = u & 1;
+            const unsigned char* bp = wr + sb * {bb};
+            const unsigned dw = __ldg((const unsigned*)bp);
+            const float d = tang_h2f_bits((unsigned short)(dw & 0xFFFFu)), dm = tang_h2f_bits((unsigned short)(dw >> 16));
+            const unsigned s0 = __ldg((const unsigned*)(bp + 4)), s1 = __ldg((const unsigned*)(bp + 8)), s2 = __ldg((const unsigned*)(bp + 12));
+            // 6-bit scales / mins of sub-blocks 4h..4h+3, one byte lane each
+            const unsigned sc = h ? ((s2 & 0x0F0F0F0Fu) | (((s0 >> 6) & 0x03030303u) << 4)) : (s0 & 0x3F3F3F3Fu);
+            const unsigned mn = h ? (((s2 >> 4) & 0x0F0F0F0Fu) | (((s1 >> 6) & 0x03030303u) << 4)) : (s1 & 0x3F3F3F3Fu);
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {{
+                const int jp = 2 * h + jj;
+                int dl = 0, dh = 0;
+                // 16-byte loads: the pair's 32 code bytes, both sub-blocks' 32 activations
+                const uint4* qv = (const uint4*)(bp + {qs} + jp * 32);
+                const int4* xlv = (const int4*)(xc + sb * 256 + (2 * jp) * 32);
+                const int4* xhv = (const int4*)(xc + sb * 256 + (2 * jp + 1) * 32);
+                const uint4 q4[2] = {{__ldg(qv), __ldg(qv + 1)}};
+                const int4 xl4[2] = {{{xld}(xlv), {xld}(xlv + 1)}}, xh4[2] = {{{xld}(xhv), {xld}(xhv + 1)}};
+{five_load}                #pragma unroll
+                for (int w = 0; w < 8; w++) {{
+                    const unsigned q = w & 4 ? (&q4[1].x)[w & 3] : (&q4[0].x)[w & 3];
+                    unsigned lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+{five}                    const int xl = w & 4 ? (&xl4[1].x)[w & 3] : (&xl4[0].x)[w & 3];
+                    const int xh = w & 4 ? (&xh4[1].x)[w & 3] : (&xh4[0].x)[w & 3];
+                    dl = __dp4a((int)lo, xl, dl);
+                    dh = __dp4a((int)hi, xh, dh);
+                }}
+                const int il = 2 * jj, ih = 2 * jj + 1; // byte lanes of sub-blocks 2jp, 2jp+1
+                const float2 xa = {xld}(xs + sb * 8 + 2 * jp), xb = {xld}(xs + sb * 8 + 2 * jp + 1);
+                acc = fmaf(d * (float)((sc >> (8 * il)) & 0xFFu) * xa.x, (float)dl, fmaf(-dm * (float)((mn >> (8 * il)) & 0xFFu), xa.y, acc));
+                acc = fmaf(d * (float)((sc >> (8 * ih)) & 0xFFu) * xb.x, (float)dh, fmaf(-dm * (float)((mn >> (8 * ih)) & 0xFFu), xb.y, acc));
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int o = {lanes} / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (live && u0 == 0) out[(long long)pos * {rows} + r] = acc;
+}}
+"#,
+        params = params.join(", "),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        x_off = g.x_off,
+        wp = g.wp,
+        w_off = g.w_off,
+    )
+    .unwrap();
+    (src, 256, g.npos * row_blocks)
 }
