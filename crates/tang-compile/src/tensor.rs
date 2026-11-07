@@ -53,6 +53,11 @@ pub mod cuda_mega;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
+/// Algorithm discovery: online, scan and chunked lifts.
+#[path = "tensor_discover.rs"]
+pub mod discover;
+#[path = "tensor_discover_catalog.rs"]
+pub mod discover_catalog;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
