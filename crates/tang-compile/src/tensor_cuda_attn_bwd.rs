@@ -36,6 +36,8 @@ const BI: usize = 64;
 /// Shared-memory row padding (halves): keeps `ldmatrix` rows in
 /// distinct banks.
 const PADH: usize = 8;
+/// Query-chunk buffers in the warp-specialized ring.
+const NST: usize = 2;
 
 /// An operand staged into shared memory as `[rows][e]` halves: rows
 /// along the query (`side_i`) or key dim, `e` the contraction's lane.
@@ -377,6 +379,16 @@ impl TensorGraph {
         }
         let live = self.live(outputs);
         for root in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
+            if std::env::var_os("TANG_ATTN_DEBUG").is_some() {
+                if let Some(c) = self.comp_at(root) {
+                    eprintln!(
+                        "attn_bwd: candidate {root} tile {:?} outs {} red {:?}",
+                        self.nodes[root].tile,
+                        c.body_outs.len(),
+                        self.tiled_reduction(root)
+                    );
+                }
+            }
             if self.nodes[root].tile.0 == 0 {
                 continue;
             }
@@ -421,7 +433,7 @@ impl TensorGraph {
                             == Some(super::super::MonoidKind::Sum)
                             && r.red.len() == 1
                             && r.tuple == 0
-                            && r.red[0].fixed().is_some_and(|e| e <= 128)
+                            && r.red[0].fixed().is_some_and(|e| e <= 256)
                             && super::super::bilinear_terms(&r.body, r.body_outs[0]).is_some()
                             && r.args.iter().all(|x| {
                                 !x.view.guard
@@ -554,19 +566,28 @@ impl TensorGraph {
         // variants past MMA_SHAPES exist only on Hopper (227 KB of shared
         // memory per block); the rest must fit an sm_86's 99 KB
         let cap = match variant {
+            _ if super::cuda_sm() >= 90 => 227 * 1024,
             Some(v) if v >= super::MMA_SHAPES.len() => 227 * 1024,
             _ => 99 * 1024,
         };
         // Hopper variants: every third one the wgmma kernel (two warpgroups
         // of 64 keys), the others mma.sync at 64 or 128 keys
-        let wg = cap > 99 * 1024
-            && std::env::var("TANG_ATTN_WG").ok().as_deref() != Some("0")
-            && variant.is_some_and(|v| (v - super::MMA_SHAPES.len()) % 3 == 0);
+        let hv = variant
+            .filter(|&v| v >= super::MMA_SHAPES.len())
+            .map(|v| (v - super::MMA_SHAPES.len()) % 4);
+        let wg = std::env::var("TANG_ATTN_WG").ok().as_deref() != Some("0")
+            && matches!(hv, Some(0) | Some(1));
+        let ws = hv == Some(0) && std::env::var("TANG_ATTN_WS").ok().as_deref() != Some("0");
         let bj = if wg { 128 } else { bj };
         let Some(src) = self
-            .cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, wg)
-            .or_else(|| self.cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, false))
-            .or_else(|| self.cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, BJS[0], cap, false))
+            .cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, wg, ws)
+            .or_else(|| self.cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, wg, false))
+            .or_else(|| {
+                self.cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, false, false)
+            })
+            .or_else(|| {
+                self.cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, BJS[0], cap, false, false)
+            })
         else {
             return false;
         };
@@ -619,7 +640,10 @@ impl TensorGraph {
         let rank = rc.rank();
         let (dx, dy, kdim) = (b.dx, b.dy, b.kdim);
         let (nk, d, nq) = (b.m, b.n, b.k_total);
-        if !nk.is_multiple_of(BJS[0]) || !nq.is_multiple_of(BI) || !(d == 64 || d == 128) {
+        // d = 256 only on Hopper (it needs the shared memory), split by
+        // columns across the block
+        let wide = d == 256 && super::cuda_sm() >= 90;
+        if !nk.is_multiple_of(BJS[0]) || !nq.is_multiple_of(BI) || !(d == 64 || d == 128 || wide) {
             return trace(2);
         }
         // every buffer the kernel touches is bf16 or f32
@@ -684,7 +708,7 @@ impl TensorGraph {
                 let [term] = &nst.terms[..] else {
                     return trace(5);
                 };
-                if !(nst.e == 64 || nst.e == 128) {
+                if !(nst.e == 64 || nst.e == 128 || (nst.e == 256 && super::cuda_sm() >= 90)) {
                     return trace(6);
                 }
                 let j_stage = stage_of(Stage {
@@ -917,13 +941,22 @@ impl TensorGraph {
         bj: usize,
         smem_cap: usize,
         wg: bool,
+        ws: bool,
     ) -> Option<String> {
+        // warp-specialized (wgmma only): a producer warpgroup stages the
+        // query chunks into a ring of NST buffers behind mbarriers
+        let ws = ws && wg;
         let p = self.attn_bwd_build(root, red, dq, reads)?;
-        if !p.nk.is_multiple_of(bj) || (wg && bj != 128) {
+        // d = 256: the block's two halves take the same 64 keys and half
+        // the lanes each (dV, dK, dQ), both computing S and dP
+        let cs = p.d > 128;
+        let bj = if cs { 64 } else { bj };
+        if !p.nk.is_multiple_of(bj) || (wg && !cs && bj != 128) || (cs && bj != 64) {
             return None;
         }
-        let warps = bj / 16;
-        let threads = warps * 32;
+        let dn = if cs { p.d / 2 } else { p.d };
+        let warps = if cs { 8 } else { bj / 16 };
+        let threads = warps * 32 + if ws && wg { 128 } else { 0 };
         let storage = |j: usize| self.storage(TensorId(j as u32)).n();
         let fmt = |j: usize| self.nodes[j].precision.storage;
         let ld = |j: usize, idx: &str| -> String {
@@ -998,14 +1031,16 @@ impl TensorGraph {
             && std::env::var("TANG_ATTN_ATOMIC").is_err();
         // (wgmma: one partial per warpgroup, each over its own keys)
         let sq_h = if bulk {
-            BI * d * 2 * if wg { 2 } else { 1 }
+            BI * d * 2 * if wg && !cs { 2 } else { 1 }
         } else {
             0
         };
         if wg && !bulk {
             return None;
         }
-        let nbuf = if (off + i_region + ds_h + sq_h) * 2 <= smem_cap {
+        let nbuf = if ws {
+            NST
+        } else if (off + i_region + ds_h + sq_h) * 2 <= smem_cap {
             2
         } else {
             1
@@ -1021,6 +1056,9 @@ impl TensorGraph {
         };
         let sq_off = off + ds_h;
         let smem_halves = sq_off + sq_h;
+        // the ring's full/empty mbarriers
+        let bar_bytes = if ws { 16 * NST } else { 0 };
+        let smem_halves = smem_halves + bar_bytes / 2;
         if smem_halves * 2 + if wg { 1024 } else { 0 } > smem_cap {
             return None;
         }
@@ -1057,8 +1095,8 @@ impl TensorGraph {
             for (ta, tb) in [(false, false), (false, true), (true, false), (true, true)] {
                 s.push_str(&super::sm90_wgmma_ss("bf16", BI, ta, tb));
             }
-            s.push_str(&wgmma_rs(d, false));
-            s.push_str(&wgmma_rs(d, true));
+            s.push_str(&wgmma_rs(dn, false));
+            s.push_str(&wgmma_rs(dn, true));
         }
         let mut params: Vec<String> = reads
             .iter()
@@ -1128,7 +1166,7 @@ impl TensorGraph {
         // stage `t` (rows from origin `r0`) into shared memory: 16-byte
         // cp.async along the stored-contiguous dim when it is bf16 and
         // aligned, else converted element by element
-        let stage = |s: &mut String, t: usize, r0: &str| {
+        let stage = |s: &mut String, t: usize, r0: &str, nthr: usize| {
             let st = &p.stages[t];
             let tl = &tiles[t];
             let (rows, row_dim) = if st.side_i { (BI, kdim) } else { (bj, dy) };
@@ -1154,7 +1192,7 @@ impl TensorGraph {
                 let mc = self.comp_at(st.buf).unwrap();
                 writeln!(
                     s,
-                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    "        for (unsigned idx = tid; idx < {}u; idx += {nthr}u) {{",
                     inner * outer
                 )
                 .unwrap();
@@ -1229,7 +1267,7 @@ impl TensorGraph {
                 let per = inner / 8;
                 writeln!(
                     s,
-                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    "        for (unsigned idx = tid; idx < {}u; idx += {nthr}u) {{",
                     inner * outer / 8
                 )
                 .unwrap();
@@ -1251,7 +1289,7 @@ impl TensorGraph {
             } else {
                 writeln!(
                     s,
-                    "        for (unsigned idx = tid; idx < {}u; idx += {threads}u) {{",
+                    "        for (unsigned idx = tid; idx < {}u; idx += {nthr}u) {{",
                     inner * outer
                 )
                 .unwrap();
@@ -1269,21 +1307,35 @@ impl TensorGraph {
         };
         // key-side stages, once
         for t in (0..p.stages.len()).filter(|&t| !p.stages[t].side_i) {
-            stage(&mut s, t, "j0");
+            stage(&mut s, t, "j0", threads);
         }
         writeln!(s, "    tang_cp_commit();").unwrap();
         let n_out = p.outs.len();
-        let nfd = d / 8;
+        let nfd = dn / 8;
         let nfi = BI / 8;
         writeln!(s, "    float acc[{n_out}][{nfd}][4];").unwrap();
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int w = 0; w < {n_out}; w++) for (int f = 0; f < {nfd}; f++) for (int r = 0; r < 4; r++) acc[w][f][r] = 0.0f;").unwrap();
         if wg {
             // warpgroup g owns keys 64g…; warp w of it rows 16(w % 4)…
-            writeln!(s, "    unsigned wgo = (warp / 4u) * 64u;").unwrap();
+            let w0 = if ws { "(warp - 4u)" } else { "warp" };
+            if cs {
+                writeln!(s, "    unsigned wgo = 0u;").unwrap();
+            } else {
+                writeln!(s, "    unsigned wgo = ({w0} / 4u) * 64u;").unwrap();
+            }
             writeln!(s, "    unsigned jw = wgo + (warp % 4u) * 16u;").unwrap();
+        } else if cs {
+            writeln!(s, "    unsigned jw = (warp % 4u) * 16u;").unwrap();
         } else {
             writeln!(s, "    unsigned jw = warp * 16u;").unwrap();
+        }
+        // the lanes this warp's dV/dK cover
+        if cs {
+            let w0 = if ws && wg { "(warp - 4u)" } else { "warp" };
+            writeln!(s, "    unsigned colo = ({w0} / 4u) * {dn}u;").unwrap();
+        } else {
+            writeln!(s, "    unsigned colo = 0u;").unwrap();
         }
         // the chunk walk: chunks the mask zeroes entirely are skipped;
         // the next chunk's query-side stages load while this one computes
@@ -1310,33 +1362,98 @@ impl TensorGraph {
         }
         let nq = p.nq;
         writeln!(s, "    auto next = [&](unsigned i) -> unsigned {{ while (i < {nq}u && ({skip})) i += {BI}u; return i; }};").unwrap();
-        writeln!(s, "    unsigned ib = 0u;").unwrap();
-        writeln!(s, "    unsigned i0 = next(0u);").unwrap();
-        writeln!(s, "    if (i0 < {nq}u) {{").unwrap();
-        for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
-            stage(&mut s, t, "i0");
-        }
-        writeln!(s, "    }}").unwrap();
-        writeln!(s, "    tang_cp_commit();").unwrap();
-        writeln!(s, "    while (i0 < {nq}u) {{").unwrap();
-        writeln!(s, "        unsigned i1 = next(i0 + {BI}u);").unwrap();
-        if nbuf == 2 {
-            writeln!(s, "        ib ^= {i_region}u;").unwrap();
-            writeln!(s, "        if (i1 < {nq}u) {{").unwrap();
-            for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
-                stage(&mut s, t, "i1");
-            }
-            writeln!(s, "        }}").unwrap();
-            writeln!(s, "        ib ^= {i_region}u;").unwrap();
-            writeln!(s, "        tang_cp_commit();").unwrap();
-            writeln!(s, "        tang_cp_wait<1>();").unwrap();
+        let bar_off = (smem_halves * 2 - bar_bytes) as u64;
+        let csync = if ws {
+            "asm volatile(\"bar.sync 1, 256;\" ::: \"memory\");"
         } else {
-            writeln!(s, "        tang_cp_wait<0>();").unwrap();
+            "__syncthreads();"
+        };
+        if ws {
+            writeln!(
+                s,
+                "    unsigned bar_f = sbase + {bar_off}u, bar_e = bar_f + {}u;",
+                8 * NST
+            )
+            .unwrap();
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+            writeln!(s, "        for (unsigned q = 0u; q < {NST}u; q++) {{ tang_bar_init(bar_f + 8u * q, 128u); tang_bar_init(bar_e + 8u * q, 256u); }}").unwrap();
+            writeln!(
+                s,
+                "        asm volatile(\"fence.mbarrier_init.release.cluster;\" ::: \"memory\");"
+            )
+            .unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    tang_cp_wait<0>(); tang_fence_async();").unwrap();
+            writeln!(s, "    __syncthreads();").unwrap();
+            // producer
+            writeln!(s, "    if (warp < 4u) {{").unwrap();
+            writeln!(s, "        tang_setmaxnreg_dec<40>();").unwrap();
+            writeln!(s, "        unsigned it = 0u;").unwrap();
+            writeln!(
+                s,
+                "        for (unsigned i0 = next(0u); i0 < {nq}u; i0 = next(i0 + {BI}u), it++) {{"
+            )
+            .unwrap();
+            writeln!(s, "            unsigned q = it % {NST}u;").unwrap();
+            writeln!(
+                s,
+                "            tang_bar_wait(bar_e + 8u * q, ((it / {NST}u) & 1u) ^ 1u);"
+            )
+            .unwrap();
+            writeln!(s, "            unsigned ib = q * {i_region}u;").unwrap();
+            for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
+                stage(&mut s, t, "i0", 128);
+            }
+            writeln!(s, "            tang_cp_commit();").unwrap();
+            writeln!(s, "            if (it > 0u) {{ tang_cp_wait<1>(); tang_fence_async(); tang_bar_arrive(bar_f + 8u * ((it - 1u) % {NST}u)); }}").unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        if (it > 0u) {{ tang_cp_wait<0>(); tang_fence_async(); tang_bar_arrive(bar_f + 8u * ((it - 1u) % {NST}u)); }}").unwrap();
+            writeln!(s, "        return;").unwrap();
+            writeln!(s, "    }}").unwrap();
+            // consumers
+            writeln!(s, "    tang_setmaxnreg_inc<232>();").unwrap();
+            writeln!(s, "    unsigned it = 0u;").unwrap();
+            writeln!(
+                s,
+                "    for (unsigned i0 = next(0u); i0 < {nq}u; i0 = next(i0 + {BI}u), it++) {{"
+            )
+            .unwrap();
+            writeln!(s, "        unsigned q = it % {NST}u;").unwrap();
+            writeln!(s, "        unsigned ib = q * {i_region}u;").unwrap();
+            writeln!(
+                s,
+                "        tang_bar_wait(bar_f + 8u * q, (it / {NST}u) & 1u);"
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "    unsigned ib = 0u;").unwrap();
+            writeln!(s, "    unsigned i0 = next(0u);").unwrap();
+            writeln!(s, "    if (i0 < {nq}u) {{").unwrap();
+            for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
+                stage(&mut s, t, "i0", threads);
+            }
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    tang_cp_commit();").unwrap();
+            writeln!(s, "    while (i0 < {nq}u) {{").unwrap();
+            writeln!(s, "        unsigned i1 = next(i0 + {BI}u);").unwrap();
+            if nbuf == 2 {
+                writeln!(s, "        ib ^= {i_region}u;").unwrap();
+                writeln!(s, "        if (i1 < {nq}u) {{").unwrap();
+                for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
+                    stage(&mut s, t, "i1", threads);
+                }
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "        ib ^= {i_region}u;").unwrap();
+                writeln!(s, "        tang_cp_commit();").unwrap();
+                writeln!(s, "        tang_cp_wait<1>();").unwrap();
+            } else {
+                writeln!(s, "        tang_cp_wait<0>();").unwrap();
+            }
+            if wg {
+                writeln!(s, "        tang_fence_async();").unwrap();
+            }
+            writeln!(s, "        __syncthreads();").unwrap();
         }
-        if wg {
-            writeln!(s, "        tang_fence_async();").unwrap();
-        }
-        writeln!(s, "        __syncthreads();").unwrap();
         // the nested contractions on the warp's 16 keys × the chunk
         // (wgmma: the warpgroup's 64 keys, from shared memory)
         if wg {
@@ -1465,7 +1582,12 @@ impl TensorGraph {
                 })
                 .collect();
             s.push_str(&pre);
-            writeln!(s, "        float mv{w}[{nfi}][4];").unwrap();
+            writeln!(
+                s,
+                "        unsigned pf{w}[{}][4]; float t{w} = 0.0f;",
+                nfi / 2
+            )
+            .unwrap();
             writeln!(s, "        #pragma unroll").unwrap();
             writeln!(s, "        for (int f = 0; f < {nfi}; f++)").unwrap();
             writeln!(s, "        #pragma unroll").unwrap();
@@ -1486,23 +1608,29 @@ impl TensorGraph {
                 )
                 .unwrap();
             }
-            writeln!(s, "            mv{w}[f][r] = {};", res[0]).unwrap();
+            // packed to bf16 pairs as soon as each pair exists: the A
+            // fragment of k-step f / 2 (rows gq / gq + 8 at r / 2)
+            writeln!(s, "            if (r % 2 == 0) t{w} = {}; else pf{w}[f / 2][(f % 2) * 2 + r / 2] = tang_pack2(t{w}, {});", res[0], res[0]).unwrap();
             writeln!(s, "        }}").unwrap();
             mv_names.push(format!("mv{w}"));
         }
         // dS (the map dQ reads) to shared memory as [key][query]
         let dqw = p.dq_out;
         writeln!(s, "        #pragma unroll").unwrap();
-        writeln!(s, "        for (int f = 0; f < {nfi}; f++) {{").unwrap();
         writeln!(
             s,
-            "            *(unsigned*)(smh + {}) = tang_pack2(mv{dqw}[f][0], mv{dqw}[f][1]);",
+            "        for (int f = 0; f < {nfi}; f++) if (colo == 0u) {{"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            *(unsigned*)(smh + {}) = pf{dqw}[f / 2][(f % 2) * 2];",
             ds.at("jw + gq", "8u * f + 2u * tq")
         )
         .unwrap();
         writeln!(
             s,
-            "            *(unsigned*)(smh + {}) = tang_pack2(mv{dqw}[f][2], mv{dqw}[f][3]);",
+            "            *(unsigned*)(smh + {}) = pf{dqw}[f / 2][(f % 2) * 2 + 1];",
             ds.at("jw + gq + 8u", "8u * f + 2u * tq")
         )
         .unwrap();
@@ -1515,11 +1643,11 @@ impl TensorGraph {
                 let tb = &tiles[o.b_stage];
                 writeln!(s, "        #pragma unroll").unwrap();
                 writeln!(s, "        for (int ks = 0; ks < {}; ks++) {{", BI / 16).unwrap();
-                writeln!(s, "            unsigned fa[4] = {{tang_pack2(mv{w}[2 * ks][0], mv{w}[2 * ks][1]), tang_pack2(mv{w}[2 * ks][2], mv{w}[2 * ks][3]), tang_pack2(mv{w}[2 * ks + 1][0], mv{w}[2 * ks + 1][1]), tang_pack2(mv{w}[2 * ks + 1][2], mv{w}[2 * ks + 1][3])}};").unwrap();
-                let (db, t) = tb.desc(false, "0u", "16u * (unsigned)ks");
+                writeln!(s, "            const unsigned* fa = pf{w}[ks];").unwrap();
+                let (db, t) = tb.desc(false, "colo", "16u * (unsigned)ks");
                 writeln!(
                     s,
-                    "            tang_wgrs{d}_{}(&acc[{w}][0][0], fa, {db});",
+                    "            tang_wgrs{dn}_{}(&acc[{w}][0][0], fa, {db});",
                     t as u8
                 )
                 .unwrap();
@@ -1527,19 +1655,22 @@ impl TensorGraph {
             }
             writeln!(s, "        tang_wg_commit();").unwrap();
             writeln!(s, "        tang_wg_wait<0>();").unwrap();
+            if ws {
+                writeln!(s, "        tang_bar_arrive(bar_e + 8u * q);").unwrap();
+            }
         }
         for (w, o) in p.outs.iter().enumerate().filter(|_| !wg) {
             let tb = &tiles[o.b_stage];
             writeln!(s, "        #pragma unroll").unwrap();
             writeln!(s, "        for (int ks = 0; ks < {}; ks++) {{", BI / 16).unwrap();
-            writeln!(s, "            unsigned fa[4] = {{tang_pack2(mv{w}[2 * ks][0], mv{w}[2 * ks][1]), tang_pack2(mv{w}[2 * ks][2], mv{w}[2 * ks][3]), tang_pack2(mv{w}[2 * ks + 1][0], mv{w}[2 * ks + 1][1]), tang_pack2(mv{w}[2 * ks + 1][2], mv{w}[2 * ks + 1][3])}};").unwrap();
+            writeln!(s, "            const unsigned* fa = pf{w}[ks];").unwrap();
             writeln!(s, "            #pragma unroll").unwrap();
             writeln!(s, "            for (int f = 0; f < {nfd}; f += 2) {{").unwrap();
             writeln!(s, "                unsigned fb[4];").unwrap();
             writeln!(
                 s,
                 "                {}",
-                tb.ldm("fb", false, false, "8u * f", "16u * ks")
+                tb.ldm("fb", false, false, "colo + 8u * f", "16u * ks")
             )
             .unwrap();
             writeln!(s, "                tang_mma16(acc[{w}][f], fa, fb);").unwrap();
@@ -1558,7 +1689,7 @@ impl TensorGraph {
         if wg {
             writeln!(s, "        tang_fence_async();").unwrap();
         }
-        writeln!(s, "        __syncthreads();").unwrap();
+        writeln!(s, "        {csync}").unwrap();
         // wgmma: each warpgroup's dQ partial over its own 64 keys, 64
         // lanes at a time, into its own f32 block
         if wg {
@@ -1568,16 +1699,21 @@ impl TensorGraph {
                 format!(" * {}f", f32_lit(p.dq_scale))
             };
             let tk = &tiles[p.dq_k];
-            writeln!(
-                s,
-                "        float* sqw = (float*)(smh + {sq_off}u) + (warp / 4u) * {}u;",
-                BI * d
-            )
-            .unwrap();
+            if cs {
+                writeln!(s, "        float* sqw = (float*)(smh + {sq_off}u);").unwrap();
+            } else {
+                let w0 = if ws { "(warp - 4u)" } else { "warp" };
+                writeln!(
+                    s,
+                    "        float* sqw = (float*)(smh + {sq_off}u) + ({w0} / 4u) * {}u;",
+                    BI * d
+                )
+                .unwrap();
+            }
             writeln!(s, "        #pragma unroll").unwrap();
             writeln!(
                 s,
-                "        for (unsigned c0 = 0u; c0 < {d}u; c0 += {BI}u) {{"
+                "        for (unsigned c0 = colo; c0 < colo + {dn}u; c0 += {BI}u) {{"
             )
             .unwrap();
             writeln!(s, "            float qa[{nfi}][4];").unwrap();
@@ -1689,10 +1825,24 @@ impl TensorGraph {
         }
         if bulk {
             writeln!(s, "        tang_bulk_fence();").unwrap();
-            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "        {csync}").unwrap();
             let row = |ii: &str| aff(&p.dq_addr, &|dd| coord(dd, "0", &format!("i0 + {ii}"), "0"));
-            if wg {
-                let src = format!("smh + {sq_off}u + (tid / 128u) * {}u", BI * d * 2);
+            if wg && cs {
+                let src = format!("smh + {sq_off}u");
+                if p.dq_addr.coefs[kdim] == d as i64 {
+                    writeln!(s, "        if ({leader} && colo == 0u) {{ tang_bulk_add(dqp + ({}), {src}, {}u); tang_bulk_commit(); }}", row("0u"), BI * d * 4).unwrap();
+                } else {
+                    writeln!(s, "        if ({leader} && colo == 0u) {{").unwrap();
+                    writeln!(s, "            for (unsigned ii = 0u; ii < {BI}u; ii++) tang_bulk_add(dqp + ({}), {src} + ii * {}u, {}u);", row("ii"), 2 * d, d * 4).unwrap();
+                    writeln!(s, "            tang_bulk_commit();").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                }
+            } else if wg {
+                let src = format!(
+                    "smh + {sq_off}u + ({}tid / 128u) * {}u",
+                    if ws { "-1u + " } else { "" },
+                    BI * d * 2
+                );
                 if p.dq_addr.coefs[kdim] == d as i64 {
                     writeln!(s, "        if ({leader}) {{ tang_bulk_add(dqp + ({}), {src}, {}u); tang_bulk_commit(); }}", row("0u"), BI * d * 4).unwrap();
                 } else {
@@ -1710,18 +1860,21 @@ impl TensorGraph {
                 writeln!(s, "        }}").unwrap();
             }
         }
-        if nbuf == 2 {
+        if ws {
+        } else if nbuf == 2 {
             writeln!(s, "        ib ^= {i_region}u;").unwrap();
         } else {
-            writeln!(s, "        __syncthreads();").unwrap();
+            writeln!(s, "        {csync}").unwrap();
             writeln!(s, "        if (i1 < {nq}u) {{").unwrap();
             for t in (0..p.stages.len()).filter(|&t| p.stages[t].side_i) {
-                stage(&mut s, t, "i1");
+                stage(&mut s, t, "i1", threads);
             }
             writeln!(s, "        }}").unwrap();
             writeln!(s, "        tang_cp_commit();").unwrap();
         }
-        writeln!(s, "        i0 = i1;").unwrap();
+        if !ws {
+            writeln!(s, "        i0 = i1;").unwrap();
+        }
         writeln!(s, "    }}").unwrap();
         if bulk {
             writeln!(s, "    if ({leader}) tang_bulk_wait();").unwrap();
@@ -1732,7 +1885,11 @@ impl TensorGraph {
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int r = 0; r < 4; r++) {{").unwrap();
         writeln!(s, "        unsigned p{dy} = j0 + jw + gq + 8u * (r / 2);").unwrap();
-        writeln!(s, "        unsigned p{dx} = 8u * f + 2u * tq + (r % 2);").unwrap();
+        writeln!(
+            s,
+            "        unsigned p{dx} = colo + 8u * f + 2u * tq + (r % 2);"
+        )
+        .unwrap();
         for (w, o) in p.outs.iter().enumerate() {
             if o.scale == 1.0 {
                 writeln!(s, "        float red{w} = acc[{w}][f][r];").unwrap();

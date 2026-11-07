@@ -23,6 +23,31 @@ use super::{TensorGraph, TensorId};
 
 #[path = "tensor_cuda_attn_bwd.rs"]
 mod attn_bwd;
+
+thread_local! {
+    static CUDA_SM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The compute capability (`90` for sm_90a) the lowerings may assume, 0
+/// when unknown. Every variant of a program must share one structure, so
+/// a lowering that only fits one arch (the d=256 attention backward needs
+/// Hopper's shared memory) asks here instead of guessing from a variant.
+pub fn cuda_sm() -> u32 {
+    CUDA_SM.with(|c| c.get())
+}
+
+/// Run `f` with [`cuda_sm`] reporting `sm`.
+pub fn with_cuda_sm<T>(sm: u32, f: impl FnOnce() -> T) -> T {
+    let prev = CUDA_SM.with(|c| c.replace(sm));
+    struct Reset(u32);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CUDA_SM.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
 #[path = "tensor_cuda_fp8.rs"]
 mod fp8;
 pub use fp8::SM90_FP8_SHAPES;
@@ -1858,7 +1883,7 @@ impl TensorGraph {
                 continue;
             }
             let e = r.red[0].fixed()?;
-            if r.red.len() != 1 || !e.is_multiple_of(8) || e > 128 {
+            if r.red.len() != 1 || !e.is_multiple_of(8) || e > 256 {
                 return None;
             }
             let terms = super::bilinear_terms(&r.body, r.body_outs[0])?;
