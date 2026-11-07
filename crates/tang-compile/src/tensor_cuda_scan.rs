@@ -79,6 +79,61 @@ typedef wmma::fragment<wmma::accumulator, 16, 16, 16, float> FC;
 /// from global memory into fragments; shared memory holds only the
 /// `C × C` f32 work (two blocks an SM). Grid `(T/C, H)`, 256 threads.
 const PREP: &str = r#"
+// Unit lower-triangular inverse of the diagonal block at b0 of I + A
+// (A in `sa`), written to `tm`; lane `cl` computes column b0 + cl.
+__device__ __forceinline__ void diag_inv(const float* sa, float* tm, int b0, int cl) {
+    float col[16];
+    #pragma unroll
+    for (int r = 0; r < 16; r++) col[r] = r == cl ? 1.0f : 0.0f;
+    #pragma unroll
+    for (int rr = 1; rr < 16; rr++) {
+        const float* ar = sa + (b0 + rr) * LDF + b0;
+        float a0 = 0.0f, a1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < rr; j += 2) {
+            a0 = fmaf(ar[j], col[j], a0);
+            if (j + 1 < rr) a1 = fmaf(ar[j + 1], col[j + 1], a1);
+        }
+        if (cl < rr) col[rr] = -(a0 + a1);
+    }
+    #pragma unroll
+    for (int r = 0; r < 16; r++) tm[(b0 + r) * LDF + b0 + cl] = col[r];
+}
+
+// Block column J of T below the diagonal: T_iJ = −T_ii·Σ_{J≤k<i} A_ik·T_kJ,
+// lane `cl` holding column 16J + cl of T in registers.
+template <int J>
+__device__ __forceinline__ void tcol(const float* sa, float* tm, int cl) {
+    float col[C - 16 * J];
+    #pragma unroll
+    for (int r = 0; r < 16; r++) col[r] = tm[(16 * J + r) * LDF + 16 * J + cl];
+    #pragma unroll
+    for (int i = J + 1; i < C / 16; i++) {
+        float x[16];
+        #pragma unroll
+        for (int r = 0; r < 16; r++) {
+            const float* ar = sa + (16 * i + r) * LDF;
+            float a0 = 0.0f, a1 = 0.0f;
+            #pragma unroll
+            for (int k = 16 * J; k < 16 * i; k += 2) {
+                a0 = fmaf(ar[k], col[k - 16 * J], a0);
+                a1 = fmaf(ar[k + 1], col[k + 1 - 16 * J], a1);
+            }
+            x[r] = a0 + a1;
+        }
+        #pragma unroll
+        for (int r = 0; r < 16; r++) {
+            const float* tr = tm + (16 * i + r) * LDF + 16 * i;
+            float acc = 0.0f;
+            #pragma unroll
+            for (int k = 0; k <= r; k++) acc = fmaf(tr[k], x[k], acc);
+            col[16 * (i - J) + r] = -acc;
+        }
+    }
+    #pragma unroll
+    for (int r = 16; r < C - 16 * J; r++) tm[(16 * J + r) * LDF + 16 * J + cl] = col[r];
+}
+
 extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ K, const bf* __restrict__ V,
     const float* __restrict__ AL, const float* __restrict__ BE,
@@ -88,7 +143,6 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     float* tm = sa + C * LDF;      // [C][LDF]  T
     float* gam = tm + C * LDF;     // [C]
     float* bet = gam + C;          // [C]
-    float* xs = bet + C;           // [3][256] block-solve scratch
     const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t row0 = (size_t)h * T + (size_t)c * C;
     if (tid < C) {
@@ -154,48 +208,15 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     }
     __syncthreads();
 #ifndef XNOSOLVE
-    // T = (I + A)⁻¹ in 16×16 blocks: diagonal blocks by substitution (warp b
-    // owns block b, lane = column), then T_ij = −T_ii·Σ_{j≤k<i} A_ik·T_kj
-    if (warp < C / 16) {
-        const int b0 = warp * 16, cl = lane & 15;
-        for (int rr = 1; rr < 16; rr++) {
-            float acc = 0.0f;
-            if (lane < 16 && cl < rr)
-                for (int j = cl; j < rr; j++) acc = fmaf(sa[(b0 + rr) * LDF + b0 + j], tm[(b0 + j) * LDF + b0 + cl], acc);
-            __syncwarp();
-            if (lane < 16 && cl < rr) tm[(b0 + rr) * LDF + b0 + cl] = -acc;
-            __syncwarp();
-        }
+    // T = (I + A)⁻¹ in 16×16 blocks, columns in registers (lane = column)
+    if (warp < C / 16 && lane < 16) diag_inv(sa, tm, warp * 16, lane);
+    __syncthreads();
+    if (lane < 16) {
+        if (warp == 0) tcol<0>(sa, tm, lane);
+        else if (warp == 1) tcol<1>(sa, tm, lane);
+        else if (warp == 2) tcol<2>(sa, tm, lane);
     }
     __syncthreads();
-    for (int bi = 1; bi < C / 16; bi++) {
-        for (int e = tid; e < bi * 256; e += 256) {
-            const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
-            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-            const float* ar = sa + (bi * 16 + r) * LDF;
-            for (int k = bj * 16; k < bi * 16; k += 4) {
-                a0 = fmaf(ar[k], tm[k * LDF + bj * 16 + cc], a0);
-                a1 = fmaf(ar[k + 1], tm[(k + 1) * LDF + bj * 16 + cc], a1);
-                a2 = fmaf(ar[k + 2], tm[(k + 2) * LDF + bj * 16 + cc], a2);
-                a3 = fmaf(ar[k + 3], tm[(k + 3) * LDF + bj * 16 + cc], a3);
-            }
-            xs[e] = (a0 + a1) + (a2 + a3);
-        }
-        __syncthreads();
-        for (int e = tid; e < bi * 256; e += 256) {
-            const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
-            float a0 = 0.0f, a1 = 0.0f;
-            const float* tr_ = tm + (bi * 16 + r) * LDF + bi * 16;
-            int k = 0;
-            for (; k + 1 <= r; k += 2) {
-                a0 = fmaf(tr_[k], xs[(bj << 8) + k * 16 + cc], a0);
-                a1 = fmaf(tr_[k + 1], xs[(bj << 8) + (k + 1) * 16 + cc], a1);
-            }
-            if (k <= r) a0 = fmaf(tr_[k], xs[(bj << 8) + k * 16 + cc], a0);
-            tm[(bi * 16 + r) * LDF + bj * 16 + cc] = -(a0 + a1);
-        }
-        __syncthreads();
-    }
 #endif
     // T'' = T·diag(β) as a bf16 operand over A's space (A is done), then
     // W = T''·(e^γ k) and U = T''·v with k, v staged over T's space
@@ -514,7 +535,7 @@ impl ChunkedScan {
         );
         let d = self.defines();
         let (c, n) = (CHUNK, self.n);
-        let smem1 = 2 * c * (c + 4) * 4 + 2 * c * 4 + 3 * 256 * 4;
+        let smem1 = 2 * c * (c + 4) * 4 + 2 * c * 4;
         let smem2 = (n * (bv + 8) + c * (bv + 8)) * 2 + c * 4 + 4 * 256 * 4;
         let smem3 = (c * (n + 8) + c * (c + 8)) * 2 + c * 4 + 8 * 512 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
