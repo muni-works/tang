@@ -6197,6 +6197,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-all"
+version = "0.1.0"
+dependencies = [
+ "tang",
+ "tang-ad",
+ "tang-compile",
+ "tang-expr",
+ "tang-gpu",
+ "tang-la",
+ "tang-optim",
+ "tang-sparse",
+ "tang-tensor",
+ "tang-train",
+]
+
+[[package]]
 name = "tang-bench"
 version = "0.1.0"
 dependencies = [
@@ -6223,12 +6239,13 @@ dependencies = [
 
 [[package]]
 name = "tang-compile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "naga",
  "tang",
  "tang-expr",
+ "tang-sparse",
 ]
 
 [[package]]
@@ -6349,8 +6366,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tang",
  "tang-ad",
+ "tang-compile",
  "tang-compute",
+ "tang-expr",
  "tang-moe",
  "tang-otel",
  "tang-tensor",
@@ -6412,7 +6432,7 @@ dependencies = [
 
 [[package]]
 name = "tang-optim"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "approx",
  "tang",
@@ -6478,7 +6498,7 @@ dependencies = [
 
 [[package]]
 name = "tang-sparse"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "tang",
