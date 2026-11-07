@@ -253,6 +253,10 @@ impl TensorGraph {
                 Op::Input(_) => true,
                 Op::Comp(_) => !self.nodes[j].inline,
                 Op::Iota(_) | Op::Reshape(_) => false,
+                Op::Operator(o) => panic!(
+                    "operator node `{}` has no device lowering; evaluate it on the host",
+                    o.op.name()
+                ),
             })
             .map(|j| self.storage(TensorId(j as u32)).n())
             .collect();

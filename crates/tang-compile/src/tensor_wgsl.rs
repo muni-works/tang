@@ -353,6 +353,10 @@ impl TensorGraph {
                     Op::Input(k) => (numel(&self.nodes[i].shape), Some(*k)),
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
                     Op::Iota(_) | Op::Reshape(_) => unreachable!(),
+                    Op::Operator(o) => panic!(
+                        "operator node `{}` has no device lowering; evaluate it on the host",
+                        o.op.name()
+                    ),
                 };
                 let format = self.nodes[i].precision.storage;
                 assert!(
@@ -399,6 +403,10 @@ impl TensorGraph {
                 Op::Comp(_) => j == i || self.nodes[j].inline,
                 Op::Reshape(_) => true,
                 Op::Input(_) | Op::Iota(_) => false,
+                Op::Operator(o) => panic!(
+                    "operator node `{}` has no device lowering; evaluate it on the host",
+                    o.op.name()
+                ),
             };
             if descend {
                 stack.extend(self.deps(j).into_iter().map(|d| (d, false)));
@@ -674,6 +682,10 @@ impl TensorGraph {
                 writeln!(s, "    return {v};").unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
+            Op::Operator(o) => panic!(
+                "operator node `{}` has no device lowering; evaluate it on the host",
+                o.op.name()
+            ),
             Op::Iota(d) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 writeln!(s, "    return f32(c{d});").unwrap();

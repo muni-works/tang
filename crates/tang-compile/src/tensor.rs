@@ -84,6 +84,10 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_space.rs"]
 pub mod space;
+/// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
+/// `IndexedGather` operator nodes.
+#[path = "tensor_sparse.rs"]
+pub mod sparse;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
@@ -579,6 +583,50 @@ pub enum Op {
     /// affine (and `backward` can invert them as pick views).
     Reshape(TensorId),
     Comp(Comp),
+    /// An opaque operator: native code forward, a user-supplied adjoint
+    /// backward. See [`Operator`].
+    Operator(OperatorNode),
+}
+
+/// An opaque operator node: whole-tensor native code with its own
+/// adjoint. Solves, simulations and other steps that are not
+/// comprehensions (a sparse linear solve, a rollout) enter the graph as
+/// one of these; everything around them stays comprehensions.
+///
+/// The reference interpreter materializes every input, calls
+/// [`forward`](Operator::forward) once, and stores the result like any
+/// other buffer. [`TensorGraph::backward`] calls
+/// [`backward`](Operator::backward), which appends the adjoint to the
+/// graph: comprehensions, further operator nodes, or both (`LinearSolve`'s
+/// adjoint is a transposed solve followed by an outer-product
+/// comprehension). Device backends do not lower operator nodes; a graph
+/// containing one runs on the interpreter or splits around it.
+pub trait Operator: Send + Sync + std::panic::RefUnwindSafe {
+    /// Short name for debugging and graph dumps.
+    fn name(&self) -> &str;
+
+    /// The output, row-major, from the inputs (row-major, in
+    /// [`OperatorNode::inputs`] order).
+    fn forward(&self, inputs: &[&[f64]]) -> Vec<f64>;
+
+    /// Append the vector-Jacobian product to `g`: given the forward
+    /// node's inputs, its output and the output cotangent `cot`, return
+    /// each input's cotangent (`None` for inputs that are not
+    /// differentiable, such as an index pattern).
+    fn backward(
+        &self,
+        g: &mut TensorGraph,
+        inputs: &[TensorId],
+        output: TensorId,
+        cot: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError>;
+}
+
+/// [`Op::Operator`]: the operator and the tensors it reads.
+#[derive(Clone)]
+pub struct OperatorNode {
+    pub op: std::sync::Arc<dyn Operator>,
+    pub inputs: Vec<TensorId>,
 }
 
 #[derive(Clone)]
@@ -947,6 +995,32 @@ impl TensorGraph {
         Ok(TensorId(self.nodes.len() as u32 - 1))
     }
 
+    /// Append an [`Operator`] node reading `inputs`, with output `shape`.
+    pub fn operator<D: Into<Dim> + Copy>(
+        &mut self,
+        op: std::sync::Arc<dyn Operator>,
+        inputs: &[TensorId],
+        shape: &[D],
+    ) -> TensorId {
+        self.nodes.push(TNode {
+            op: Op::Operator(OperatorNode {
+                op,
+                inputs: inputs.to_vec(),
+            }),
+            shape: dims(shape),
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+            reg: (1, 1),
+            fragment: false,
+            int_mma: None,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            precision: Precision::default(),
+        });
+        TensorId(self.nodes.len() as u32 - 1)
+    }
+
     /// The node whose buffer holds `t`'s bytes: `t` itself, or the source
     /// behind a chain of reshapes.
     pub fn storage(&self, t: TensorId) -> TensorId {
@@ -961,6 +1035,7 @@ impl TensorGraph {
         match &self.nodes[i].op {
             Op::Comp(c) => c.args.iter().map(|a| a.src.n()).collect(),
             Op::Reshape(src) => vec![src.n()],
+            Op::Operator(o) => o.inputs.iter().map(|t| t.n()).collect(),
             Op::Input(_) | Op::Iota(_) => Vec::new(),
         }
     }
@@ -1262,7 +1337,7 @@ impl TensorGraph {
     pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
         }
     }
 
@@ -1537,6 +1612,15 @@ impl TensorGraph {
             });
             reads <= 1 && !transcendental
         };
+        // an operator node reads whole buffers: its inputs stay materialized
+        let mut op_read = vec![false; n];
+        for i in (0..n).filter(|&i| live[i]) {
+            if let Op::Operator(o) = &self.nodes[i].op {
+                for t in &o.inputs {
+                    op_read[t.n()] = true;
+                }
+            }
+        }
         // a map read through a guarded view must stay materialized
         let mut guarded = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
@@ -1554,6 +1638,7 @@ impl TensorGraph {
                         && !is_output(i)
                         && !reshaped[i]
                         && !guarded[i]
+                        && !op_read[i]
                         && (!cost_aware || recompute[i] == Some(1) || cheap(c))
                 })
             })
@@ -1577,6 +1662,14 @@ impl TensorGraph {
                 Op::Input(k) => Op::Input(*k),
                 Op::Iota(d) => Op::Iota(*d),
                 Op::Reshape(src) => Op::Reshape(TensorId(remap[src.n()].unwrap() as u32)),
+                Op::Operator(o) => Op::Operator(OperatorNode {
+                    op: o.op.clone(),
+                    inputs: o
+                        .inputs
+                        .iter()
+                        .map(|t| TensorId(remap[t.n()].unwrap() as u32))
+                        .collect(),
+                }),
                 Op::Comp(c) => {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
@@ -2134,6 +2227,11 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => *src = TensorId(remap[src.n()].unwrap() as u32),
+                Op::Operator(o) => {
+                    for t in &mut o.inputs {
+                        *t = TensorId(remap[t.n()].unwrap() as u32);
+                    }
+                }
                 Op::Input(_) | Op::Iota(_) => {}
             }
             ng.nodes.push(node);
@@ -2312,7 +2410,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => true,
+                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -2594,6 +2692,10 @@ impl TensorGraph {
                 }
             } else if let Op::Reshape(src) = &mut g.nodes[i].op {
                 *src = TensorId(redirect[src.n()] as u32);
+            } else if let Op::Operator(o) = &mut g.nodes[i].op {
+                for t in &mut o.inputs {
+                    *t = TensorId(redirect[t.n()] as u32);
+                }
             }
             let Op::Comp(c) = &g.nodes[i].op else {
                 continue;
@@ -3909,14 +4011,33 @@ impl TensorGraph {
                 .iter()
                 .map(|n| match &n.op {
                     Op::Comp(c) => Some(Compiled {
-                        body: c.body.compile_many(&c.body_outs),
-                        combine: c.monoid.as_ref().map(|m| m.combine.compile_many(&m.outs)),
+                        body: Prog::new(&c.body, &c.body_outs),
+                        combine: c.monoid.as_ref().map(|m| Prog::new(&m.combine, &m.outs)),
+                        direct: c
+                            .args
+                            .iter()
+                            .map(|a| direct_read(self, a, c.rank(), emulate))
+                            .collect(),
                     }),
-                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
                 })
                 .collect(),
         };
         for i in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
+            if let Op::Operator(o) = &self.nodes[i].op {
+                let ins: Vec<std::borrow::Cow<[f64]>> =
+                    o.inputs.iter().map(|t| ev.tensor_ref(*t)).collect();
+                let refs: Vec<&[f64]> = ins.iter().map(|v| &v[..]).collect();
+                let out = o.op.forward(&refs);
+                assert_eq!(
+                    out.len(),
+                    numel(&self.nodes[i].shape),
+                    "operator `{}` returned the wrong number of values",
+                    o.op.name()
+                );
+                ev.bufs[i] = out;
+                continue;
+            }
             if let Some(c) = self.comp_at(i) {
                 let w = c.width();
                 let pts = fixed(c.points());
@@ -3924,17 +4045,31 @@ impl TensorGraph {
                 let mut buf = vec![0.0; n * w];
                 // points are independent: evaluate them on all cores (the
                 // result does not depend on the split)
+                // a thread per ~32k scalar ops of work: spawning costs tens
+                // of microseconds, so small or cheap comps use fewer threads
+                let per_elem = ev.compiled[i]
+                    .as_ref()
+                    .map_or(1, |k| k.body.ops.len() + c.args.len());
+                let work = n
+                    .saturating_mul(numel(&c.red).max(1))
+                    .saturating_mul(per_elem);
                 let threads = std::thread::available_parallelism()
                     .map_or(1, |t| t.get())
-                    .min(n.div_ceil(256))
+                    .min(work.div_ceil(1 << 15))
+                    .min(n)
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
                 if threads == 1 {
                     // one chunk: run it here. This is also the only path on targets that
                     // cannot spawn threads (wasm32), where available_parallelism errs to 1.
-                    for (p, idx) in indices(&pts).enumerate() {
-                        ev_ref.point(i, &idx, &mut buf[p * w..(p + 1) * w]);
+                    let mut sc = Scratch::default();
+                    let mut idx = vec![0; pts.len()];
+                    for p in 0..n {
+                        if p > 0 {
+                            odometer(&mut idx, &pts);
+                        }
+                        ev_ref.point(i, &idx, &mut buf[p * w..(p + 1) * w], &mut sc);
                     }
                 } else {
                     std::thread::scope(|sc| {
@@ -3942,10 +4077,18 @@ impl TensorGraph {
                             let pts = &pts;
                             sc.spawn(move || {
                                 let start = t * per;
-                                for (p, idx) in
-                                    indices(pts).skip(start).take(chunk.len() / w).enumerate()
-                                {
-                                    ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w]);
+                                let mut scr = Scratch::default();
+                                let mut idx = vec![0; pts.len()];
+                                let mut rest = start;
+                                for d in (0..pts.len()).rev() {
+                                    idx[d] = rest % pts[d];
+                                    rest /= pts[d];
+                                }
+                                for p in 0..chunk.len() / w {
+                                    if p > 0 {
+                                        odometer(&mut idx, pts);
+                                    }
+                                    ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w], &mut scr);
                                 }
                             });
                         }
@@ -3958,14 +4101,7 @@ impl TensorGraph {
                 ev.bufs[i] = buf;
             }
         }
-        outputs
-            .iter()
-            .map(|o| {
-                indices(&fixed(&self.nodes[o.n()].shape))
-                    .map(|idx| ev.read(*o, &idx))
-                    .collect()
-            })
-            .collect()
+        outputs.iter().map(|o| ev.tensor(*o)).collect()
     }
 }
 
@@ -4019,9 +4155,222 @@ fn intern_arg(args: &mut Vec<Arg>, a: Arg) -> usize {
     })
 }
 
+/// A scalar body as a flat program over dense slots, evaluated into a
+/// caller-owned scratch buffer (no allocation per call). Same arithmetic,
+/// node for node, as `tang_expr`'s `compile_many`.
+struct Prog {
+    ops: Vec<POp>,
+    outs: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum POp {
+    Var(u16),
+    Lit(f64),
+    Add(u32, u32),
+    Mul(u32, u32),
+    Neg(u32),
+    Recip(u32),
+    Sqrt(u32),
+    Sin(u32),
+    Atan2(u32, u32),
+    Exp2(u32),
+    Log2(u32),
+    Select(u32, u32, u32),
+}
+
+impl Prog {
+    fn new(g: &ExprGraph, outs: &[ExprId]) -> Self {
+        let nodes = g.nodes_slice();
+        let n = outs
+            .iter()
+            .map(|o| o.index() as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut live = vec![false; n];
+        let mut stack: Vec<usize> = outs.iter().map(|o| o.index() as usize).collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut live[i], true) {
+                continue;
+            }
+            let kids: &[ExprId] = match &nodes[i] {
+                Node::Var(_) | Node::Lit(_) => &[],
+                Node::Add(a, b) | Node::Mul(a, b) | Node::Atan2(a, b) => &[*a, *b],
+                Node::Neg(a)
+                | Node::Recip(a)
+                | Node::Sqrt(a)
+                | Node::Sin(a)
+                | Node::Exp2(a)
+                | Node::Log2(a) => std::slice::from_ref(a),
+                Node::Select(c, a, b) => &[*c, *a, *b],
+            };
+            stack.extend(kids.iter().map(|k| k.index() as usize));
+        }
+        let mut slot = vec![0u32; n];
+        let mut ops = Vec::new();
+        for i in (0..n).filter(|&i| live[i]) {
+            let m = |e: &ExprId| slot[e.index() as usize];
+            let op = match &nodes[i] {
+                Node::Var(v) => POp::Var(*v),
+                Node::Lit(bits) => POp::Lit(f64::from_bits(*bits)),
+                Node::Add(a, b) => POp::Add(m(a), m(b)),
+                Node::Mul(a, b) => POp::Mul(m(a), m(b)),
+                Node::Neg(a) => POp::Neg(m(a)),
+                Node::Recip(a) => POp::Recip(m(a)),
+                Node::Sqrt(a) => POp::Sqrt(m(a)),
+                Node::Sin(a) => POp::Sin(m(a)),
+                Node::Atan2(y, x) => POp::Atan2(m(y), m(x)),
+                Node::Exp2(a) => POp::Exp2(m(a)),
+                Node::Log2(a) => POp::Log2(m(a)),
+                Node::Select(c, a, b) => POp::Select(m(c), m(a), m(b)),
+            };
+            slot[i] = ops.len() as u32;
+            ops.push(op);
+        }
+        Self {
+            outs: outs.iter().map(|o| slot[o.index() as usize]).collect(),
+            ops,
+        }
+    }
+
+    #[inline]
+    fn eval(&self, inputs: &[f64], outputs: &mut [f64], v: &mut Vec<f64>) {
+        v.clear();
+        for op in &self.ops {
+            let x = match *op {
+                POp::Var(i) => inputs[i as usize],
+                POp::Lit(x) => x,
+                POp::Add(a, b) => v[a as usize] + v[b as usize],
+                POp::Mul(a, b) => v[a as usize] * v[b as usize],
+                POp::Neg(a) => -v[a as usize],
+                POp::Recip(a) => 1.0 / v[a as usize],
+                POp::Sqrt(a) => v[a as usize].sqrt(),
+                POp::Sin(a) => v[a as usize].sin(),
+                POp::Atan2(y, x) => v[y as usize].atan2(v[x as usize]),
+                POp::Exp2(a) => v[a as usize].exp2(),
+                POp::Log2(a) => v[a as usize].log2(),
+                POp::Select(c, a, b) => {
+                    if v[c as usize] > 0.0 {
+                        v[a as usize]
+                    } else {
+                        v[b as usize]
+                    }
+                }
+            };
+            v.push(x);
+        }
+        for (o, &s) in outputs.iter_mut().zip(&self.outs) {
+            *o = v[s as usize];
+        }
+    }
+}
+
+/// Per-thread buffers for [`Evaluator::point`].
+#[derive(Default)]
+struct Scratch {
+    arg_vals: Vec<f64>,
+    idx: Vec<usize>,
+    elem: Vec<f64>,
+    pair: Vec<f64>,
+    prog: Vec<f64>,
+    cprog: Vec<f64>,
+}
+
 struct Compiled {
-    body: tang_expr::compile::CompiledMany,
-    combine: Option<tang_expr::compile::CompiledMany>,
+    body: Prog,
+    combine: Option<Prog>,
+    /// Per arg: a precomputed flat-address read, when the arg reads a
+    /// plain buffer (see [`direct_read`]).
+    direct: Vec<Option<Direct>>,
+}
+
+/// Where a [`Direct`] read finds its buffer.
+#[derive(Clone, Copy)]
+enum DirectSrc {
+    Input(usize),
+    Buf(usize),
+}
+
+/// An arg read as `buf[base + Σ_k lin[k]·idx[k] + gather·round(index)]`:
+/// the composition of its affine view with the source's row-major strides.
+struct Direct {
+    src: DirectSrc,
+    base: i64,
+    lin: Vec<i64>,
+    gather: i64,
+    /// `Some` for a guarded view: reads outside any source dim are 0.
+    guard: Option<Vec<GuardDim>>,
+}
+
+/// The [`Direct`] plan for `a`, or `None` when the read needs the general
+/// path: a guarded view, a source that is not a plain one-value-per-point
+/// buffer (an iota, a reshape, an inlined or tuple comp), or emulation
+/// (which rounds input reads).
+fn direct_read(g: &TensorGraph, a: &Arg, rank: usize, emulate: bool) -> Option<Direct> {
+    if emulate {
+        return None;
+    }
+    // a reshape reads its storage's bytes row-major under its own shape
+    let node = &g.nodes[a.src.n()];
+    let store = g.storage(a.src);
+    let snode = &g.nodes[store.n()];
+    let src = match &snode.op {
+        Op::Input(k) => DirectSrc::Input(*k),
+        Op::Operator(_) => DirectSrc::Buf(store.n()),
+        Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => DirectSrc::Buf(store.n()),
+        _ => return None,
+    };
+    let shape = node
+        .shape
+        .iter()
+        .map(|d| d.fixed())
+        .collect::<Option<Vec<_>>>()?;
+    let mut strides = vec![0i64; shape.len()];
+    let mut st = 1i64;
+    for d in (0..shape.len()).rev() {
+        strides[d] = st;
+        st *= shape[d] as i64;
+    }
+    let mut base = 0;
+    let mut lin = vec![0i64; rank];
+    for (d, f) in a.view.forms.iter().enumerate() {
+        base += strides[d] * f.offset;
+        for (k, &c) in f.coefs.iter().enumerate() {
+            lin[k] += strides[d] * c;
+        }
+    }
+    let gather = a.view.gather.as_ref().map_or(0, |ga| {
+        ga.coefs.iter().zip(&strides).map(|(c, s)| c * s).sum()
+    });
+    // a guarded view checks each source coordinate against its extent
+    let guard = a.view.guard.then(|| {
+        a.view
+            .forms
+            .iter()
+            .enumerate()
+            .map(|(d, f)| GuardDim {
+                offset: f.offset,
+                coefs: f.coefs.clone(),
+                gather: a.view.gather.as_ref().map_or(0, |ga| ga.coefs[d]),
+                extent: shape[d] as i64,
+            })
+            .collect()
+    });
+    Some(Direct {
+        src,
+        base,
+        lin,
+        gather,
+        guard,
+    })
+}
+
+/// One source dim of a guarded [`Direct`] read.
+struct GuardDim {
+    offset: i64,
+    coefs: Vec<i64>,
+    gather: i64,
+    extent: i64,
 }
 
 struct Evaluator<'a> {
@@ -4034,6 +4383,31 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    /// All of `t`, row-major: a copy of its buffer when it has a plain
+    /// one, else read point by point.
+    fn tensor(&self, t: TensorId) -> Vec<f64> {
+        self.tensor_ref(t).into_owned()
+    }
+
+    /// [`tensor`](Self::tensor), borrowing the buffer when there is one.
+    fn tensor_ref(&self, t: TensorId) -> std::borrow::Cow<'_, [f64]> {
+        let node = &self.g.nodes[t.n()];
+        let store = self.g.storage(t);
+        let snode = &self.g.nodes[store.n()];
+        match &snode.op {
+            Op::Input(k) if !self.emulate => return self.inputs[*k][..].into(),
+            Op::Operator(_) => return self.bufs[store.n()][..].into(),
+            Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => {
+                return self.bufs[store.n()][..].into()
+            }
+            _ => {}
+        }
+        indices(&fixed(&node.shape))
+            .map(|idx| self.read(t, &idx))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     /// Value of `t` at full-shape coordinates `idx`.
     fn read(&self, t: TensorId, idx: &[usize]) -> f64 {
         let node = &self.g.nodes[t.n()];
@@ -4048,6 +4422,7 @@ impl Evaluator<'_> {
                 }
             }
             Op::Iota(d) => idx[*d] as f64,
+            Op::Operator(_) => self.bufs[t.n()][flat_index(&fixed(&node.shape), idx)],
             Op::Reshape(src) => {
                 let flat = flat_index(&fixed(&node.shape), idx);
                 let src_shape = fixed(&self.g.nodes[src.n()].shape);
@@ -4064,7 +4439,7 @@ impl Evaluator<'_> {
                 let slot = flat_index(&fixed(&c.out[c.points().len()..]), tup);
                 if node.inline {
                     let mut vals = vec![0.0; c.width()];
-                    self.point(t.n(), pt, &mut vals);
+                    self.point(t.n(), pt, &mut vals, &mut Scratch::default());
                     return vals[slot];
                 }
                 let w = c.width();
@@ -4073,12 +4448,22 @@ impl Evaluator<'_> {
         }
     }
 
-    fn point(&self, i: usize, out_idx: &[usize], vals: &mut [f64]) {
+    fn point(&self, i: usize, out_idx: &[usize], vals: &mut [f64], sc: &mut Scratch) {
         let c = self.g.comp_at(i).unwrap();
         let k = self.compiled[i].as_ref().unwrap();
         let w = c.width();
-        let mut arg_vals = vec![0.0; c.args.len()];
-        let mut idx = out_idx.to_vec();
+        let Scratch {
+            arg_vals,
+            idx,
+            elem,
+            pair,
+            prog,
+            cprog,
+        } = sc;
+        arg_vals.clear();
+        arg_vals.resize(c.args.len(), 0.0);
+        idx.clear();
+        idx.extend_from_slice(out_idx);
         let base = idx.len();
         idx.extend(std::iter::repeat_n(0, c.red.len()));
         let mut body_at = |idx: &[usize], elem: &mut [f64]| {
@@ -4089,6 +4474,32 @@ impl Evaluator<'_> {
                         continue;
                     }
                     let index = a.view.gather.as_ref().map_or(0.0, |g| arg_vals[g.arg]);
+                    if let Some(d) = &k.direct[j] {
+                        let gi = index.round() as i64;
+                        if let Some(dims) = &d.guard {
+                            let outside = dims.iter().any(|gd| {
+                                let mut c = gd.offset + gd.gather * gi;
+                                for (l, &x) in gd.coefs.iter().zip(idx) {
+                                    c += l * x as i64;
+                                }
+                                c < 0 || c >= gd.extent
+                            });
+                            if outside {
+                                arg_vals[j] = 0.0;
+                                continue;
+                            }
+                        }
+                        let mut at = d.base + d.gather * gi;
+                        for (l, &x) in d.lin.iter().zip(idx) {
+                            at += l * x as i64;
+                        }
+                        let buf = match d.src {
+                            DirectSrc::Input(n) => &self.inputs[n],
+                            DirectSrc::Buf(n) => &self.bufs[n],
+                        };
+                        arg_vals[j] = buf[at as usize];
+                        continue;
+                    }
                     let shape = fixed(&self.g.nodes[a.src.n()].shape);
                     arg_vals[j] = match a.view.coords_in(idx, &shape, index) {
                         Some(at) => self.read(a.src, &at),
@@ -4096,25 +4507,38 @@ impl Evaluator<'_> {
                     };
                 }
             }
-            (k.body)(&arg_vals, elem);
+            k.body.eval(arg_vals, elem, prog);
         };
         let Some(m) = &c.monoid else {
-            body_at(&idx, vals);
+            body_at(idx, vals);
             return;
         };
         vals.copy_from_slice(&m.identity);
         let combine = k.combine.as_ref().unwrap();
-        let mut elem = vec![0.0; w];
-        let mut pair = vec![0.0; 2 * w];
+        elem.clear();
+        elem.resize(w, 0.0);
+        pair.clear();
+        pair.resize(2 * w, 0.0);
         // softmax weights rounded to the operand format (an online-softmax
         // reduction on a tile that feeds exp(s − m) to the tensor cores):
         // the element's weight is rounded before it scales g₁…gₖ
         let operand = self.g.nodes[i].precision.operand;
         let round_weights =
             self.emulate && operand != Format::F32 && m.kind() == MonoidKind::OnlineSoftmax;
-        for red_idx in indices(&fixed(&c.red)) {
-            idx[base..].copy_from_slice(&red_idx);
-            body_at(&idx, &mut elem);
+        let red = fixed(&c.red);
+        let n_red: usize = red.iter().product();
+        for step in 0..n_red {
+            if step > 0 {
+                // odometer over the reduce dims, last fastest
+                for d in (0..red.len()).rev() {
+                    idx[base + d] += 1;
+                    if idx[base + d] < red[d] {
+                        break;
+                    }
+                    idx[base + d] = 0;
+                }
+            }
+            body_at(idx, elem);
             if round_weights {
                 // m' = max(m, s); accᵢ' = accᵢ·exp(m − m') + gᵢ·round(exp(s − m'))
                 let mx = vals[0].max(elem[0]);
@@ -4138,13 +4562,24 @@ impl Evaluator<'_> {
                 continue;
             }
             pair[..w].copy_from_slice(vals);
-            pair[w..].copy_from_slice(&elem);
-            combine(&pair, vals);
+            pair[w..].copy_from_slice(elem);
+            combine.eval(pair, vals, cprog);
             if self.emulate {
                 let f = self.g.nodes[i].precision.accum;
                 vals.iter_mut().for_each(|v| *v = f.round(*v));
             }
         }
+    }
+}
+
+/// Advance row-major coordinates `idx` in `shape` by one (last dim fastest).
+fn odometer(idx: &mut [usize], shape: &[usize]) {
+    for d in (0..shape.len()).rev() {
+        idx[d] += 1;
+        if idx[d] < shape[d] {
+            return;
+        }
+        idx[d] = 0;
     }
 }
 
