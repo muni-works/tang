@@ -281,6 +281,8 @@ fn rmsnorm(
             |x| vec![x[0] * x[0]],
         )
         .unwrap();
+    // a block a row (one thread would sum all n serially)
+    g.set_schedule(ss, 256, (0, 0, 0), (1, 1));
     let (inv_n, eps) = (1.0 / n as f64, eps);
     g.comp(
         &[t, n],
