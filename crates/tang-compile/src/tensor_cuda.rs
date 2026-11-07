@@ -1978,7 +1978,7 @@ impl TensorGraph {
             let mut fused = nested.clone();
             fused.attn_bwd_schedule(&plan);
             let mut program = fused.to_cuda_variant_scheduled(outputs, variant);
-            if fused.attn_bwd_patch(&plan, &mut program) {
+            if fused.attn_bwd_patch(&plan, &mut program, variant) {
                 return program.canonical();
             }
         }
