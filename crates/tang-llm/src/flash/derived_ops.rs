@@ -470,16 +470,24 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
         .unwrap();
     g.set_precision(w, Precision::storage(Format::Q8_0));
     g.set_precision(xq, Precision::storage(Format::Q8x32));
+    // one row: the dp4a GEMV, x quantized in its prologue; more rows: int8
+    // tensor cores (eight positions are the MMA's N), x quantized once
+    let mma = t
+        >= std::env::var("TANG_GEMV_MMA_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
     g.set_int_mma(
         out,
         Some(IntMma {
-            stage: Stage::Gemv,
-            ksplit: 1,
-            pos_tile: std::env::var("TANG_GEMV_PT").ok().and_then(|v| v.parse().ok()).unwrap_or(t.min(8) as u32),
+            stage: if mma { Stage::Mma } else { Stage::Gemv },
+            ksplit: std::env::var("TANG_GEMV_KSPLIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            pos_tile: t.min(8) as u32,
         }),
     );
-    // one window row: quantize in the GEMV prologue; more rows: once, by a
-    // Q8x32 writer kernel (every block would redo all rows otherwise)
     g.set_inline(xq, t == 1);
     Spec {
         g,
