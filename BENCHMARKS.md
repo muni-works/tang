@@ -3222,6 +3222,71 @@ dependent loads, and the split-KV combine alone (32 chunks × 4096 outputs × 3 
 short-context attention did. What it needs next: chunks sized to the live length (split chosen per step, not
 per capacity), more independent loads in flight per round, and the combine folded into the finalize map.
 
+### Launch fusion as a schedule: what it buys on the 3090 (RunPod RTX 3090, Qwen3-8B decode)
+
+Measured on a RunPod RTX 3090 (secure cloud, EU-CZ-1, driver 595) because mew's disk was full; tang main
+there is 6.72 / 7.06 / 8.05 ms, the same as mew. llama.cpp (fresh `master`, `llama-bench -n 128 -fa 1 -ngl 99`,
+Q4_0 requantized from Qwen's Q8_0 GGUF) is a little faster on this card than on mew.
+
+Three new lowerings in `tensor_cuda_gemv.rs`, all generic, all derived from the graph:
+
+- **`staged_map`** (the cooperative shared-producer lowering): a map or an in-place cache update that reads
+  a small inlined Sum/Max reduction computes that producer's whole output into shared memory once per
+  block, with warps per producer point and partials combined through smem. It then evaluates its points
+  from there. A CUDA-decode schedule rule inlines such reductions when the recomputation is bounded:
+  RMSNorm's sum of squares, and the per-head q/k-norm statistics. A map read only by cache updates (the
+  roped key) is evaluated inside the update. The norm stats, the q-norm+rope map, and k-norm+rope+KV-write
+  each become one kernel, taking a step from 729 to 584 kernels and from 656 to 511 dependent phases.
+  `TANG_STAGED_MAP=0` turns it off.
+- **Sub-warp groups** in `warp_reduction`: a reduction with few chunks (a split's 4-part combine,
+  attention's 128-wide q·k) shares a warp among 32/lpg groups, with about 4 chunks per lane. GEMVs over
+  4-bit weights keep a warp per group. `TANG_SUBWARP=0` turns it off.
+- **A second register dim** in `warp_reduction`, picked by the load model when it cuts streamed bytes by a
+  quarter. In P·V the 4 GQA heads share V and 4 output dims share the probabilities; before, either V or
+  the f32 probabilities were re-streamed per tile. P·V goes from 512 groups × 8 to 256 × 16, which also
+  puts it in the 8-warp block split. `TANG_REG2=0` turns it off.
+
+Also built, but opt-in because it is slower: **`split_fused`** (`TANG_SPLIT_FUSE=1`) runs a split-K
+partial and its combine as one kernel. Each warp writes its part to a module-scope scratch and bumps a
+per-group arrival counter; the warp that brings in the last part sums the parts and runs the combine's
+epilogue. That gives 475 kernels per step, all 109 combines gone, and the same output, but 6.86 / 7.05 /
+7.70 ms against 6.71 / 6.91 / 7.55 without it. The per-warp `__threadfence` and atomic cost more than the
+combine launch inside a CUDA graph.
+
+Interleaved runs of the old and new defaults, then llama.cpp, all on this card:
+
+| ms per step (tok/s) | 64 | 1024 | 4096 |
+|---|---|---|---|
+| main (`TANG_STAGED_MAP=0 TANG_SUBWARP=0 TANG_REG2=0`) | 6.77 (147.7) | 7.12 (140.4) | 8.12 (123.2) |
+| this PR | 6.80 (147.0) | 7.02 (142.5) | 7.65 (130.7) |
+| this PR, `TANG_REG2=0` | 6.73 (148.7) | 7.02 (142.5) | 7.89 (126.7) |
+| llama.cpp Q4_0 | 6.59 (151.7) | 6.79 (147.3) | 7.37 (135.7) |
+
+All variants: `qwen_decode tiny` 4.85e-5 (decode) / 3.31e-4 (prefill) with caches within 1 ulp; Qwen3-8B
+teacher-forced on 32 positions against the CPU f32 reference, argmax 32/32, max |err| 5.9e-3.
+
+What this says about launch fusion on sm_86: removing launches does not remove time inside a CUDA graph.
+145 fewer kernels from `staged_map` is time-neutral (6.70 vs 6.70 ms). The first version, which reduced a
+one-point producer on a single warp, was 60 µs slower. 109 fewer combines from `split_fused` costs 150 µs.
+A dependent launch in a graph costs about what a cross-block dependency inside a kernel costs: a fence, an
+atomic, a tail. The 1.09 ms "launch overhead" from the paper's count (580 kernels × ~1.9 µs) is mostly the
+kernels' own ramp and tail, and fusing moves that latency without deleting it. Without programmatic
+dependent launch (sm_90+) there is no overlap of one kernel's tail with the next one's head. The wins here
+come from the kernels themselves: the attention re-reads (sub-warp q·k, the 2-D register tile for P·V)
+are −470 µs at 4k and −100 µs at 1k.
+
+Single-pass attention on top (`TANG_FUSED_ATTN=1 TANG_ATTN_SPLIT=4/8/16`): 7.8–7.9 / 8.7–9.7 / 9.2–10.0 ms,
+still slower. On current main 36 per-layer kernels of that path fall back to WGSL (548 of 584 native, with or
+without this PR's changes), so it regressed against the previous section's 7.39 / 7.90 / 9.19; that is a
+follow-up.
+
+Where the rest of the gap to llama.cpp is (profile at 4096, isolated launches): the 4-bit GEMVs run at 82%
+(gate/up, 74 µs), 72% (down, 42 µs + combine), and about 60% (qkv, 25 µs + combine; o, 18 µs + combine) of
+936 GB/s, which is 6.2 of the 7.6 ms. Attention is now q·k 18 µs + softmax 2 × 6 µs + P·V 19 µs per layer,
+against 18 µs for the K/V bytes. The 2-D tile's block split costs about 70 µs at length 64; the right fix is
+choosing the split from the live length per step. q·k could take the same 2-D tile if the key-length bound
+were applied per register point rather than per group.
+
 ## Fused attention backward on Hopper (H200 SXM, bf16, kernel-only)
 
 The derived backward as one kernel per key block (`tensor_cuda_attn_bwd.rs`).
