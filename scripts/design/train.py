@@ -10,6 +10,8 @@ One GPT-style model per run; only the sequence mixer changes. Mixers:
   logdist         s - log(1 + i - j), softmax                               tang: lifts
   sigmoid         sigmoid(s - log T), unnormalized                          tang: lifts
   forget_sigmoid  sigmoid(s + c_i - c_j - log T)                            tang: lifts (fwd, dq dk dv)
+  swvar           softmax attn + w*Var_p[v] (discover's one-pass lift)       tang: lifts (derived bwd)
+  gla             diag-decay linear attn, gdn's wrapper (fla chunk_gla)     discover: chunked fwd, scan bwd
   softcap_forget  30 tanh(s/30) + c_i - c_j, softmax                        tang: lifts (fwd, dq dk dv)
 
 usage: python train.py MIXER --data DIR --tokens 1e9 [--out res.jsonl]
@@ -75,6 +77,8 @@ class Attn(nn.Module):
         self.qkv = nn.Linear(D, 3 * D, bias=False)
         self.o = nn.Linear(D, D, bias=False)
         self.gated = "forget" in kind
+        if kind == "swvar":
+            self.vw = nn.Parameter(torch.zeros(H, 1, HD))
         if self.gated:
             self.fg = nn.Linear(D, H, bias=True)
             nn.init.constant_(self.fg.bias, 3.0)  # start near "no forgetting"
@@ -88,6 +92,12 @@ class Attn(nn.Module):
             c = F.logsigmoid(self.fg(x).float()).transpose(1, 2).cumsum(-1)  # [B, H, T]
         if kind == "softmax":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif kind == "swvar":
+            # softmax-weighted variance readout (discover, PR #181): one flash
+            # pass over [v, v^2] gives E_p[v] and E_p[v^2]
+            m = F.scaled_dot_product_attention(q, k, torch.cat([v, v * v], -1), is_causal=True)
+            mu, m2 = m[..., :HD], m[..., HD:]
+            y = mu + self.vw * (m2 - mu * mu).clamp(min=0)
         elif kind == "logdist":
             mod = lambda s, b, h, i, j: s - torch.log1p((i - j).clamp(min=0).float())
             y = flex(q, k, v, mod)
@@ -115,14 +125,15 @@ class SSD(nn.Module):
     chunk_simple_gla, with the same projections/conv/gate/norm as fla's
     GatedDeltaNet so the only difference from `gdn` is the delta rule."""
 
-    def __init__(self):
+    def __init__(self, diag=False):
         super().__init__()
         from fla.modules import ShortConvolution, FusedRMSNormGated
+        self.diag = diag
         self.nh, self.dk, self.dv = D // 128, 128, 256
         self.q = nn.Linear(D, self.nh * self.dk, bias=False)
         self.k = nn.Linear(D, self.nh * self.dk, bias=False)
         self.v = nn.Linear(D, self.nh * self.dv, bias=False)
-        self.a = nn.Linear(D, self.nh, bias=True)
+        self.a = nn.Linear(D, self.nh * (self.dk if diag else 1), bias=True)
         self.g = nn.Linear(D, self.nh * self.dv, bias=False)
         self.cq = ShortConvolution(self.nh * self.dk, 4, activation="silu")
         self.ck = ShortConvolution(self.nh * self.dk, 4, activation="silu")
@@ -137,9 +148,14 @@ class SSD(nn.Module):
         q = F.normalize(c(self.cq, self.q(x)).view(B, T, self.nh, self.dk), dim=-1)
         k = F.normalize(c(self.ck, self.k(x)).view(B, T, self.nh, self.dk), dim=-1)
         v = c(self.cv, self.v(x)).view(B, T, self.nh, self.dv)
-        g = F.logsigmoid(self.a(x).float())  # log decay, [B, T, H]
         dt = torch.bfloat16
-        o, _ = chunk_simple_gla(q.to(dt), k.to(dt), v.to(dt), g, scale=self.dk ** -0.5)
+        if self.diag:  # GLA: per-channel decay (GLA's 1/16 gate normalizer)
+            from fla.ops.gla import chunk_gla
+            g = F.logsigmoid(self.a(x).float()).view(B, T, self.nh, self.dk) / 16
+            o, _ = chunk_gla(q.to(dt), k.to(dt), v.to(dt), g, scale=self.dk ** -0.5)
+        else:
+            g = F.logsigmoid(self.a(x).float())  # log decay, [B, T, H]
+            o, _ = chunk_simple_gla(q.to(dt), k.to(dt), v.to(dt), g, scale=self.dk ** -0.5)
         o = self.norm(o, self.g(x).view(B, T, self.nh, self.dv))
         return self.o(o.reshape(B, T, -1))
 
@@ -147,6 +163,8 @@ class SSD(nn.Module):
 def mixer(kind):
     if kind == "ssd":
         return SSD()
+    if kind == "gla":
+        return SSD(diag=True)
     if kind == "mamba2":
         from fla.layers import Mamba2
         return Mamba2(hidden_size=D, num_heads=2 * D // 64, head_dim=64, state_size=128,
@@ -210,7 +228,7 @@ def batch(src, n, gen):
 model = GPT(a.mixer).to(dev)
 nparam = sum(p.numel() for p in model.parameters())
 nmix = sum(p.numel() for b in model.blocks for p in b.mix.parameters())
-cmodel = model if a.mixer in ("mamba2", "gdn", "ssd") else torch.compile(model)
+cmodel = model if a.mixer in ("mamba2", "gdn", "ssd", "gla") else torch.compile(model)
 decay = [p for p in model.parameters() if p.dim() >= 2]
 nodecay = [p for p in model.parameters() if p.dim() < 2]
 opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
