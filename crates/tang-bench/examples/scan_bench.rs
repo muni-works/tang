@@ -110,6 +110,7 @@ struct Run {
     ins: Vec<CudaSlice<u16>>,
     gates: Vec<CudaSlice<f32>>,
     scratch16: Vec<CudaSlice<u16>>,
+    delta: bool,
     gc: CudaSlice<f32>,
 }
 
@@ -120,8 +121,8 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
     let ins = vec![up16(&d.q), up16(&d.k), up16(&d.v)];
     let gates = vec![up32(&d.alpha), up32(&d.beta)];
     let sz = plan.scratch();
-    let scratch16 = sz[..5].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect();
-    let gc = s.alloc_zeros::<f32>(sz[5]).unwrap();
+    let scratch16 = sz[..7].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect();
+    let gc = s.alloc_zeros::<f32>(sz[7]).unwrap();
     let out = s.alloc_zeros::<u16>(plan.heads * plan.t * plan.m).unwrap();
     let launches = plan
         .kernels(bv)
@@ -129,7 +130,7 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
         .map(|l| {
             let f = dev.function(&l.source);
             let cfg = LaunchConfig {
-                grid_dim: (l.grid.0, l.grid.1, 1),
+                grid_dim: l.grid,
                 block_dim: (l.block, 1, 1),
                 shared_mem_bytes: l.smem,
             };
@@ -142,41 +143,46 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
         ins,
         gates,
         scratch16,
+        delta: plan.delta,
         gc,
     }
 }
 
 fn launch(dev: &CudaDevice, r: &Run) {
-    launch_k(dev, r, 0);
-    launch_k(dev, r, 1);
+    for k in 0..3 {
+        launch_k(dev, r, k);
+    }
 }
 
+/// Launch `k` with its arguments (see `ChunkedScan::kernels`).
 fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
     let s = &dev.stream;
-    if k == 1 {
-        let (f, cfg) = &r.launches[1];
-        let mut b = s.launch_builder(f);
-        for x in &r.scratch16 {
-            b.arg(x);
-        }
-        b.arg(&r.gc);
-        b.arg(&r.out);
-        unsafe { b.launch(*cfg) }.expect("state launch");
-        return;
-    }
-    let (f, cfg) = &r.launches[0];
+    let (f, cfg) = &r.launches[k];
+    let sc = &r.scratch16;
+    // V' is U itself without the delta term
+    let vn = if r.delta { &sc[6] } else { &sc[1] };
     let mut b = s.launch_builder(f);
-    for x in &r.ins {
-        b.arg(x);
+    match k {
+        0 => {
+            for x in &r.ins {
+                b.arg(x);
+            }
+            for x in &r.gates {
+                b.arg(x);
+            }
+            for x in &sc[..5] {
+                b.arg(x);
+            }
+            b.arg(&r.gc);
+        }
+        1 => {
+            b.arg(&sc[0]).arg(&sc[1]).arg(&sc[3]).arg(&r.gc).arg(&sc[5]).arg(&sc[6]);
+        }
+        _ => {
+            b.arg(&sc[2]).arg(&sc[4]).arg(&sc[5]).arg(vn).arg(&r.out);
+        }
     }
-    for x in &r.gates {
-        b.arg(x);
-    }
-    for x in &r.scratch16 {
-        b.arg(x);
-    }
-    b.arg(&r.gc);
-    unsafe { b.launch(*cfg) }.expect("prep launch");
+    unsafe { b.launch(*cfg) }.expect("launch");
 }
 
 /// Median ms of 20 runs of `f`.
@@ -242,13 +248,14 @@ fn main() {
     let total = median(&dev, || launch(&dev, &r));
     let k1 = median(&dev, || launch_k(&dev, &r, 0));
     let k2 = median(&dev, || launch_k(&dev, &r, 1));
+    let k3 = median(&dev, || launch_k(&dev, &r, 2));
     let name = match mode {
         Mode::Gdn => "gdn",
         Mode::Ssd => "ssd",
         Mode::Lin => "lin",
     };
     println!(
-        "{name} H={h} T={t} n={n} m={m} bv={bv} {total:.3} ms (chunk {k1:.3} + state {k2:.3}) rel_err={rel:.2e} ({})",
+        "{name} H={h} T={t} n={n} m={m} bv={bv} {total:.3} ms (chunk {k1:.3} + state {k2:.3} + out {k3:.3}) rel_err={rel:.2e} ({})",
         dev.name
     );
 }

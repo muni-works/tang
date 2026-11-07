@@ -52,7 +52,7 @@ pub struct ChunkedScan {
 pub struct ScanLaunch {
     /// CUDA source; entry point [`CUDA_ENTRY`](super::cuda::CUDA_ENTRY).
     pub source: String,
-    pub grid: (u32, u32),
+    pub grid: (u32, u32, u32),
     pub block: u32,
     /// Dynamic shared memory (bytes; also `TANG_SMEM` in the source).
     pub smem: u32,
@@ -90,6 +90,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     float* tm = sa + C * LDF;
     float* gam = tm + C * LDF;
     float* bet = gam + C;
+    float* xs = bet + C;  // [3][16][16] block-solve scratch
     const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t row0 = (size_t)h * T + (size_t)c * C;
     for (int i = tid; i < C * DK / 8; i += 256) {
@@ -158,12 +159,36 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         sa[r * LDF + j] = j < r ? bet[r] * sa[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f;
     }
     __syncthreads();
-    // T = (I + A)⁻¹, unit lower triangular: row r = e_r − Σ_{j<r} A[r][j]·T[j]
-    for (int r = 1; r < C; r++) {
-        if (tid < r) {
+    // T = (I + A)⁻¹, unit lower triangular, in 16×16 blocks. Diagonal
+    // blocks: warp b substitutes block b row by row (lane = column).
+    if (warp < C / 16) {
+        const int b0 = warp * 16, cl = lane & 15;
+        for (int rr = 1; rr < 16; rr++) {
             float acc = 0.0f;
-            for (int j = tid; j < r; j++) acc = fmaf(sa[r * LDF + j], tm[j * LDF + tid], acc);
-            tm[r * LDF + tid] = -acc;
+            if (lane < 16 && cl < rr)
+                for (int j = cl; j < rr; j++) acc = fmaf(sa[(b0 + rr) * LDF + b0 + j], tm[(b0 + j) * LDF + b0 + cl], acc);
+            __syncwarp();
+            if (lane < 16 && cl < rr) tm[(b0 + rr) * LDF + b0 + cl] = -acc;
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    // Off-diagonal blocks, block row by block row: T_ij = −T_ii·Σ_{j≤k<i} A_ik·T_kj
+    for (int bi = 1; bi < C / 16; bi++) {
+        for (int e = tid; e < bi * 256; e += 256) {
+            const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
+            float acc = 0.0f;
+            for (int k = bj * 16; k < bi * 16; k++)
+                acc = fmaf(sa[(bi * 16 + r) * LDF + k], tm[k * LDF + bj * 16 + cc], acc);
+            xs[e] = acc;
+        }
+        __syncthreads();
+        for (int e = tid; e < bi * 256; e += 256) {
+            const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
+            float acc = 0.0f;
+            for (int k = 0; k <= r; k++)
+                acc = fmaf(tm[(bi * 16 + r) * LDF + bi * 16 + k], xs[(bj << 8) + k * 16 + cc], acc);
+            tm[(bi * 16 + r) * LDF + bj * 16 + cc] = -acc;
         }
         __syncthreads();
     }
@@ -227,65 +252,82 @@ extern "C" __global__ void __launch_bounds__(256) main0(
 }
 "#;
 
-/// Kernel 2: the inter-chunk state scan with the readout fused. Grid
-/// `(DV/BV, H)`, 128 threads; warp `w` holds state rows `32w..32w+32`
-/// of the `DK × BV` block in accumulator fragments.
+/// Kernel 2: the inter-chunk state scan. Grid `(DV/BV, H)`, 128
+/// threads; warp `w` holds state rows `w·DK/4…` of the `DK × BV` block in
+/// accumulator fragments. Per chunk it writes the incoming state (bf16)
+/// and `V' = U − W·S`, then `S ← e^{γ_C}·S + (k e^{γ_C−γ})ᵀ·V'`; the next
+/// chunk's `W`, `k`, `U` stream in with `cp.async` meanwhile.
 const STATE: &str = r#"
 #define LDB (BV + 8)
 #define NTC (BV / 16)
+__device__ __forceinline__ void cp16(void* s, const void* g) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(s);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(a), "l"(g));
+}
 extern "C" __global__ void __launch_bounds__(128) main0(
-    const bf* __restrict__ Wo, const bf* __restrict__ Uo, const bf* __restrict__ Qo,
-    const bf* __restrict__ Ko, const bf* __restrict__ Ao, const float* __restrict__ GC,
-    bf* __restrict__ O) {
+    const bf* __restrict__ Wo, const bf* __restrict__ Uo, const bf* __restrict__ Ko,
+    const float* __restrict__ GC, bf* __restrict__ Hs, bf* __restrict__ Vn) {
     extern __shared__ __align__(16) unsigned char smem[];
-    bf* qc = (bf*)smem;
-    bf* kc = qc + C * LDK;
-    bf* wc = kc + C * LDK;
-    bf* uc = wc + C * LDK;
-    bf* ac = uc + C * LDB;
-    bf* sb = ac + C * LDT;
-    bf* vn = sb + DK * LDB;
-    float* stg0 = (float*)(vn + C * LDB);
+    bf* kc0 = (bf*)smem;               // [2][C][LDK]
+    bf* wc0 = kc0 + 2 * C * LDK;       // [2][C][LDK]
+    bf* uc0 = wc0 + 2 * C * LDK;       // [2][C][LDB]
+    bf* sb = uc0 + 2 * C * LDB;        // [DK][LDB]
+    bf* vn = sb + DK * LDB;            // [C][LDB]
+    float* stg = (float*)(vn + C * LDB) + (threadIdx.x >> 5) * 256;
     const int vb = blockIdx.x * BV, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    float* stg = stg0 + warp * 256;
-    constexpr int RT = DK / 64;  // state row tiles a warp (DK / 16 over 4 warps)
+    constexpr int RT = DK / 64;
+    auto fetch = [&](int c) {
+        const size_t row0 = (size_t)h * T + (size_t)c * C;
+        bf* kc = kc0 + (c & 1) * C * LDK;
+        bf* wc = wc0 + (c & 1) * C * LDK;
+        bf* uc = uc0 + (c & 1) * C * LDB;
+        for (int i = tid; i < C * DK / 8; i += 128) {
+            const int r = i / (DK / 8), x = (i % (DK / 8)) * 8;
+            cp16(&kc[r * LDK + x], &Ko[(row0 + r) * DK + x]);
+#if DELTA
+            cp16(&wc[r * LDK + x], &Wo[(row0 + r) * DK + x]);
+#endif
+        }
+        for (int i = tid; i < C * BV / 8; i += 128) {
+            const int r = i / (BV / 8), x = (i % (BV / 8)) * 8;
+            cp16(&uc[r * LDB + x], &Uo[(row0 + r) * DV + vb + x]);
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
     FC st[RT][NTC];
     #pragma unroll
     for (int i = 0; i < RT; i++)
         #pragma unroll
         for (int j = 0; j < NTC; j++) wmma::fill_fragment(st[i][j], 0.0f);
+    fetch(0);
     for (int c = 0; c < NT; c++) {
         const size_t row0 = (size_t)h * T + (size_t)c * C;
-        for (int i = tid; i < C * DK / 8; i += 128) {
-            const int r = i / (DK / 8), x = (i % (DK / 8)) * 8;
-            *(uint4*)&qc[r * LDK + x] = *(const uint4*)&Qo[(row0 + r) * DK + x];
-            *(uint4*)&kc[r * LDK + x] = *(const uint4*)&Ko[(row0 + r) * DK + x];
-#if DELTA
-            *(uint4*)&wc[r * LDK + x] = *(const uint4*)&Wo[(row0 + r) * DK + x];
-#endif
+        if (c + 1 < NT) {
+            fetch(c + 1);
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
         }
-        for (int i = tid; i < C * BV / 8; i += 128) {
-            const int r = i / (BV / 8), x = (i % (BV / 8)) * 8;
-            *(uint4*)&uc[r * LDB + x] = *(const uint4*)&Uo[(row0 + r) * DV + vb + x];
-        }
-        for (int i = tid; i < C * C / 8; i += 128) {
-            const int r = i / (C / 8), x = (i % (C / 8)) * 8;
-            *(uint4*)&ac[r * LDT + x] = *(const uint4*)&Ao[(row0 + r) * C + x];
-        }
+        const bf* kc = kc0 + (c & 1) * C * LDK;
+        const bf* wc = wc0 + (c & 1) * C * LDK;
+        const bf* uc = uc0 + (c & 1) * C * LDB;
         const float gc = __expf(GC[h * NT + c]);
-        // the state as a bf16 operand
+        bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
         for (int i = 0; i < RT; i++)
             #pragma unroll
             for (int j = 0; j < NTC; j++) {
                 wmma::store_matrix_sync(stg, st[i][j], 16, wmma::mem_row_major);
                 __syncwarp();
-                for (int e = lane; e < 256; e += 32)
-                    sb[((warp * RT + i) * 16 + e / 16) * LDB + j * 16 + e % 16] = __float2bfloat16(stg[e]);
+                for (int e = lane; e < 256; e += 32) {
+                    const int r = (warp * RT + i) * 16 + e / 16, x = j * 16 + e % 16;
+                    const bf v = __float2bfloat16(stg[e]);
+                    sb[r * LDB + x] = v;
+                    hs[(size_t)r * DV + vb + x] = v;
+                }
                 __syncwarp();
             }
         __syncthreads();
-        // V' = U − W·S
         const bf* vp = uc;
 #if DELTA
         for (int tt = warp; tt < 4 * NTC; tt += 4) {
@@ -304,40 +346,15 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             __syncwarp();
             for (int e = lane; e < 256; e += 32) {
                 const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
-                vn[r * LDB + x] = __float2bfloat16(__bfloat162float(uc[r * LDB + x]) - stg[e]);
+                const bf v = __float2bfloat16(__bfloat162float(uc[r * LDB + x]) - stg[e]);
+                vn[r * LDB + x] = v;
+                Vn[(row0 + r) * DV + vb + x] = v;
             }
             __syncwarp();
         }
         __syncthreads();
         vp = vn;
 #endif
-        // o = (q e^γ)·S + tril(q kᵀ e^{γᵢ−γⱼ})·V'
-        for (int tt = warp; tt < 4 * NTC; tt += 4) {
-            const int tr = tt & 3, tcol = tt >> 2;
-            FC acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (int e = 0; e < DK; e += 16) {
-                FA a;
-                FBr b;
-                wmma::load_matrix_sync(a, qc + tr * 16 * LDK + e, LDK);
-                wmma::load_matrix_sync(b, sb + e * LDB + tcol * 16, LDB);
-                wmma::mma_sync(acc, a, b, acc);
-            }
-            for (int e = 0; e <= tr * 16; e += 16) {
-                FA a;
-                FBr b;
-                wmma::load_matrix_sync(a, ac + tr * 16 * LDT + e, LDT);
-                wmma::load_matrix_sync(b, vp + e * LDB + tcol * 16, LDB);
-                wmma::mma_sync(acc, a, b, acc);
-            }
-            wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
-            __syncwarp();
-            for (int e = lane; e < 256; e += 32)
-                O[(row0 + tr * 16 + e / 16) * DV + vb + tcol * 16 + e % 16] = __float2bfloat16(stg[e]);
-            __syncwarp();
-        }
-        // S ← e^{γ_C}·S + (k e^{γ_C−γ})ᵀ·V'
         #pragma unroll
         for (int i = 0; i < RT; i++)
             #pragma unroll
@@ -358,6 +375,68 @@ extern "C" __global__ void __launch_bounds__(128) main0(
 }
 "#;
 
+/// Kernel 3: the readout, in parallel over chunks: `o = (q e^{γ})·S_c +
+/// tril(q kᵀ e^{γᵢ−γⱼ})·V'`. Grid `(T/C, H, DV/64)`, 128 threads.
+const OUT: &str = r#"
+#define BO 64
+#define LDO (BO + 8)
+extern "C" __global__ void __launch_bounds__(128) main0(
+    const bf* __restrict__ Qo, const bf* __restrict__ Ao, const bf* __restrict__ Hs,
+    const bf* __restrict__ Vn, bf* __restrict__ O) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    bf* qc = (bf*)smem;          // [C][LDK]
+    bf* hc = qc + C * LDK;       // [DK][LDO]
+    bf* ac = hc + DK * LDO;      // [C][LDT]
+    bf* vc = ac + C * LDT;       // [C][LDO]
+    float* stg = (float*)(vc + C * LDO) + (threadIdx.x >> 5) * 256;
+    const int c = blockIdx.x, h = blockIdx.y, vb = blockIdx.z * BO, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const size_t row0 = (size_t)h * T + (size_t)c * C;
+    const bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
+    for (int i = tid; i < C * DK / 8; i += 128) {
+        const int r = i / (DK / 8), x = (i % (DK / 8)) * 8;
+        *(uint4*)&qc[r * LDK + x] = *(const uint4*)&Qo[(row0 + r) * DK + x];
+    }
+    for (int i = tid; i < DK * BO / 8; i += 128) {
+        const int r = i / (BO / 8), x = (i % (BO / 8)) * 8;
+        *(uint4*)&hc[r * LDO + x] = *(const uint4*)&hs[(size_t)r * DV + vb + x];
+    }
+    for (int i = tid; i < C * BO / 8; i += 128) {
+        const int r = i / (BO / 8), x = (i % (BO / 8)) * 8;
+        *(uint4*)&vc[r * LDO + x] = *(const uint4*)&Vn[(row0 + r) * DV + vb + x];
+    }
+    for (int i = tid; i < C * C / 8; i += 128) {
+        const int r = i / (C / 8), x = (i % (C / 8)) * 8;
+        *(uint4*)&ac[r * LDT + x] = *(const uint4*)&Ao[(row0 + r) * C + x];
+    }
+    __syncthreads();
+    for (int tt = warp; tt < 4 * (BO / 16); tt += 4) {
+        const int tr = tt & 3, tcol = tt >> 2;
+        FC acc;
+        wmma::fill_fragment(acc, 0.0f);
+        #pragma unroll
+        for (int e = 0; e < DK; e += 16) {
+            FA a;
+            FBr b;
+            wmma::load_matrix_sync(a, qc + tr * 16 * LDK + e, LDK);
+            wmma::load_matrix_sync(b, hc + e * LDO + tcol * 16, LDO);
+            wmma::mma_sync(acc, a, b, acc);
+        }
+        for (int e = 0; e <= tr * 16; e += 16) {
+            FA a;
+            FBr b;
+            wmma::load_matrix_sync(a, ac + tr * 16 * LDT + e, LDT);
+            wmma::load_matrix_sync(b, vc + e * LDO + tcol * 16, LDO);
+            wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32)
+            O[(row0 + tr * 16 + e / 16) * DV + vb + tcol * 16 + e % 16] = __float2bfloat16(stg[e]);
+        __syncwarp();
+    }
+}
+"#;
+
 impl ChunkedScan {
     fn defines(&self) -> String {
         format!(
@@ -372,10 +451,10 @@ impl ChunkedScan {
         )
     }
 
-    /// Scratch buffers between the two kernels, in kernel-1 output order
-    /// (`W`, `U`, `q e^γ`, `k e^{γ_C−γ}`, `A_qk` bf16; `γ_C` f32), as
-    /// element counts.
-    pub fn scratch(&self) -> [usize; 6] {
+    /// Scratch buffers between the kernels, as element counts: bf16 `W`,
+    /// `U`, `q e^γ`, `k e^{γ_C−γ}`, `A_qk`, the per-chunk states `[H, T/C,
+    /// n, m]`, `V'` (`U` itself without the delta term); then f32 `γ_C`.
+    pub fn scratch(&self) -> [usize; 8] {
         let rows = self.heads * self.t;
         [
             rows * self.n,
@@ -383,35 +462,48 @@ impl ChunkedScan {
             rows * self.n,
             rows * self.n,
             rows * CHUNK,
+            self.heads * (self.t / CHUNK) * self.n * self.m,
+            rows * self.m,
             self.heads * (self.t / CHUNK),
         ]
     }
 
-    /// The two launches. `bv` is the state column block of kernel 2 (16,
-    /// 32 or 64; more blocks, less reuse).
-    pub fn kernels(&self, bv: usize) -> [ScanLaunch; 2] {
+    /// The three launches: per-chunk transform, state scan, readout.
+    /// `bv` is the state column block of the scan (16, 32 or 64).
+    /// Arguments, in order — prep: `q k v α β | W U qg kg Aqk | γ_C`;
+    /// state: `W U kg γ_C | H V'`; readout: `qg Aqk H V' | o` (`V'` is
+    /// `U` when there is no delta term).
+    pub fn kernels(&self, bv: usize) -> [ScanLaunch; 3] {
         assert!(self.t % CHUNK == 0, "chunked scan: T = {} not a multiple of {CHUNK}", self.t);
         assert!(self.n % 64 == 0 && self.n <= 128, "chunked scan: n = {}", self.n);
-        assert!(self.m % bv == 0 && self.m <= 128 && bv % 16 == 0, "chunked scan: m = {}, bv {bv}", self.m);
+        assert!(self.m % 64 == 0 && self.m % bv == 0 && self.m <= 128 && bv % 16 == 0, "chunked scan: m = {}, bv {bv}", self.m);
         let d = self.defines();
         let (c, n, m) = (CHUNK, self.n, self.m);
-        let smem1 = (2 * c * (n + 8) + c * (m + 8)) * 2 + 2 * c * (c + 4) * 4 + 2 * c * 4;
+        let smem1 = (2 * c * (n + 8) + c * (m + 8)) * 2 + 2 * c * (c + 4) * 4 + 2 * c * 4 + 3 * 256 * 4;
         let ldb = bv + 8;
-        let smem2 = (3 * c * (n + 8) + c * ldb + c * (c + 8) + n * ldb + c * ldb) * 2 + 4 * 256 * 4;
-        let prep = format!("#define TANG_SMEM {smem1}\n{INCLUDES}{d}{PRELUDE}{PREP}");
-        let state = format!("#define TANG_SMEM {smem2}\n{INCLUDES}{d}#define BV {bv}\n{PRELUDE}{STATE}");
+        let smem2 = (4 * c * (n + 8) + 2 * c * ldb + n * ldb + c * ldb) * 2 + 4 * 256 * 4;
+        let smem3 = (c * (n + 8) + n * 72 + c * (c + 8) + c * 72) * 2 + 4 * 256 * 4;
+        let src = |smem: usize, extra: &str, body: &str| {
+            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{extra}{PRELUDE}{body}")
+        };
         [
             ScanLaunch {
-                source: prep,
-                grid: ((self.t / c) as u32, self.heads as u32),
+                source: src(smem1, "", PREP),
+                grid: ((self.t / c) as u32, self.heads as u32, 1),
                 block: 256,
                 smem: smem1 as u32,
             },
             ScanLaunch {
-                source: state,
-                grid: ((m / bv) as u32, self.heads as u32),
+                source: src(smem2, &format!("#define BV {bv}\n"), STATE),
+                grid: ((m / bv) as u32, self.heads as u32, 1),
                 block: 128,
                 smem: smem2 as u32,
+            },
+            ScanLaunch {
+                source: src(smem3, "", OUT),
+                grid: ((self.t / c) as u32, self.heads as u32, (m / 64) as u32),
+                block: 128,
+                smem: smem3 as u32,
             },
         ]
     }
