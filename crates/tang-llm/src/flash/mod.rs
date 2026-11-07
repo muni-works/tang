@@ -13,6 +13,7 @@ pub mod coder;
 pub mod coder_kernels;
 pub mod coder_mtp;
 pub mod deepseek;
+pub mod derived_attn;
 #[cfg(feature = "cuda")]
 pub mod engine;
 pub mod fa2;

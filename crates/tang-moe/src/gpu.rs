@@ -141,6 +141,11 @@ impl Gpu {
         self.load_ptx(&ptx)
     }
 
+    /// Load PTX compiled elsewhere (e.g. for an arch-specific target such as `sm_90a`).
+    pub fn module_from_ptx(&self, ptx: &str) -> Result<Module> {
+        self.load_ptx(ptx)
+    }
+
     fn load_ptx(&self, ptx: &str) -> Result<Module> {
         let src = CString::new(ptx).unwrap();
         let mut m: sys::CUmodule = std::ptr::null_mut();

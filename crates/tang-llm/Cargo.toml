@@ -54,6 +54,9 @@ sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
 tang-moe = { workspace = true, optional = true }
+tang-compile = { workspace = true }
+tang-expr = { workspace = true }
+tang = { workspace = true }
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 tang-otel = { workspace = true, optional = true }
