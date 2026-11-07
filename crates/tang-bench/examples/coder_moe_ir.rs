@@ -198,43 +198,69 @@ fn layer_graph(m: Dims) -> Layer {
             |v| vec![v[0] * v[1]],
         )
         .unwrap();
-    // top-k over the routed logits: round j takes the argmax with earlier picks masked
+    // top-k over the routed logits: one reduction with the top-k monoid (the k
+    // best (index, logit) pairs, best first; ties to the smaller index, as k
+    // argmax rounds would pick). `TANG_MOE_ARGMAX_ROUNDS=1`: the k rounds.
     let iota_e = g.iota(&[t, e], 1);
-    let mut picks: Vec<TensorId> = Vec::new();
-    let slot = |j: i64| View {
-        forms: vec![Form::unit(2, 0), Form::constant(2, j)],
+    let col = |c: i64| View {
+        forms: vec![Form::unit(2, 0), Form::constant(2, c)],
         guard: false,
         gather: None,
     };
-    for _ in 0..k {
-        let mut args = vec![
-            arg(logits, View::identity(2, 2)),
-            arg(iota_e, View::identity(2, 2)),
-        ];
-        args.extend(picks.iter().map(|&q| arg(q, slot(0))));
-        let n_prev = picks.len();
-        let masked = g
-            .comp(&[t, e], &[], args, None, |v| {
-                let mut hit = ExprId::ZERO;
-                for j in 0..n_prev {
-                    hit = hit + eq(v[1], v[2 + j]);
-                }
-                vec![v[0] - hit * ExprId::from_f64(1e9)]
-            })
-            .unwrap();
-        let am = g
+    // picks[j] = (tensor, column of its index); its logit is the next column
+    let mut picks: Vec<(TensorId, i64)> = Vec::new();
+    if std::env::var("TANG_MOE_ARGMAX_ROUNDS").as_deref() == Ok("1") {
+        for _ in 0..k {
+            let mut args = vec![
+                arg(logits, View::identity(2, 2)),
+                arg(iota_e, View::identity(2, 2)),
+            ];
+            args.extend(picks.iter().map(|&(q, c)| arg(q, col(c))));
+            let n_prev = picks.len();
+            let masked = g
+                .comp(&[t, e], &[], args, None, |v| {
+                    let mut hit = ExprId::ZERO;
+                    for j in 0..n_prev {
+                        hit = hit + eq(v[1], v[2 + j]);
+                    }
+                    vec![v[0] - hit * ExprId::from_f64(1e9)]
+                })
+                .unwrap();
+            let am = g
+                .comp_tuple(
+                    &[t, 2],
+                    &[e],
+                    vec![
+                        arg(iota_e, View::identity(2, 2)),
+                        arg(masked, View::identity(2, 2)),
+                    ],
+                    Some(Monoid::argmax()),
+                    |v| vec![v[0], v[1]],
+                )
+                .unwrap();
+            picks.push((am, 0));
+        }
+    } else {
+        let tk = g
             .comp_tuple(
-                &[t, 2],
+                &[t, 2 * k],
                 &[e],
                 vec![
                     arg(iota_e, View::identity(2, 2)),
-                    arg(masked, View::identity(2, 2)),
+                    arg(logits, View::identity(2, 2)),
                 ],
-                Some(Monoid::argmax()),
-                |v| vec![v[0], v[1]],
+                Some(Monoid::topk(k)),
+                |v| {
+                    let mut o = vec![v[0], v[1]];
+                    for _ in 1..k {
+                        o.push(ExprId::ZERO);
+                        o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                    }
+                    o
+                },
             )
             .unwrap();
-        picks.push(am);
+        picks.extend((0..k).map(|j| (tk, 2 * j as i64)));
     }
     // sel[t, j] (j = k: the shared expert, index e) and the combine weights
     // (softmax renormalized over the top k; the shared expert's sigmoid gate)
@@ -252,7 +278,7 @@ fn layer_graph(m: Dims) -> Layer {
         args.extend(
             picks
                 .iter()
-                .map(|&q| arg(q, slot(if weights { 1 } else { 0 }))),
+                .map(|&(q, c)| arg(q, col(if weights { c + 1 } else { c }))),
         );
         g.comp(&[t, k1], &[], args, None, |v| {
             let mut acc = ExprId::ZERO;

@@ -446,6 +446,49 @@ impl Monoid {
         })
     }
 
+    /// The `k` best `(index, value)` pairs, best first: state and element
+    /// are both `(i₀, v₀, …, iₖ₋₁, vₖ₋₁)` sorted by value descending, the
+    /// smaller index first on a tie (the order k argmax rounds pick in, so
+    /// the result is the same whatever the combine order). An element of
+    /// one pair is `(j, w)` followed by `k − 1` identity pairs
+    /// `(0, -f32::MAX)`. The combine is the merge-path rule: the r-th best
+    /// of two sorted lists `A`, `B` is the best of `Aᵣ`, `Bᵣ` and
+    /// `min(Aᵢ₋₁, Bᵣ₋ᵢ)` for `i` in `1..=r` (k²/2 compare-selects, no
+    /// sort). One reduction replaces k argmax rounds and their masks.
+    pub fn topk(k: usize) -> Self {
+        assert!(k >= 1, "top-k of k >= 1");
+        let mut id = Vec::with_capacity(2 * k);
+        for _ in 0..k {
+            id.push(0.0);
+            id.push(-(f32::MAX as f64));
+        }
+        Self::build(2 * k, id, |a, e| {
+            let sel = |c, t, f| tang_expr::with_graph(|g| g.select(c, t, f));
+            // > 0 when x ranks above y (larger value, then smaller index)
+            let better = |x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                let d = x.1 - y.1;
+                sel(d, ExprId::ONE, sel(-d, -ExprId::ONE, y.0 - x.0))
+            };
+            let pick = |c: ExprId, x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                (sel(c, x.0, y.0), sel(c, x.1, y.1))
+            };
+            let hi = |x, y| pick(better(x, y), x, y);
+            let lo = |x, y| pick(better(x, y), y, x);
+            let av: Vec<(ExprId, ExprId)> = (0..k).map(|r| (a[2 * r], a[2 * r + 1])).collect();
+            let bv: Vec<(ExprId, ExprId)> = (0..k).map(|r| (e[2 * r], e[2 * r + 1])).collect();
+            let mut out = Vec::with_capacity(2 * k);
+            for r in 0..k {
+                let mut best = hi(av[r], bv[r]);
+                for i in 1..=r {
+                    best = hi(best, lo(av[i - 1], bv[r - i]));
+                }
+                out.push(best.0);
+                out.push(best.1);
+            }
+            out
+        })
+    }
+
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
     /// `m' = max(m, s)`, `accᵢ' = accᵢ·exp(m−m') + gᵢ·exp(s−m')`.
     pub fn online_softmax(k: usize) -> Self {
@@ -4888,6 +4931,58 @@ mod tests {
         let want = g.eval(&data, &[am]).remove(0);
         let (sg, so) = g.split_reduction(&[am], am, 4).unwrap();
         close(&sg.eval(&data, &so).remove(0), &want);
+
+        // top-k: k argmax rounds in one tuple reduction, ties to the smaller
+        // index, the same result split or not
+        for k in [1usize, 3, 5] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[2, 16]);
+            let i = g.iota(&[2, 16], 1);
+            let tk = g
+                .comp_tuple(
+                    &[2, 2 * k],
+                    &[16],
+                    vec![
+                        Arg {
+                            src: i,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                        Arg {
+                            src: x,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                    ],
+                    Some(Monoid::topk(k)),
+                    |v| {
+                        let mut o = vec![v[0], v[1]];
+                        for _ in 1..k {
+                            o.push(ExprId::ZERO);
+                            o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                        }
+                        o
+                    },
+                )
+                .unwrap();
+            let data = vec![(0..32)
+                .map(|j| ((j * 7) % 5) as f64 + 0.01 * (j % 3) as f64)
+                .collect::<Vec<_>>()];
+            let got = g.eval(&data, &[tk]).remove(0);
+            for row in 0..2 {
+                let mut idx: Vec<usize> = (0..16).collect();
+                let v = &data[0][row * 16..row * 16 + 16];
+                idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap().then(a.cmp(&b)));
+                for r in 0..k {
+                    assert_eq!(
+                        got[row * 2 * k + 2 * r] as usize,
+                        idx[r],
+                        "k {k} row {row} rank {r}"
+                    );
+                    assert_eq!(got[row * 2 * k + 2 * r + 1], v[idx[r]]);
+                }
+            }
+            let (sg, so) = g.split_reduction(&[tk], tk, 4).unwrap();
+            close(&sg.eval(&data, &so).remove(0), &got);
+        }
 
         // the rule: a 2-point, 4096-long sum splits to fill 64 points
         let mut g = TensorGraph::new();
