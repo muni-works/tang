@@ -77,6 +77,10 @@ name = "coder_moe_hand"
 required-features = ["cuda"]
 
 [[example]]
+name = "coder_derived_ops"
+required-features = ["cuda"]
+
+[[example]]
 name = "bench_prefill"
 required-features = ["metal"]
 

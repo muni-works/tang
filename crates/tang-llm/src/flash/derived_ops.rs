@@ -14,7 +14,9 @@
 //! ids, f32 router weights.
 
 use tang::Scalar;
-use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
+use tang_compile::tensor::{
+    Arg, Form, Format, IntMma, Monoid, Precision, Stage, TensorGraph, TensorId, View,
+};
 use tang_expr::ExprId;
 
 /// The math of an op, before lowering: graph, external tensors in launch
@@ -23,6 +25,9 @@ pub struct Spec {
     pub g: TensorGraph,
     pub ext: Vec<TensorId>,
     pub outs: Vec<TensorId>,
+    /// Run `schedule_auto` before lowering (off when the builder set the
+    /// whole schedule itself).
+    pub auto: bool,
 }
 
 /// One lowered kernel's source and bindings (device-free; the testable part).
@@ -58,7 +63,9 @@ fn define(src: &str, name: &str) -> Option<u32> {
 impl Spec {
     /// Run the standard schedule and lower to CUDA.
     pub fn lower(mut self) -> Result<Lowered, String> {
-        self.g.schedule_auto(&self.outs);
+        if self.auto {
+            self.g.schedule_auto(&self.outs);
+        }
         let p = self.g.to_cuda(&self.outs);
         // reshape aliases: a node whose bytes live in another node's buffer
         let resolve = |mut t: TensorId| {
@@ -229,7 +236,12 @@ pub fn add_norm(t: usize, n: usize, eps: f64, add: bool) -> Spec {
     }
     ext.push(x);
     outs.push(x);
-    Spec { g, ext, outs }
+    Spec {
+        g,
+        ext,
+        outs,
+        auto: true,
+    }
 }
 
 fn rmsnorm(
@@ -346,6 +358,7 @@ pub fn moe_combine_norm(t: usize, n: usize, topk: usize, ne: usize, ls: usize, e
         g,
         ext: vec![r, parts, wts, lg, w, y, ro, x],
         outs: vec![y, ro, x],
+        auto: true,
     }
 }
 
@@ -369,6 +382,7 @@ pub fn argmax(t: usize, v: usize) -> Spec {
         g,
         ext: vec![l, am],
         outs: vec![am],
+        auto: true,
     }
 }
 
@@ -429,6 +443,46 @@ pub fn route(t: usize, ne: usize, ls: usize, k: usize) -> Spec {
         g,
         ext: vec![lg, top, wts],
         outs: vec![top, wts],
+        auto: true,
+    }
+}
+
+/// A dense GEMV on GGUF Q8_0 weights (`cx_gemvk`'s job): `out[t, r] =
+/// Σ_k W[r, k] · q8(x)[t, k]`, `x` quantized to int8 per 32 in the kernel's
+/// prologue (`Format::Q8x32` inlined), the dot on `dp4a`.
+/// ext `[x, w, out]`; `w` the GGUF bytes, rows of `k / 32 · 34`.
+pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
+    let mut g = TensorGraph::new();
+    let x = g.input(&[t, k]);
+    let w = g.input(&[rows, k]);
+    let xq = g.map(&[x], |v| v[0]).unwrap();
+    let out = g
+        .comp(
+            &[t, rows],
+            &[k],
+            vec![
+                arg(w, View::pick(3, &[Some(1), Some(2)])),
+                arg(xq, View::pick(3, &[Some(0), Some(2)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap();
+    g.set_precision(w, Precision::storage(Format::Q8_0));
+    g.set_precision(xq, Precision::storage(Format::Q8x32));
+    g.set_int_mma(
+        out,
+        Some(IntMma {
+            stage: Stage::Gemv,
+            ksplit: 1,
+        }),
+    );
+    g.set_inline(xq, true);
+    Spec {
+        g,
+        ext: vec![x, w, out],
+        outs: vec![out],
+        auto: false,
     }
 }
 
@@ -568,6 +622,7 @@ mod tests {
             ),
             ("route", route(4, 512, 513, 10)),
             ("argmax", argmax(2, 151936)),
+            ("gemv_q8_0", gemv_q8_0(1, 4096, 2048)),
         ] {
             let l = s.lower().unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!l.kernels.is_empty(), "{name}");
@@ -575,6 +630,20 @@ mod tests {
                 "{name}: {} kernels, {} scratch",
                 l.kernels.len(),
                 l.scratch.len()
+            );
+        }
+    }
+}
+#[cfg(test)]
+mod dump {
+    #[test]
+    #[ignore]
+    fn dump_add_norm_64() {
+        let l = super::add_norm(64, 2048, 1e-6, true).lower().unwrap();
+        for k in &l.kernels {
+            eprintln!(
+                "--- grid {} block {} smem {} points {} args {:?}\n{}",
+                k.grid, k.block, k.smem, k.points, k.args, k.source
             );
         }
     }

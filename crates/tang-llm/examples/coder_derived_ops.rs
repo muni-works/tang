@@ -156,8 +156,18 @@ fn main() {
         let ext = [b_r.ptr, b_y.ptr, b_w.ptr, b_ro.ptr, b_dx.ptr];
         op.launch(&s, &ext).unwrap();
         s.sync().unwrap();
-        let err = max_rel(&b_ro.read::<f32>(0, t * N).unwrap(), &want_r)
-            .max(max_rel(&b_dx.read::<f32>(0, t * N).unwrap(), &want_x));
+        let (er, ex) = (
+            max_rel(&b_ro.read::<f32>(0, t * N).unwrap(), &want_r),
+            max_rel(&b_dx.read::<f32>(0, t * N).unwrap(), &want_x),
+        );
+        if std::env::var_os("DBG").is_some() {
+            let d = b_dx.read::<f32>(0, t * N).unwrap();
+            let bad: Vec<usize> = (0..t)
+                .filter(|&ti| (0..N).any(|i| (d[ti * N + i] - want_x[ti * N + i]).abs() > 1e-3))
+                .collect();
+            eprintln!("add_norm T={t}: err r {er:.2e} x {ex:.2e}; bad rows {bad:?}");
+        }
+        let err = er.max(ex);
         // timing: the hand kernel adds in place, so time it on a copy (values drift; the time does not)
         let th = time(&s, || hand(scratch_r.ptr));
         let td = time(&s, || op.launch(&s, &ext).unwrap());
@@ -283,5 +293,74 @@ fn main() {
             op.kernels(),
             if ids_ok { "equal" } else { "DIFFER" }
         );
+
+        // ---- dense Q8_0 GEMV (attn_qkv-sized: 2048 -> 8192 rows... use 4096)
+        for &(rows, k) in &[(4096usize, 2048usize), (2048, 4096), (151936, 2048)] {
+            let x = rnd(t * k, 11);
+            let mut wb = vec![0u8; rows * k / 32 * 34];
+            let mut seed = 12u64;
+            let mut wref = vec![0f32; rows * k];
+            for blk in 0..rows * k / 32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let d = 0.001 + (seed >> 40) as f32 / (1u64 << 24) as f32 * 0.01;
+                let dh = half_bits(d);
+                let dv = half_val(dh);
+                wb[blk * 34..blk * 34 + 2].copy_from_slice(&dh.to_le_bytes());
+                for j in 0..32 {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let q = ((seed >> 33) % 255) as i32 - 127;
+                    wb[blk * 34 + 2 + j] = q as i8 as u8;
+                    wref[blk * 32 + j] = dv * q as f32;
+                }
+            }
+            // reference over the int8-rounded activations
+            let mut want = vec![0f32; t * rows];
+            for ti in 0..t {
+                let mut xq = vec![0f64; k];
+                for b in 0..k / 32 {
+                    let blk = &x[ti * k + b * 32..][..32];
+                    let a = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let d = a / 127.0;
+                    for j in 0..32 {
+                        xq[b * 32 + j] = if d == 0.0 {
+                            0.0
+                        } else {
+                            ((blk[j] / d).round().clamp(-127.0, 127.0) * d) as f64
+                        };
+                    }
+                }
+                for r in 0..rows {
+                    let row = &wref[r * k..(r + 1) * k];
+                    want[ti * rows + r] = row
+                        .iter()
+                        .zip(&xq)
+                        .map(|(&a, &b)| a as f64 * b)
+                        .sum::<f64>() as f32;
+                }
+            }
+            let (b_x, b_w) = (
+                DevBuf::from_slice(&x).unwrap(),
+                DevBuf::from_slice(&wb).unwrap(),
+            );
+            let b_o = DevBuf::zeroed_elems::<f32>(t * rows).unwrap();
+            let op = Op::load(&gpu, dop::gemv_q8_0(t, rows, k).lower().unwrap(), 3).unwrap();
+            let ext = [b_x.ptr, b_w.ptr, b_o.ptr];
+            op.launch(&s, &ext).unwrap();
+            s.sync().unwrap();
+            let err = max_rel(&b_o.read::<f32>(0, t * rows).unwrap(), &want);
+            let td = time(&s, || op.launch(&s, &ext).unwrap());
+            let gbs = wb.len() as f64 / (td * 1e-6) / 1e9;
+            println!(
+                "| gemv_q8_0 {rows}x{k} | {t} | - | {td:.2} ({gbs:.0} GB/s) | {} | {err:.2e} |",
+                op.kernels()
+            );
+        }
     }
+}
+
+fn half_bits(x: f32) -> u16 {
+    tang_compile::tensor::precision::f16_bits(x as f64)
+}
+fn half_val(b: u16) -> f32 {
+    tang_compile::tensor::precision::f16_from_bits(b) as f32
 }
