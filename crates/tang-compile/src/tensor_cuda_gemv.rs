@@ -969,6 +969,56 @@ impl Lowering<'_> {
                     .map(|d| (d, rows));
             }
         }
+        // the load model: bytes each lane loads per output point with dim
+        // `d` tiled `t` in registers (a leaf that ignores `d` is loaded
+        // once for all `t` points); only leaves that vary along the reduce
+        // are counted. When another tiling loads a quarter fewer bytes
+        // than the rule above (attention's P·V: tiling the heads shares V
+        // but re-reads the f32 probabilities per `d`; tiling `d` shares
+        // them), take it. `TANG_REG_MODEL=0` keeps the rule.
+        if std::env::var("TANG_REG_MODEL").as_deref() != Ok("0") {
+            let bytes = |l: &Leaf| match l.pack {
+                Some(Packing::U4) => 0.5,
+                Some(Packing::Bf16 | Packing::F16) => 2.0,
+                None => 4.0,
+            };
+            let streamed: Vec<&Leaf> = leaves
+                .iter()
+                .filter(|l| (pk..rank).any(|r| l.addr.coefs[r] != 0))
+                .collect();
+            let cost = |r: Option<(usize, usize)>| -> f64 {
+                streamed
+                    .iter()
+                    .map(|l| match r {
+                        Some((d, t)) if l.addr.coefs[d] == 0 => bytes(l) / t as f64,
+                        _ => bytes(l),
+                    })
+                    .sum()
+            };
+            let rows = if self.opts.rows == 0 {
+                2
+            } else {
+                self.opts.rows
+            };
+            let best = (0..pk)
+                .filter(|&d| pts[d] > 1 && free(d))
+                .filter_map(|d| {
+                    let t = if (2..=8).contains(&pts[d]) {
+                        pts[d]
+                    } else if rows > 1 && pts[d].is_multiple_of(rows) {
+                        rows
+                    } else {
+                        return None;
+                    };
+                    Some((d, t))
+                })
+                .min_by(|a, b| cost(Some(*a)).total_cmp(&cost(Some(*b))));
+            if let Some(b) = best {
+                if cost(Some(b)) < 0.75 * cost(reg) {
+                    reg = Some(b);
+                }
+            }
+        }
         let rt = reg.map_or(1, |r| r.1);
         let on_reg = |cd: &Cond| reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0);
         // a runtime scalar of a bound is loaded per point group: it may not
@@ -1043,7 +1093,10 @@ impl Lowering<'_> {
         // that dim is the slowest in the group order, and a grid-stride
         // loop stops at the bound
         let dyn_dim = point_cond.as_ref().and_then(|cd| {
-            let dims: Vec<usize> = (0..pk).filter(|&d| cd.coefs[d] != 0.0).collect();
+            // (a dim of extent 1 is always coordinate 0: it bounds nothing)
+            let dims: Vec<usize> = (0..pk)
+                .filter(|&d| cd.coefs[d] != 0.0 && pts[d] > 1)
+                .collect();
             let constant_rt = cd
                 .rt
                 .iter()

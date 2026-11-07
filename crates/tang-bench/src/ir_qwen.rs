@@ -972,6 +972,63 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
 /// stored f16 when `half_tiles` (CUDA's m16n8k16 tiles; Metal's
 /// simdgroup tile stages f32). Returns the graph and its outputs:
 /// `dg.outputs` (same order), then `dg.keep`, then `dg.logit_chunks`.
+/// Schedule (decode): split-K every reduction that reads a 4-bit weight
+/// (directly or through its dequantization map) whose output has fewer
+/// than `target` points, into the smallest power-of-two number of chunks
+/// that reaches `target` (dividing its outermost reduce axis, at most
+/// 16): a GEMV over few rows (q|k|v: 6144, o: 4096) otherwise has too
+/// few warps in flight for its long K.
+pub fn split_gemvs(
+    mut g: TensorGraph,
+    mut outs: Vec<TensorId>,
+    dg: &DecodeGraph,
+    target: usize,
+) -> (TensorGraph, Vec<TensorId>) {
+    use tang_compile::tensor::Op;
+    let u4: Vec<usize> = dg
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.packing == Some(Packing::U4))
+        .map(|(k, _)| k)
+        .collect();
+    // (node, parts) of the next GEMV to split; the graph is dead-code
+    // free here and after each split, and a split node becomes the
+    // combine (which reads no weight)
+    let next = |g: &TensorGraph| -> Option<(usize, usize)> {
+        let is_u4 = |j: usize| matches!(g.nodes()[j].op, Op::Input(k) if u4.contains(&k));
+        let weight = |j: usize| {
+            is_u4(j)
+                || g.comp_at(j).is_some_and(|c| {
+                    c.monoid.is_none() && c.args.iter().any(|a| is_u4(a.src.index()))
+                })
+        };
+        (0..g.nodes().len()).find_map(|i| {
+            let c = g.comp_at(i)?;
+            if c.monoid.is_none() || c.tuple > 1 || !c.args.iter().any(|a| weight(a.src.index())) {
+                return None;
+            }
+            let points: usize = g.nodes()[i].shape.iter().map(|d| d.n()).product();
+            let r0 = c.red[0].n();
+            let mut p = 1;
+            while points * p < target && p < 16 && r0 % (p * 2) == 0 && r0 / (p * 2) >= 2 {
+                p *= 2;
+            }
+            (p > 1).then_some((i, p))
+        })
+    };
+    while let Some((t, p)) = next(&g) {
+        match g.split_reduction(&outs, TensorId::from_index(t), p) {
+            Ok((g2, o2)) => {
+                g = g2;
+                outs = o2;
+            }
+            Err(_) => break,
+        }
+    }
+    (g, outs)
+}
+
 pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<TensorId>) {
     let all: Vec<TensorId> = dg
         .outputs
@@ -994,54 +1051,43 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         (g, outs)
     };
-    // TANG_SPLIT_GEMV=P: decode reductions over at least TANG_SPLIT_MIN_K
-    // keys (default 8192: the down projection) split-K into P chunks
-    let parts: usize = std::env::var("TANG_SPLIT_GEMV")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if dg.seq == 1 && parts > 1 {
-        let min_k: usize = std::env::var("TANG_SPLIT_MIN_K")
+    // decode split-K of the 4-bit GEMVs (see `split_gemvs`)
+    if dg.seq == 1 {
+        // CUDA default: 16384 (q|k|v and o split 4 ways, down 4)
+        let target = std::env::var("TANG_SPLIT_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
-        // (the graph is dead-code free here and after each split)
-        let live = |g: &TensorGraph, _outs: &[TensorId]| {
-            (0..g.nodes().len())
-                .filter(|&i| {
+            .unwrap_or(if half_tiles { 16384 } else { 0 });
+        if target > 0 {
+            (g, outs) = split_gemvs(g, outs, dg, target);
+        }
+        // TANG_SPLIT_ATTN=P: the reductions over the KV cache (keys >=
+        // 4096, no weight read) split-K into P chunks
+        let attn: usize = std::env::var("TANG_SPLIT_ATTN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if attn > 1 {
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find(|&i| {
                     g.comp_at(i).is_some_and(|c| {
                         c.monoid.is_some()
                             && c.tuple <= 1
-                            && c.red.iter().map(|d| d.n()).product::<usize>() >= min_k
-                            && c.red[0].n() % parts == 0
-                            && c.red[0].n() / parts >= 2
+                            && c.red.len() == 1
+                            && c.red[0].n() >= 4096
+                            && c.red[0].n() % attn == 0
+                            && g.nodes()[i].shape.iter().map(|d| d.n()).product::<usize>() < 65536
                     })
                 })
-                .collect::<Vec<_>>()
-        };
-        if std::env::var_os("TANG_SPLIT_DEBUG").is_some() {
-            for i in 0..g.nodes().len() {
-                if let Some(c) = g.comp_at(i).filter(|c| c.monoid.is_some()) {
-                    let red: Vec<usize> = c.red.iter().map(|d| d.n()).collect();
-                    eprintln!(
-                        "red node {i}: shape {:?} red {red:?} tuple {}",
-                        g.nodes()[i].shape,
-                        c.tuple
-                    );
-                }
-            }
-        }
-        let todo = live(&g, &outs).len();
-        for _ in 0..todo {
-            let Some(&t) = live(&g, &outs).first() else {
-                break;
             };
-            match g.split_reduction(&outs, TensorId::from_index(t), parts) {
-                Ok((g2, o2)) => {
-                    g = g2;
-                    outs = o2;
+            while let Some(t) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), attn) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         }
     }
@@ -1057,7 +1103,20 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .map(|(k, _)| k)
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
-    g.schedule_decode_maps(&outs, &u4, &caches);
+    // the norms recomputed inside every GEMV lane (TANG_DECODE_MAPS=1),
+    // or materialized once by a small map kernel (=0). CUDA decode
+    // defaults to materialized: with 8 GEMV rows per warp the lanes are
+    // bound by their loads, and recomputing the norm doubles the
+    // activation bytes each one streams (7.80 -> 7.22 ms per Qwen3-8B
+    // step on the 3090)
+    let maps = match std::env::var("TANG_DECODE_MAPS").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => !(half_tiles && dg.seq == 1),
+    };
+    if maps {
+        g.schedule_decode_maps(&outs, &u4, &caches);
+    }
     if dg.q4 {
         // a prefill over packed weights: the dequantization maps are
         // evaluated where the matmul loads the packed words, and the
@@ -1410,7 +1469,9 @@ mod tests {
         ] {
             let transpiled = p.native.iter().filter(|n| !**n).count();
             assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
-            assert!(transpiled <= dims.layers + 2, "{transpiled} transpiled");
+            // (the norms CUDA decode keeps materialized are plain maps,
+            // transpiled: two per layer)
+            assert!(transpiled <= 3 * dims.layers + 3, "{transpiled} transpiled");
             // packed weights are sized in words
             let k = dg.input("model.layers.0.qkv.q");
             let q = p
