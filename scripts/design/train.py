@@ -209,7 +209,7 @@ def batch(src, n, gen):
 model = GPT(a.mixer).to(dev)
 nparam = sum(p.numel() for p in model.parameters())
 nmix = sum(p.numel() for b in model.blocks for p in b.mix.parameters())
-cmodel = model if a.mixer in ("mamba2", "gdn") else torch.compile(model)
+cmodel = model if a.mixer in ("mamba2", "gdn", "ssd") else torch.compile(model)
 decay = [p for p in model.parameters() if p.dim() >= 2]
 nodecay = [p for p in model.parameters() if p.dim() < 2]
 opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
