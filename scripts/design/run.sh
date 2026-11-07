@@ -3,7 +3,7 @@
 # MIXERS and TOKENS from env. Results: RES lines in the log, and a gzip|base64
 # dump of all jsonl at the end.
 cd /work
-pip install -q tiktoken pyarrow "flash-linear-attention==0.3.2" "fla-core==0.3.2" 2>&1 | tail -2
+pip install -q tiktoken pyarrow; for v in 0.3.2 0.3.1 0.3.0 0.2.2; do pip install -q "flash-linear-attention==$v" 2>&1 | tail -1; python -c "import fla.layers" && break; done
 python -c "import torch, fla; print('torch', torch.__version__, 'fla ok')"
 python prep.py /data ${SHARDS:-2} || exit 1
 MIX=(${MIXERS:-softmax mamba2 gdn forget logdist sigmoid forget_sigmoid softcap_forget})
