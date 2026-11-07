@@ -352,7 +352,7 @@ impl TensorGraph {
             let nt = (s.pos_tile.max(1) as usize)
                 .div_ceil(8)
                 .min(npos.div_ceil(8));
-            if nt > 1 && wa.view.gather.is_none() && xkey.is_none() && (k / 128) % ksplit == 0 {
+            if wa.view.gather.is_none() && xkey.is_none() && (k / 128) % ksplit == 0 {
                 // dense: a block takes `nt` position tiles, the A fragments loaded once
                 let groups = npos.div_ceil(8 * nt);
                 let mut src = String::new();
@@ -442,7 +442,6 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
 "#,
                     params = params.join(", "),
                     row_bytes = k / 32 * 34,
-                    nb_per = nb / ksplit,
                     pg = 8 * nt,
                     nu_per = k / 128 / ksplit,
                     reduce_nt = if ksplit > 1 {
