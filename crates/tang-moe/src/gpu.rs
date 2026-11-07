@@ -99,8 +99,17 @@ impl Gpu {
         let minor =
             self.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
         let arch: &'static str = Box::leak(format!("sm_{major}{minor}").into_boxed_str());
+        // the toolkit's headers, for sources that include them (`<mma.h>`, `<cuda_fp16.h>`)
+        let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let include = format!("{include}/include");
         let opts = cudarc::nvrtc::CompileOptions {
             arch: Some(arch),
+            include_paths: if src.contains("#include <") && std::path::Path::new(&include).exists()
+            {
+                vec![include]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
         // NVRTC from an older CUDA doesn't know newer architectures (e.g. B300's sm_103
@@ -129,7 +138,7 @@ impl Gpu {
             {
                 let opts = cudarc::nvrtc::CompileOptions {
                     arch: Some("sm_90"),
-                    ..Default::default()
+                    ..opts
                 };
                 cudarc::nvrtc::compile_ptx_with_opts(src, opts)
                     .map_err(|e| Error(format!("nvrtc: {e:?}")))?

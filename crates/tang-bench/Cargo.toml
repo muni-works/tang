@@ -112,3 +112,7 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_half_matmul"
 required-features = ["cuda"]
+
+[[example]]
+name = "scan_bench"
+required-features = ["cuda"]

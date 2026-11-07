@@ -253,6 +253,7 @@ impl TensorGraph {
                 Op::Input(_) => true,
                 Op::Comp(_) => !self.nodes[j].inline,
                 Op::Iota(_) | Op::Reshape(_) => false,
+                Op::Scan(_) => panic!("scan nodes have no C lowering yet"),
                 Op::Operator(o) => panic!(
                     "operator node `{}` has no device lowering; evaluate it on the host",
                     o.op.name()

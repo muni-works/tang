@@ -765,6 +765,53 @@ f32 slices.
 
 Numbers (H200): `docs/bench/fp8-hopper.md`.
 
+## Scans: prefix monoids and the chunked delta rule
+
+`Op::Scan` (`tensor_scan.rs`) is the third construct next to views and
+comprehensions: `out[…, t, …] = e[…, 0, …] ⊕ … ⊕ e[…, t, …]` along one
+dim, inclusive or exclusive, forward or reverse, for an associative `⊕`.
+Two monoids:
+
+- a **tuple monoid** (`TensorGraph::scan`), the same `Monoid` a reduction
+  uses: cumulative sums, running maxima, the scalar affine `(a, b)` of a
+  gated recurrence;
+- the **matrix affine monoid** (`linear_scan`): `S_t = A_t·S_{t−1} + U_t`
+  with `A [P…, n, n]`, `U [P…, n, m]`, combine `(A₂, U₂)∘(A₁, U₁) =
+  (A₂A₁, A₂U₁ + U₂)`. Linear attention (`A = I`), Mamba-2's SSD
+  (`A = αI`) and the gated delta rule (`A = α(I − β·k·kᵀ)`) are this scan
+  with `U = β·k·vᵀ`; `delta_scan` builds `A` and `U` as comprehensions
+  and records the structure (`DeltaForm`), `scan_readout` is `o = Sᵀq`.
+
+The **backward is derived**: the cotangent of a scan is a reverse scan
+with the transposed combine. For the affine monoid that is closed —
+`λ_t = G_t + A_{t+1}ᵀλ_{t+1}` (an affine scan the other way), `∂U = λ`,
+`∂A_t = λ_t·S_{t−1}ᵀ`. A tuple monoid becomes the same thing over `w×w`
+matrices: the combine's Jacobians come from `tang-expr` derivatives, so
+`λ_t = G_t + J_{t+1}ᵀλ_{t+1}` and `∂e_t = J^eᵀ_t·λ_t`. Finite differences
+check every variant (inclusive/exclusive × forward/reverse, max, the
+gated delta rule end to end). The interpreter evaluates scans directly;
+the WGSL lowering (so Metal and CUDA through the transpiler) runs one
+thread per scanned line.
+
+**Chunked schedule** (`tensor_cuda_scan.rs`). `chunked_scan_plan`
+recognizes a readout over a delta scan and lowers it to the SSD /
+chunked-delta-rule form on bf16 tensor cores: inside a chunk of 64 steps
+the product of the `I − β·k·kᵀ` factors is one unit-triangular solve (the
+WY/UT transform: `W = T·diag(β e^γ)k`, `U = T·diag(β)v`, `T = (I +
+tril(β kkᵀ ⊙ e^{γᵢ−γⱼ}))⁻¹`, solved in 16×16 blocks with columns in
+registers), and only the `n×m` state crosses chunks in a sequential scan
+(`V' = U − W·S`, `S ← e^{γ_C}S + kᵀ·(e^{γ_C−γ}V')`, next chunk's fragments
+prefetched into registers); the readout `o = e^γ q·S + tril(q kᵀ ⊙
+e^{γᵢ−γⱼ})·V'` is a third, fully parallel kernel. The backward is the
+derived reverse scan at chunk granularity — the transposed chunk map
+`dS₀ = e^{γ_C}dS − Wᵀ·dV' + (e^γ q)ᵀ·dO` with `dV' = e^{γ_C−γ}k·dS +
+A_qkᵀ·dO` — plus one parallel kernel per chunk that pushes `dV'`,
+`dS_end` and `dO` back through `W`, `T`, the masked Gram matrices and the
+decays to `dq dk dv dβ dα`. `examples/scan_bench.rs` checks the forward
+and all five gradients against the f64 interpreter (rel. err 2–5e-3,
+bf16) and times them; BENCHMARKS.md has the comparison with fla and
+mamba_ssm.
+
 ## Not yet
 
 - Fragments for attention on Metal (QKᵀ and PV under the online-softmax
@@ -792,7 +839,12 @@ Numbers (H200): `docs/bench/fp8-hopper.md`.
 - Gathers ([above](#gather-views)): the backward is a dense gated sum
   (a segmented-sum or atomic lowering is the follow-up); gathered reads
   never tile, so a prefill-sized MoE GEMM runs one thread per point;
-  expert-major dispatch needs a scan; the C backend rejects them.
+  the C backend rejects them.
+- Scans: the chunked schedule is CUDA-only and pattern-matched on
+  `delta_scan` + `scan_readout` (graph inputs `[H, T, ·]`, `T % 64 == 0`,
+  `n = m = 128` for the backward); other scans run the sequential WGSL
+  kernel. No `wgmma` variant yet (Hopper runs the `wmma` kernels). The C
+  backend rejects scans.
 - Placement is a transform now (`shard_reduction` + `fold_partials`:
   partial reductions over slices, the all-reduce as a comprehension over
   the monoid's combine; `examples/shard_attention.rs` runs flash

@@ -1,0 +1,1197 @@
+//! Scans: inclusive or exclusive prefix combines over one dim.
+//!
+//! A [`Scan`] node is `out[…, t, …] = e[…, 0, …] ⊕ … ⊕ e[…, t, …]` for an
+//! associative `⊕`. Two kinds of monoid:
+//!
+//! - **[`ScanKind::Monoid`]**: a tuple monoid ([`Monoid`], the same type a
+//!   reduction uses), one input tensor per state slot. Cumulative sums,
+//!   running maxima, the scalar affine monoid `(a, b)` of a gated
+//!   recurrence.
+//! - **[`ScanKind::Affine`]**: the matrix affine monoid. Inputs `A
+//!   [P…, n, n]`, `U [P…, n, m]`; the state is a matrix and
+//!   `S_t = A_t·S_{t−1} + U_t` (`S_{−1} = 0`). Its combine, `(A₂, U₂) ∘
+//!   (A₁, U₁) = (A₂A₁, A₂U₁ + U₂)`, is associative, so this is a scan, and
+//!   it is the state recurrence of every linear-attention-like layer:
+//!   linear attention (`A = I`), Mamba-2's SSD (`A = αI`), DeltaNet and
+//!   the gated delta rule (`A = α(I − β·k·kᵀ)`), with `U = β·k·vᵀ`.
+//!
+//! **Backward.** The cotangent of a scan is a reverse scan with the
+//! transposed combine. For the affine monoid that is exact and closed:
+//! `λ_t = G_t + A_{t+1}ᵀ·λ_{t+1}` (an affine scan the other way), then
+//! `∂U_t = λ_t` and `∂A_t = λ_t·S_{t−1}ᵀ`. A tuple monoid reduces to the
+//! same thing: `λ_t = G_t + J_{t+1}ᵀ·λ_{t+1}` with `J` the Jacobian of the
+//! combine in its accumulator, which is an affine scan over `w×w`
+//! matrices built from `tang-expr` derivatives of the combine, then
+//! `∂e_t = J^eᵀ_t·λ_t`. Every derivative is derived from the monoid; no
+//! scan has a hand-written adjoint.
+//!
+//! **Chunked schedule.** An affine scan built by
+//! [`TensorGraph::delta_scan`] remembers its structure ([`DeltaForm`]),
+//! and a readout of it ([`TensorGraph::scan_readout`]) lowers on CUDA to
+//! the chunked (SSD / chunked-delta-rule) form: inside a chunk the scan
+//! is a handful of small matmuls on tensor cores (the WY/UT transform
+//! turns the product of `I − β·k·kᵀ` factors into one triangular solve),
+//! and only the `n×m` state crosses chunk boundaries, through a
+//! sequential scan over chunks. See `tensor_cuda_scan.rs`.
+
+use std::fmt::Write;
+
+use super::wgsl::{load, store, WgslKernel};
+use super::*;
+
+/// Which inputs of an affine [`Scan`] its `A` and `U` were built from:
+/// `A_t = α_t·(I − [delta]·β_t·k_t·k_tᵀ)`, `U_t = β_t·k_t·v_tᵀ`, with
+/// `α`, `β` (shape `[P…]`) 1 when absent. Indices into
+/// [`Scan::inputs`]; `k` is `[P…, n]`, `v` is `[P…, m]`. The interpreter
+/// and the backward use `A` and `U`; the chunked schedule uses the form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaForm {
+    pub alpha: Option<usize>,
+    pub beta: Option<usize>,
+    pub k: usize,
+    pub v: usize,
+    pub delta: bool,
+}
+
+#[derive(Clone)]
+pub enum ScanKind {
+    /// A tuple monoid; input `s` is state slot `s`.
+    Monoid(Monoid),
+    /// The matrix affine monoid; inputs `[A, U, …]` (anything after `U`
+    /// is only referenced by `form`).
+    Affine { form: Option<DeltaForm> },
+}
+
+/// A prefix scan along point dim `dim` (see the module docs).
+///
+/// `reverse` scans from the end: a suffix product in the original order,
+/// `out_t = e_t ⊕ e_{t+1} ⊕ …` (affine: `S_t = A_t·S_{t+1} + U_t`).
+/// `exclusive` shifts by one: `out_t` is the state before `e_t` (the
+/// identity, or `0`, at the first step).
+#[derive(Clone)]
+pub struct Scan {
+    pub inputs: Vec<TensorId>,
+    pub dim: usize,
+    pub exclusive: bool,
+    pub reverse: bool,
+    pub kind: ScanKind,
+}
+
+impl Scan {
+    /// The reference interpreter: `ins` row-major with `shapes`.
+    pub(super) fn eval(&self, ins: &[&[f64]], shapes: &[Vec<usize>], _out: &[usize]) -> Vec<f64> {
+        let ps: &[usize] = match &self.kind {
+            ScanKind::Monoid(_) => &shapes[0],
+            ScanKind::Affine { .. } => &shapes[0][..shapes[0].len() - 2],
+        };
+        let tn = ps[self.dim];
+        let outer: usize = ps[..self.dim].iter().product();
+        let inner: usize = ps[self.dim + 1..].iter().product();
+        let npts = outer * tn * inner;
+        let order = |step: usize| if self.reverse { tn - 1 - step } else { step };
+        match &self.kind {
+            ScanKind::Monoid(m) => {
+                let w = m.width;
+                let mut out = vec![0.0; npts * w];
+                let mut vars = vec![0.0; 2 * w];
+                for o in 0..outer {
+                    for i in 0..inner {
+                        let mut s = m.identity.clone();
+                        for step in 0..tn {
+                            let p = (o * tn + order(step)) * inner + i;
+                            if self.exclusive {
+                                out[p * w..(p + 1) * w].copy_from_slice(&s);
+                            }
+                            // forward: s ⊕ e; reverse: e ⊕ s
+                            for k in 0..w {
+                                let e = ins[k][p];
+                                if self.reverse {
+                                    vars[k] = e;
+                                    vars[w + k] = s[k];
+                                } else {
+                                    vars[k] = s[k];
+                                    vars[w + k] = e;
+                                }
+                            }
+                            s = m.combine.eval_many(&m.outs, &vars);
+                            if !self.exclusive {
+                                out[p * w..(p + 1) * w].copy_from_slice(&s);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            ScanKind::Affine { .. } => {
+                let n = shapes[0][shapes[0].len() - 1];
+                let m = shapes[1][shapes[1].len() - 1];
+                let mut out = vec![0.0; npts * n * m];
+                let mut s = vec![0.0; n * m];
+                let mut nx = vec![0.0; n * m];
+                for o in 0..outer {
+                    for i in 0..inner {
+                        s.iter_mut().for_each(|x| *x = 0.0);
+                        for step in 0..tn {
+                            let p = (o * tn + order(step)) * inner + i;
+                            if self.exclusive {
+                                out[p * n * m..(p + 1) * n * m].copy_from_slice(&s);
+                            }
+                            let a = &ins[0][p * n * n..(p + 1) * n * n];
+                            let u = &ins[1][p * n * m..(p + 1) * n * m];
+                            for r in 0..n {
+                                for c in 0..m {
+                                    let mut acc = u[r * m + c];
+                                    for j in 0..n {
+                                        acc += a[r * n + j] * s[j * m + c];
+                                    }
+                                    nx[r * m + c] = acc;
+                                }
+                            }
+                            std::mem::swap(&mut s, &mut nx);
+                            if !self.exclusive {
+                                out[p * n * m..(p + 1) * n * m].copy_from_slice(&s);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// The point shape (the elements' shape, without the state dims).
+    fn points(&self, g: &TensorGraph) -> Vec<Dim> {
+        let s = g.shape(self.inputs[0]);
+        match &self.kind {
+            ScanKind::Monoid(_) => s.to_vec(),
+            ScanKind::Affine { .. } => s[..s.len() - 2].to_vec(),
+        }
+    }
+}
+
+/// A plain (unguarded unless `guard`) view from forms.
+fn view(forms: Vec<Form>, guard: bool) -> View {
+    View {
+        forms,
+        guard,
+        gather: None,
+    }
+}
+
+/// `unit(rank, d)` shifted by `off`.
+fn shifted(rank: usize, d: usize, off: i64) -> Form {
+    let mut f = Form::unit(rank, d);
+    f.offset = off;
+    f
+}
+
+impl TensorGraph {
+    fn push_scan(&mut self, sc: Scan, shape: Vec<Dim>) -> TensorId {
+        self.nodes.push(TNode {
+            op: Op::Scan(sc),
+            shape,
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+            reg: (1, 1),
+            fragment: false,
+            int_mma: None,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            precision: Precision::default(),
+        });
+        TensorId(self.nodes.len() as u32 - 1)
+    }
+
+    /// The [`Scan`] at `t`, if it is one.
+    pub fn scan_at(&self, t: TensorId) -> Option<&Scan> {
+        match &self.nodes[t.n()].op {
+            Op::Scan(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A tuple-monoid scan of `elems` (one tensor per state slot, all the
+    /// same shape) along `dim`. The output is the elements' shape, plus a
+    /// trailing dim of the monoid's width when it is wider than 1.
+    pub fn scan(
+        &mut self,
+        elems: &[TensorId],
+        dim: usize,
+        monoid: Monoid,
+        exclusive: bool,
+        reverse: bool,
+    ) -> Result<TensorId, ShapeError> {
+        if elems.len() != monoid.width {
+            return err(format!(
+                "scan: {} elements for a monoid of width {}",
+                elems.len(),
+                monoid.width
+            ));
+        }
+        let ps = self.shape(elems[0]).to_vec();
+        if elems.iter().any(|e| self.shape(*e) != ps) {
+            return err("scan: elements differ in shape");
+        }
+        if dim >= ps.len() {
+            return err(format!("scan dim {dim} of {ps:?}"));
+        }
+        let mut shape = ps;
+        if monoid.width > 1 {
+            shape.push(Dim::Fixed(monoid.width));
+        }
+        Ok(self.push_scan(
+            Scan {
+                inputs: elems.to_vec(),
+                dim,
+                exclusive,
+                reverse,
+                kind: ScanKind::Monoid(monoid),
+            },
+            shape,
+        ))
+    }
+
+    /// The matrix affine scan `S_t = A_t·S_{t−1} + U_t` along `dim` of
+    /// `A [P…, n, n]`, `U [P…, n, m]`; the output is `U`'s shape.
+    pub fn linear_scan(
+        &mut self,
+        a: TensorId,
+        u: TensorId,
+        dim: usize,
+        exclusive: bool,
+        reverse: bool,
+    ) -> Result<TensorId, ShapeError> {
+        self.affine_scan(vec![a, u], dim, exclusive, reverse, None)
+    }
+
+    fn affine_scan(
+        &mut self,
+        inputs: Vec<TensorId>,
+        dim: usize,
+        exclusive: bool,
+        reverse: bool,
+        form: Option<DeltaForm>,
+    ) -> Result<TensorId, ShapeError> {
+        let (sa, su) = (
+            self.shape(inputs[0]).to_vec(),
+            self.shape(inputs[1]).to_vec(),
+        );
+        let r = su.len();
+        let ok = r >= 3
+            && sa.len() == r
+            && sa[..r - 2] == su[..r - 2]
+            && sa[r - 2] == sa[r - 1]
+            && sa[r - 1] == su[r - 2]
+            && dim < r - 2;
+        if !ok {
+            return err(format!("linear_scan: A {sa:?}, U {su:?}, dim {dim}"));
+        }
+        Ok(self.push_scan(
+            Scan {
+                inputs,
+                dim,
+                exclusive,
+                reverse,
+                kind: ScanKind::Affine { form },
+            },
+            su,
+        ))
+    }
+
+    /// The delta-rule state scan along `dim`: `S_t = α_t·(I −
+    /// [delta]·β_t·k_t·k_tᵀ)·S_{t−1} + β_t·k_t·v_tᵀ` for `k [P…, n]`, `v
+    /// [P…, m]`, `α`, `β` `[P…]` (1 when `None`). `A` and `U` are built
+    /// as comprehensions, so the interpreter, the backward and every
+    /// backend see an ordinary affine scan; the scan also records the
+    /// [`DeltaForm`] for the chunked schedule.
+    ///
+    /// - linear attention: `alpha: None, beta: None, delta: false`
+    /// - Mamba-2 SSD: `α = exp(Δ·A)`, `β = Δ`, `k = B`, `v = x`, no delta
+    /// - gated delta rule (Qwen3-Next GDN): `α = exp(g)`, `β`, `delta: true`
+    pub fn delta_scan(
+        &mut self,
+        k: TensorId,
+        v: TensorId,
+        alpha: Option<TensorId>,
+        beta: Option<TensorId>,
+        dim: usize,
+        delta: bool,
+    ) -> Result<TensorId, ShapeError> {
+        let sk = self.shape(k).to_vec();
+        let sv = self.shape(v).to_vec();
+        let p = sk.len() - 1;
+        let ps = sk[..p].to_vec();
+        if sv[..sv.len() - 1] != ps[..] {
+            return err(format!("delta_scan: k {sk:?}, v {sv:?}"));
+        }
+        for x in [alpha, beta].into_iter().flatten() {
+            if self.shape(x) != &ps[..] {
+                return err(format!("delta_scan: gate {:?} vs {ps:?}", self.shape(x)));
+            }
+        }
+        let (n, m) = (sk[p], sv[p]);
+        let pts: Vec<Option<usize>> = (0..p).map(Some).collect();
+        let pick = |extra: &[Option<usize>]| {
+            let mut v = pts.clone();
+            v.extend_from_slice(extra);
+            View::pick(p + 2, &v)
+        };
+        // A[P…, i, j] = α·(δᵢⱼ − [delta]·β·kᵢ·kⱼ)
+        let ii = self.iota(&[n, n], 0);
+        let jj = self.iota(&[n, n], 1);
+        let mut args = vec![
+            Arg {
+                src: ii,
+                view: View::pick(p + 2, &[Some(p), Some(p + 1)]),
+            },
+            Arg {
+                src: jj,
+                view: View::pick(p + 2, &[Some(p), Some(p + 1)]),
+            },
+            Arg {
+                src: k,
+                view: pick(&[Some(p)]),
+            },
+            Arg {
+                src: k,
+                view: pick(&[Some(p + 1)]),
+            },
+        ];
+        let ia = alpha.map(|a| {
+            args.push(Arg {
+                src: a,
+                view: pick(&[]),
+            });
+            args.len() - 1
+        });
+        let ib = beta.map(|b| {
+            args.push(Arg {
+                src: b,
+                view: pick(&[]),
+            });
+            args.len() - 1
+        });
+        let mut ashape = ps.clone();
+        ashape.extend([n, n]);
+        let a = self.comp(&ashape, &[], args, None, |x| {
+            let d = x[0] - x[1];
+            let half = ExprId::from_f64(0.5);
+            let c = half - d * d;
+            let eye = tang_expr::with_graph(|g| g.select(c, ExprId::ONE, ExprId::ZERO));
+            let mut v = if delta {
+                let kk = x[2] * x[3];
+                let bkk = ib.map_or(kk, |b| x[b] * kk);
+                eye - bkk
+            } else {
+                eye
+            };
+            if let Some(a) = ia {
+                v = x[a] * v;
+            }
+            vec![v]
+        })?;
+        // U[P…, i, c] = β·kᵢ·v_c
+        let mut uargs = vec![
+            Arg {
+                src: k,
+                view: pick(&[Some(p)]),
+            },
+            Arg {
+                src: v,
+                view: pick(&[Some(p + 1)]),
+            },
+        ];
+        if let Some(b) = beta {
+            uargs.push(Arg {
+                src: b,
+                view: pick(&[]),
+            });
+        }
+        let mut ushape = ps.clone();
+        ushape.extend([n, m]);
+        let has_b = beta.is_some();
+        let u = self.comp(&ushape, &[], uargs, None, |x| {
+            let kv = x[0] * x[1];
+            vec![if has_b { x[2] * kv } else { kv }]
+        })?;
+        let mut inputs = vec![a, u, k, v];
+        let alpha_i = alpha.map(|t| {
+            inputs.push(t);
+            inputs.len() - 1
+        });
+        let beta_i = beta.map(|t| {
+            inputs.push(t);
+            inputs.len() - 1
+        });
+        let form = DeltaForm {
+            alpha: alpha_i,
+            beta: beta_i,
+            k: 2,
+            v: 3,
+            delta,
+        };
+        self.affine_scan(inputs, dim, false, false, Some(form))
+    }
+
+    /// `o[P…, c] = scale · Σᵢ S[P…, i, c]·q[P…, i]`: the output of a
+    /// linear-attention-like layer from its state scan `s [P…, n, m]` and
+    /// queries `q [P…, n]`.
+    pub fn scan_readout(
+        &mut self,
+        s: TensorId,
+        q: TensorId,
+        scale: f64,
+    ) -> Result<TensorId, ShapeError> {
+        let ss = self.shape(s).to_vec();
+        let r = ss.len();
+        let p = r - 2;
+        let mut out = ss[..p].to_vec();
+        out.push(ss[r - 1]);
+        let pts: Vec<Option<usize>> = (0..p).map(Some).collect();
+        // space [P…, c, i]
+        let mut sp = pts.clone();
+        sp.extend([Some(p + 1), Some(p)]);
+        let mut qp = pts.clone();
+        qp.push(Some(p + 1));
+        self.comp(
+            &out,
+            &[ss[p]],
+            vec![
+                Arg {
+                    src: s,
+                    view: View::pick(p + 2, &sp),
+                },
+                Arg {
+                    src: q,
+                    view: View::pick(p + 2, &qp),
+                },
+            ],
+            Some(Monoid::sum()),
+            move |x| vec![ExprId::from_f64(scale) * x[0] * x[1]],
+        )
+    }
+
+    /// The input cotangents of scan node `j` given its output cotangent
+    /// `dy` (see the module docs), appended to the graph.
+    pub(super) fn scan_backward(
+        &mut self,
+        j: usize,
+        dy: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError> {
+        let sc = self.scan_at(TensorId(j as u32)).unwrap().clone();
+        let ps = sc.points(self);
+        let q = ps.len();
+        let dim = sc.dim;
+        // the step the recurrence takes: S_t depends on S_{t−d}
+        let d: i64 = if sc.reverse { -1 } else { 1 };
+        let out = TensorId(j as u32);
+        match &sc.kind {
+            ScanKind::Affine { .. } => {
+                let (a, sa) = (sc.inputs[0], self.shape(sc.inputs[0]).to_vec());
+                let su = self.shape(sc.inputs[1]).to_vec();
+                let r = q + 2;
+                // A'_t = A_{t+d}ᵀ (0 past the end)
+                let mut f: Vec<Form> = (0..q).map(|x| Form::unit(r, x)).collect();
+                f[dim] = shifted(r, dim, d);
+                f.push(Form::unit(r, q + 1));
+                f.push(Form::unit(r, q));
+                let at = self.comp(
+                    &sa,
+                    &[],
+                    vec![Arg {
+                        src: a,
+                        view: view(f, true),
+                    }],
+                    None,
+                    |x| vec![x[0]],
+                )?;
+                // the cotangent of the internal (inclusive) state
+                let gint = if sc.exclusive {
+                    let mut f: Vec<Form> = (0..r).map(|x| Form::unit(r, x)).collect();
+                    f[dim] = shifted(r, dim, d);
+                    self.comp(
+                        &su,
+                        &[],
+                        vec![Arg {
+                            src: dy,
+                            view: view(f, true),
+                        }],
+                        None,
+                        |x| vec![x[0]],
+                    )?
+                } else {
+                    dy
+                };
+                let lam = self.linear_scan(at, gint, dim, false, !sc.reverse)?;
+                // S_{t−d}: the exclusive output itself, or the inclusive one shifted
+                let sprev = if sc.exclusive {
+                    out
+                } else {
+                    let mut f: Vec<Form> = (0..r).map(|x| Form::unit(r, x)).collect();
+                    f[dim] = shifted(r, dim, -d);
+                    self.comp(
+                        &su,
+                        &[],
+                        vec![Arg {
+                            src: out,
+                            view: view(f, true),
+                        }],
+                        None,
+                        |x| vec![x[0]],
+                    )?
+                };
+                // ∂A[P…, i, j] = Σ_c λ[P…, i, c]·S_prev[P…, j, c]; space [P…, i, j, c]
+                let r4 = q + 3;
+                let mut lf: Vec<Form> = (0..q).map(|x| Form::unit(r4, x)).collect();
+                lf.extend([Form::unit(r4, q), Form::unit(r4, q + 2)]);
+                let mut sf: Vec<Form> = (0..q).map(|x| Form::unit(r4, x)).collect();
+                sf.extend([Form::unit(r4, q + 1), Form::unit(r4, q + 2)]);
+                let ga = self.comp(
+                    &sa,
+                    &[su[q + 1]],
+                    vec![
+                        Arg {
+                            src: lam,
+                            view: view(lf, false),
+                        },
+                        Arg {
+                            src: sprev,
+                            view: view(sf, false),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |x| vec![x[0] * x[1]],
+                )?;
+                let mut gs = vec![Some(ga), Some(lam)];
+                gs.resize(sc.inputs.len(), None);
+                Ok(gs)
+            }
+            ScanKind::Monoid(m) => {
+                let w = m.width;
+                let tn = ps[dim]
+                    .fixed()
+                    .ok_or_else(|| ShapeError("scan backward needs a bound scan dim".into()))?;
+                // Jacobians of F(p, e) (= p ⊕ e forward, e ⊕ p reverse) in p and e
+                let mut g2 = ExprGraph::new();
+                let pv: Vec<ExprId> = (0..w).map(|i| g2.var(i as u16)).collect();
+                let ev: Vec<ExprId> = (0..w).map(|i| g2.var((w + i) as u16)).collect();
+                let vars: Vec<ExprId> = if sc.reverse {
+                    ev.iter().chain(&pv).copied().collect()
+                } else {
+                    pv.iter().chain(&ev).copied().collect()
+                };
+                let fo = replay(&m.combine, &m.outs, &vars, &mut g2);
+                let mut jp = Vec::with_capacity(w * w);
+                let mut je = Vec::with_capacity(w * w);
+                for &fa in &fo {
+                    for b in 0..w {
+                        jp.push(g2.diff(fa, b as u16));
+                    }
+                }
+                for &fa in &fo {
+                    for b in 0..w {
+                        je.push(g2.diff(fa, (w + b) as u16));
+                    }
+                }
+                // args: prev state slots (raw), element slots, the scan coordinate
+                let mut args = Vec::new();
+                for s in 0..w {
+                    let mut f: Vec<Form> = (0..q).map(|x| Form::unit(q, x)).collect();
+                    if !sc.exclusive {
+                        f[dim] = shifted(q, dim, -d);
+                    }
+                    if w > 1 {
+                        f.push(Form::constant(q, s as i64));
+                    }
+                    args.push(Arg {
+                        src: out,
+                        view: view(f, !sc.exclusive),
+                    });
+                }
+                for &e in &sc.inputs {
+                    args.push(Arg {
+                        src: e,
+                        view: View::identity(q, q),
+                    });
+                }
+                let iota = self.iota(&ps, dim);
+                args.push(Arg {
+                    src: iota,
+                    view: View::identity(q, q),
+                });
+                let id = m.identity.clone();
+                let (excl, rev) = (sc.exclusive, sc.reverse);
+                let jac = |g: &mut TensorGraph, outs: Vec<ExprId>| {
+                    let mut shape = ps.clone();
+                    shape.push(Dim::Fixed(w * w));
+                    let g2 = g2.clone();
+                    let id = id.clone();
+                    let flat = g.comp_tuple(&shape, &[], args.clone(), None, move |x| {
+                        // boundary: the first step has the identity as its prev
+                        let t = x[2 * w];
+                        let c = if rev {
+                            t - ExprId::from_f64(tn as f64 - 1.5)
+                        } else {
+                            ExprId::from_f64(0.5) - t
+                        };
+                        let mut vars: Vec<ExprId> = (0..w)
+                            .map(|s| {
+                                if excl {
+                                    x[s]
+                                } else {
+                                    let idv = ExprId::from_f64(id[s]);
+                                    tang_expr::with_graph(|gr| gr.select(c, idv, x[s]))
+                                }
+                            })
+                            .collect();
+                        vars.extend((0..w).map(|s| x[w + s]));
+                        tang_expr::with_graph(|gr| replay(&g2, &outs, &vars, gr))
+                    })?;
+                    let mut shape = ps.clone();
+                    shape.extend([Dim::Fixed(w), Dim::Fixed(w)]);
+                    g.reshape(flat, &shape)
+                };
+                let jpt = jac(self, jp)?;
+                let jet = jac(self, je)?;
+                // A'_t[b, a] = Jp_{t+d}[a, b]
+                let r = q + 2;
+                let mut f: Vec<Form> = (0..q).map(|x| Form::unit(r, x)).collect();
+                f[dim] = shifted(r, dim, d);
+                f.extend([Form::unit(r, q + 1), Form::unit(r, q)]);
+                let mut sa = ps.clone();
+                sa.extend([Dim::Fixed(w), Dim::Fixed(w)]);
+                let at = self.comp(
+                    &sa,
+                    &[],
+                    vec![Arg {
+                        src: jpt,
+                        view: view(f, true),
+                    }],
+                    None,
+                    |x| vec![x[0]],
+                )?;
+                // U' = the internal state's cotangent as [P…, w, 1]
+                let mut f: Vec<Form> = (0..q).map(|x| Form::unit(r, x)).collect();
+                if sc.exclusive {
+                    f[dim] = shifted(r, dim, d);
+                }
+                if w > 1 {
+                    f.push(Form::unit(r, q));
+                }
+                let mut su = ps.clone();
+                su.extend([Dim::Fixed(w), Dim::Fixed(1)]);
+                let gint = self.comp(
+                    &su,
+                    &[],
+                    vec![Arg {
+                        src: dy,
+                        view: view(f, sc.exclusive),
+                    }],
+                    None,
+                    |x| vec![x[0]],
+                )?;
+                let lam = self.linear_scan(at, gint, dim, false, !sc.reverse)?;
+                // ∂e_b = Σ_a Je[P…, a, b]·λ[P…, a, 0]; space [P…, a]
+                let r1 = q + 1;
+                let mut gs = Vec::with_capacity(w);
+                for b in 0..w {
+                    let mut jf: Vec<Form> = (0..q).map(|x| Form::unit(r1, x)).collect();
+                    jf.extend([Form::unit(r1, q), Form::constant(r1, b as i64)]);
+                    let mut lf: Vec<Form> = (0..q).map(|x| Form::unit(r1, x)).collect();
+                    lf.extend([Form::unit(r1, q), Form::constant(r1, 0)]);
+                    let ge = self.comp(
+                        &ps,
+                        &[Dim::Fixed(w)],
+                        vec![
+                            Arg {
+                                src: jet,
+                                view: view(jf, false),
+                            },
+                            Arg {
+                                src: lam,
+                                view: view(lf, false),
+                            },
+                        ],
+                        Some(Monoid::sum()),
+                        |x| vec![x[0] * x[1]],
+                    )?;
+                    gs.push(Some(ge));
+                }
+                Ok(gs)
+            }
+        }
+    }
+
+    /// The WGSL kernel of scan node `j`: one thread per scanned line
+    /// (and per state column, for the affine monoid) walking the scan
+    /// dim sequentially. Correct for any monoid on every backend; the
+    /// chunked schedule is the fast path for delta-rule scans on CUDA.
+    pub(super) fn scan_kernel(&self, j: usize) -> WgslKernel {
+        let sc = self.scan_at(TensorId(j as u32)).unwrap();
+        let ps = fixed(&sc.points(self));
+        let tn = ps[sc.dim];
+        let outer: usize = ps[..sc.dim].iter().product();
+        let inner: usize = ps[sc.dim + 1..].iter().product();
+        let mut reads: Vec<usize> = Vec::new();
+        for t in &sc.inputs {
+            let s = self.storage(*t).n();
+            if !reads.contains(&s) {
+                reads.push(s);
+            }
+        }
+        let bind = |t: TensorId| format!("b{}", self.storage(t).n());
+        let fmt = |t: TensorId| self.nodes[self.storage(t).n()].precision.storage;
+        let out_f = self.nodes[j].precision.storage;
+        let mut s = String::new();
+        writeln!(
+            s,
+            "// Auto-generated by tang-compile from a TensorGraph (scan)"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "struct Params {{ count: u32, _p1: u32, _p2: u32, _p3: u32 }}"
+        )
+        .unwrap();
+        for (b, &r) in reads.iter().enumerate() {
+            writeln!(
+                s,
+                "@group(0) @binding({b}) var<storage, read> b{r}: array<{}>;",
+                super::wgsl::elem_ty(self.nodes[r].precision.storage)
+            )
+            .unwrap();
+        }
+        writeln!(
+            s,
+            "@group(0) @binding({}) var<storage, read_write> out: array<{}>;",
+            reads.len(),
+            super::wgsl::out_ty(out_f)
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "@group(0) @binding({}) var<uniform> params: Params;\n",
+            reads.len() + 1
+        )
+        .unwrap();
+        let step = |s: &mut String| {
+            if sc.reverse {
+                writeln!(s, "        let t = {}u - st;", tn - 1).unwrap();
+            } else {
+                writeln!(s, "        let t = st;").unwrap();
+            }
+            writeln!(s, "        let p = (po * {tn}u + t) * {inner}u + pi;").unwrap();
+        };
+        let lines;
+        match &sc.kind {
+            ScanKind::Monoid(m) => {
+                let w = m.width;
+                super::wgsl::emit_combine(&mut s, j, m, Format::F32);
+                lines = outer * inner;
+                writeln!(s, "@compute @workgroup_size(64)").unwrap();
+                writeln!(
+                    s,
+                    "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{"
+                )
+                .unwrap();
+                writeln!(s, "    let g = gid.x + gid.y * {}u;", 65535 * 64).unwrap();
+                writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
+                writeln!(s, "    let po = g / {inner}u;").unwrap();
+                writeln!(s, "    let pi = g % {inner}u;").unwrap();
+                let ids = m
+                    .identity
+                    .iter()
+                    .map(|v| super::wgsl::lit(*v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(s, "    var acc = array<f32, {w}>({ids});").unwrap();
+                writeln!(s, "    for (var st: u32 = 0u; st < {tn}u; st = st + 1u) {{").unwrap();
+                step(&mut s);
+                let el = sc
+                    .inputs
+                    .iter()
+                    .map(|t| load(fmt(*t), &bind(*t), "p"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(s, "        let e = array<f32, {w}>({el});").unwrap();
+                let put = |s: &mut String| {
+                    for k in 0..w {
+                        let st = store(out_f, &format!("p * {w}u + {k}u"), &format!("acc[{k}]"));
+                        writeln!(s, "        {st}").unwrap();
+                    }
+                };
+                if sc.exclusive {
+                    put(&mut s);
+                }
+                if sc.reverse {
+                    writeln!(s, "        acc = combine_{j}(e, acc);").unwrap();
+                } else {
+                    writeln!(s, "        acc = combine_{j}(acc, e);").unwrap();
+                }
+                if !sc.exclusive {
+                    put(&mut s);
+                }
+                writeln!(s, "    }}").unwrap();
+                writeln!(s, "}}").unwrap();
+            }
+            ScanKind::Affine { .. } => {
+                let su = fixed(self.shape(sc.inputs[1]));
+                let (n, m) = (su[su.len() - 2], su[su.len() - 1]);
+                lines = outer * inner * m;
+                let (ta, tu) = (sc.inputs[0], sc.inputs[1]);
+                writeln!(s, "@compute @workgroup_size(64)").unwrap();
+                writeln!(
+                    s,
+                    "fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{"
+                )
+                .unwrap();
+                writeln!(s, "    let g = gid.x + gid.y * {}u;", 65535 * 64).unwrap();
+                writeln!(s, "    if (g >= params.count) {{ return; }}").unwrap();
+                writeln!(s, "    let col = g % {m}u;").unwrap();
+                writeln!(s, "    let line = g / {m}u;").unwrap();
+                writeln!(s, "    let po = line / {inner}u;").unwrap();
+                writeln!(s, "    let pi = line % {inner}u;").unwrap();
+                writeln!(s, "    var sv: array<f32, {n}>;").unwrap();
+                writeln!(s, "    var nv: array<f32, {n}>;").unwrap();
+                writeln!(
+                    s,
+                    "    for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{ sv[i] = 0.0; }}"
+                )
+                .unwrap();
+                writeln!(s, "    for (var st: u32 = 0u; st < {tn}u; st = st + 1u) {{").unwrap();
+                step(&mut s);
+                let put = |s: &mut String| {
+                    writeln!(s, "        for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{").unwrap();
+                    let st = store(out_f, &format!("(p * {n}u + i) * {m}u + col"), "sv[i]");
+                    writeln!(s, "            {st}").unwrap();
+                    writeln!(s, "        }}").unwrap();
+                };
+                if sc.exclusive {
+                    put(&mut s);
+                }
+                writeln!(s, "        for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{").unwrap();
+                let u = load(fmt(tu), &bind(tu), &format!("(p * {n}u + i) * {m}u + col"));
+                writeln!(s, "            var acc: f32 = {u};").unwrap();
+                writeln!(
+                    s,
+                    "            for (var k: u32 = 0u; k < {n}u; k = k + 1u) {{"
+                )
+                .unwrap();
+                let a = load(fmt(ta), &bind(ta), &format!("(p * {n}u + i) * {n}u + k"));
+                writeln!(s, "                acc = acc + {a} * sv[k];").unwrap();
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "            nv[i] = acc;").unwrap();
+                writeln!(s, "        }}").unwrap();
+                writeln!(
+                    s,
+                    "        for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{ sv[i] = nv[i]; }}"
+                )
+                .unwrap();
+                if !sc.exclusive {
+                    put(&mut s);
+                }
+                writeln!(s, "    }}").unwrap();
+                writeln!(s, "}}").unwrap();
+            }
+        }
+        WgslKernel {
+            source: s,
+            node: TensorId(j as u32),
+            reads: reads.into_iter().map(|r| TensorId(r as u32)).collect(),
+            points: lines as u32,
+            count: lines.div_ceil(64) as u32 * 64,
+            workgroup_size: 64,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: &[f64], b: &[f64], tol: f64) {
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!((x - y).abs() <= tol * (1.0 + y.abs()), "[{i}] {x} vs {y}");
+        }
+    }
+
+    fn ramp(n: usize, scale: f64, off: f64) -> Vec<f64> {
+        (0..n)
+            .map(|i| ((i * 7919 + 13) % 97) as f64 * scale + off)
+            .collect()
+    }
+
+    /// Scalar affine monoid `(a, b)`: `h_t = a_t·h_{t−1} + b_t`, not
+    /// commutative.
+    fn affine1() -> Monoid {
+        Monoid::build(2, vec![1.0, 0.0], |p, e| {
+            vec![p[0] * e[0], e[0] * p[1] + e[1]]
+        })
+    }
+
+    /// Finite-difference check of `∂(Σ r·y)/∂x_k` for every input `k`.
+    fn check_grads(g: &TensorGraph, y: TensorId, inputs: &[Vec<f64>], tol: f64) {
+        let mut g = g.clone();
+        let ny = numel(g.shape(y));
+        let r = g.input(&[ny]);
+        let ys = g.shape(y).to_vec();
+        let rr = g.reshape(r, &ys).unwrap();
+        let prod = g.map(&[y, rr], |v| v[0] * v[1]).unwrap();
+        let flat = g.reshape(prod, &[ny]).unwrap();
+        let loss = g
+            .comp(
+                &[1usize],
+                &[ny],
+                vec![Arg {
+                    src: flat,
+                    view: View::pick(2, &[Some(1)]),
+                }],
+                Some(Monoid::sum()),
+                |x| vec![x[0]],
+            )
+            .unwrap();
+        let wrt: Vec<TensorId> = (0..inputs.len())
+            .map(|k| {
+                g.nodes
+                    .iter()
+                    .position(|n| matches!(n.op, Op::Input(i) if i == k))
+                    .map(|p| TensorId(p as u32))
+                    .unwrap()
+            })
+            .collect();
+        let grads = g.backward(loss, &wrt).unwrap();
+        let mut ins = inputs.to_vec();
+        ins.push(ramp(ny, 0.02, -0.9));
+        let gv = g.eval(&ins, &grads);
+        let h = 1e-6;
+        for k in 0..inputs.len() {
+            for i in 0..ins[k].len() {
+                let mut p = ins.clone();
+                p[k][i] += h;
+                let lp = g.eval(&p, &[loss])[0][0];
+                p[k][i] -= 2.0 * h;
+                let lm = g.eval(&p, &[loss])[0][0];
+                let fd = (lp - lm) / (2.0 * h);
+                let an = gv[k][i];
+                assert!(
+                    (fd - an).abs() <= tol * (1.0 + fd.abs()),
+                    "input {k}[{i}]: fd {fd} vs backward {an}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cumsum_all_variants() {
+        let x = ramp(2 * 5 * 3, 0.1, -2.0);
+        for (excl, rev) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut g = TensorGraph::new();
+            let xi = g.input(&[2, 5, 3]);
+            let y = g.scan(&[xi], 1, Monoid::sum(), excl, rev).unwrap();
+            let got = &g.eval(std::slice::from_ref(&x), &[y])[0];
+            let mut want = vec![0.0; x.len()];
+            for o in 0..2 {
+                for i in 0..3 {
+                    for t in 0..5 {
+                        let range: Vec<usize> = match (excl, rev) {
+                            (false, false) => (0..=t).collect(),
+                            (true, false) => (0..t).collect(),
+                            (false, true) => (t..5).collect(),
+                            (true, true) => (t + 1..5).collect(),
+                        };
+                        want[(o * 5 + t) * 3 + i] =
+                            range.iter().map(|&s| x[(o * 5 + s) * 3 + i]).sum();
+                    }
+                }
+            }
+            close(got, &want, 1e-12);
+        }
+    }
+
+    #[test]
+    fn noncommutative_monoid_is_the_recurrence() {
+        let (tn, c) = (7, 2);
+        let a = ramp(tn * c, 0.01, 0.5);
+        let b = ramp(tn * c, 0.03, -1.0);
+        for rev in [false, true] {
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[tn, c]);
+            let bi = g.input(&[tn, c]);
+            let y = g.scan(&[ai, bi], 0, affine1(), false, rev).unwrap();
+            let got = &g.eval(&[a.clone(), b.clone()], &[y])[0];
+            // forward: e_0 ⊕ … ⊕ e_t; reverse: e_t ⊕ … ⊕ e_{T−1}, both applied
+            // left to right as h ← a·h + b from h = 0
+            for ch in 0..c {
+                for t in 0..tn {
+                    let range = if rev { t..tn } else { 0..t + 1 };
+                    let h = range.fold(0.0, |h, s| a[s * c + ch] * h + b[s * c + ch]);
+                    let p = t * c + ch;
+                    assert!((got[p * 2 + 1] - h).abs() < 1e-12, "rev {rev} t {t}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monoid_scan_backward() {
+        let (tn, c) = (6, 2);
+        let ins = vec![ramp(tn * c, 0.01, 0.5), ramp(tn * c, 0.03, -1.0)];
+        for (excl, rev) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[tn, c]);
+            let bi = g.input(&[tn, c]);
+            let y = g.scan(&[ai, bi], 0, affine1(), excl, rev).unwrap();
+            check_grads(&g, y, &ins, 1e-5);
+        }
+        // a running max (piecewise linear, no ties in the data)
+        let mut g = TensorGraph::new();
+        let xi = g.input(&[2, 9]);
+        let y = g.scan(&[xi], 1, Monoid::max(), false, false).unwrap();
+        let x: Vec<f64> = (0..18)
+            .map(|i| ((i * 37) % 19) as f64 * 0.1 + i as f64 * 1e-3)
+            .collect();
+        check_grads(&g, y, &[x], 1e-5);
+    }
+
+    fn rand_like(n: usize, seed: u64, scale: f64) -> Vec<f64> {
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 2.0 * scale
+            })
+            .collect()
+    }
+
+    #[test]
+    fn affine_scan_backward() {
+        let (h, tn, n, m) = (2, 5, 3, 2);
+        let a = rand_like(h * tn * n * n, 1, 0.6);
+        let u = rand_like(h * tn * n * m, 2, 1.0);
+        for (excl, rev) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[h, tn, n, n]);
+            let ui = g.input(&[h, tn, n, m]);
+            let s = g.linear_scan(ai, ui, 1, excl, rev).unwrap();
+            check_grads(&g, s, &[a.clone(), u.clone()], 1e-5);
+        }
+    }
+
+    /// The gated delta rule, token by token.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_reference(
+        h: usize,
+        tn: usize,
+        n: usize,
+        m: usize,
+        q: &[f64],
+        k: &[f64],
+        v: &[f64],
+        al: &[f64],
+        be: &[f64],
+        scale: f64,
+    ) -> Vec<f64> {
+        let mut o = vec![0.0; h * tn * m];
+        for hh in 0..h {
+            let mut s = vec![0.0; n * m];
+            for t in 0..tn {
+                let pt = hh * tn + t;
+                let kt = &k[pt * n..(pt + 1) * n];
+                let (a, b) = (al[pt], be[pt]);
+                // S = a·S;  S += β·k·(v − Sᵀk)ᵀ
+                s.iter_mut().for_each(|x| *x *= a);
+                for c in 0..m {
+                    let sk: f64 = (0..n).map(|i| s[i * m + c] * kt[i]).sum();
+                    let d = b * (v[pt * m + c] - sk);
+                    for i in 0..n {
+                        s[i * m + c] += kt[i] * d;
+                    }
+                }
+                for c in 0..m {
+                    o[pt * m + c] =
+                        scale * (0..n).map(|i| s[i * m + c] * q[pt * n + i]).sum::<f64>();
+                }
+            }
+        }
+        o
+    }
+
+    fn gdn_graph(h: usize, tn: usize, n: usize, m: usize) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let q = g.input(&[h, tn, n]);
+        let k = g.input(&[h, tn, n]);
+        let v = g.input(&[h, tn, m]);
+        let al = g.input(&[h, tn]);
+        let be = g.input(&[h, tn]);
+        let s = g.delta_scan(k, v, Some(al), Some(be), 1, true).unwrap();
+        let o = g.scan_readout(s, q, 1.0 / (n as f64).sqrt()).unwrap();
+        (g, o)
+    }
+
+    #[test]
+    fn delta_scan_is_the_gated_delta_rule() {
+        let (h, tn, n, m) = (2, 9, 4, 3);
+        let q = rand_like(h * tn * n, 3, 1.0);
+        let k = rand_like(h * tn * n, 4, 0.5);
+        let v = rand_like(h * tn * m, 5, 1.0);
+        let al: Vec<f64> = rand_like(h * tn, 6, 0.1).iter().map(|x| 0.9 + x).collect();
+        let be: Vec<f64> = rand_like(h * tn, 7, 0.3).iter().map(|x| 0.5 + x).collect();
+        let (g, o) = gdn_graph(h, tn, n, m);
+        let got = &g.eval(
+            &[q.clone(), k.clone(), v.clone(), al.clone(), be.clone()],
+            &[o],
+        )[0];
+        let want = gdn_reference(h, tn, n, m, &q, &k, &v, &al, &be, 1.0 / (n as f64).sqrt());
+        close(got, &want, 1e-12);
+    }
+
+    #[test]
+    fn delta_scan_backward() {
+        let (h, tn, n, m) = (1, 5, 3, 2);
+        let ins = vec![
+            rand_like(h * tn * n, 3, 1.0),
+            rand_like(h * tn * n, 4, 0.5),
+            rand_like(h * tn * m, 5, 1.0),
+            rand_like(h * tn, 6, 0.1).iter().map(|x| 0.9 + x).collect(),
+            rand_like(h * tn, 7, 0.3).iter().map(|x| 0.5 + x).collect(),
+        ];
+        let (g, o) = gdn_graph(h, tn, n, m);
+        check_grads(&g, o, &ins, 1e-5);
+    }
+
+    fn naga_ok(src: &str) {
+        let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    }
+
+    #[test]
+    fn scans_lower_to_valid_wgsl() {
+        let (h, tn, n, m) = (2, 9, 4, 3);
+        let (g, o) = gdn_graph(h, tn, n, m);
+        let p = g.to_wgsl(&[o]);
+        assert!(p.kernels.iter().any(|k| k.source.contains("(scan)")));
+        for k in &p.kernels {
+            naga_ok(&k.source);
+        }
+        for (excl, rev) in [(false, false), (true, true)] {
+            let mut g = TensorGraph::new();
+            let ai = g.input(&[7, 2]);
+            let bi = g.input(&[7, 2]);
+            let y = g.scan(&[ai, bi], 0, affine1(), excl, rev).unwrap();
+            for k in &g.to_wgsl(&[y]).kernels {
+                naga_ok(&k.source);
+            }
+        }
+    }
+}
