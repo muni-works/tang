@@ -488,7 +488,12 @@ struct GemvShape<'a> {
 /// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
 fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     let units = g.k / 128;
-    let lanes = units.next_power_of_two().min(32);
+    // half-super-blocks a lane (more loads in flight a lane), then lanes a row
+    let upl: usize = std::env::var("TANG_GEMV_UPL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let rpw = 32 / lanes;
     let row_blocks = g.rows.div_ceil(8 * rpw);
     let (bb, qs) = (g.b.bytes, g.b.qs);
@@ -500,10 +505,13 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
         Some(e) => format!("      const long long XKEY = {e};\n"),
         None => String::new(),
     };
-    let five = if g.b.five {
-        "                const unsigned qh = __ldg((const unsigned*)(bp + 16 + 4 * w));\n                lo |= ((qh >> (2 * jp)) & 0x01010101u) << 4;\n                hi |= ((qh >> (2 * jp + 1)) & 0x01010101u) << 4;\n"
+    let (five_load, five) = if g.b.five {
+        (
+            "                const uint4 h4[2] = {__ldg((const uint4*)(bp + 16)), __ldg((const uint4*)(bp + 32))};\n",
+            "                    const unsigned qh = w & 4 ? (&h4[1].x)[w & 3] : (&h4[0].x)[w & 3];\n                    lo |= ((qh >> (2 * jp)) & 0x01010101u) << 4;\n                    hi |= ((qh >> (2 * jp + 1)) & 0x01010101u) << 4;\n",
+        )
     } else {
-        ""
+        ("", "")
     };
     let mut src = String::new();
     src.push_str(HELPERS);
@@ -540,12 +548,18 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
             for (int jj = 0; jj < 2; jj++) {{
                 const int jp = 2 * h + jj;
                 int dl = 0, dh = 0;
-                #pragma unroll
+                // 16-byte loads: the pair's 32 code bytes, both sub-blocks' 32 activations
+                const uint4* qv = (const uint4*)(bp + {qs} + jp * 32);
+                const int4* xlv = (const int4*)(xc + sb * 256 + (2 * jp) * 32);
+                const int4* xhv = (const int4*)(xc + sb * 256 + (2 * jp + 1) * 32);
+                const uint4 q4[2] = {{__ldg(qv), __ldg(qv + 1)}};
+                const int4 xl4[2] = {{__ldg(xlv), __ldg(xlv + 1)}}, xh4[2] = {{__ldg(xhv), __ldg(xhv + 1)}};
+{five_load}                #pragma unroll
                 for (int w = 0; w < 8; w++) {{
-                    const unsigned q = __ldg((const unsigned*)(bp + {qs} + jp * 32 + 4 * w));
+                    const unsigned q = w & 4 ? (&q4[1].x)[w & 3] : (&q4[0].x)[w & 3];
                     unsigned lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
-{five}                    const int xl = __ldg((const int*)(xc + sb * 256 + (2 * jp) * 32 + 4 * w));
-                    const int xh = __ldg((const int*)(xc + sb * 256 + (2 * jp + 1) * 32 + 4 * w));
+{five}                    const int xl = w & 4 ? (&xl4[1].x)[w & 3] : (&xl4[0].x)[w & 3];
+                    const int xh = w & 4 ? (&xh4[1].x)[w & 3] : (&xh4[0].x)[w & 3];
                     dl = __dp4a((int)lo, xl, dl);
                     dh = __dp4a((int)hi, xh, dh);
                 }}
@@ -575,4 +589,3 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     .unwrap();
     (src, 256, g.npos * row_blocks)
 }
-

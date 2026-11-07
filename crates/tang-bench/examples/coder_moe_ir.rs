@@ -238,6 +238,7 @@ fn layer_graph(m: Dims) -> Layer {
                     |v| vec![v[0], v[1]],
                 )
                 .unwrap();
+            g.set_schedule(am, 256, (0, 0, 0), (1, 1));
             picks.push((am, 0));
         }
     } else {
@@ -260,6 +261,10 @@ fn layer_graph(m: Dims) -> Layer {
                 },
             )
             .unwrap();
+        // a block of threads a row, the subgroup tree (one thread a row would
+        // fold all e elements through the k²/2-select combine serially)
+        let split = std::env::var("TANG_MOE_TOPK_SPLIT").map_or(256, |s| s.parse().unwrap());
+        g.set_schedule(tk, split, (0, 0, 0), (1, 1));
         picks.extend((0..k).map(|j| (tk, 2 * j as i64)));
     }
     // sel[t, j] (j = k: the shared expert, index e) and the combine weights
