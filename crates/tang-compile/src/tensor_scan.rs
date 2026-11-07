@@ -990,7 +990,7 @@ mod tests {
             let mut g = TensorGraph::new();
             let xi = g.input(&[2, 5, 3]);
             let y = g.scan(&[xi], 1, Monoid::sum(), excl, rev).unwrap();
-            let got = &g.eval(&[x.clone()], &[y])[0];
+            let got = &g.eval(std::slice::from_ref(&x), &[y])[0];
             let mut want = vec![0.0; x.len()];
             for o in 0..2 {
                 for i in 0..3 {
