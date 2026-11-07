@@ -49,6 +49,8 @@ pub mod cuda_gemv;
 #[path = "tensor_cuda_int8.rs"]
 mod cuda_int8;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
+#[path = "tensor_cuda_scan.rs"]
+pub mod cuda_scan;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
 #[cfg(test)]
