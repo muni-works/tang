@@ -272,6 +272,20 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
         e.sync().unwrap();
         best = best.min(e.since(&a).unwrap() as f64 * 100.0);
     }
+    if std::env::var_os("PER_KERNEL").is_some() {
+        for i in 0..op.kernels() {
+            let mut b = f64::MAX;
+            for _ in 0..20 {
+                let (a, e) = (Event::new(true).unwrap(), Event::new(true).unwrap());
+                a.record(s).unwrap();
+                op.launch_range(s, &bufs.ptrs, i..i + 1).unwrap();
+                e.record(s).unwrap();
+                e.sync().unwrap();
+                b = b.min(e.since(&a).unwrap() as f64 * 1000.0);
+            }
+            eprintln!("  T={t} ne={ne} kernel {i} {:?}: {b:.1} µs", op.shape(i));
+        }
+    }
     println!(
         "| {t} | {ne} | {} | {best:.1} | {build:.1} s | {} |",
         op.kernels(),

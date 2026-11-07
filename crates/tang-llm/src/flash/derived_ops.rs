@@ -185,8 +185,24 @@ mod gpu_impl {
         /// Enqueue every kernel on `s`; `ext[i]` is external tensor `i`'s
         /// device address.
         pub fn launch(&self, s: &Stream, ext: &[u64]) -> anyhow::Result<()> {
+            self.launch_range(s, ext, 0..self.ks.len())
+        }
+
+        /// Kernel `i`'s launch shape `(grid, block, smem)`.
+        pub fn shape(&self, i: usize) -> (u32, u32, u32) {
+            let k = &self.ks[i];
+            (k.grid, k.block, k.smem)
+        }
+
+        /// Enqueue kernels `r` only (profiling).
+        pub fn launch_range(
+            &self,
+            s: &Stream,
+            ext: &[u64],
+            r: std::ops::Range<usize>,
+        ) -> anyhow::Result<()> {
             assert_eq!(ext.len(), self.n_ext, "derived op: external pointer count");
-            for k in &self.ks {
+            for k in &self.ks[r] {
                 let mut vals: Vec<u64> = k
                     .args
                     .iter()
