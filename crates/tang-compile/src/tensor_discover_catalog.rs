@@ -58,7 +58,7 @@ fn absx(x: ExprId) -> ExprId {
 
 /// `occupied` for a max slot (`> 0` unless `−∞`).
 fn occ_max(i: usize) -> Build {
-    build(move |s| vec![s[i] + c(1e300)])
+    build(move |s| vec![s[i] + c(1e30)])
 }
 
 /// `occupied` for a count slot.
@@ -1263,5 +1263,43 @@ mod tests {
             .collect();
         assert!(rows.len() >= 30);
         assert!(bad.is_empty(), "unexpected:\n{}", bad.join("\n"));
+    }
+
+    /// Backward of `Var_p[v]` is elementwise from the saved forward
+    /// state `(m, Z, μ, Var)`: `∂/∂vᵢ = 2pᵢ(vᵢ − μ)`,
+    /// `∂/∂sᵢ = pᵢ((vᵢ − μ)² − Var)`. Checked by central differences.
+    #[test]
+    fn weighted_variance_backward_is_elementwise() {
+        let var = |s: &[f64], v: &[f64]| {
+            let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
+            let p: Vec<f64> = s.iter().map(|x| (x - m).exp() / z).collect();
+            let mu: f64 = p.iter().zip(v).map(|(a, b)| a * b).sum();
+            (
+                p.iter()
+                    .zip(v)
+                    .map(|(a, b)| a * (b - mu) * (b - mu))
+                    .sum::<f64>(),
+                p,
+                mu,
+            )
+        };
+        let mut rng = Rng(11);
+        let s: Vec<f64> = (0..17).map(|_| 2.0 * rng.normal()).collect();
+        let v: Vec<f64> = (0..17).map(|_| 1.0 + rng.normal()).collect();
+        let (vv, p, mu) = var(&s, &v);
+        let h = 1e-6;
+        for i in 0..17 {
+            let (mut sp, mut sm, mut vp, mut vm) = (s.clone(), s.clone(), v.clone(), v.clone());
+            sp[i] += h;
+            sm[i] -= h;
+            vp[i] += h;
+            vm[i] -= h;
+            let ds = (var(&sp, &v).0 - var(&sm, &v).0) / (2.0 * h);
+            let dv = (var(&s, &vp).0 - var(&s, &vm).0) / (2.0 * h);
+            let d = v[i] - mu;
+            assert!((ds - p[i] * (d * d - vv)).abs() < 1e-7, "ds {i}");
+            assert!((dv - 2.0 * p[i] * d).abs() < 1e-7, "dv {i}");
+        }
     }
 }
