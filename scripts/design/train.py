@@ -138,7 +138,8 @@ class SSD(nn.Module):
         k = F.normalize(c(self.ck, self.k(x)).view(B, T, self.nh, self.dk), dim=-1)
         v = c(self.cv, self.v(x)).view(B, T, self.nh, self.dv)
         g = F.logsigmoid(self.a(x).float())  # log decay, [B, T, H]
-        o, _ = chunk_simple_gla(q, k, v, g, scale=self.dk ** -0.5)
+        dt = torch.bfloat16
+        o, _ = chunk_simple_gla(q.to(dt), k.to(dt), v.to(dt), g, scale=self.dk ** -0.5)
         o = self.norm(o, self.g(x).view(B, T, self.nh, self.dv))
         return self.o(o.reshape(B, T, -1))
 
