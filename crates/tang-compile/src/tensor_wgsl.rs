@@ -742,6 +742,32 @@ impl TensorGraph {
         }
     }
 
+    /// Node `j`'s [`Segment`](super::Segment) as `(reduce dim, key buffer,
+    /// point dim)` when it still holds: the key a materialized 1-D buffer
+    /// read by an arg of `c` as `key[r_red]`. `TANG_NO_SEGMENT=1` ignores it.
+    fn segment_read(&self, j: usize, c: &Comp) -> Option<(usize, usize, usize)> {
+        let sg = self.nodes[j].segment?;
+        if std::env::var("TANG_NO_SEGMENT").as_deref() == Ok("1") {
+            return None;
+        }
+        let key = sg.key.n();
+        let k = c.points().len();
+        let node = &self.nodes[key];
+        let ok = sg.red < c.red.len()
+            && sg.point < k
+            && node.sorted
+            && !node.inline
+            && node.shape.len() == 1
+            && matches!(node.precision.storage, super::Format::F32)
+            && c.args.iter().any(|a| {
+                a.src == sg.key
+                    && !a.view.is_gather()
+                    && !a.view.guard
+                    && a.view.forms[0].as_unit() == Some(k + sg.red)
+            });
+        ok.then_some((sg.red, key, sg.point))
+    }
+
     /// `point_j(p…) -> array<f32, W>`: the comp at one output point.
     fn emit_point(&self, s: &mut String, j: usize, c: &Comp) {
         let w = c.width();
@@ -758,13 +784,45 @@ impl TensorGraph {
             return;
         };
         emit_scalar_acc(s, "    ", m);
+        // a segmented sum: the run of the sorted key equal to the point
+        // coord, found by two binary searches (the body still gates)
+        let seg = self.segment_read(j, c);
+        if let Some((red, key, point)) = seg {
+            let n = fixed(&c.red)[red];
+            let steps = usize::BITS - n.leading_zeros() + 1;
+            // one statement a line: the CUDA and MSL dialects translate
+            // declarations at line starts
+            for (name, cmp) in [("seg_lo", "<"), ("seg_hi", "<=")] {
+                write!(
+                    s,
+                    "    var {name}: u32 = 0u;
+    var {name}_end: u32 = {n}u;
+    for (var {name}_it: u32 = 0u; {name}_it < {steps}u; {name}_it = {name}_it + 1u) {{
+        if ({name} < {name}_end) {{
+            let {name}_mid: u32 = ({name} + {name}_end) / 2u;
+            if (read_{key}({name}_mid) {cmp} f32(p{point})) {{ {name} = {name}_mid + 1u; }} else {{ {name}_end = {name}_mid; }}
+        }}
+    }}
+"
+                )
+                .unwrap();
+            }
+        }
         let mut indent = String::from("    ");
         for (i, n) in fixed(&c.red).into_iter().enumerate() {
-            writeln!(
-                s,
-                "{indent}for (var r{i}: u32 = 0u; r{i} < {n}u; r{i} = r{i} + 1u) {{"
-            )
-            .unwrap();
+            if seg.is_some_and(|q| q.0 == i) {
+                writeln!(
+                    s,
+                    "{indent}for (var r{i}: u32 = seg_lo; r{i} < seg_hi; r{i} = r{i} + 1u) {{"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "{indent}for (var r{i}: u32 = 0u; r{i} < {n}u; r{i} = r{i} + 1u) {{"
+                )
+                .unwrap();
+            }
             indent.push_str("    ");
         }
         emit_step(

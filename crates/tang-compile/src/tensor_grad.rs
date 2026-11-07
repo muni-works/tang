@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::{
-    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, ShapeError, TensorGraph, TensorId,
-    View,
+    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, Segment, ShapeError, TensorGraph,
+    TensorId, View,
 };
 
 /// Options for [`TensorGraph::backward_with`].
@@ -558,6 +558,26 @@ impl TensorGraph {
             body,
             body_outs: vec![out],
             monoid: (!free.is_empty()).then(Monoid::sum),
+        })
+        .map(|id| {
+            // a dim gathered as `a[key[x]]`, key sorted and x reduced here:
+            // only x's run with key == the dim's coord contributes
+            let seg = arg.view.gather.as_ref().and_then(|g| {
+                let ia = &c.args[g.arg];
+                let key = ia.src;
+                if !self.nodes[key.n()].sorted || ia.view.forms.len() != 1 || ia.view.is_gather() {
+                    return None;
+                }
+                let x = ia.view.forms[0].as_unit()?;
+                let red = free.iter().position(|&f| f == x)?;
+                let d = scatter.iter().copied().find(|&d| {
+                    let f = &arg.view.forms[d];
+                    g.coefs[d] == 1 && f.offset == 0 && f.coefs.iter().all(|&v| v == 0)
+                })?;
+                Some(Segment { red, key, point: d })
+            });
+            self.nodes[id.n()].segment = seg;
+            id
         })
     }
 }

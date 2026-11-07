@@ -672,6 +672,16 @@ pub struct OperatorNode {
     pub inputs: Vec<TensorId>,
 }
 
+/// [`TNode::segment`]: reduce dim `red` (index into the comp's reduce dims)
+/// only contributes where `key[r] == point coord `point``, `key` a sorted
+/// 1-D tensor read by one of the comp's args as `key[r]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub red: usize,
+    pub key: TensorId,
+    pub point: usize,
+}
+
 #[derive(Clone)]
 pub struct TNode {
     pub op: Op,
@@ -698,6 +708,17 @@ pub struct TNode {
     /// in registers from a block format. See [`IntMma`]. Backends without
     /// the lowering ignore it (and then reject the block formats).
     pub int_mma: Option<IntMma>,
+    /// A fact about the data, not a schedule: this 1-D tensor is
+    /// nondecreasing (e.g. MoE pairs sorted by expert). Set by
+    /// [`TensorGraph::set_sorted`]; the backward uses it to give gathered
+    /// contractions a [`Segment`].
+    pub sorted: bool,
+    /// The reduction's contributing range along one reduce dim is the run
+    /// of a sorted key equal to a point coordinate (a segmented sum). Set by
+    /// the backward of a gather through a [`sorted`](Self::sorted) index;
+    /// the body keeps its `[key == coord]` gate, so lowerings that ignore
+    /// it stay correct and the WGSL point loop binary-searches the run.
+    pub segment: Option<Segment>,
     /// Schedule: combine a `split` reduction's per-thread partials with
     /// subgroup operations (WGSL `subgroupAdd`/`subgroupShuffleXor`, MSL
     /// `simd_sum`/`simd_shuffle_xor`) instead of a workgroup-memory tree:
@@ -903,6 +924,17 @@ impl TensorGraph {
         self.nodes[t.n()].subgroup = on;
     }
 
+    /// Assert that 1-D `t` is nondecreasing (data, e.g. keys sorted by an
+    /// earlier comp). Gradients of contractions gathered through it then
+    /// reduce over runs found by binary search instead of the whole dim.
+    pub fn set_sorted(&mut self, t: TensorId, sorted: bool) {
+        self.nodes[t.n()].sorted = sorted;
+    }
+
+    pub fn segment(&self, t: TensorId) -> Option<Segment> {
+        self.nodes[t.n()].segment
+    }
+
     pub fn set_inline(&mut self, t: TensorId, inline: bool) {
         self.nodes[t.n()].inline = inline;
     }
@@ -984,6 +1016,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1003,6 +1037,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1037,6 +1073,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1063,6 +1101,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1210,6 +1250,8 @@ impl TensorGraph {
             reg: (1, 1),
             fragment: false,
             int_mma: None,
+            segment: None,
+            sorted: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1745,6 +1787,8 @@ impl TensorGraph {
                 reg: node.reg,
                 fragment: node.fragment,
                 int_mma: node.int_mma,
+                segment: node.segment,
+                sorted: node.sorted,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
                 precision: node.precision,
@@ -2998,6 +3042,8 @@ impl TensorGraph {
                 reg: (1, 1),
                 fragment: false,
                 int_mma: None,
+                segment: None,
+                sorted: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
                 precision: Precision::default(),
@@ -3596,6 +3642,8 @@ impl TensorGraph {
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
                     int_mma: None,
+                    segment: None,
+                    sorted: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
                     inline: false,

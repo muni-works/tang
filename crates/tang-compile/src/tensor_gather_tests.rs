@@ -299,3 +299,69 @@ fn wgsl_reads_the_index() {
     let src = &g.to_wgsl(&[out]).kernels[0].source;
     assert!(src.contains("round(read_"), "{src}");
 }
+
+/// `y[p, r] = Σ_f W[key[p], r, f] · h[p, f]` with the pairs sorted by
+/// key (MoE): dW reduces over p, gated by `key[p] == e`; with the key
+/// marked sorted the backward tags that reduction as a segment, and the
+/// WGSL point loop runs over the binary-searched run only.
+fn sorted_expert_graph(
+    (e, p, r, f): (usize, usize, usize, usize),
+    sorted: bool,
+) -> (TensorGraph, TensorId, TensorId) {
+    let mut g = TensorGraph::new();
+    let w = g.input(&[e, r, f]);
+    let h = g.input(&[p, f]);
+    let key = g.input(&[p]);
+    let dy = g.input(&[p, r]);
+    g.set_sorted(key, sorted);
+    let a = |src, view| Arg { src, view };
+    let y = g
+        .comp(
+            &[p, r],
+            &[f],
+            vec![
+                a(w, View::pick(3, &[None, Some(1), Some(2)]).gather(0, 2, 1)),
+                a(h, View::pick(3, &[Some(0), Some(2)])),
+                a(key, View::pick(3, &[Some(0)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap();
+    let prod = g.map(&[y, dy], |x| x[0] * x[1]).unwrap();
+    let r1 = g.reduce(prod, 1, Monoid::sum()).unwrap();
+    let loss = g.reduce(r1, 0, Monoid::sum()).unwrap();
+    let dw = g.backward(loss, &[w]).unwrap()[0];
+    (g, dw, key)
+}
+
+#[test]
+fn sorted_gather_backward_is_a_segmented_sum() {
+    let dims @ (e, p, r, f) = (5, 12, 3, 4);
+    let keys: Vec<f64> = vec![0., 0., 0., 1., 2., 2., 2., 2., 4., 4., 4., 4.];
+    let wv = ramp(e * r * f, 0.1, -1.0);
+    let hv = ramp(p * f, 0.2, -0.5);
+    let dyv = ramp(p * r, 0.3, -0.7);
+    let mut want = vec![0.0; e * r * f];
+    for (q, &k) in keys.iter().enumerate() {
+        for i in 0..r {
+            for j in 0..f {
+                want[(k as usize * r + i) * f + j] += dyv[q * r + i] * hv[q * f + j];
+            }
+        }
+    }
+    for sorted in [false, true] {
+        let (g, dw, key) = sorted_expert_graph(dims, sorted);
+        let got = g.eval(&[wv.clone(), hv.clone(), keys.clone(), dyv.clone()], &[dw]);
+        close(&got[0], &want, 1e-12);
+        let seg = g.segment(dw);
+        assert_eq!(seg.map(|s| (s.key, s.point)), sorted.then_some((key, 0)));
+        let src: String = g
+            .to_wgsl(&[dw])
+            .kernels
+            .iter()
+            .map(|k| k.source.clone())
+            .collect();
+        assert_eq!(src.contains("seg_lo"), sorted, "{src}");
+    }
+}
