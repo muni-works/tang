@@ -13,13 +13,16 @@ pub const FA2_BN: usize = 32;
 /// Dynamic shared memory of `cx_attn_fa2` (`FA_SMEM`): the Q tile plus double-buffered K and V
 /// tiles, rows padded by 8 bf16. 101376 bytes at head dim 256. Under `TANG_CODER_KV=int8`
 /// (`int8`) the int8 K/V tiles land in their own double-buffered staging first
-/// (`4 * FA_BN * head_dim` bytes more: 134144 at head dim 256).
+/// (`4 * FA_BN * head_dim` bytes) and the fp16 tiles are single: 100352 at head dim 256, two
+/// blocks an SM.
 pub fn fa2_smem(head_dim: usize) -> usize {
     fa2_smem_as(kv8(), head_dim)
 }
 
 pub fn fa2_smem_as(int8: bool, head_dim: usize) -> usize {
-    (FA2_BM + 4 * FA2_BN) * (head_dim + 8) * 2 + if int8 { 4 * FA2_BN * head_dim } else { 0 }
+    let tiles = if int8 { 1 } else { 2 };
+    (FA2_BM + 2 * tiles * FA2_BN) * (head_dim + 8) * 2
+        + if int8 { 4 * FA2_BN * head_dim } else { 0 }
 }
 
 /// The attention K/V cache format (`TANG_CODER_KV=bf16|int8`, read once at first use; default
@@ -396,7 +399,7 @@ mod tests {
         );
         assert!(crate::batch::slots_that_fit(free, 4_000_000_000, i8, 256) >= 46);
         assert_eq!(super::fa2_smem_as(false, 256), 101376);
-        assert_eq!(super::fa2_smem_as(true, 256), 134144);
+        assert_eq!(super::fa2_smem_as(true, 256), 100352);
     }
 
     /// int8 K/V through the FA2 model against exact f64 attention on the unrounded K/V, beside

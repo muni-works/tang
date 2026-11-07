@@ -3448,10 +3448,17 @@ extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const fl
 #define FA_LD (CX_HD + 8)
 #ifdef CX_KV8
 // int8 K/V tiles land (cp.async) in a double-buffered staging area [2][K, V][FA_BN][CX_HD] after the
-// fp16 tiles, and the per-tile conversion pass dequantizes them into the fp16 tiles.
-#define FA_SMEM ((FA_BM + 4 * FA_BN) * FA_LD * 2 + 4 * FA_BN * CX_HD)
+// fp16 tiles, and the per-tile conversion pass dequantizes them into the fp16 tiles. The staging
+// is the double buffer, so the fp16 tiles are single (FA_TB = 1): the conversion runs between the
+// loop's two barriers, after every warp is done with the previous tile. 100,352 B at head dim 256,
+// two blocks an SM (double fp16 tiles made it 134,144: one).
+#define FA_TB 1
+#define FA_KB(b) 0
+#define FA_SMEM ((FA_BM + 2 * FA_TB * FA_BN) * FA_LD * 2 + 4 * FA_BN * CX_HD)
 #else
-#define FA_SMEM ((FA_BM + 4 * FA_BN) * FA_LD * 2)
+#define FA_TB 2
+#define FA_KB(b) (b)
+#define FA_SMEM ((FA_BM + 2 * FA_TB * FA_BN) * FA_LD * 2)
 #endif
 static_assert(FA_BM % CX_G == 0, "FA2 tile: whole rows of G heads");
 static_assert(CX_HD % 16 == 0, "FA2 tile: head dim a multiple of 16");
@@ -3510,10 +3517,10 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
                                                               int t, float* part, int nsplit) {
     extern __shared__ __align__(16) unsigned char fa_sm[];
     unsigned short* sq = (unsigned short*)fa_sm;  // [FA_BM][FA_LD]
-    unsigned short* sk = sq + FA_BM * FA_LD;     // [2][FA_BN][FA_LD]
-    unsigned short* sv = sk + 2 * FA_BN * FA_LD; // [2][FA_BN][FA_LD]
+    unsigned short* sk = sq + FA_BM * FA_LD;     // [FA_TB][FA_BN][FA_LD]
+    unsigned short* sv = sk + FA_TB * FA_BN * FA_LD; // [FA_TB][FA_BN][FA_LD]
 #ifdef CX_KV8
-    unsigned char* s8 = (unsigned char*)(sv + 2 * FA_BN * FA_LD); // [2][2][FA_BN][CX_HD]
+    unsigned char* s8 = (unsigned char*)(sv + FA_TB * FA_BN * FA_LD); // [2][2][FA_BN][CX_HD]
 #endif
     const int g = blockIdx.y, j = blockIdx.z, tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t4 = lane & 3;
@@ -3603,7 +3610,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
             auto h2 = [&](unsigned w, int i) {
                 return fa_pack((float)(signed char)(w >> (8 * i)) * sc, (float)(signed char)(w >> (8 * i + 8)) * sc);
             };
-            *(uint4*)((isv ? sv : sk) + (b * FA_BN + p) * FA_LD + d) = make_uint4(h2(x.x, 0), h2(x.x, 2), h2(x.y, 0), h2(x.y, 2));
+            *(uint4*)((isv ? sv : sk) + (FA_KB(b) * FA_BN + p) * FA_LD + d) = make_uint4(h2(x.x, 0), h2(x.x, 2), h2(x.y, 0), h2(x.y, 2));
         }
         __syncthreads();
 #elif !defined(FA_BF16)
@@ -3625,7 +3632,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
         #pragma unroll
         for (int n = 0; n < FA_BN / 8; n++) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
         const unsigned short* qa = sq + (warp * 16 + gq) * FA_LD + 2 * t4;
-        const unsigned short* kr = sk + (b * FA_BN + gq) * FA_LD + 2 * t4;
+        const unsigned short* kr = sk + (FA_KB(b) * FA_BN + gq) * FA_LD + 2 * t4;
         #pragma unroll
         for (int kk = 0; kk < CX_HD / 16; kk++) {
             const unsigned a0 = *(const unsigned*)(qa + kk * 16), a1 = *(const unsigned*)(qa + 8 * FA_LD + kk * 16);
@@ -3684,7 +3691,7 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_fa2(const float* q, co
             const unsigned p0 = fa_pack(s[2 * kk][0], s[2 * kk][1]), p1 = fa_pack(s[2 * kk][2], s[2 * kk][3]);
             const unsigned p2 = fa_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
                            p3 = fa_pack(s[2 * kk + 1][2], s[2 * kk + 1][3]);
-            const unsigned short* vr = sv + (b * FA_BN + kk * 16 + (lane & 15)) * FA_LD + (lane >> 4) * 8;
+            const unsigned short* vr = sv + (FA_KB(b) * FA_BN + kk * 16 + (lane & 15)) * FA_LD + (lane >> 4) * 8;
             #pragma unroll
             for (int dn = 0; dn < CX_HD / 16; dn++) {
                 unsigned r0, r1, r2, r3;
