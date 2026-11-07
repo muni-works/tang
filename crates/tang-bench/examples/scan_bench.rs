@@ -111,7 +111,7 @@ struct Run {
     gates: Vec<CudaSlice<f32>>,
     scratch16: Vec<CudaSlice<u16>>,
     delta: bool,
-    gc: CudaSlice<f32>,
+    gf: Vec<CudaSlice<f32>>,
 }
 
 fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
@@ -121,8 +121,8 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
     let ins = vec![up16(&d.q), up16(&d.k), up16(&d.v)];
     let gates = vec![up32(&d.alpha), up32(&d.beta)];
     let sz = plan.scratch();
-    let scratch16 = sz[..7].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect();
-    let gc = s.alloc_zeros::<f32>(sz[7]).unwrap();
+    let scratch16 = sz[..4].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect();
+    let gf = sz[4..].iter().map(|&n| s.alloc_zeros::<f32>(n).unwrap()).collect();
     let out = s.alloc_zeros::<u16>(plan.heads * plan.t * plan.m).unwrap();
     let launches = plan
         .kernels(bv)
@@ -144,7 +144,7 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
         gates,
         scratch16,
         delta: plan.delta,
-        gc,
+        gf,
     }
 }
 
@@ -160,26 +160,20 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
     let (f, cfg) = &r.launches[k];
     let sc = &r.scratch16;
     // V' is U itself without the delta term
-    let vn = if r.delta { &sc[6] } else { &sc[1] };
+    let vn = if r.delta { &sc[3] } else { &sc[1] };
     let mut b = s.launch_builder(f);
+    let (q, kk, v) = (&r.ins[0], &r.ins[1], &r.ins[2]);
+    let (gr, gc) = (&r.gf[0], &r.gf[1]);
     match k {
         0 => {
-            for x in &r.ins {
-                b.arg(x);
-            }
-            for x in &r.gates {
-                b.arg(x);
-            }
-            for x in &sc[..5] {
-                b.arg(x);
-            }
-            b.arg(&r.gc);
+            b.arg(kk).arg(v).arg(&r.gates[0]).arg(&r.gates[1]);
+            b.arg(&sc[0]).arg(&sc[1]).arg(gr).arg(gc);
         }
         1 => {
-            b.arg(&sc[0]).arg(&sc[1]).arg(&sc[3]).arg(&r.gc).arg(&sc[5]).arg(&sc[6]);
+            b.arg(&sc[0]).arg(&sc[1]).arg(kk).arg(gr).arg(gc).arg(&sc[2]).arg(&sc[3]);
         }
         _ => {
-            b.arg(&sc[2]).arg(&sc[4]).arg(&sc[5]).arg(vn).arg(&r.out);
+            b.arg(q).arg(kk).arg(gr).arg(&sc[2]).arg(vn).arg(&r.out);
         }
     }
     unsafe { b.launch(*cfg) }.expect("launch");
