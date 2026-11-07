@@ -1,0 +1,42 @@
+[package]
+name = "tang-all"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "One dependency for the tang stack: re-exports tang and its subcrates behind features"
+repository.workspace = true
+readme = "README.md"
+keywords = ["math", "autodiff", "sparse", "optimization", "compiler"]
+categories = ["mathematics", "science"]
+include = ["src/**/*", "README.md"]
+
+[features]
+default = ["la"]
+# light, pure-Rust numerics
+la = ["dep:tang-la"]
+sparse = ["dep:tang-sparse"]
+ad = ["dep:tang-ad"]
+expr = ["dep:tang-expr"]
+optim = ["dep:tang-optim"]
+compile = ["dep:tang-compile", "expr", "sparse"]
+tensor = ["dep:tang-tensor"]
+# heavier stacks, off unless asked for
+gpu = ["dep:tang-gpu"]
+train = ["dep:tang-train", "tensor"]
+full = ["la", "sparse", "ad", "expr", "optim", "compile", "tensor"]
+
+[dependencies]
+tang = { workspace = true }
+tang-la = { workspace = true, optional = true }
+tang-sparse = { workspace = true, optional = true }
+tang-ad = { workspace = true, optional = true }
+tang-expr = { workspace = true, optional = true }
+tang-optim = { workspace = true, optional = true }
+tang-compile = { workspace = true, optional = true }
+tang-tensor = { workspace = true, optional = true }
+tang-gpu = { workspace = true, optional = true }
+tang-train = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+features = ["full", "gpu", "train"]

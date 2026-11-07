@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tang",
+    "crates/tang-all",
     "crates/tang-la",
     "crates/tang-ad",
     "crates/tang-sparse",
