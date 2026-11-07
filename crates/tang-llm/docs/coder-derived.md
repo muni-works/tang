@@ -124,3 +124,26 @@ numbers. Order of the remaining work, by what unblocks the most:
   Reference check ≤ 4.2e-7 except T=48 with 16 experts (2.8e-4 on both the sorted and the unsorted
   path: an int8 code flip at a rounding boundary in the reference's SwiGLU quantization, not the
   sort).
+
+## Where the decode gap goes (per kernel, round 4)
+
+`PER_KERNEL=1 cargo run --release -p tang-llm --features cuda --example coder_derived_moe 1 8 16` times each kernel alone, using the engine shape (512 experts, top-10) on an RTX 3090. Kernels are named by `derived_ops::tag`. These are µs per kernel run alone, so each includes about 2–3 µs of launch overhead.
+
+| kernel | T=1 | T=8 | T=16 |
+|---|---|---|---|
+| top-k chain (3 untagged nodes + weights) | 21.6 | 21.6 | 22.6 (+20.5 sort) |
+| xq | 4.1 | 4.1 | 4.1 |
+| ex_gate | 10.2 | 64.5 | 116.7 |
+| ex_up | 10.2 | 64.5 | 120.8 |
+| ex_silu | inlined | 4.1 | 4.1 |
+| ex_down | 11.3 | 88.1 | 124.9 |
+| shared gate/up/silu/down | 16.3 | 39.9 | 45.1 |
+| routed, y, resid, norm_ss, norm | 19.5 | 20.5 | 21.5 |
+| kernels in the layer | 16 | 18 | 22 |
+
+The hand path on the H200 engine profile at N=8 uses about 134 µs per layer (moe_gu 54, moe_down 60, route 10, add_norm 10). The derived path uses about 168 µs, so the gap is about 34 µs per layer, which is roughly 1.6 ms per step over 48 layers. The measured gap is 1.5 ms.
+
+Where it goes:
+1. **Gate and up are separate weight passes.** Each one walks the same 10 experts and re-reads x. The hand moe_gu kernel does both in one pass. This is the largest piece once T is above 1.
+2. **18 kernels against the hand path's ~5.** Around 13 kernels run in 3–5 µs each and are launch-bound: the top-k chain (4), xq, the silus, routed, y, resid, norm_ss and norm. Their tails add up even inside a CUDA graph.
+3. **The shared expert is three separate GEMVs.** The hand path folds the shared expert into the routed passes as an extra expert.
