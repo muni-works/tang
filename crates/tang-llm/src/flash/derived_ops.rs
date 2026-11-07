@@ -452,7 +452,7 @@ pub fn route(t: usize, ne: usize, ls: usize, k: usize) -> Spec {
                 let ge = sel(d + ExprId::from_f64(0.5), ExprId::ONE, ExprId::ZERO);
                 let le = sel(ExprId::from_f64(0.5) - d, ExprId::ONE, ExprId::ZERO);
                 let hit = ge * le;
-                acc = acc + hit * e;
+                acc += hit * e;
             }
             vec![acc / norm]
         })
@@ -620,7 +620,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 let d = v[0] - ExprId::from_f64(j as f64);
                 let hit = sel(d + ExprId::from_f64(0.5), ExprId::ONE, ExprId::ZERO)
                     * sel(ExprId::from_f64(0.5) - d, ExprId::ONE, ExprId::ZERO);
-                acc = acc + hit * e;
+                acc += hit * e;
             }
             vec![acc / norm]
         })
