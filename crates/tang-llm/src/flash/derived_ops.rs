@@ -485,7 +485,10 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
-            pos_tile: t.min(8) as u32,
+            pos_tile: std::env::var("TANG_GEMV_PT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or((if mma { t.min(64) } else { t.min(8) }) as u32),
         }),
     );
     g.set_inline(xq, t == 1);
