@@ -8,6 +8,10 @@
 //!    fragments instead of TF32; one operand alone leaves it on the
 //!    transpiled fallback.
 //! 2. **Per buffer.** Every remaining f32 buffer, largest first.
+//!    FP8 formats (`Format::E4M3(block)`, `E5M2(block)`) go to the same
+//!    moves: an attention kernel's softmax weights follow ([`apply_for`]).
+//!    An FP8 candidate is dropped before it reaches the GPU when no FP8
+//!    tile lowers it, or when `eval_emulated` predicts it over budget.
 //! 3. Each candidate is run against the f64 reference. It is kept only if
 //!    the program stays within the [`ErrorBudget`] and gets `min_gain`
 //!    faster than the schedule so far (a move "all tiles" comes first:
@@ -114,6 +118,24 @@ pub fn apply(g: &TensorGraph, m: &Move, f: Format) -> TensorGraph {
         let mut p = v.precision(b);
         p.storage = f;
         v.set_precision(b, p);
+    }
+    v
+}
+
+/// [`apply`], and for an FP8 move that covers an attention kernel's Q,
+/// K and V (in the program for `outputs`), that kernel's softmax weights
+/// rounded to E4M3 (the reduction's `operand` format), as its FP8 tile
+/// does.
+pub fn apply_for(g: &TensorGraph, m: &Move, f: Format, outputs: &[TensorId]) -> TensorGraph {
+    let mut v = apply(g, m, f);
+    if f.is_fp8() {
+        for (red, bufs) in g.cuda_flash_reductions(outputs) {
+            if bufs.iter().all(|b| v.precision(*b).storage.is_fp8()) {
+                let mut p = v.precision(red);
+                p.operand = Format::E4M3(0);
+                v.set_precision(red, p);
+            }
+        }
     }
     v
 }
@@ -258,7 +280,32 @@ pub fn tune_precision(
         // (graph, error, cost, trial index)
         let mut best: Option<(TensorGraph, ErrorStats, f64, usize)> = None;
         for &f in formats {
-            let v = apply(&cur, &m, f);
+            let v = apply_for(&cur, &m, f, outputs);
+            if f.is_fp8() {
+                // FP8 only where an FP8 tile reads it, and only if the
+                // emulator predicts the error within budget: no GPU time
+                // for a schedule that cannot be accepted
+                let skip = if !v.cuda_fp8_lowers(outputs) {
+                    Some(("no FP8 tile", ErrorStats::default()))
+                } else {
+                    let ins: Vec<Vec<f64>> = inputs
+                        .iter()
+                        .map(|x| x.iter().map(|&y| y as f64).collect())
+                        .collect();
+                    let pred = ErrorStats::compare(&v.eval_emulated(&ins, outputs), want);
+                    (!budget.admits(&pred)).then_some(("predicted over budget", pred))
+                };
+                if let Some((why, pred)) = skip {
+                    trials.push(PrecisionTrial {
+                        what: format!("{} {f:?} ({why})", m.what),
+                        error: pred,
+                        ms: None,
+                        vs: None,
+                        kept: false,
+                    });
+                    continue;
+                }
+            }
             let p = Program::compile(rt, &v, outputs, inputs);
             let err = program_error(rt, &p, outputs, want);
             drop(p);

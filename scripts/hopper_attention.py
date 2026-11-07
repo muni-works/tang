@@ -5,6 +5,8 @@ FlashAttention-3 and PyTorch SDPA.
     python scripts/hopper_attention.py gen DIR N D CAUSAL   # inputs + reference
     python scripts/hopper_attention.py bench DIR            # FA3 and SDPA
     python scripts/hopper_attention.py matmul [MxKxN,...]   # cuBLAS bf16
+    python scripts/hopper_attention.py fp8mm [MxKxN,...]    # cuBLASLt FP8
+    python scripts/hopper_attention.py fp8attn [N,...] [CAUSAL]  # FA3 FP8 / bf16, SDPA
 
 16k tokens per config (batch = 16384 / N) and 2048 hidden (heads = 2048 / D),
 FlashAttention's benchmark convention. q, k, v, dO ~ N(0, 1) in bf16, layout
@@ -161,6 +163,75 @@ def matmul(cases):
             print(f"cublas matmul {m}x{k}x{n} b={lay}: {t:.4f} ms {2 * m * k * n / t / 1e9:.1f} TFLOP/s")
 
 
+def fp8mm(cases):
+    """cuBLASLt FP8 (`torch._scaled_mm`, e4m3 × e4m3, fp32 accumulation,
+    bf16 out) on the shapes of `examples/hopper_fp8.rs`: A [m, k] and B
+    [n, k], per-tensor and per-row/column ("rowwise") scales. cuBLASLt on
+    sm_90 has no 1×128 block scaling; tang's tiles do (DeepSeek-style)."""
+    for m, k, n in cases:
+        a = torch.randn(m, k, device="cuda")
+        b = torch.randn(n, k, device="cuda")
+        fa = a.to(torch.float8_e4m3fn)
+        fb = b.to(torch.float8_e4m3fn)
+        one = torch.ones((), device="cuda")
+        f = lambda: torch._scaled_mm(fa, fb.t(), scale_a=one, scale_b=one, out_dtype=torch.bfloat16)
+        t = best_ms(f)
+        line = f"cublaslt fp8 {m}x{k}x{n}: tensor {t:.4f} ms {2 * m * k * n / t / 1e9:.1f} TFLOP/s"
+        try:
+            sa = torch.ones(m, 1, device="cuda")
+            sb = torch.ones(1, n, device="cuda")
+            g = lambda: torch._scaled_mm(fa, fb.t(), scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            t2 = best_ms(g)
+            line += f"  rowwise {t2:.4f} ms {2 * m * k * n / t2 / 1e9:.1f} TFLOP/s"
+        except Exception as e:  # noqa: BLE001
+            line += f"  rowwise n/a ({type(e).__name__})"
+        print(line)
+
+
+def fp8attn(ns, causal):
+    """FlashAttention-3 FP8 forward (e4m3 Q, K, V with per-(batch, head)
+    descales, bf16 out) and FA3 / SDPA bf16 on the shapes of
+    `examples/hopper_fp8_attn.rs`: 16k tokens, 16 heads of 128."""
+    try:
+        fa3, src = load_fa3()
+        print(f"# FA3 from {src}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"# FA3 unavailable ({type(e).__name__}: {e})", flush=True)
+        fa3 = None
+    for n in ns:
+        b, h, d = 16384 // n, 16, 128
+        q, k, v = (torch.randn(b, n, h, d, device="cuda") for _ in range(3))
+        flop = 4 * b * h * n * n * d * (0.5 if causal else 1.0)
+        line = f"n={n} d={d} bh={b * h} causal={causal}:"
+        qb, kb, vb = (x.bfloat16() for x in (q, k, v))
+        t = best_ms(lambda: F.scaled_dot_product_attention(qb.transpose(1, 2), kb.transpose(1, 2), vb.transpose(1, 2), is_causal=causal))
+        line += f"  sdpa bf16 {t:.3f} ms {flop / t / 1e9:.1f} TFLOP/s"
+        if fa3 is not None:
+            t = best_ms(lambda: fa3(qb, kb, vb, causal=causal))
+            line += f"  fa3 bf16 {t:.3f} ms {flop / t / 1e9:.1f} TFLOP/s"
+            amax = [x.abs().amax(dim=(1, 3)) for x in (q, k, v)]  # [b, h]
+            sc = [(a / 448.0).float() for a in amax]
+            q8, k8, v8 = (
+                (x / s[:, None, :, None]).to(torch.float8_e4m3fn) for x, s in zip((q, k, v), sc)
+            )
+            f = lambda: fa3(q8, k8, v8, causal=causal, q_descale=sc[0], k_descale=sc[1], v_descale=sc[2])
+            try:
+                t = best_ms(f)
+                o = f()
+                o = o[0] if isinstance(o, tuple) else o
+                # error vs f64 on the first and last head of batch 0
+                hs = [0, h - 1]
+                qd, kd, vd = (x[0, :, hs].double().transpose(0, 1) for x in (q, k, v))
+                ref = F.scaled_dot_product_attention(qd, kd, vd, is_causal=causal)
+                got = o[0, :, hs].double().transpose(0, 1)
+                err = ((got - ref).abs().amax() / ref.abs().amax()).item()
+                mean = ((got - ref).abs().mean() / ref.abs().amax()).item()
+                line += f"  fa3 fp8 {t:.3f} ms {flop / t / 1e9:.1f} TFLOP/s (max_rel {err:.2e} mean_rel {mean:.2e})"
+            except Exception as e:  # noqa: BLE001
+                line += f"  fa3 fp8 n/a ({type(e).__name__}: {e})"
+        print(line, flush=True)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "gen":
@@ -170,5 +241,11 @@ if __name__ == "__main__":
     elif cmd == "matmul":
         spec = sys.argv[2] if len(sys.argv) > 2 else "1024x1024x1024,2048x2048x2048,4096x4096x4096,8192x8192x8192,16384x2048x2048,16384x2048x8192,16384x8192x2048"
         matmul([tuple(map(int, c.split("x"))) for c in spec.split(",")])
+    elif cmd == "fp8attn":
+        ns = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "1024,2048,4096,8192,16384").split(",")]
+        fp8attn(ns, len(sys.argv) > 3 and sys.argv[3] == "1")
+    elif cmd == "fp8mm":
+        spec = sys.argv[2] if len(sys.argv) > 2 else "1024x1024x1024,2048x2048x2048,4096x4096x4096,8192x8192x8192,16384x2048x8192,16384x8192x2048"
+        fp8mm([tuple(map(int, c.split("x"))) for c in spec.split(",")])
     else:
         sys.exit(__doc__)

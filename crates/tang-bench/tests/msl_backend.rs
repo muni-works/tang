@@ -131,6 +131,7 @@ fn f16_storage_and_accum_match_emulation() {
                 Precision {
                     storage: Format::F16,
                     accum,
+                    operand: Format::F32,
                 },
             );
             g.set_schedule(y, split, tile, reg);

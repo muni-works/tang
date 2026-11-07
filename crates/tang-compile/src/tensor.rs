@@ -3878,6 +3878,27 @@ impl TensorGraph {
 
     fn eval_with(&self, inputs: &[Vec<f64>], outputs: &[TensorId], emulate: bool) -> Vec<Vec<f64>> {
         let live = self.live(outputs);
+        // block-scaled inputs: the scales depend on the whole buffer
+        let scaled: Vec<Vec<f64>>;
+        let inputs = if emulate
+            && self
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Input(_)) && n.precision.storage.is_fp8())
+        {
+            let mut v = inputs.to_vec();
+            for n in &self.nodes {
+                if let Op::Input(k) = n.op {
+                    if n.precision.storage.is_fp8() {
+                        n.precision.storage.round_buf(&mut v[k]);
+                    }
+                }
+            }
+            scaled = v;
+            &scaled[..]
+        } else {
+            inputs
+        };
         let mut ev = Evaluator {
             g: self,
             emulate,
@@ -3931,9 +3952,8 @@ impl TensorGraph {
                     });
                 }
                 if emulate {
-                    let f = self.nodes[i].precision.storage;
-                    buf.iter_mut().for_each(|v| *v = f.round(*v));
-                    f.round_blocks(&mut buf);
+                    self.nodes[i].precision.storage.round_buf(&mut buf);
+                    self.nodes[i].precision.storage.round_blocks(&mut buf);
                 }
                 ev.bufs[i] = buf;
             }
@@ -4020,7 +4040,8 @@ impl Evaluator<'_> {
         match &node.op {
             Op::Input(k) => {
                 let v = self.inputs[*k][flat_index(&fixed(&node.shape), idx)];
-                if self.emulate {
+                // block-scaled inputs are rounded whole up front
+                if self.emulate && !node.precision.storage.is_fp8() {
                     node.precision.storage.round(v)
                 } else {
                     v
@@ -4085,9 +4106,37 @@ impl Evaluator<'_> {
         let combine = k.combine.as_ref().unwrap();
         let mut elem = vec![0.0; w];
         let mut pair = vec![0.0; 2 * w];
+        // softmax weights rounded to the operand format (an online-softmax
+        // reduction on a tile that feeds exp(s − m) to the tensor cores):
+        // the element's weight is rounded before it scales g₁…gₖ
+        let operand = self.g.nodes[i].precision.operand;
+        let round_weights =
+            self.emulate && operand != Format::F32 && m.kind() == MonoidKind::OnlineSoftmax;
         for red_idx in indices(&fixed(&c.red)) {
             idx[base..].copy_from_slice(&red_idx);
             body_at(&idx, &mut elem);
+            if round_weights {
+                // m' = max(m, s); accᵢ' = accᵢ·exp(m − m') + gᵢ·round(exp(s − m'))
+                let mx = vals[0].max(elem[0]);
+                if mx == f64::NEG_INFINITY {
+                    continue;
+                }
+                let sa = if vals[0] == f64::NEG_INFINITY {
+                    0.0
+                } else {
+                    (vals[0] - mx).exp()
+                };
+                let se = precision::round_weight(operand, (elem[0] - mx).exp());
+                vals[0] = mx;
+                for t in 1..w {
+                    vals[t] = vals[t] * sa + elem[t] * se;
+                }
+                if self.emulate {
+                    let f = self.g.nodes[i].precision.accum;
+                    vals.iter_mut().for_each(|v| *v = f.round(*v));
+                }
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(&elem);
             combine(&pair, vals);
