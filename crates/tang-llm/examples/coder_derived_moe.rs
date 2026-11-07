@@ -318,6 +318,7 @@ fn main() {
             gu: Format::Q4K,
             down: Format::Q5K,
             eps_bits: 1e-6f64.to_bits(),
+            keep_y: true,
         };
         run(&gpu, &s, base, true);
         run(

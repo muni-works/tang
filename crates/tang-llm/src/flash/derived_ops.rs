@@ -532,6 +532,9 @@ pub struct MoeShape {
     pub gu: Format,
     pub down: Format,
     pub eps_bits: u64,
+    /// The MoE output `y` is written (else it is computed inside `r_out`'s kernel only and
+    /// the `y` pointer is not touched).
+    pub keep_y: bool,
 }
 
 /// External tensors of [`moe_block`], in launch order.
@@ -584,7 +587,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
     // routing: the top-k ids `topi [t, k]` and logits `topv [t, k]`, best first, ties to the
     // lower id. Default: every expert's rank counted by comparison (all experts in parallel),
     // then the id and logit at each rank; `TANG_DMOE_TOPK=tree`: the top-k monoid (one block a row)
-    let (topi, topv) = if std::env::var("TANG_DMOE_TOPK").as_deref() == Ok("tree") {
+    let (topi, topv) = if std::env::var("TANG_DMOE_TOPK").as_deref() != Ok("rank") {
         let ie = g.iota(&[t, ne], 1);
         let top = g
             .comp_tuple(
@@ -665,7 +668,12 @@ pub fn moe_block(m: MoeShape) -> Spec {
         let topi = pick_rank(&mut g, None);
         let topv = pick_rank(&mut g, Some(lg));
         // reductions split across threads (one thread a point would loop over every expert)
-        g.set_schedule(rank, envn("TANG_DMOE_RANK_SPLIT", 32) as u32, (0, 0, 0), (1, 1));
+        g.set_schedule(
+            rank,
+            envn("TANG_DMOE_RANK_SPLIT", 32) as u32,
+            (0, 0, 0),
+            (1, 1),
+        );
         g.set_schedule(topi, 256, (0, 0, 0), (1, 1));
         g.set_schedule(topv, 256, (0, 0, 0), (1, 1));
         (topi, topv)
@@ -876,6 +884,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
         )
         .unwrap();
     let ro = g.map(&[r, y], |v| v[0] + v[1]).unwrap();
+    g.set_inline(y, !m.keep_y);
     let xo = rmsnorm(&mut g, ro, wn, t, n, eps);
 
     // schedule: storage formats, int8 contractions, x / SwiGLU quantized
@@ -938,7 +947,11 @@ pub fn moe_block(m: MoeShape) -> Spec {
     Spec {
         g,
         ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo],
-        outs: vec![y, ro, xo],
+        outs: if m.keep_y {
+            vec![y, ro, xo]
+        } else {
+            vec![ro, xo]
+        },
         auto: false,
     }
 }
@@ -1122,6 +1135,7 @@ mod tests {
             gu: Format::Q4K,
             down: Format::Q5K,
             eps_bits: 1e-6f64.to_bits(),
+            keep_y: true,
         }
     }
 
@@ -1182,6 +1196,7 @@ mod moe_lowering {
                 gu: Format::Q4K,
                 down: Format::Q5K,
                 eps_bits: 1e-6f64.to_bits(),
+                keep_y: true,
             })
             .lower()
             .unwrap();

@@ -1142,8 +1142,8 @@ fn derived_moe_on() -> bool {
     })
 }
 
-/// (window rows, int8 layout rows, gate|up GGUF type, down GGUF type)
-type DMoeKey = (usize, usize, i32, i32);
+/// (window rows, int8 layout rows, gate|up GGUF type, down GGUF type, MoE output kept)
+type DMoeKey = (usize, usize, i32, i32, bool);
 
 /// One derived MoE shape: the layer op, the int8 re-layout ops, and a `y` scratch.
 struct DMoe {
@@ -1165,7 +1165,7 @@ fn ggml_format(ty: i32) -> Option<tang_compile::tensor::Format> {
 impl DMoe {
     fn build(gpu: &Gpu, k: DMoeKey, hp: &Hparams, eps: f32) -> anyhow::Result<Self> {
         use super::derived_ops as dop;
-        let (t, rows, gu, down) = k;
+        let (t, rows, gu, down, keep_y) = k;
         let (n, ne) = (hp.n_embd, hp.n_expert);
         let m = dop::MoeShape {
             t,
@@ -1179,6 +1179,7 @@ impl DMoe {
                 .filter(|_| down == 13)
                 .ok_or_else(|| anyhow!("down type {down}"))?,
             eps_bits: (eps as f64).to_bits(),
+            keep_y,
         };
         let lower = |s: dop::Spec| s.lower().map_err(|e| anyhow!(e));
         let moe = dop::Op::load(gpu, lower(dop::moe_block(m))?, dop::MOE_EXT.len())?;
@@ -4803,7 +4804,7 @@ impl Coder {
         let mut cache = self.dmoe.borrow_mut();
         for t in 1..=MAX_T {
             for &(gu, down) in &tys {
-                let key: DMoeKey = (t, MAX_T, gu, down);
+                let key: DMoeKey = (t, MAX_T, gu, down, false);
                 let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
                 if let Err(e) = &built {
                     eprintln!("coder: no derived MoE for {key:?} ({e}); hand kernels");
@@ -4834,7 +4835,7 @@ impl Coder {
         {
             return false;
         }
-        let key: DMoeKey = (t, self.tw(), tys.0, tys.2);
+        let key: DMoeKey = (t, self.tw(), tys.0, tys.2, keep_y);
         let v = self.stage_view(wi);
         let mut cache = self.dmoe.borrow_mut();
         if !cache.contains_key(&key) {
