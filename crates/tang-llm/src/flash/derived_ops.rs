@@ -740,7 +740,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
     }
     // one row: every GEMV quantizes its own activations in its prologue
     if t == 1 {
-        g.set_inline(xq, envn("TANG_DMOE_INLINE_X", 1) == 1);
+        g.set_inline(xq, envn("TANG_DMOE_INLINE_X", 0) == 1);
         g.set_inline(h, true);
         g.set_inline(sh, true);
     }
