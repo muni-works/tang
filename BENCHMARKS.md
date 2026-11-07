@@ -3148,3 +3148,49 @@ gap is the GEMV inner loop: llama.cpp's MMVQ quantizes the activation to q8_1 on
 int8 dot products; tang dequantizes every nibble to f32 and FMAs, and recomputes the norm per
 element. That is the next schedule to derive (an int8 activation-quantization map before the
 GEMV, then a dp4a body), along with per-kernel rows/split choices through the autotuner.
+
+## Fused attention backward on Hopper (H200 SXM, bf16, kernel-only)
+
+The derived backward as one kernel per key block (`tensor_cuda_attn_bwd.rs`).
+The kernel is recognized from the graph `backward` produces, not hand-written for attention.
+- **Pattern:** the tuple reduction over queries `(dV, dK)` whose operands are pointwise maps of two short contractions (S = q·kᵀ, dP = (dO/l)·vᵀ), plus the dQ reduction reading the same map.
+- **Inside the kernel:** S and dP run on bf16 `mma.sync`, and the maps' own bodies run on the accumulators. dV/dK stay in registers. dQ goes into a zero-filled f32 buffer, by atomics before Hopper and by a bulk async reduce (`cp.reduce.async.bulk`) per chunk on Hopper.
+- **Tuning:** the autotuner picks 64- or 128-key blocks. Query chunks are double-buffered with `cp.async`, and chunks the causal mask zeroes are skipped.
+
+Same method, inputs and f64 check as the section above. All results are at rel_err 2–6e-3.
+- **Columns:**
+  - "before" is the 9-kernel derived program measured earlier.
+  - "fused program" is the whole tang program. It also recomputes the forward softmax state and rowsum(dO·O), which SDPA and FA3 take from their forward pass.
+  - "kernel only" is the fused kernel's own time.
+- **Units:** TFLOP/s in FlashAttention's backward convention (2.5× the forward FLOPs).
+- **Baselines:** SDPA and FA3 come from `docs/bench/hopper-h200-baselines.log`; SDPA was rerun on this pod type and lands within 1%.
+
+| d | causal | N | before (9 kernels) | fused program | fused kernel only | SDPA bwd | FA3 bwd |
+|---|---|---|---|---|---|---|---|
+| 64 | false | 1024 | 22 | 81 | 169 | 216 | 426 |
+| 64 | false | 2048 | 22 | 105 | 178 | 249 | 488 |
+| 64 | false | 4096 | 25 | 123 | 182 | 269 | 527 |
+| 64 | false | 8192 | 24 | 134 | 184 | 280 | 538 |
+| 64 | false | 16384 | – | 141 | 184 | 287 | 541 |
+| 64 | true | 1024 | 17 | 53 | 142 | 155 | 299 |
+| 64 | true | 2048 | 20 | 77 | 159 | 200 | 410 |
+| 64 | true | 4096 | 22 | 99 | 169 | 233 | 502 |
+| 64 | true | 8192 | 23 | 118 | 180 | 256 | 535 |
+| 64 | true | 16384 | – | 130 | 185 | 274 | 556 |
+| 128 | false | 1024 | 16 | 84 | 174 | 227 | 491 |
+| 128 | false | 2048 | 17 | 113 | 187 | 264 | 574 |
+| 128 | false | 4096 | 18 | 134 | 194 | 286 | 597 |
+| 128 | false | 8192 | 18 | 148 | 196 | 298 | 611 |
+| 128 | false | 16384 | – | 155 | 195 | 304 | 615 |
+| 128 | true | 1024 | 13 | 56 | 151 | 169 | 356 |
+| 128 | true | 2048 | 16 | 85 | 172 | 217 | 483 |
+| 128 | true | 4096 | 19 | 113 | 187 | 254 | 548 |
+| 128 | true | 8192 | 20 | 137 | 200 | 280 | 596 |
+| 128 | true | 16384 | – | 157 | 215 | 308 | 607 |
+
+The fused program is 4–8× faster than the 9-kernel one.
+- **Fused kernel vs SDPA:** 0.6–0.9× (169–215 vs 155–308 TFLOP/s). The whole program is at 0.35–0.55×.
+- **Fused kernel vs FA3:** about 0.35×.
+- **Why the gap:** `mma.sync` m16n8k16 tops out well below Hopper's `wgmma`. FA3's backward uses `wgmma` with warp-specialized TMA producers. The next step is moving the same recognized kernel onto `wgmma`.
+
+Raw logs: `docs/bench/hopper-h200-attn-bwd-fused*.log`.
