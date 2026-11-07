@@ -3474,3 +3474,39 @@ column, token by token; Qwen3-Coder-Next GDN: 32 v heads, 16 k heads, d 128;
 | H200 | 4k | 2.49 | **0.62** |
 | | 16k | 9.91 | **2.33** |
 | | 64k | 39.69 | **9.14** |
+
+## Coder-Next: per-op hand vs derived (RTX 3090, kernel-only)
+
+First step toward `TANG_CODER_DERIVED=all` (plan and inventory: `crates/tang-llm/docs/coder-derived.md`).
+Ops written as naive IR graphs in `crates/tang-llm/src/flash/derived_ops.rs`, lowered by tang-compile,
+NVRTC-compiled and launched on raw device buffers (the engine's calling convention). Engine shapes:
+hidden 2048, 512 experts, top-10. `cargo run --release -p tang-llm --features cuda --example coder_derived_ops 1 2 8`
+on mew (RTX 3090, shared GPU, `flock`). Time = min µs per launch over 50 × 20 warm launches.
+Error = max |Δ| / max |want| against the hand kernel (route: weights; ids compared exactly).
+
+| op | hand kernel | T | hand µs | derived µs | derived kernels | max rel err |
+|---|---|---|---|---|---|---|
+| residual add + RMSNorm | `cx_norm_q8` | 1 | 5.99 | 5.89 | 3 | 0 |
+| | | 8 | 6.20 | 6.50 | 3 | 1.4e-7 |
+| MoE combine + residual + RMSNorm | `cx_moe_add_norm` | 1 | 5.68 | 7.88 | 4 | 1.2e-7 |
+| softmax top-10 routing | `cx_route` | 1 | 10.60 | 12.29 | 2 | 1.5e-7, ids equal |
+| | | 8 | 11.01 | 12.54 | 2 | 2.2e-7, ids equal |
+
+The hand kernels also write the int8 activations, which the derived ones do not yet (that output
+is in the IR's `Q8x32` layout, not the engine's), so these rows compare unequal work in the hand
+kernel's favour. Derived `add_norm` at T=64 equals a CPU reference exactly. At T ≥ 8 the hand
+`cx_moe_add_norm` / `cx_norm_q8` results in this harness were not reproducible (my launch of the
+hand kernel, not the derived op), so those rows are left out.
+
+Dense Q8_0 GEMV (new `Format::Q8_0` in the IR, `Stage::Gemv`, x → int8 quantized in the prologue at
+T=1 and by a writer kernel past that; `IntMma::pos_tile` = T shares one weight read), against a CPU
+reference on the same int8-rounded activations (err ≤ 1.3e-7 everywhere):
+
+| rows × k | T=1 µs (GB/s) | T=2 | T=8 |
+|---|---|---|---|
+| 4096 × 2048 | 17.7 (503) | 20.3 (438) | 44.9 (199) |
+| 2048 × 4096 | 21.0 (424) | 20.7 (430) | 47.8 (186) |
+| 151936 × 2048 (LM head) | 383 (862) | 392 (844) | 1189 (278) |
+
+T=1/2 on the LM head is 92% of the 3090's 936 GB/s. T=8 is compute/register-bound (next step in
+the plan). No H200 or end-to-end numbers yet: nothing here is wired into the engine.
