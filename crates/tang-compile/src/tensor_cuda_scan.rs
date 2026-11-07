@@ -668,6 +668,14 @@ extern "C" __global__ void __launch_bounds__(128) main0(
 /// masked Gram matrices and the decays (`dγ` summed back to `d log α`).
 /// Grid `(T/C, H)`, 256 threads. Requires `DK == DV == 128`.
 const BWD_GRAD: &str = r#"
+// Sum over the 16 lanes of a half warp (all lanes get it).
+__device__ __forceinline__ float hsum16(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
 extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ Q, const bf* __restrict__ K, const bf* __restrict__ V,
     const float* __restrict__ AL, const float* __restrict__ BE, const float* __restrict__ GR,
@@ -832,19 +840,28 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     __syncthreads();
 #if DELTA
     // D = dA (strict lower): dβ, Q = D ⊙ A into dγ, B = D·β_i·E in place
+    // row sums (thread r) and column sums (thread C + j) of Q = D ⊙ A, and dβ
+    if (tid < C) {
+        const int r = tid;
+        float sb = 0.0f, sq = 0.0f;
+        for (int j = 0; j < r; j++) {
+            const float t = f2[r * LDF + j] * xr[r * C + j] * __expf(gam[r] - gam[j]);
+            sb += t;
+            sq += t * bet[r];
+        }
+        dbet[r] += sb;
+        dgam[r] += sq;
+    } else if (tid < 2 * C) {
+        const int j = tid - C;
+        float sq = 0.0f;
+        for (int r = j + 1; r < C; r++)
+            sq += f2[r * LDF + j] * xr[r * C + j] * __expf(gam[r] - gam[j]) * bet[r];
+        atomicAdd(&dgam[j], -sq);
+    }
+    __syncthreads();
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        if (j < r) {
-            const float e = __expf(gam[r] - gam[j]);
-            const float d = f2[r * LDF + j], mk = xr[r * C + j];
-            atomicAdd(&dbet[r], d * mk * e);
-            const float qv = d * bet[r] * mk * e;
-            atomicAdd(&dgam[r], qv);
-            atomicAdd(&dgam[j], -qv);
-            f2[r * LDF + j] = d * bet[r] * e;
-        } else {
-            f2[r * LDF + j] = 0.0f;
-        }
+        f2[r * LDF + j] = j < r ? f2[r * LDF + j] * bet[r] * __expf(gam[r] - gam[j]) : 0.0f;
     }
     __syncthreads();
     for (int i = tid; i < C * C; i += 256) {
@@ -877,18 +894,20 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     }
     __syncthreads();
     // P = dA_qk ⊙ A_qk into dγ; G1 = scale·dA_qk ⊙ E (incl lower)
+    if (tid < C) {
+        const int r = tid;
+        float sp = 0.0f;
+        for (int j = 0; j <= r; j++) sp += f2[r * LDF + j] * f1[r * LDF + j] * __expf(gam[r] - gam[j]);
+        atomicAdd(&dgam[r], (float)SCALE * sp);
+    } else if (tid < 2 * C) {
+        const int j = tid - C;
+        float sp = 0.0f;
+        for (int r = j; r < C; r++) sp += f2[r * LDF + j] * f1[r * LDF + j] * __expf(gam[r] - gam[j]);
+        atomicAdd(&dgam[j], -(float)SCALE * sp);
+    }
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        float g = 0.0f;
-        if (j <= r) {
-            const float e = __expf(gam[r] - gam[j]);
-            const float da = f2[r * LDF + j];
-            const float pv = da * (float)SCALE * f1[r * LDF + j] * e;
-            atomicAdd(&dgam[r], pv);
-            atomicAdd(&dgam[j], -pv);
-            g = (float)SCALE * da * e;
-        }
-        g1b[r * LDT + j] = __float2bfloat16(g);
+        g1b[r * LDT + j] = __float2bfloat16(j <= r ? (float)SCALE * f2[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f);
     }
     __syncthreads();
     // outputs; staging over f1/f2 (3 tiles a warp)
@@ -932,17 +951,23 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         wmma::store_matrix_sync(stg + 256, akb, 16, wmma::mem_row_major);
         wmma::store_matrix_sync(stg + 512, akg, 16, wmma::mem_row_major);
         __syncwarp();
-        for (int e = lane; e < 256; e += 32) {
+        float rsum = 0.0f;
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const int e = lane + 32 * q;
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
             const float kv = __bfloat162float(K[(row0 + r) * DK + x]);
             const float eg = __expf(gam[r]), ec = __expf(glast - gam[r]);
             const float kb = stg[256 + e], kg = stg[512 + e];
             DK_[(row0 + r) * DK + x] = stg[e] + bet[r] * eg * kb + ec * kg;
-            const float rk = ec * kg * kv;
-            atomicAdd(&dbet[r], eg * kb * kv);
-            atomicAdd(&dgam[r], bet[r] * eg * kb * kv - rk);
-            atomicAdd(&red[1], rk);
+            const float rk = hsum16(ec * kg * kv), bk = hsum16(eg * kb * kv);
+            if ((lane & 15) == 0) {
+                atomicAdd(&dbet[r], bk);
+                atomicAdd(&dgam[r], bet[r] * bk - rk);
+                rsum += rk;
+            }
         }
+        if ((lane & 15) == 0) atomicAdd(&red[1], rsum);
         __syncwarp();
     }
     // dq = scale·e^γ·dO·S₀ᵀ + G1·k   [C × DK]
@@ -970,11 +995,14 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         wmma::store_matrix_sync(stg, aq, 16, wmma::mem_row_major);
         wmma::store_matrix_sync(stg + 256, ag, 16, wmma::mem_row_major);
         __syncwarp();
-        for (int e = lane; e < 256; e += 32) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const int e = lane + 32 * q;
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
             const float sg = (float)SCALE * __expf(gam[r]);
             DQ[(row0 + r) * DK + x] = sg * stg[e] + stg[256 + e];
-            atomicAdd(&dgam[r], sg * stg[e] * __bfloat162float(Q[(row0 + r) * DK + x]));
+            const float t = hsum16(sg * stg[e] * __bfloat162float(Q[(row0 + r) * DK + x]));
+            if ((lane & 15) == 0) atomicAdd(&dgam[r], t);
         }
         __syncwarp();
     }
@@ -996,7 +1024,9 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         wmma::store_matrix_sync(stg, av, 16, wmma::mem_row_major);
         __syncwarp();
 #endif
-        for (int e = lane; e < 256; e += 32) {
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+            const int e = lane + 32 * q;
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
 #if DELTA
             const float dvb = stg[e];
@@ -1004,7 +1034,8 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             const float dvb = __bfloat162float(DVn[(row0 + r) * DV + x]);
 #endif
             DV_[(row0 + r) * DV + x] = bet[r] * dvb;
-            atomicAdd(&dbet[r], dvb * __bfloat162float(V[(row0 + r) * DV + x]));
+            const float t = hsum16(dvb * __bfloat162float(V[(row0 + r) * DV + x]));
+            if ((lane & 15) == 0) atomicAdd(&dbet[r], t);
         }
         __syncwarp();
     }
