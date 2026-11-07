@@ -153,6 +153,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         tm[r * LDF + j] = r == j ? 1.0f : 0.0f;
     }
     __syncthreads();
+#ifndef XNOSOLVE
     // T = (I + A)⁻¹ in 16×16 blocks: diagonal blocks by substitution (warp b
     // owns block b, lane = column), then T_ij = −T_ii·Σ_{j≤k<i} A_ik·T_kj
     if (warp < C / 16) {
@@ -195,6 +196,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         }
         __syncthreads();
     }
+#endif
     // T'' = T·diag(β) as a bf16 operand over A's space (A is done), then
     // W = T''·(e^γ k) and U = T''·v with k, v staged over T's space
     bf* t2 = (bf*)sa;
@@ -234,14 +236,18 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         *(__nv_bfloat162*)&ost[r * LDK + x] = __floats2bfloat162_rn(__low2float(v) * g, __high2float(v) * g);
     }
     __syncthreads();
+#ifndef XNOTRI
     tri(LDK, DK, Wo);
+#endif
     __syncthreads();
     for (int i = tid; i < C * DV / 8; i += 256) {
         const int r = i / (DV / 8), x = (i % (DV / 8)) * 8;
         *(uint4*)&ost[r * LDV + x] = *(const uint4*)&V[(row0 + r) * DV + x];
     }
     __syncthreads();
+#ifndef XNOTRI
     tri(LDV, DV, Uo);
+#endif
 #else
     __syncthreads();
     for (int i = tid; i < C * DV / 2; i += 256) {
@@ -512,7 +518,8 @@ impl ChunkedScan {
         let smem2 = (n * (bv + 8) + c * (bv + 8)) * 2 + c * 4 + 4 * 256 * 4;
         let smem3 = (c * (n + 8) + c * (c + 8)) * 2 + c * 4 + 8 * 512 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
-            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{extra}{PRELUDE}{body}")
+            let x = std::env::var("TANG_SCAN_DEFS").unwrap_or_default().replace(';', "\n");
+            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{x}\n{extra}{PRELUDE}{body}")
         };
         [
             ScanLaunch {
