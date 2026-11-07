@@ -257,6 +257,24 @@ impl TensorGraph {
         let w_off = offset_expr(&wa.view, &ws, &names, Some("KEY"));
         let x_off = offset_expr(&xa.view, &xs, &names, xkey.as_ref().map(|_| "XKEY"));
         let x_total: usize = xs.iter().product();
+        if s.stage == Stage::Gemv {
+            let (wp, xp) = (param(wi)?, param(xi)?);
+            return Ok(gemv_kernel(&GemvShape {
+                reads: reads.len(),
+                npos,
+                rows,
+                k,
+                b,
+                decode: &decode,
+                wkey: &wkey,
+                xkey: xkey.as_deref(),
+                w_off: &w_off,
+                x_off: &x_off,
+                x_total,
+                wp: &wp,
+                xp: &xp,
+            }));
+        }
         let ksplit = s.ksplit as usize;
         if ![1, 2, 4, 8].contains(&ksplit) || (k / 256) % ksplit != 0 {
             return Err(format!("ksplit {ksplit} must divide 8 and k / 256"));
@@ -445,3 +463,116 @@ impl TensorGraph {
         Ok((src, 256, npos * row_blocks))
     }
 }
+
+/// What [`gemv_kernel`] needs from the validated contraction.
+struct GemvShape<'a> {
+    reads: usize,
+    npos: usize,
+    rows: usize,
+    k: usize,
+    b: Blk,
+    decode: &'a str,
+    wkey: &'a str,
+    xkey: Option<&'a str>,
+    w_off: &'a str,
+    x_off: &'a str,
+    x_total: usize,
+    wp: &'a str,
+    xp: &'a str,
+}
+
+/// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
+/// half super-block (128 columns: sub-blocks `4h..4h + 4`, qs pairs `2h`
+/// and `2h + 1`) at a time; `lanes` lanes share a row, `32 / lanes` rows a
+/// warp, 8 warps a block, one position a block. Same scaling as the MMA
+/// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
+fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
+    let units = g.k / 128;
+    let lanes = units.next_power_of_two().min(32);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let (bb, qs) = (g.b.bytes, g.b.qs);
+    let row_bytes = g.k / 256 * bb;
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let five = if g.b.five {
+        "                const unsigned qh = __ldg((const unsigned*)(bp + 16 + 4 * w));\n                lo |= ((qh >> (2 * jp)) & 0x01010101u) << 4;\n                hi |= ((qh >> (2 * jp + 1)) & 0x01010101u) << 4;\n"
+    } else {
+        ""
+    };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (pos >= {npos}) return;
+    const bool live = r < {rows};
+    long long KEY, xr;
+    {{ const long long P = pos;
+{decode}      KEY = {wkey};
+{xkey_decl}      xr = ({x_off}); }}
+    const unsigned char* wbase;
+    {{ const long long P = pos;
+{decode}      wbase = (const unsigned char*)({wp}) + ({w_off}) / 256 * {bb}; }}
+    const unsigned char* wr = wbase + (size_t)(live ? r : 0) * {row_bytes};
+    const signed char* xc = (const signed char*)({xp}) + xr;
+    const float2* xs = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;
+    float acc = 0.f;
+    if (live) {{
+        for (int u = u0; u < {units}; u += {lanes}) {{
+            const int sb = u >> 1, h = u & 1;
+            const unsigned char* bp = wr + sb * {bb};
+            const unsigned dw = __ldg((const unsigned*)bp);
+            const float d = tang_h2f_bits((unsigned short)(dw & 0xFFFFu)), dm = tang_h2f_bits((unsigned short)(dw >> 16));
+            const unsigned s0 = __ldg((const unsigned*)(bp + 4)), s1 = __ldg((const unsigned*)(bp + 8)), s2 = __ldg((const unsigned*)(bp + 12));
+            // 6-bit scales / mins of sub-blocks 4h..4h+3, one byte lane each
+            const unsigned sc = h ? ((s2 & 0x0F0F0F0Fu) | (((s0 >> 6) & 0x03030303u) << 4)) : (s0 & 0x3F3F3F3Fu);
+            const unsigned mn = h ? (((s2 >> 4) & 0x0F0F0F0Fu) | (((s1 >> 6) & 0x03030303u) << 4)) : (s1 & 0x3F3F3F3Fu);
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {{
+                const int jp = 2 * h + jj;
+                int dl = 0, dh = 0;
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {{
+                    const unsigned q = __ldg((const unsigned*)(bp + {qs} + jp * 32 + 4 * w));
+                    unsigned lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+{five}                    const int xl = __ldg((const int*)(xc + sb * 256 + (2 * jp) * 32 + 4 * w));
+                    const int xh = __ldg((const int*)(xc + sb * 256 + (2 * jp + 1) * 32 + 4 * w));
+                    dl = __dp4a((int)lo, xl, dl);
+                    dh = __dp4a((int)hi, xh, dh);
+                }}
+                const int il = 2 * jj, ih = 2 * jj + 1; // byte lanes of sub-blocks 2jp, 2jp+1
+                const float2 xa = __ldg(xs + sb * 8 + 2 * jp), xb = __ldg(xs + sb * 8 + 2 * jp + 1);
+                acc = fmaf(d * (float)((sc >> (8 * il)) & 0xFFu) * xa.x, (float)dl, fmaf(-dm * (float)((mn >> (8 * il)) & 0xFFu), xa.y, acc));
+                acc = fmaf(d * (float)((sc >> (8 * ih)) & 0xFFu) * xb.x, (float)dh, fmaf(-dm * (float)((mn >> (8 * ih)) & 0xFFu), xb.y, acc));
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int o = {lanes} / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (live && u0 == 0) out[(long long)pos * {rows} + r] = acc;
+}}
+"#,
+        params = params.join(", "),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        x_off = g.x_off,
+        wp = g.wp,
+        xp = g.xp,
+        w_off = g.w_off,
+        x_total = g.x_total,
+    )
+    .unwrap();
+    (src, 256, g.npos * row_blocks)
+}
+

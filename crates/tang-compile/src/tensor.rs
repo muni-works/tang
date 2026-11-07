@@ -744,6 +744,12 @@ pub enum Stage {
     /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
     /// and `16 + 4·tig..`), on both operands.
     Mma,
+    /// No MMA: the narrow schedule for few points a weight slice (decode,
+    /// batch 1). Each output `(p, r)` is a dot of one weight row with one
+    /// activation row on `dp4a`, the row's half-super-blocks spread over
+    /// a group of lanes (as many as `k / 128`, at most 32) and summed by
+    /// shuffles; a warp holds `32 / lanes` rows. `ksplit` is ignored.
+    Gemv,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)

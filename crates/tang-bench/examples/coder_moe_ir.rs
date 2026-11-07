@@ -676,9 +676,13 @@ mod gpu {
             .split(',')
             .map(|s| s.parse().unwrap())
             .collect();
-        let stage = match std::env::var("CODER_MOE_STAGE").as_deref() {
-            Ok("mma") => Stage::Mma,
-            _ => Stage::Fragment,
+        // CODER_MOE_STAGE=frag|mma|gemv forces one; default: the narrow GEMV
+        // schedule at B <= 4, fragment-order MMA above
+        let forced = match std::env::var("CODER_MOE_STAGE").as_deref() {
+            Ok("mma") => Some(Stage::Mma),
+            Ok("frag") => Some(Stage::Fragment),
+            Ok("gemv") => Some(Stage::Gemv),
+            _ => None,
         };
         let iters = 100;
         // one weight set (the largest B's routing reuses it)
@@ -708,6 +712,7 @@ mod gpu {
                 }
                 Err(_) => (2, 1),
             };
+            let stage = forced.unwrap_or(if b <= 4 { Stage::Gemv } else { Stage::Fragment });
             let mut l = layer_graph(m);
             schedule(&mut l, stage, ks);
             let outs = [l.y, l.sel, l.wts, l.logits, l.gu, l.dn, l.rank];
@@ -751,9 +756,9 @@ mod gpu {
                 let (w, c) = time(&rt, &exe, i, &mut flush, iters);
                 let n = k.node;
                 let name = if n == l.gu {
-                    "gate|up (int8 MMA)"
+                    "gate|up"
                 } else if n == l.dn {
-                    "down (int8 MMA)"
+                    "down"
                 } else if n == l.h {
                     "SwiGLU → Q8x32"
                 } else if n == l.xq {
