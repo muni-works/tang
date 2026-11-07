@@ -512,7 +512,12 @@ pub fn coder_check(dev: &CudaDevice, t: usize, n: usize) {
             row[2 * hk * d + i] = (4.0 * (u() - 0.5)) as f32;
         }
         for h in 0..hv {
-            row[2 * hk * d + hv * d + h] = (-0.3 * u()).exp() as f32;
+            // every 37th step a full forget (α = 0, as the model's exp underflow gives)
+            row[2 * hk * d + hv * d + h] = if (r * 7 + h) % 37 == 0 {
+                0.0
+            } else {
+                (-0.3 * u()).exp() as f32
+            };
             row[2 * hk * d + hv * d + hv + h] = u() as f32;
         }
     }

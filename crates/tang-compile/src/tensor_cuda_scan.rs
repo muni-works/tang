@@ -165,7 +165,9 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     const size_t row0 = (size_t)h * T + (size_t)c * C;
     if (tid < C) {
 #if GATE
-        gam[tid] = logf(AL[row0 + tid]);
+        // log α floored: α = 0 (a full forget, exp underflow in the model) would make γ = −∞
+        // and e^{γᵢ−γⱼ} NaN; e^−60 ≈ 1e−26 forgets just as completely
+        gam[tid] = fmaxf(logf(AL[row0 + tid]), -60.0f);
 #else
         gam[tid] = 0.0f;
 #endif
