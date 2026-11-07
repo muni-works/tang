@@ -58,9 +58,9 @@ pub struct ScanLaunch {
     pub smem: u32,
 }
 
-const PRELUDE: &str = r#"#include <mma.h>
-#include <cuda_bf16.h>
-using namespace nvcuda;
+const INCLUDES: &str = "#include <mma.h>\n#include <cuda_bf16.h>\n";
+
+const PRELUDE: &str = r#"using namespace nvcuda;
 typedef __nv_bfloat16 bf;
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, bf, wmma::row_major> FA;
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, bf, wmma::col_major> FAc;
@@ -398,8 +398,8 @@ impl ChunkedScan {
         let smem1 = (2 * c * (n + 8) + c * (m + 8)) * 2 + 2 * c * (c + 4) * 4 + 2 * c * 4;
         let ldb = bv + 8;
         let smem2 = (3 * c * (n + 8) + c * ldb + c * (c + 8) + n * ldb + c * ldb) * 2 + 4 * 256 * 4;
-        let prep = format!("#define TANG_SMEM {smem1}\n{d}{PRELUDE}{PREP}");
-        let state = format!("#define TANG_SMEM {smem2}\n{d}#define BV {bv}\n{PRELUDE}{STATE}");
+        let prep = format!("#define TANG_SMEM {smem1}\n{INCLUDES}{d}{PRELUDE}{PREP}");
+        let state = format!("#define TANG_SMEM {smem2}\n{INCLUDES}{d}#define BV {bv}\n{PRELUDE}{STATE}");
         [
             ScanLaunch {
                 source: prep,
