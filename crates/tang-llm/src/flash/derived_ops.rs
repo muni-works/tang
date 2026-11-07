@@ -478,7 +478,9 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
             pos_tile: t.min(8) as u32,
         }),
     );
-    g.set_inline(xq, true);
+    // one window row: quantize in the GEMV prologue; more rows: once, by a
+    // Q8x32 writer kernel (every block would redo all rows otherwise)
+    g.set_inline(xq, t == 1);
     Spec {
         g,
         ext: vec![x, w, out],
