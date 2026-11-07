@@ -701,13 +701,19 @@ pub fn moe_block(m: MoeShape) -> Spec {
     for c in [eg, eu, dn] {
         g.set_int_mma(c, Some(gemv));
     }
-    let shared = if t == 1 {
-        gemv
-    } else {
+    // the shared expert: the dp4a GEMV with every row on one weight read, the same
+    // accumulation order at any T (a token's outputs bitwise the same in any window);
+    // `TANG_CODER_DMOE_MMA=1`: int8 tensor cores past one row (faster, not bitwise across T)
+    let shared = if t > 1 && std::env::var("TANG_CODER_DMOE_MMA").is_ok_and(|v| v == "1") {
         IntMma {
             stage: Stage::Mma,
             ksplit: 2,
             pos_tile: t.min(64) as u32,
+        }
+    } else {
+        IntMma {
+            pos_tile: t.min(8) as u32,
+            ..gemv
         }
     };
     for c in [shg, shu, shd] {
