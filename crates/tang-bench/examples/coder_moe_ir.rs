@@ -456,6 +456,12 @@ fn schedule(l: &mut Layer, stage: Stage, ksplit: (u32, u32)) {
             ksplit: ksplit.1,
         }),
     );
+    // the narrow GEMV quantizes its own activations: x → Q8x32 and SwiGLU →
+    // Q8x32 inlined into gate|up and down (`CODER_MOE_FUSE=0`: their own kernels)
+    if stage == Stage::Gemv && std::env::var("CODER_MOE_FUSE").as_deref() != Ok("0") {
+        g.set_inline(l.xq, true);
+        g.set_inline(l.h, true);
+    }
     // the router: a 2048-long dot a point, split across a warp
     g.set_schedule(l.logits, 32, (0, 0, 0), (1, 1));
 }
