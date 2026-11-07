@@ -3346,3 +3346,66 @@ Fused d=256 backward (new; previously unfused), kernel vs SDPA:
 | bh=8 n=16k causal | 13.4 ms | 10.8 ms | 0.80× |
 
 d=128 n=16k: kernel 19.8 ms (non-causal), 10.8 ms (causal). Two blocks/SM is not reachable at 256 consumer threads (needs ≤128 regs; dV/dK accumulators alone are 128 at d=128). Softmax/GEMM overlap not done yet.
+
+## Scans: chunked delta rule, SSD and linear attention (RTX 3090, H200 SXM; bf16, kernel-only)
+
+`delta_scan` + `scan_readout` in tensor IR, lowered by `chunked_scan_plan`
+(`tensor_cuda_scan.rs`): per-chunk WY/UT transform, sequential state scan,
+parallel readout; backward = the derived reverse scan at chunk granularity +
+one gradient kernel per chunk. `examples/scan_bench.rs` (`--bwd`) checks the
+output and all gradients against the f64 interpreter (rel. err 2–5e-3) and
+times back-to-back launches; references from `scripts/scan_ref_bench.py`
+(CUDA events, median of 20): fla 0.3.2 `chunk_gated_delta_rule` /
+`chunk_simple_gla` (g = 0), mamba_ssm 2.3.2 `mamba_chunk_scan_combined`
+(chunk 64). Batch 1, H = 32, dk = 128, dv = 128 (SSD: dstate 128, headdim 64).
+Times in ms.
+
+**RTX 3090**
+
+| layer | T | tang fwd | ref fwd | tang fwd+bwd | ref fwd+bwd |
+|---|---|---|---|---|---|
+| gated delta rule (fla) | 4k | **1.12** | 1.19 | 4.44 | **4.30** |
+| | 16k | 4.28 | **4.21** | 17.65 | **16.68** |
+| | 64k | 17.08 | **16.24** | | |
+| linear attention (fla) | 4k | 0.69 | **0.63** | 3.23 | **2.81** |
+| | 16k | 2.67 | **2.49** | 12.75 | **11.60** |
+| | 64k | **10.55** | 12.23 | | |
+| Mamba-2 SSD (mamba_ssm) | 4k | **0.47** | 0.83 | — | 4.12 |
+| | 16k | **1.74** | 2.40 | — | 13.12 |
+| | 64k | **6.75** | 8.72 | | |
+
+**H200 SXM** (the same `wmma` kernels; no `wgmma` variant yet)
+
+| layer | T | tang fwd | ref fwd | tang fwd+bwd | ref fwd+bwd |
+|---|---|---|---|---|---|
+| gated delta rule (fla) | 4k | 0.62 | **0.52** | 2.40 | **1.43** |
+| | 16k | 2.33 | **1.52** | 9.23 | **4.64** |
+| | 64k | 9.14 | **5.69** | | |
+| linear attention (fla) | 4k | 0.38 | **0.28** | 1.65 | **0.92** |
+| | 16k | 1.45 | **0.67** | 6.35 | **2.75** |
+| | 64k | 5.71 | **2.33** | | |
+| Mamba-2 SSD (mamba_ssm) | 4k | **0.30** | 0.53 | — | 2.54 |
+| | 16k | 1.14 | **0.74** | — | 3.73 |
+| | 64k | 4.48 | **2.33** | | |
+
+The backward needs dk = dv = 128 (SSD at headdim 64 runs forward only).
+On the 3090 (half-rate fp32-accumulate MMA on GeForce Ampere) the derived
+kernels match fla within ±6% forward and 3–10% fwd+bwd, and beat mamba_ssm's
+SSD forward 1.3–1.8×. On the H200 fla's Triton kernels are 1.2–2.4× ahead at
+long T: the sequential state scan (`H · dv/32` = 128 blocks, ~3.8 µs a chunk)
+is latency-bound there. Next: a two-level state scan (segments in parallel,
+combined through the chunk maps — the affine monoid is associative at any
+granularity) and `wgmma` tiles.
+
+**vs tang-llm's hand prefill recurrence** (`fl_gdn_wide`, a warp per state
+column, token by token; Qwen3-Coder-Next GDN: 32 v heads, 16 k heads, d 128;
+`scripts/gdn_hand_bench.cu`), recurrence only:
+
+| GPU | T | `fl_gdn_wide` | chunked scan (32 heads) |
+|---|---|---|---|
+| RTX 3090 | 4k | 2.39 | **1.12** |
+| | 16k | 9.48 | **4.28** |
+| | 64k | 35.38 | **17.08** |
+| H200 | 4k | 2.49 | **0.62** |
+| | 16k | 9.91 | **2.33** |
+| | 64k | 39.69 | **9.14** |

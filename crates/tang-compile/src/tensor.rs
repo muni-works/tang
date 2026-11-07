@@ -48,9 +48,11 @@ pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
 #[path = "tensor_cuda_int8.rs"]
 mod cuda_int8;
-/// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
+/// A whole program as one persistent CUDA kernel (no kernel boundaries).
+#[path = "tensor_cuda_scan.rs"]
+pub mod cuda_scan;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
@@ -82,6 +84,9 @@ pub use place::{Boundary, MemorySchedule, Place, Placed};
 #[path = "tensor_precision.rs"]
 pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
+#[path = "tensor_scan.rs"]
+pub mod scan;
+pub use scan::{DeltaForm, Scan, ScanKind};
 #[path = "tensor_space.rs"]
 pub mod space;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
@@ -629,6 +634,9 @@ pub enum Op {
     /// An opaque operator: native code forward, a user-supplied adjoint
     /// backward. See [`Operator`].
     Operator(OperatorNode),
+    /// A prefix scan over one dim with an associative combine: a tuple
+    /// monoid or the matrix affine monoid. See [`Scan`].
+    Scan(Scan),
 }
 
 /// An opaque operator node: whole-tensor native code with its own
@@ -1125,6 +1133,7 @@ impl TensorGraph {
             Op::Comp(c) => c.args.iter().map(|a| a.src.n()).collect(),
             Op::Reshape(src) => vec![src.n()],
             Op::Operator(o) => o.inputs.iter().map(|t| t.n()).collect(),
+            Op::Scan(sc) => sc.inputs.iter().map(|t| t.n()).collect(),
             Op::Input(_) | Op::Iota(_) => Vec::new(),
         }
     }
@@ -1428,7 +1437,7 @@ impl TensorGraph {
     pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => None,
         }
     }
 
@@ -1711,6 +1720,11 @@ impl TensorGraph {
                     op_read[t.n()] = true;
                 }
             }
+            if let Op::Scan(sc) = &self.nodes[i].op {
+                for t in &sc.inputs {
+                    op_read[t.n()] = true;
+                }
+            }
         }
         // a map read through a guarded view must stay materialized
         let mut guarded = vec![false; n];
@@ -1760,6 +1774,14 @@ impl TensorGraph {
                         .iter()
                         .map(|t| TensorId(remap[t.n()].unwrap() as u32))
                         .collect(),
+                }),
+                Op::Scan(sc) => Op::Scan(Scan {
+                    inputs: sc
+                        .inputs
+                        .iter()
+                        .map(|t| TensorId(remap[t.n()].unwrap() as u32))
+                        .collect(),
+                    ..sc.clone()
                 }),
                 Op::Comp(c) => {
                     let rank = c.rank();
@@ -2325,6 +2347,11 @@ impl TensorGraph {
                         *t = TensorId(remap[t.n()].unwrap() as u32);
                     }
                 }
+                Op::Scan(sc) => {
+                    for t in &mut sc.inputs {
+                        *t = TensorId(remap[t.n()].unwrap() as u32);
+                    }
+                }
                 Op::Input(_) | Op::Iota(_) => {}
             }
             ng.nodes.push(node);
@@ -2503,7 +2530,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => true,
+                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -2787,6 +2814,10 @@ impl TensorGraph {
                 *src = TensorId(redirect[src.n()] as u32);
             } else if let Op::Operator(o) = &mut g.nodes[i].op {
                 for t in &mut o.inputs {
+                    *t = TensorId(redirect[t.n()] as u32);
+                }
+            } else if let Op::Scan(sc) = &mut g.nodes[i].op {
+                for t in &mut sc.inputs {
                     *t = TensorId(redirect[t.n()] as u32);
                 }
             }
@@ -4116,7 +4147,9 @@ impl TensorGraph {
                             .map(|a| direct_read(self, a, c.rank(), emulate))
                             .collect(),
                     }),
-                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
+                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => {
+                        None
+                    }
                 })
                 .collect(),
         };
@@ -4133,6 +4166,15 @@ impl TensorGraph {
                     o.op.name()
                 );
                 ev.bufs[i] = out;
+                continue;
+            }
+            if let Op::Scan(sc) = &self.nodes[i].op {
+                let ins: Vec<std::borrow::Cow<[f64]>> =
+                    sc.inputs.iter().map(|t| ev.tensor_ref(*t)).collect();
+                let refs: Vec<&[f64]> = ins.iter().map(|v| &v[..]).collect();
+                let shapes: Vec<Vec<usize>> =
+                    sc.inputs.iter().map(|t| fixed(self.shape(*t))).collect();
+                ev.bufs[i] = sc.eval(&refs, &shapes, &fixed(&self.nodes[i].shape));
                 continue;
             }
             if let Some(c) = self.comp_at(i) {
@@ -4413,7 +4455,7 @@ fn direct_read(g: &TensorGraph, a: &Arg, rank: usize, emulate: bool) -> Option<D
     let snode = &g.nodes[store.n()];
     let src = match &snode.op {
         Op::Input(k) => DirectSrc::Input(*k),
-        Op::Operator(_) => DirectSrc::Buf(store.n()),
+        Op::Operator(_) | Op::Scan(_) => DirectSrc::Buf(store.n()),
         Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => DirectSrc::Buf(store.n()),
         _ => return None,
     };
@@ -4493,7 +4535,7 @@ impl Evaluator<'_> {
         let snode = &self.g.nodes[store.n()];
         match &snode.op {
             Op::Input(k) if !self.emulate => return self.inputs[*k][..].into(),
-            Op::Operator(_) => return self.bufs[store.n()][..].into(),
+            Op::Operator(_) | Op::Scan(_) => return self.bufs[store.n()][..].into(),
             Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => {
                 return self.bufs[store.n()][..].into()
             }
@@ -4519,7 +4561,7 @@ impl Evaluator<'_> {
                 }
             }
             Op::Iota(d) => idx[*d] as f64,
-            Op::Operator(_) => self.bufs[t.n()][flat_index(&fixed(&node.shape), idx)],
+            Op::Operator(_) | Op::Scan(_) => self.bufs[t.n()][flat_index(&fixed(&node.shape), idx)],
             Op::Reshape(src) => {
                 let flat = flat_index(&fixed(&node.shape), idx);
                 let src_shape = fixed(&self.g.nodes[src.n()].shape);

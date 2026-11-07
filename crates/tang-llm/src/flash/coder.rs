@@ -206,6 +206,10 @@ struct Variants {
     /// the default (H200: 1.66× at 30k, 2.15× at 54k); `TANG_CODER_ATTN=splitk` for split-K.
     /// Not bitwise: gated by `flash-wide-check`'s greedy + KL bar.
     attn_fa2: bool,
+    /// Wide windows run attention as the kernel derived from the tensor IR (flash/derived_attn.rs:
+    /// the Hopper flash lowering of the naive window attention; `TANG_CODER_ATTN=derived`, sm_90
+    /// only). Not bitwise with FA2 (gated by flash-wide-check's KL bar).
+    attn_derived: bool,
     /// Batch decode windows (past `MAX_T` rows) run the dense layers and experts as the
     /// tensor-core GEMMs too (`TANG_CODER_BGEMM=1`). Not bitwise; off by default.
     bgemm: bool,
@@ -249,6 +253,7 @@ impl Default for Variants {
             wgemm_gu: true,
             wgemm_down: true,
             attn_fa2: false,
+            attn_derived: false,
             bgemm: false,
             stream: true,
             mma_gu: true,
@@ -288,6 +293,7 @@ impl Variants {
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
             attn_fa2: !env_is("TANG_CODER_ATTN", "splitk"),
+            attn_derived: env_is("TANG_CODER_ATTN", "derived"),
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
             dmma: !env_is("TANG_CODER_DMMA", "0"),
@@ -637,6 +643,9 @@ struct Kern {
     part: Fun,
     merge: Fun,
     fa2: Fun,
+    da_q: Fun,
+    da_kv: Fun,
+    da_un: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     gdn_step_seg: Fun,
@@ -714,6 +723,9 @@ impl Kern {
             part: f("cx_attn_part")?,
             merge: f("cx_attn_merge")?,
             fa2: f("cx_attn_fa2")?,
+            da_q: f("cx_attn_dq")?,
+            da_kv: f("cx_attn_dkv")?,
+            da_un: f("cx_attn_dunpack")?,
             gdn_step: self.gdn_step,
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
@@ -837,6 +849,9 @@ impl Kern {
             part: f(cm, "cx_attn_part")?,
             merge: f(cm, "cx_attn_merge")?,
             fa2: f(cm, "cx_attn_fa2")?,
+            da_q: f(cm, "cx_attn_dq")?,
+            da_kv: f(cm, "cx_attn_dkv")?,
+            da_un: f(cm, "cx_attn_dunpack")?,
             gdn_step: f(fm, "fl_gdn_conv_step")?,
             gdn_commit: f(fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
@@ -1053,11 +1068,76 @@ struct Wide {
     xq: B,
     /// Split-K partials of the batch module's dense MMA (`DMMA_PART` f32; empty elsewhere).
     part: B,
+    /// `TANG_CODER_GDN=chunked`: the GDN recurrence as tang's chunked scan (GPU 0).
+    gdnc: Option<GdnChunked>,
+}
+
+/// State column block of the chunked GDN state scan.
+const GDNC_BV: usize = 32;
+
+/// `TANG_CODER_GDN=chunked` (off by default): wide windows run the GDN recurrence as the
+/// chunked scan of `tang_compile::tensor::cuda_scan` (`ChunkedScan::coder`) instead of
+/// `fl_gdn_wide` — per 64-token chunk a WY/UT transform on tensor cores, then a sequential scan
+/// of the f32 state over chunks, then the readout. Same inputs (`fl_gdn_wide_prep`'s rows), the
+/// slot's f32 state in and out, the same `Y` rows; fp16 operands. Needs
+/// `TANG_CODER_GDN_STATE=f32` (the default).
+struct GdnChunked {
+    f: [Fun; 4],
+    smem: [u32; 4],
+    block: [u32; 4],
+    bufs: Vec<B>,
+    plan: tang_compile::tensor::cuda_scan::ChunkedScan,
+    _m: Vec<Module>,
+}
+
+impl GdnChunked {
+    fn enabled() -> bool {
+        env_is("TANG_CODER_GDN", "chunked") && !gdn_s16()
+    }
+
+    fn new(gpu: &Gpu, dev: &CudaComputeDevice, geo: &Geometry, rows: usize) -> Result<Self> {
+        let plan =
+            tang_compile::tensor::cuda_scan::ChunkedScan::coder(geo.gdn_hv, geo.gdn_hk, geo.gdn_d);
+        let ls = plan.coder_kernels(GDNC_BV);
+        let mut f: [Fun; 4] = [std::ptr::null_mut(); 4];
+        let mut ms = Vec::new();
+        for (i, l) in ls.iter().enumerate() {
+            let m = gpu
+                .module(&l.source)
+                .map_err(|e| anyhow!("chunked GDN kernel {i}: {e}"))?;
+            f[i] = m.func("main0").map_err(|e| anyhow!("{e}"))?;
+            ms.push(m);
+        }
+        let tp = rows.next_multiple_of(tang_compile::tensor::cuda_scan::CHUNK);
+        let bufs = plan
+            .coder_scratch(tp)
+            .iter()
+            .map(|&b| dev.alloc_f32(b.div_ceil(4)))
+            .collect();
+        Ok(Self {
+            f,
+            smem: [ls[0].smem, ls[1].smem, ls[2].smem, ls[3].smem],
+            block: [ls[0].block, ls[1].block, ls[2].block, ls[3].block],
+            bufs,
+            plan,
+            _m: ms,
+        })
+    }
 }
 
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
 /// grows with rows × context).
 const WIDE_ATTN_ROWS: usize = 32;
+
+/// `TANG_CODER_ATTN=derived` state: compiled window kernels by padded key count, and the fp16
+/// operands / output they read and write (sized for the wide window and `max_ctx` keys).
+#[derive(Default)]
+struct DerivedAttn {
+    kernels: HashMap<usize, super::derived_attn::Kernel>,
+    /// q16, k16, v16, pos, o
+    bufs: Option<[B; 5]>,
+    failed: bool,
+}
 
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
@@ -1257,6 +1337,8 @@ pub struct Coder {
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
+    /// `TANG_CODER_ATTN=derived`: the window kernels by padded key count and their scratch.
+    derived: std::cell::RefCell<DerivedAttn>,
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
@@ -1578,6 +1660,7 @@ impl Coder {
             last_commit_ms: 0.0,
             last_tree: (0, 0),
             load_report,
+            derived: Default::default(),
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
@@ -2641,6 +2724,7 @@ impl Coder {
             proj,
             xq,
             part: self.dev.alloc_f32(DMMA_PART),
+            gdnc: None,
         });
         Ok(())
     }
@@ -2734,6 +2818,11 @@ impl Coder {
             proj,
             xq,
             part: self.dev.alloc_f32(1),
+            gdnc: if GdnChunked::enabled() {
+                Some(GdnChunked::new(&self.gpu, &self.dev, &self.geo, rows)?)
+            } else {
+                None
+            },
         });
         // The peer's own wide set: the same kernels compiled on its context, its scratch
         // and staging, sized by its layers.
@@ -2787,8 +2876,47 @@ impl Coder {
                 proj: prj,
                 xq: pxq,
                 part: p.dev.alloc_f32(1),
+                gdnc: None,
             });
             p.ctx.sync()?;
+        }
+        // TANG_CODER_ATTN=derived: compile the window kernels for every padded key count now
+        // (all cores), not on each count's first window.
+        if self.var.attn_derived && !env_is("TANG_CODER_ATTN_LAZY", "1") {
+            let hp = &self.hp;
+            let base = super::derived_attn::AttnShape {
+                t: rows,
+                n_pad: super::derived_attn::KEY_STEP,
+                nkv: hp.n_head_kv,
+                g: hp.n_head / hp.n_head_kv,
+                hd: hp.head_dim,
+            };
+            let t0 = Instant::now();
+            let built = super::derived_attn::prebuild(base, self.max_ctx);
+            let mut da = self.derived.borrow_mut();
+            da.kernels.clear();
+            let mut n = 0;
+            for c in built {
+                match c.and_then(|c| {
+                    let k = c.shape.n_pad;
+                    c.load(&self.gpu).map(|kk| (k, kk))
+                }) {
+                    Ok((k, kk)) => {
+                        da.kernels.insert(k, kk);
+                        n += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("coder: no derived attention ({e}); FA2 instead");
+                        da.failed = true;
+                        break;
+                    }
+                }
+            }
+            eprintln!(
+                "coder: derived attention: {n} window kernels (to {} keys) built in {:.1} s",
+                self.max_ctx,
+                t0.elapsed().as_secs_f64()
+            );
         }
         Ok(())
     }
@@ -3213,6 +3341,9 @@ impl Coder {
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
             (k.fa2, "attn_fa2"),
+            (k.da_q, "attn_dpack"),
+            (k.da_kv, "attn_dpack"),
+            (k.da_un, "attn_dunpack"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
@@ -3852,6 +3983,163 @@ impl Coder {
         (ns > 0).then_some(ns)
     }
 
+    /// The derived attention of a wide window of `t` rows (stage `w`): build the fp16 operands,
+    /// run the window kernel for the padded key count (compiled on first use), write its output
+    /// as one split of the partials, merge. `false` (nothing launched): use FA2 instead (not
+    /// stage 0, a peer stage, no kernel, or partials that wouldn't fit).
+    #[allow(clippy::too_many_arguments)]
+    fn run_derived(
+        &self,
+        w: usize,
+        t: usize,
+        q: u64,
+        kt: u64,
+        vt: u64,
+        rows: u64,
+        part: u64,
+        proj: u64,
+        st: i32,
+        attn: u64,
+    ) -> bool {
+        use super::derived_attn::{AttnShape, Kernel, Role, KEY_STEP};
+        let hp = &self.hp;
+        let (nkv, g, hd) = (hp.n_head_kv, hp.n_head / hp.n_head_kv, hp.head_dim);
+        let tw = self.wide_rows();
+        let keys = self.wide_pos0.get() + t;
+        let n_pad = keys.next_multiple_of(KEY_STEP);
+        let part_cap = WIDE_ATTN_ROWS * (self.max_ctx / ck::attn_chunk());
+        if w != 0
+            || tw == 0
+            || t > tw
+            || n_pad > self.max_ctx.next_multiple_of(KEY_STEP)
+            || t > part_cap
+        {
+            return false;
+        }
+        let mut da = self.derived.borrow_mut();
+        if da.failed {
+            return false;
+        }
+        if da.bufs.is_none() {
+            let kmax = self.max_ctx.next_multiple_of(KEY_STEP);
+            let f16 = |n: usize| self.dev.alloc_f32(n.div_ceil(2));
+            da.bufs = Some([
+                f16(nkv * g * tw * hd),
+                f16(nkv * kmax * hd),
+                f16(nkv * kmax * hd),
+                self.dev.alloc_f32(g * tw),
+                self.dev.alloc_f32(nkv * g * tw * hd),
+            ]);
+        }
+        let da = &mut *da;
+        if let std::collections::hash_map::Entry::Vacant(slot) = da.kernels.entry(n_pad) {
+            let s = AttnShape {
+                t: tw,
+                n_pad,
+                nkv,
+                g,
+                hd,
+            };
+            let t0 = Instant::now();
+            match Kernel::build(&self.gpu, s) {
+                Ok(k) => {
+                    eprintln!(
+                        "coder: derived attention for {n_pad} keys: {} blocks × {} threads, {} B smem, built in {:.1} s",
+                        k.tiles,
+                        k.threads,
+                        k.smem,
+                        t0.elapsed().as_secs_f64()
+                    );
+                    slot.insert(k);
+                }
+                Err(e) => {
+                    eprintln!("coder: no derived attention ({e}); FA2 instead");
+                    da.failed = true;
+                    return false;
+                }
+            }
+        }
+        let [q16, k16, v16, pos, o] = da
+            .bufs
+            .as_ref()
+            .unwrap()
+            .each_ref()
+            .map(|b| self.dev.buffer_addr(b));
+        let k = &da.kernels[&n_pad];
+        let stream = self.stream_on(w);
+        let kn = self.kn_on(w);
+        let (ti, twi, npi) = (t as i32, tw as i32, n_pad as i32);
+        let blocks = |n: usize| n.div_ceil(256) as u32;
+        unsafe {
+            self.launch_on(
+                stream,
+                kn.da_q,
+                (blocks(nkv * g * tw * hd), 1, 1),
+                256,
+                0,
+                tang_moe::args![q, rows, ti, twi, q16, pos],
+            );
+            self.launch_on(
+                stream,
+                kn.da_kv,
+                (blocks(nkv * n_pad * hd), 1, 1),
+                256,
+                0,
+                tang_moe::args![kt, vt, rows, ti, npi, k16, v16],
+            );
+            let ptrs: Vec<u64> = k
+                .params
+                .iter()
+                .map(|r| match r {
+                    Role::Q => q16,
+                    Role::K => k16,
+                    Role::V => v16,
+                    Role::Pos => pos,
+                })
+                .collect();
+            let mut vals: Vec<u64> = ptrs;
+            vals.push(o);
+            let count = k.count;
+            let mut args: Vec<*mut std::ffi::c_void> = vals
+                .iter_mut()
+                .map(|p| p as *mut u64 as *mut std::ffi::c_void)
+                .collect();
+            let mut count_v = count;
+            args.push(&mut count_v as *mut u32 as *mut std::ffi::c_void);
+            gpu::launch(
+                k.f,
+                (k.tiles, 1, 1),
+                (k.threads, 1, 1),
+                k.smem,
+                stream,
+                &mut args,
+            )
+            .expect("derived attention launch");
+            if let Some(p) = &self.prof {
+                let ev = gpu::Event::new(true).expect("event");
+                ev.record(stream).expect("record");
+                p.borrow_mut().marks.push(("attn_derived", ev));
+            }
+            self.launch_on(
+                stream,
+                kn.da_un,
+                (blocks(t * nkv * g * (hd + 2)), 1, 1),
+                256,
+                0,
+                tang_moe::args![o, ti, twi, part],
+            );
+            self.launch_on(
+                stream,
+                kn.merge,
+                (t as u32, hp.n_head as u32, 1),
+                hd as u32,
+                0,
+                tang_moe::args![part, 1i32, proj, st, attn],
+            );
+        }
+        true
+    }
+
     // ---- the window
 
     fn enqueue_inputs(&self, t: usize) {
@@ -4013,7 +4301,24 @@ impl Coder {
                     }
                 }
             };
-            if let Some(ns) = self.fa2_splits(w, t) {
+            if self.var.attn_derived
+                && self.in_wide.get()
+                && self.run_derived(w, t, q, kt, vt, rows, part, proj, st, attn)
+            {
+                // the derived kernel, then the merge as one split; the output projection as
+                // after FA2
+                self.gemv(
+                    w,
+                    "attn_out",
+                    &layer.w_out,
+                    attn,
+                    None,
+                    self.a_on(w, &s.mix),
+                    t,
+                    n,
+                );
+                return;
+            } else if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
                 let run_fa2 = || unsafe {
@@ -4202,14 +4507,58 @@ impl Coder {
                     0,
                     tang_moe::args![htab, p, sd, dt, sa, seg, eps, wc, x],
                 );
-                self.launch_on(
-                    v.stream,
-                    v.k.gdn_wide,
-                    (self.geo.gdn_hv as u32, 2, 1),
-                    256,
-                    0,
-                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
-                );
+                if let Some(c) = v.wide.and_then(|w| w.gdnc.as_ref()) {
+                    // the chunked scan: glue (X rows -> head-major, padded), WY/UT per chunk,
+                    // state scan over chunks (the slot's f32 state in and out), readout into Y
+                    let tp = (t as usize).next_multiple_of(tang_compile::tensor::cuda_scan::CHUNK);
+                    let gr = c.plan.coder_grids(tp, GDNC_BV);
+                    let a: Vec<u64> = c.bufs.iter().map(|b| v.dev.buffer_addr(b)).collect();
+                    let (cq, ck_, cv, cal, cbe, cw, cu, chs, cvn, cg, cgc) = (
+                        a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10],
+                    );
+                    let (tn, null) = (tp as u32, 0u64);
+                    self.launch_on(
+                        v.stream,
+                        c.f[0],
+                        gr[0],
+                        c.block[0],
+                        c.smem[0],
+                        tang_moe::args![x, seg, cq, ck_, cv, cal, cbe, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[1],
+                        gr[1],
+                        c.block[1],
+                        c.smem[1],
+                        tang_moe::args![ck_, cv, cal, cbe, cw, cu, cg, cgc, null, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[2],
+                        gr[2],
+                        c.block[2],
+                        c.smem[2],
+                        tang_moe::args![cw, cu, ck_, cg, cgc, chs, cvn, stab, seg, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[3],
+                        gr[3],
+                        c.block[3],
+                        c.smem[3],
+                        tang_moe::args![cq, ck_, cg, chs, cvn, null, null, y, seg, tn],
+                    );
+                } else {
+                    self.launch_on(
+                        v.stream,
+                        v.k.gdn_wide,
+                        (self.geo.gdn_hv as u32, 2, 1),
+                        256,
+                        0,
+                        tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
+                    );
+                }
                 self.launch_on(
                     v.stream,
                     v.k.gdn_wide_norm,

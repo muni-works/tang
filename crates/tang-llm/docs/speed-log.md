@@ -822,3 +822,56 @@ Gates (this build): flash-tcheck bitwise (0 of 151936); batch-check N=8 bitwise,
 2066e91aa9110ab5; N=64 tolerance 99.36 %, mean 0.123; spec-batch-check 16 streams k=2 every
 budget 16/16 identical (budget 16 990 tok/s, 1.21×); sample-check N=64 PASS; `cargo test -p
 tang-llm` 208 passed.
+
+## 2026-11-07: chunked GDN recurrence for wide prefill (`TANG_CODER_GDN=chunked`, H200)
+
+`TANG_CODER_GDN=chunked` (off by default; f32 GDN state only) replaces `fl_gdn_wide` in wide
+windows with tang-compile's chunked scan (`ChunkedScan::coder`, tang#179). It runs on 64-token
+chunks:
+- a glue kernel turns `fl_gdn_wide_prep`'s rows into head-major fp16 operands, each v head reading
+  k head `h / 2`, with the window's tail padded by identity steps (α = 1, β = 0)
+- a per-chunk WY/UT transform on fp16 tensor cores
+- a sequential scan of the slot's f32 state over chunks (read at the start, written back at the end)
+- a parallel readout into the same `Y` rows; `fl_gdn_wide_norm` is unchanged
+
+`log α` is floored at −60, because steps where `α` underflows to 0 (full forgets) would make the
+running sum −∞. Pod csjujaaoh9npv7 (secure H200 SXM, driver 595.91),
+`Qwen3-Coder-Next-UD-Q4_K_XL.gguf`.
+
+Recurrence alone (`scripts/gdn_hand_bench.cu`, synthetic rows, 32 v heads):
+
+| window rows | `fl_gdn_wide` | chunked |
+|---|---|---|
+| 4096 | 2.49 ms | 0.62 ms |
+| 16384 | 9.91 ms | 2.33 ms |
+| 65536 | 39.69 ms | 9.14 ms |
+
+Gates (`flash-wide-check --ids-file refactor.ids -n 32`, `TANG_CODER_WIDE=2048`,
+`TANG_WIDE_CTXS=3000,8000`). Teacher-forced max KL vs narrow; greedy output equal in every run.
+
+| KV | GDN | KL 3000 (bar 2.0e-4) | KL 8000 (bar 3.2e-5) | wide tok/s 3000 / 8000 |
+|---|---|---|---|---|
+| int8 | `fl_gdn_wide` | 1.33e-4 | 8.93e-6 | 7,156 / 7,332 |
+| int8 | chunked | 1.67e-4 | 1.25e-5 | 7,783 / 8,204 |
+| bf16 | `fl_gdn_wide` | 1.81e-4 | 2.88e-5 | 7,268 / 7,653 |
+| bf16 | chunked | 1.28e-4 | 1.94e-5 | 7,899 / 8,474 |
+
+- **batch-check N=8** (chunked, `TANG_BATCH_CTX=8192`): PASS bitwise, checksum
+  5324c706f111df45.
+- **Continuation:** on a fresh server, `/v1/prefill` of a 2,970-token first turn, then the
+  6,020-token conversation (reused 2,970, the 3,050-token extension wide-prefilled from the cached
+  state). Its 48-token greedy reply equals a cold chunked run (reused 0) and the `fl_gdn_wide` run.
+- **TTFT** through `serve --batch 8 --ctx 65536`, `TANG_CODER_KV=int8`, a 44,172-token prompt
+  (median of 3, prompt cache defeated):
+
+| build | TTFT | prefill tok/s |
+|---|---|---|
+| main (fl_gdn_wide) | 8.33 s | 5,300 |
+| `TANG_CODER_GDN=chunked` | 7.70 s | 5,740 |
+| tang#176 `TANG_CODER_ATTN=derived` | 6.17 s | 7,160 |
+| tang#176 + `TANG_CODER_GDN=chunked` | **5.54 s** | **7,980** |
+
+The GDN saving is about 0.63 s at 45k: ~1.9 ms per 4096-row window × 36 layers × 11 windows.
+The rest of the 45k TTFT is attention (tang#176) and MoE.
+Note: wide prefill windows only run under `serve --batch N` (the batched scheduler calls
+`prefill_slot_wide`). The single-stream server prefills 44k tokens at ~470 tok/s (94 s).

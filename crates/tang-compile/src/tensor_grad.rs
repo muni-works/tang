@@ -97,6 +97,19 @@ impl TensorGraph {
                 grads.insert(src.n(), acc);
                 continue;
             }
+            if let Op::Scan(sc) = &self.nodes[j].op {
+                let inputs = sc.inputs.clone();
+                let gs = self.scan_backward(j, dy)?;
+                for (src, g) in inputs.iter().zip(gs) {
+                    let Some(g) = g else { continue };
+                    let acc = match grads.get(&src.n()) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src.n(), acc);
+                }
+                continue;
+            }
             if let Op::Operator(o) = &self.nodes[j].op {
                 let (op, inputs) = (o.op.clone(), o.inputs.clone());
                 let gs = op.backward(self, &inputs, TensorId(j as u32), dy)?;

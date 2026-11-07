@@ -3399,6 +3399,69 @@ extern "C" __global__ void __launch_bounds__(128) cx_attn_part(const float* q, c
 
 // Merge each (token, head)'s chunks and apply the sigmoid gate (the second half of the head's
 // q projection). Grid (t, NH), block HD.
+// ---- derived wide attention (TANG_CODER_ATTN=derived, flash/derived_attn.rs) ----
+//
+// The derived flash kernel reads fp16 heads-first operands: q16[NKV][G][TW][HD] (a kv head's G query
+// heads folded into its rows), k16 / v16[NKV][NPAD][HD], pos[G * TW] (each row's position, -1 past the
+// window's t rows). cx_attn_dq / cx_attn_dkv build them from the prepped queries and the slot's cache;
+// cx_attn_dunpack writes the kernel's normalized output as one split (m 0, l 1) of cx_attn_part's
+// partials, so cx_attn_merge applies the gate (and the int8 path's inverse rotation) as usual.
+__device__ __forceinline__ unsigned short da_f2h(float f) {
+    unsigned short h;
+    f = fminf(fmaxf(f, -65504.f), 65504.f);
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+// Grid ceil(NKV * G * TW * HD / 256), block 256: one element a thread.
+extern "C" __global__ void cx_attn_dq(const float* q, const unsigned* rows, int t, int tw, unsigned short* q16, float* pos) {
+    const size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= (size_t)CX_NKV * CX_G * tw * CX_HD) return;
+    const int d = (int)(e % CX_HD);
+    const size_t r = e / CX_HD; // (h * G + a) * tw + i
+    const int i = (int)(r % tw), ha = (int)(r / tw); // ha = h * G + a: the query head
+    q16[e] = i < t ? da_f2h(q[((size_t)i * CX_NH + ha) * CX_HD + d]) : (unsigned short)0;
+    if (d == 0 && ha < CX_G) pos[(size_t)ha * tw + i] = i < t ? (float)rows[i] : -1.f;
+}
+// Grid ceil(NKV * npad * HD / 256), block 256. Keys past the window's last position are zeros (a
+// masked P is 0, and 0 * a stale NaN would poison O).
+extern "C" __global__ void cx_attn_dkv(const unsigned long long* ktab, const unsigned long long* vtab,
+                                       const unsigned* rows, int t, int npad, unsigned short* k16,
+                                       unsigned short* v16) {
+    const size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= (size_t)CX_NKV * npad * CX_HD) return;
+    const int d = (int)(e % CX_HD);
+    const int j = (int)((e / CX_HD) % npad), g = (int)(e / ((size_t)CX_HD * npad));
+    const int top = (int)rows[t - 1];
+    const unsigned slot = rows[CX_MAXT];
+    float kf = 0.f, vf = 0.f;
+    if (j <= top) {
+#ifdef CX_KV8
+        const void* kc = (const void*)ktab[slot];
+        const void* vc = (const void*)vtab[slot];
+        kf = (float)KV8_Q(kc, j, g)[d] * KV8_S(kc, j, g, d);
+        vf = (float)KV8_Q(vc, j, g)[d] * KV8_S(vc, j, g, d);
+#else
+        const unsigned short* kc = (const unsigned short*)ktab[slot];
+        const unsigned short* vc = (const unsigned short*)vtab[slot];
+        const size_t o = ((size_t)j * CX_NKV + g) * CX_HD + d;
+        kf = __uint_as_float((unsigned)kc[o] << 16);
+        vf = __uint_as_float((unsigned)vc[o] << 16);
+#endif
+    }
+    k16[e] = da_f2h(kf);
+    v16[e] = da_f2h(vf);
+}
+// Grid ceil(t * NKV * G * (HD + 2) / 256), block 256: o[NKV][G][TW][HD] -> part[t][NKV][1][G][m, l, acc].
+extern "C" __global__ void cx_attn_dunpack(const float* o, int t, int tw, float* part) {
+    const size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t hs = CX_HD + 2;
+    if (e >= (size_t)t * CX_NKV * CX_G * hs) return;
+    const int x = (int)(e % hs);
+    const size_t r = e / hs; // (i * NKV + g) * G + a
+    const int a = (int)(r % CX_G), g = (int)((r / CX_G) % CX_NKV), i = (int)(r / ((size_t)CX_G * CX_NKV));
+    part[e] = x == 0 ? 0.f : x == 1 ? 1.f : o[(((size_t)g * CX_G + a) * tw + i) * CX_HD + (x - 2)];
+}
+
 extern "C" __global__ void cx_attn_merge(const float* part, int nchunk, const float* proj, int stride, float* out) {
     const int c = blockIdx.x, h = blockIdx.y, g = h / CX_G, hh = h % CX_G, d = threadIdx.x;
     const size_t hs = (size_t)CX_G * (CX_HD + 2);
