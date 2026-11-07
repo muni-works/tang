@@ -281,8 +281,12 @@ fn rmsnorm(
             |x| vec![x[0] * x[0]],
         )
         .unwrap();
-    // a block a row (one thread would sum all n serially)
-    g.set_schedule(ss, 256, (0, 0, 0), (1, 1));
+    // a block a row (one thread would sum all n serially); `TANG_DMOE_SS_SPLIT=0`: one thread
+    let split = std::env::var("TANG_DMOE_SS_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256u32);
+    g.set_schedule(ss, split, (0, 0, 0), (1, 1));
     let (inv_n, eps) = (1.0 / n as f64, eps);
     g.comp(
         &[t, n],
@@ -884,7 +888,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
         )
         .unwrap();
     let ro = g.map(&[r, y], |v| v[0] + v[1]).unwrap();
-    g.set_inline(y, !m.keep_y);
+    g.set_inline(y, !m.keep_y && envn("TANG_DMOE_KEEP_Y", 0) == 0);
     let xo = rmsnorm(&mut g, ro, wn, t, n, eps);
 
     // schedule: storage formats, int8 contractions, x / SwiGLU quantized
