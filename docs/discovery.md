@@ -107,14 +107,46 @@ compute-bound and the generic combine pays two `exp` per element. A
 production kernel would fold elements in blocks and rescale once per
 block, as FlashAttention does; the engine does not do that yet.
 
-**Backward.** Given the saved forward state `(m, Z, μ, Var)` the
-gradient is elementwise — `∂/∂vᵢ = 2pᵢ(vᵢ−μ)`,
-`∂/∂sᵢ = pᵢ((vᵢ−μ)² − Var)` — so no reduction is needed (the
-FlashAttention-backward pattern; checked by central differences in
-`weighted_variance_backward_is_elementwise`). `tensor_grad` does not
-differentiate `MonoidKind::Other` reductions, so this backward is not
-yet derived automatically; the honest route is differentiating the
-two-pass spec and lifting its reductions, which is future work.
+**Backward (derived automatically).** `TensorGraph::backward` now
+differentiates any monoid reduction:
+
+- *Saved-state path* (every discovered online lift; the monoid carries
+  `Monoid::saved`). Because `S_T = Σⱼ D(xⱼ, b_T)` holds identically,
+  `dS_T/dxᵢ = ∂ₓD(xᵢ, b_T) + A·S_T·db_T/dxᵢ`, and `dT₁/dxᵢ` is the
+  block-wise derivative of the first pass (sums: the lift; max: routed to
+  the argmax as tang's `Max` does; online softmax: the same identity one
+  level down — `R₁` is decomposed automatically by `r1_blocks`). So
+  `x̄ᵢ = ∇ₓ[S̄·D(x, b_T) + w·T₁lin(x)]` with `w = T̄₁ + ∂(μ·b)/∂T₁`,
+  `μ_p = S̄·A_p·S`: **one elementwise pass over the elements reading the
+  saved state** — the FlashAttention-backward shape, derived for every
+  lift rather than written for softmax (`SavedBwd::element_grad`).
+- *Generic path* (any other tuple monoid: top-k, argmax, the catalog's
+  `sums`/`prod`, tuple maps). `∂y/∂e_k` is the Jacobian of
+  `P_k ⊕ e ⊕ S_k` with exclusive prefix/suffix scans of the same monoid,
+  then an elementwise `tang-expr` vjp of the combine. Exact for any
+  associative combine, but it materializes `2·width` floats per element.
+
+`discovered_lifts_have_derived_backward` checks all 24 found lifts:
+the one-pass backward has no scans (saved-state path taken), matches
+central differences of the interpreter to 1e-5, and matches the two-pass
+definition's backward to 1e-8. (Also fixed: `Monoid::kind` called any
+tuple monoid with a `−∞` first slot `OnlineSoftmax`; it now checks the
+combine. And the emitted combine no longer evaluates `0/0` references
+for an empty side, which poisoned derivatives with NaN.)
+
+Against the two-pass written with stock ops (`max`, `sum`, maps; tang
+derives its backward the usual way), WGSL on Metal, M4 Max:
+
+| rows × n | fwd two-pass | fwd one-pass | | bwd two-pass | bwd one-pass | |
+|---|---|---|---|---|---|---|
+| 4096 × 4096 | 1.634 ms | 0.353 ms | 4.63× | 7.222 ms | 3.613 ms | 2.00× |
+| 1024 × 16384 | 1.465 ms | 0.379 ms | 3.87× | 7.325 ms | 3.772 ms | 1.94× |
+| 16384 × 1024 | 1.760 ms | 0.420 ms | 4.19× | 6.935 ms | 3.813 ms | 1.82× |
+
+(fwd max diff 3e-6, bwd 1.2e-4 of max|grad|, f32.) The backward
+includes its forward and is still ~5× off the memory roof: it lowers to
+one comp per argument plus the scatter map; fusing those is ordinary
+scheduling work, not discovery.
 
 No RunPod GPU was used.
 

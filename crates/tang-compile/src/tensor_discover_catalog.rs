@@ -1302,4 +1302,80 @@ mod tests {
             assert!((dv - 2.0 * p[i] * d).abs() < 1e-7, "dv {i}");
         }
     }
+
+    /// The backward of every discovered one-pass graph is derived
+    /// (generic monoid vjp: prefix/suffix scans + combine vjp) and matches
+    /// central differences of the interpreter, and the backward of the
+    /// two-pass definition.
+    #[test]
+    fn discovered_lifts_have_derived_backward() {
+        let mut checked = 0;
+        for case in online_catalog()
+            .into_iter()
+            .filter(|c| c.expect == Expect::Found)
+        {
+            let s = &case.spec;
+            let l = online_lift(s).unwrap_or_else(|e| panic!("{e:?}"));
+            let (rows, n) = (2, 9);
+            let (mut g2, two, mut g1, one) = online_graphs(s, &l, rows, n);
+            let xs1: Vec<_> = (0..s.n_x)
+                .map(|i| super::super::TensorId::from_index(i))
+                .collect();
+            let gr1 = g1
+                .backward(one, &xs1)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", s.name));
+            assert!(
+                l.monoid.saved.is_some(),
+                "{}: no saved-state structure",
+                s.name
+            );
+            // the saved-state path: no prefix/suffix scans in the one-pass backward
+            assert!(
+                (0..g1.nodes().len())
+                    .all(|i| g1.scan_at(super::super::TensorId::from_index(i)).is_none()),
+                "{}: backward fell back to scans",
+                s.name
+            );
+            let gr2 = g2
+                .backward(two, &xs1)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", s.name));
+            let mut rng = Rng(21);
+            let mut inputs: Vec<Vec<f64>> = vec![vec![]; s.n_x];
+            for _ in 0..rows * n {
+                for (c, x) in inputs.iter_mut().zip((s.sample)(&mut rng)) {
+                    c.push(x);
+                }
+            }
+            let a = g1.eval(&inputs, &gr1);
+            let b = g2.eval(&inputs, &gr2);
+            let total = |inp: &Vec<Vec<f64>>| g1.eval(inp, &[one])[0].iter().sum::<f64>();
+            for xi in 0..s.n_x {
+                // integer positions (ALiBi) have no meaningful derivative
+                if s.name.starts_with("ALiBi") && xi == 2 {
+                    continue;
+                }
+                for p in 0..rows * n {
+                    let h = 1e-6 * (1.0 + inputs[xi][p].abs());
+                    let (mut up, mut dn) = (inputs.clone(), inputs.clone());
+                    up[xi][p] += h;
+                    dn[xi][p] -= h;
+                    let fd = (total(&up) - total(&dn)) / (2.0 * h);
+                    let scale = 1e-5 * (1.0 + fd.abs());
+                    assert!(
+                        (a[xi][p] - fd).abs() <= scale,
+                        "{} x{xi}[{p}]: derived {} fd {fd}",
+                        s.name,
+                        a[xi][p]
+                    );
+                    assert!(
+                        (a[xi][p] - b[xi][p]).abs() <= 1e-8 * (1.0 + fd.abs()),
+                        "{} one vs two pass",
+                        s.name
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20);
+    }
 }

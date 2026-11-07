@@ -226,7 +226,7 @@ fn snap(v: f64) -> f64 {
     v
 }
 
-type Mat = Vec<Vec<f64>>;
+pub type Mat = Vec<Vec<f64>>;
 
 fn eye(n: usize) -> Mat {
     (0..n)
@@ -913,12 +913,17 @@ fn emit_online(spec: &OnlineSpec, lift: &mut OnlineLift, graph: &ExprGraph, basi
         let mut v = s1.to_vec();
         v.extend_from_slice(s2);
         let s3 = inline(&r1.combine, &r1.outs, &v);
-        let (b1, b2, b3) = (phi_m(s1), phi_m(s2), phi_m(&s3));
+        // an empty side takes the merged state as its reference: δ = 0,
+        // nothing NaN (0/0 means) reaches the combine or its derivative
+        let (o1, o2) = (occ(s1)[0], occ(s2)[0]);
+        let safe = |o: ExprId, s: &[ExprId]| -> Vec<ExprId> {
+            s.iter().zip(&s3).map(|(&x, &y)| sel(o, x, y)).collect()
+        };
+        let (b1, b2, b3) = (phi_m(&safe(o1, s1)), phi_m(&safe(o2, s2)), phi_m(&s3));
         let d1: Vec<ExprId> = b3.iter().zip(&b1).map(|(&x, &y)| x - y).collect();
         let d2: Vec<ExprId> = b3.iter().zip(&b2).map(|(&x, &y)| x - y).collect();
         let t1 = shift(&l2, &d1, x1);
         let t2 = shift(&l2, &d2, x2);
-        let (o1, o2) = (occ(s1)[0], occ(s2)[0]);
         let z = lit(0.0);
         let mut out = s3;
         out.extend(
@@ -928,6 +933,39 @@ fn emit_online(spec: &OnlineSpec, lift: &mut OnlineLift, graph: &ExprGraph, basi
         );
         out
     });
+    if let Some(blocks) = r1_blocks(&spec.r1) {
+        let nref = lift.coords.len();
+        let coords = lift.coords.clone();
+        let refb = spec.reference.clone();
+        let phi_b = build(move |st| {
+            refb(st)
+                .into_iter()
+                .zip(&coords)
+                .map(|(a, c)| match c {
+                    Coord::Add => a,
+                    Coord::Log => eln(a),
+                })
+                .collect()
+        });
+        let _ = nref;
+        lift.monoid.saved = Some(std::sync::Arc::new(SavedBwd {
+            n_x: nx,
+            w1,
+            r,
+            blocks,
+            lift: Fun::trace(nx, &spec.lift),
+            phi: Fun::trace(w1, &phi_b),
+            basis: Fun {
+                g: graph.clone(),
+                outs: basis.to_vec(),
+            },
+            gens: lift.gens.clone(),
+            element: Fun {
+                g: ExprGraph::new(),
+                outs: vec![],
+            },
+        }));
+    }
     let lb = spec.lift.clone();
     let g = graph.clone();
     let bs = basis.to_vec();
@@ -940,6 +978,12 @@ fn emit_online(spec: &OnlineSpec, lift: &mut OnlineLift, graph: &ExprGraph, basi
         out.extend(inline(&g, &bs, &v));
         out
     });
+    if let Some(sv) = lift.monoid.saved.take() {
+        if let Ok(mut sv) = std::sync::Arc::try_unwrap(sv) {
+            sv.element = Fun::trace(nx, &lift.element);
+            lift.monoid.saved = Some(std::sync::Arc::new(sv));
+        }
+    }
 }
 
 /// Max relative error of the one-pass monoid (random combine trees,
@@ -2087,4 +2131,200 @@ pub fn chunk_lift(spec: &ScanSpec) -> Option<ChunkLift> {
         }
     }
     Some(ChunkLift { form, err: worst })
+}
+
+// ---------------------------------------------------------------------------
+// Saved-state backward of online lifts
+// ---------------------------------------------------------------------------
+
+/// A block of a first-pass monoid's state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum R1Block {
+    /// Slot `j` is a running sum.
+    Sum(usize),
+    /// Slot `j` is a running max.
+    Max(usize),
+    /// Slots `(m, acc₁…)`: an online softmax (`accₗ = Σ gₗ·e^{s−m}`).
+    Softmax(Vec<usize>),
+}
+
+/// Decompose `m` into independent sum / max / online-softmax blocks
+/// (dependence structure from `deps`, block kind by probing the combine).
+pub fn r1_blocks(m: &Monoid) -> Option<Vec<R1Block>> {
+    let w = m.width;
+    let mut parent: Vec<usize> = (0..w).collect();
+    fn find(p: &mut Vec<usize>, x: usize) -> usize {
+        if p[x] != x {
+            let r = find(p, p[x]);
+            p[x] = r;
+        }
+        p[x]
+    }
+    for i in 0..w {
+        let d = m.combine.deps(m.outs[i]);
+        for j in 0..w {
+            if d >> j & 1 == 1 || d >> (w + j) & 1 == 1 {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = vec![];
+    for i in 0..w {
+        let r = find(&mut parent, i);
+        match groups
+            .iter_mut()
+            .find(|g| find(&mut parent.clone(), g[0]) == r)
+        {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    let f = Fun {
+        g: m.combine.clone(),
+        outs: m.outs.clone(),
+    };
+    let mut rng = Rng(0xb10c);
+    let probes: Vec<(Vec<f64>, Vec<f64>)> = (0..6)
+        .map(|_| {
+            let v: Vec<f64> = (0..2 * w).map(|_| rng.normal()).collect();
+            let o = f.call(&v);
+            (v, o)
+        })
+        .collect();
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * (1.0 + b.abs());
+    let mut out = vec![];
+    for g in groups {
+        if g.len() == 1 {
+            let j = g[0];
+            if probes.iter().all(|(v, o)| close(o[j], v[j] + v[w + j])) {
+                out.push(R1Block::Sum(j));
+            } else if probes.iter().all(|(v, o)| close(o[j], v[j].max(v[w + j]))) {
+                out.push(R1Block::Max(j));
+            } else {
+                return None;
+            }
+            continue;
+        }
+        // online softmax: max slot first, then accumulators
+        let ok = probes.iter().all(|(v, o)| {
+            let (ma, me) = (v[g[0]], v[w + g[0]]);
+            let mm = ma.max(me);
+            close(o[g[0]], mm)
+                && g[1..]
+                    .iter()
+                    .all(|&l| close(o[l], v[l] * (ma - mm).exp() + v[w + l] * (me - mm).exp()))
+        });
+        if !ok {
+            return None;
+        }
+        out.push(R1Block::Softmax(g));
+    }
+    Some(out)
+}
+
+/// What the backward needs from an online lift.
+pub struct SavedBwd {
+    pub n_x: usize,
+    pub w1: usize,
+    pub r: usize,
+    pub blocks: Vec<R1Block>,
+    /// `x → R₁ element`.
+    pub lift: Fun,
+    /// `R₁ state → b` (reference in search coordinates).
+    pub phi: Fun,
+    /// Basis `D(x, b)`: vars `x…, b…`.
+    pub basis: Fun,
+    pub gens: Vec<Mat>,
+    /// `x → monoid element`.
+    pub element: Fun,
+}
+
+impl SavedBwd {
+    /// `x̄` for one element from the saved final state `T = (T₁, S)`
+    /// and its cotangent: `x̄ = ∇ₓ[S̄·D(x, b_T) + w·T₁lin(x)]` with
+    /// `w = T̄₁ + ∂(μ·b(T₁))/∂T₁`, `μ_p = S̄·A_p·S` — because
+    /// `S_T = Σⱼ D(xⱼ, b_T)` identically, so `dS_T/dxᵢ = ∂ₓD(xᵢ, b_T) +
+    /// A·S_T·db_T/dxᵢ`, and `dT₁/dxᵢ` is the block-wise derivative of the
+    /// first pass (sums: the lift; max: routed to the argmax; online
+    /// softmax: the same identity one level down). Vars: `x` (n_x), `T`
+    /// (w1 + r), `T̄` (w1 + r); outputs `n_x`.
+    pub fn element_grad(&self) -> (ExprGraph, Vec<ExprId>) {
+        let (nx, w1, r) = (self.n_x, self.w1, self.r);
+        let p = self.gens.len();
+        let w = w1 + r;
+        // ∂(μ·b(T₁))/∂T₁ as a graph over (T₁, μ)
+        let (hg, hv) = {
+            let (mut g, outs) = trace(|| {
+                let t: Vec<ExprId> = (0..w1).map(|i| ExprId::var(i as u16)).collect();
+                let b = inline(&self.phi.g, &self.phi.outs, &t);
+                let mut acc = lit(0.0);
+                for (k, &bk) in b.iter().enumerate() {
+                    acc = acc + ExprId::var((w1 + k) as u16) * bk;
+                }
+                vec![acc]
+            });
+            let one = g.lit(1.0);
+            let v = g.vjp(&outs, &[one], w1);
+            (g, v)
+        };
+        let (mut g, f) = trace(|| {
+            let x: Vec<ExprId> = (0..nx).map(|i| ExprId::var(i as u16)).collect();
+            let t: Vec<ExprId> = (0..w).map(|i| ExprId::var((nx + i) as u16)).collect();
+            let tb: Vec<ExprId> = (0..w).map(|i| ExprId::var((nx + w + i) as u16)).collect();
+            let (t1, s) = t.split_at(w1);
+            let (tb1, sb) = tb.split_at(w1);
+            let b = inline(&self.phi.g, &self.phi.outs, t1);
+            // μ_p = S̄·A_p·S
+            let mu: Vec<ExprId> = (0..p)
+                .map(|k| {
+                    let mut acc = lit(0.0);
+                    for i in 0..r {
+                        for j in 0..r {
+                            let a = self.gens[k][i][j];
+                            if a != 0.0 {
+                                acc = acc + sb[i] * lit(a) * s[j];
+                            }
+                        }
+                    }
+                    acc
+                })
+                .collect();
+            let mut hin = t1.to_vec();
+            hin.extend_from_slice(&mu);
+            let dh = inline(&hg, &hv, &hin);
+            let wv: Vec<ExprId> = (0..w1).map(|i| tb1[i] + dh[i]).collect();
+            // S̄·D(x, b_T)
+            let mut xb = x.clone();
+            xb.extend_from_slice(&b);
+            let d = inline(&self.basis.g, &self.basis.outs, &xb);
+            let mut fsum = lit(0.0);
+            for i in 0..r {
+                fsum = fsum + sb[i] * d[i];
+            }
+            // w·T₁lin(x)
+            let l = inline(&self.lift.g, &self.lift.outs, &x);
+            let eq = |a: ExprId, b: ExprId| sel(a - b, lit(-1.0), sel(b - a, lit(-1.0), lit(1.0)));
+            for blk in &self.blocks {
+                match blk {
+                    R1Block::Sum(j) => fsum = fsum + wv[*j] * l[*j],
+                    R1Block::Max(j) => {
+                        fsum = fsum + wv[*j] * sel(eq(l[*j], t1[*j]), l[*j], lit(0.0))
+                    }
+                    R1Block::Softmax(sl) => {
+                        let (mj, sv) = (sl[0], l[sl[0]]);
+                        let am = sel(eq(sv, t1[mj]), sv, lit(0.0));
+                        fsum = fsum + wv[mj] * am;
+                        for &a in &sl[1..] {
+                            fsum = fsum + wv[a] * (l[a] * eexp(sv - t1[mj]) - t1[a] * am);
+                        }
+                    }
+                }
+            }
+            vec![fsum]
+        });
+        let one = g.lit(1.0);
+        let xb = g.vjp(&f, &[one], nx);
+        (g, xb)
+    }
 }

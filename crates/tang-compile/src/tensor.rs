@@ -404,6 +404,10 @@ pub struct Monoid {
     pub identity: Vec<f64>,
     pub combine: ExprGraph,
     pub outs: Vec<ExprId>,
+    /// Structure of a discovered online lift (state `(R₁, Σ D)`), from
+    /// which the backward derives an elementwise saved-state gradient
+    /// instead of the generic prefix/suffix-scan one.
+    pub saved: Option<std::sync::Arc<discover::SavedBwd>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,6 +436,7 @@ impl Monoid {
             identity,
             combine,
             outs,
+            saved: None,
         }
     }
 
@@ -529,11 +534,31 @@ impl Monoid {
                 _ => MonoidKind::Other,
             };
         }
-        if self.identity[0] <= -1e30 {
+        if self.identity[0] <= -1e30 && self.matches(&Monoid::online_softmax(self.width - 1)) {
             MonoidKind::OnlineSoftmax
         } else {
             MonoidKind::Other
         }
+    }
+
+    /// Same combine as `o` at a few probe points (a tuple monoid with a
+    /// `−∞` first slot is not necessarily an online softmax: the
+    /// discovered lifts have that shape too).
+    fn matches(&self, o: &Monoid) -> bool {
+        if o.width != self.width {
+            return false;
+        }
+        let w = self.width;
+        (0..3).all(|t| {
+            let v: Vec<f64> = (0..2 * w)
+                .map(|i| ((i * 7 + t * 13) % 11) as f64 * 0.37 - 1.3)
+                .collect();
+            let a = self.combine.eval_many::<f64>(&self.outs, &v);
+            let b = o.combine.eval_many::<f64>(&o.outs, &v);
+            a.iter()
+                .zip(&b)
+                .all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + y.abs()))
+        })
     }
 }
 
@@ -3698,6 +3723,7 @@ impl TensorGraph {
                             identity,
                             combine,
                             outs,
+                            saved: None,
                         }),
                     }),
                 });
