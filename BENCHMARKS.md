@@ -3554,9 +3554,20 @@ Decode step (`flash-batch-check`, context ~1,380, 64 steps):
 | 2 | 4.74 | 6.79 | 5.84 |
 | 4 | 6.53 | 8.76 | 7.54 |
 | 8 | 9.82 | 12.71 | 11.27 |
+| 16 | 15.88 | — | 16.71 |
+| 32 | 23.49 | — | 27.21 |
+| 48 | 29.99 | — | 37.89 |
+
+16–48 streams are the batch module (64 rows), where the hand experts run on int8 tensor cores
+(`cx_moe_*_q`) and the derived routed experts are still one dp4a GEMV per (token, expert) pair. That
+is the gap at 32–48 (−16% / −21% throughput); the IntMma stage with gathered weights (sorted pairs,
+as `coder_moe_ir` does for wide windows) is the fix. batch-check N=48 tolerance: derived 99.27% /
+mean 0.150 (PASS); hand 99.00% / 0.142 on this prompt (FAIL by the bar's strict inequality). The batch
+shapes (T=16/32/48) built lazily outside capture in 1.2 s each.
 
 The fixes: the RMSNorm sum of squares ran as one thread per row (27 µs a layer), and every GEMV
 block re-quantized x in its prologue (x is now written once). Per layer on the H200 at T=1 (512 experts,
 top-10, `examples/coder_derived_moe.rs`): 90 → 60 µs. What is left at T=1: the top-k reduction is 13 µs
 in one block (the hand `cx_route` is one warp), and 14 kernels against the hand path's ~4.
 Startup: the derived shapes build in 6.3 s at load.
+Pod time: ~1.4 h at $5.29/hr (≈ $7.50), pod terminated.

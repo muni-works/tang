@@ -105,6 +105,8 @@ numbers. Order of the remaining work, by what unblocks the most:
   Narrow shapes (T=1..MAX_T × each layer's formats) are built at load, since nothing builds
   inside a graph capture; batch-window shapes are built on first use outside a capture, else
   they run on the hand kernels.
-- Not run on the model yet: the 80B GGUF needs the H200. Gates to run there: flash-wide-check
-  (3k/8k, int8 + bf16 KV), greedy equal, batch-check N=8, cached-prefix continuation, plus
-  decode tok/s at T=1/8/16/48 against the hand engine.
+- On the H200 (BENCHMARKS.md § "`TANG_CODER_DERIVED=moe` on the model"): wide-check 3k/8k int8
+  and bf16 PASS, greedy equal, batch-check N=8 bitwise PASS, continuation equal. Slower than hand:
+  decode step 5.04 vs 4.04 ms at 1 stream, 11.27 vs 9.82 at 8, 37.9 vs 30.0 at 48. Next, in order:
+  routed experts on IntMma with sorted pairs at T ≥ 16; a faster top-k lowering (13 µs in one
+  block); fewer kernels a layer (14 vs ~4); `Format::Q6K` for the last layer; the router GEMV.
