@@ -137,7 +137,8 @@ __device__ __forceinline__ void tcol(const float* sa, float* tm, int cl) {
 extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ K, const bf* __restrict__ V,
     const float* __restrict__ AL, const float* __restrict__ BE,
-    bf* __restrict__ Wo, bf* __restrict__ Uo, float* __restrict__ GR, float* __restrict__ GC) {
+    bf* __restrict__ Wo, bf* __restrict__ Uo, float* __restrict__ GR, float* __restrict__ GC,
+    float* __restrict__ TS) {
     extern __shared__ __align__(16) unsigned char smem[];
     float* sa = (float*)smem;      // [C][LDF]  A, then bf16 T' / T'' and staging
     float* tm = sa + C * LDF;      // [C][LDF]  T
@@ -217,6 +218,11 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         else if (warp == 2) tcol<2>(sa, tm, lane);
     }
     __syncthreads();
+#endif
+#if SAVE_T
+    // T for the backward ([H, T/C, C, C] f32)
+    for (int i = tid; i < C * C; i += 256)
+        TS[((size_t)h * NT + c) * C * C + i] = tm[(i / C) * LDF + i % C];
 #endif
     // T'' = T·diag(β) as a bf16 operand over A's space (A is done), then
     // W = T''·(e^γ k) and U = T''·v with k, v staged over T's space
@@ -506,17 +512,541 @@ extern "C" __global__ void __launch_bounds__(256) main0(
 }
 "#;
 
+/// Backward kernel 1: `A_qk = scale·tril(q kᵀ ⊙ e^{γᵢ−γⱼ})` per chunk
+/// (bf16 `[H, T, C]`), for the reverse state scan. Grid `(T/C, H)`, 128
+/// threads.
+const BWD_AQK: &str = r#"
+extern "C" __global__ void __launch_bounds__(128) main0(
+    const bf* __restrict__ Q, const bf* __restrict__ K, const float* __restrict__ GR, bf* __restrict__ Ao) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    float* gm = (float*)smem;
+    float* stg = gm + C + (threadIdx.x >> 5) * 256;
+    const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const size_t row0 = (size_t)h * T + (size_t)c * C;
+    if (tid < C) gm[tid] = GR[row0 + tid];
+    __syncthreads();
+    for (int tt = warp; tt < 16; tt += 4) {
+        const int tr = tt >> 2, tc = tt & 3;
+        FC acc;
+        wmma::fill_fragment(acc, 0.0f);
+        if (tc <= tr) {
+            #pragma unroll
+            for (int e = 0; e < DK; e += 16) {
+                FA a;
+                FBc b;
+                wmma::load_matrix_sync(a, Q + (row0 + tr * 16) * DK + e, DK);
+                wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+        }
+        wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
+            Ao[(row0 + r) * C + j] = __float2bfloat16(j <= r ? (float)SCALE * stg[e] * __expf(gm[r] - gm[j]) : 0.0f);
+        }
+        __syncwarp();
+    }
+}
+"#;
+
+/// Backward kernel 2: the reverse scan of the state cotangent with the
+/// transposed chunk map. Per chunk, from the last: write `dS_end` (bf16),
+/// `dV' = e^{γ_C−γ}·(k·dS) + A_qkᵀ·dO`, then `dS ← e^{γ_C}·dS − Wᵀ·dV' +
+/// qᵀ·(scale·e^{γ} dO)`. Grid `(DV/BV, H)`, 128 threads.
+const BWD_STATE: &str = r#"
+#define LDB (BV + 8)
+#define NTC (BV / 16)
+extern "C" __global__ void __launch_bounds__(128) main0(
+    const bf* __restrict__ Q, const bf* __restrict__ K, const bf* __restrict__ Wo,
+    const bf* __restrict__ Ao, const bf* __restrict__ DO, const float* __restrict__ GR,
+    const float* __restrict__ GC, bf* __restrict__ DHs, bf* __restrict__ DVn) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    bf* sb = (bf*)smem;                // [DK][LDB]  dS
+    bf* vng = sb + DK * LDB;           // [C][LDB]   −dV'
+    bf* dog = vng + C * LDB;           // [C][LDB]   scale·e^γ·dO
+    float* gm = (float*)(dog + C * LDB);   // [C] γ
+    float* stg = gm + C + (threadIdx.x >> 5) * 512;
+    const int vb = blockIdx.x * BV, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    constexpr int RT = DK / 64;
+    FC st[RT][NTC];
+    #pragma unroll
+    for (int i = 0; i < RT; i++)
+        #pragma unroll
+        for (int j = 0; j < NTC; j++) wmma::fill_fragment(st[i][j], 0.0f);
+    for (int c = NT - 1; c >= 0; c--) {
+        const size_t row0 = (size_t)h * T + (size_t)c * C;
+        const float glast = GC[h * NT + c];
+        if (tid < C) gm[tid] = GR[row0 + tid];
+        bf* dhs = DHs + ((size_t)h * NT + c) * DK * DV;
+        #pragma unroll
+        for (int i = 0; i < RT; i++)
+            #pragma unroll
+            for (int j = 0; j < NTC; j++) {
+                wmma::store_matrix_sync(stg, st[i][j], 16, wmma::mem_row_major);
+                __syncwarp();
+                for (int e = lane; e < 128; e += 32) {
+                    const int r = (warp * RT + i) * 16 + (e >> 3), x = j * 16 + (e & 7) * 2;
+                    const __nv_bfloat162 v = __floats2bfloat162_rn(stg[(e >> 3) * 16 + (e & 7) * 2], stg[(e >> 3) * 16 + (e & 7) * 2 + 1]);
+                    *(__nv_bfloat162*)&sb[r * LDB + x] = v;
+                    *(__nv_bfloat162*)&dhs[(size_t)r * DV + vb + x] = v;
+                }
+                __syncwarp();
+            }
+        __syncthreads();
+        #pragma unroll
+        for (int tcol = 0; tcol < NTC; tcol++) {
+            const int tr = warp;
+            FC a1, a2;
+            wmma::fill_fragment(a1, 0.0f);
+            wmma::fill_fragment(a2, 0.0f);
+            #pragma unroll
+            for (int e = 0; e < DK; e += 16) {
+                FA a;
+                FBr b;
+                wmma::load_matrix_sync(a, K + (row0 + tr * 16) * DK + e, DK);
+                wmma::load_matrix_sync(b, sb + e * LDB + tcol * 16, LDB);
+                wmma::mma_sync(a1, a, b, a1);
+            }
+            // A_qkᵀ is upper: rows tr need columns e ≥ tr of A_qk
+            for (int e = tr * 16; e < C; e += 16) {
+                FAc a;
+                FBr b;
+                wmma::load_matrix_sync(a, Ao + (row0 + e) * C + tr * 16, C);
+                wmma::load_matrix_sync(b, DO + (row0 + e) * DV + vb + tcol * 16, DV);
+                wmma::mma_sync(a2, a, b, a2);
+            }
+            wmma::store_matrix_sync(stg, a1, 16, wmma::mem_row_major);
+            wmma::store_matrix_sync(stg + 256, a2, 16, wmma::mem_row_major);
+            __syncwarp();
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const int e = lane + 32 * q;
+                const int rr = e >> 3, cc = (e & 7) * 2, r = tr * 16 + rr, x = tcol * 16 + cc;
+                const float g = __expf(glast - gm[r]);
+                const float d0 = g * stg[rr * 16 + cc] + stg[256 + rr * 16 + cc];
+                const float d1 = g * stg[rr * 16 + cc + 1] + stg[256 + rr * 16 + cc + 1];
+                *(__nv_bfloat162*)&DVn[(row0 + r) * DV + vb + x] = __floats2bfloat162_rn(d0, d1);
+                *(__nv_bfloat162*)&vng[r * LDB + x] = __floats2bfloat162_rn(-d0, -d1);
+                const __nv_bfloat162 dd = *(const __nv_bfloat162*)&DO[(row0 + r) * DV + vb + x];
+                const float sg = (float)SCALE * __expf(gm[r]);
+                *(__nv_bfloat162*)&dog[r * LDB + x] = __floats2bfloat162_rn(__low2float(dd) * sg, __high2float(dd) * sg);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+        const float gc = __expf(glast);
+        #pragma unroll
+        for (int i = 0; i < RT; i++)
+            #pragma unroll
+            for (int j = 0; j < NTC; j++) {
+                #pragma unroll
+                for (int x = 0; x < st[i][j].num_elements; x++) st[i][j].x[x] *= gc;
+                #pragma unroll
+                for (int e = 0; e < C; e += 16) {
+                    FAc a;
+                    FBr b;
+#if DELTA
+                    wmma::load_matrix_sync(a, Wo + (row0 + e) * DK + (warp * RT + i) * 16, DK);
+                    wmma::load_matrix_sync(b, vng + e * LDB + j * 16, LDB);
+                    wmma::mma_sync(st[i][j], a, b, st[i][j]);
+#endif
+                    wmma::load_matrix_sync(a, Q + (row0 + e) * DK + (warp * RT + i) * 16, DK);
+                    wmma::load_matrix_sync(b, dog + e * LDB + j * 16, LDB);
+                    wmma::mma_sync(st[i][j], a, b, st[i][j]);
+                }
+            }
+        __syncthreads();
+    }
+}
+"#;
+
+/// Backward kernel 3: per chunk, everything else. With `S₀` (forward
+/// states), `dS_end`, `dV'`, `dO`, `V'`, `W` and the saved `T`:
+/// `dW = −dV'·S₀ᵀ`, `dT = (dV'·vᵀ)diag(β) + (dW·kᵀ)diag(β e^γ)`,
+/// `dA = −Tᵀ·dT·Tᵀ`, then `dq`, `dk`, `dv`, `dβ` and `dα` through the
+/// masked Gram matrices and the decays (`dγ` summed back to `d log α`).
+/// Grid `(T/C, H)`, 256 threads. Requires `DK == DV == 128`.
+const BWD_GRAD: &str = r#"
+extern "C" __global__ void __launch_bounds__(256) main0(
+    const bf* __restrict__ Q, const bf* __restrict__ K, const bf* __restrict__ V,
+    const float* __restrict__ AL, const float* __restrict__ BE, const float* __restrict__ GR,
+    const float* __restrict__ GC, const float* __restrict__ TS, const bf* __restrict__ Hs,
+    const bf* __restrict__ DHs, const bf* __restrict__ DO, const bf* __restrict__ Vn,
+    const bf* __restrict__ DVn, float* __restrict__ DQ, float* __restrict__ DK_,
+    float* __restrict__ DV_, float* __restrict__ DA, float* __restrict__ DB) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    float* f1 = (float*)smem;                    // [C][LDF]  T, then q kᵀ; then staging
+    float* f2 = f1 + C * LDF;                    // [C][LDF]  dT, dA, B, dA_qk; then staging
+    float* xr = f2 + C * LDF;                    // [C][C] f32 (X = dT·Tᵀ, then k kᵀ) / 2·[C][LDT] bf16
+    bf* bsb = (bf*)xr;                           // [C][LDT]  B + Bᵀ   (after k kᵀ)
+    bf* g1b = bsb + C * LDT;                     // [C][LDT]  scale·dA_qk ⊙ E
+    bf* tb = (bf*)(xr + C * LDT);                // [C][LDT]  T (bf16)
+    bf* dwb = tb + C * LDT;                      // [C][LDK]  dW
+    float* gam = (float*)(dwb + C * LDK);        // [C]
+    float* bet = gam + C;                        // [C]
+    float* dgam = bet + C;                       // [C]
+    float* dbet = dgam + C;                      // [C]
+    float* red = dbet + C;                       // [2]: ⟨dS_end, S₀⟩, Σ R
+    const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const size_t row0 = (size_t)h * T + (size_t)c * C;
+    const bf* s0 = Hs + ((size_t)h * NT + c) * DK * DV;
+    const bf* dse = DHs + ((size_t)h * NT + c) * DK * DV;
+    const float glast = GC[h * NT + c];
+    if (tid < C) {
+        gam[tid] = GR[row0 + tid];
+#if BETA
+        bet[tid] = BE[row0 + tid];
+#else
+        bet[tid] = 1.0f;
+#endif
+        dgam[tid] = 0.0f;
+        dbet[tid] = 0.0f;
+    }
+    if (tid < 2) red[tid] = 0.0f;
+#if DELTA
+    for (int i = tid; i < C * C; i += 256) {
+        const float t = TS[((size_t)h * NT + c) * C * C + i];
+        f1[(i / C) * LDF + i % C] = t;
+        tb[(i / C) * LDT + i % C] = __float2bfloat16(t);
+    }
+#endif
+    __syncthreads();
+    // ⟨dS_end, S₀⟩ (for d γ_C)
+    {
+        float acc = 0.0f;
+        for (int i = tid; i < DK * DV / 2; i += 256) {
+            const __nv_bfloat162 a = ((const __nv_bfloat162*)dse)[i], b = ((const __nv_bfloat162*)s0)[i];
+            acc = fmaf(__low2float(a), __low2float(b), fmaf(__high2float(a), __high2float(b), acc));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) atomicAdd(&red[0], acc);
+    }
+    float* stg = xr + warp * 256;
+#if DELTA
+    // dW = −dV'·S₀ᵀ  [C × DK]; staging over xr (free until X)
+    for (int tt = warp; tt < 4 * (DK / 16); tt += 8) {
+        const int tr = tt & 3, tcol = tt >> 2;
+        FC acc;
+        wmma::fill_fragment(acc, 0.0f);
+        #pragma unroll
+        for (int e = 0; e < DV; e += 16) {
+            FA a;
+            FBc b;
+            wmma::load_matrix_sync(a, DVn + (row0 + tr * 16) * DV + e, DV);
+            wmma::load_matrix_sync(b, s0 + (size_t)(tcol * 16) * DV + e, DV);
+            wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32)
+            dwb[(tr * 16 + e / 16) * LDK + tcol * 16 + e % 16] = __float2bfloat16(-stg[e]);
+        __syncwarp();
+    }
+    __syncthreads();
+    // dT = (dV'·vᵀ)·diag(β) + (dW·kᵀ)·diag(β e^γ)  → f2
+    for (int tt = warp; tt < 16; tt += 8) {
+        const int tr = tt >> 2, tc = tt & 3;
+        FC a1, a2;
+        wmma::fill_fragment(a1, 0.0f);
+        wmma::fill_fragment(a2, 0.0f);
+        #pragma unroll
+        for (int e = 0; e < DV; e += 16) {
+            FA a;
+            FBc b;
+            wmma::load_matrix_sync(a, DVn + (row0 + tr * 16) * DV + e, DV);
+            wmma::load_matrix_sync(b, V + (row0 + tc * 16) * DV + e, DV);
+            wmma::mma_sync(a1, a, b, a1);
+        }
+        #pragma unroll
+        for (int e = 0; e < DK; e += 16) {
+            FA a;
+            FBc b;
+            wmma::load_matrix_sync(a, dwb + tr * 16 * LDK + e, LDK);
+            wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
+            wmma::mma_sync(a2, a, b, a2);
+        }
+        wmma::store_matrix_sync(stg, a1, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
+            f2[r * LDF + j] = bet[j] * stg[e];
+        }
+        __syncwarp();
+        wmma::store_matrix_sync(stg, a2, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
+            f2[r * LDF + j] += bet[j] * __expf(gam[j]) * stg[e];
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+    // X = dT·Tᵀ (X[k][j] = Σ_{l≤j} dT[k][l]·T[j][l]), then dA = −Tᵀ·X, strict lower
+    for (int i = tid; i < C * C; i += 256) {
+        const int k = i / C, j = i % C;
+        float a0 = 0.0f, a1 = 0.0f;
+        int l = 0;
+        for (; l + 1 <= j; l += 2) {
+            a0 = fmaf(f2[k * LDF + l], f1[j * LDF + l], a0);
+            a1 = fmaf(f2[k * LDF + l + 1], f1[j * LDF + l + 1], a1);
+        }
+        if (l <= j) a0 = fmaf(f2[k * LDF + l], f1[j * LDF + l], a0);
+        xr[k * C + j] = a0 + a1;
+    }
+    __syncthreads();
+    for (int i = tid; i < C * C; i += 256) {
+        const int r = i / C, j = i % C;
+        float a0 = 0.0f, a1 = 0.0f;
+        if (j < r) {
+            int k = r;
+            for (; k + 1 < C; k += 2) {
+                a0 = fmaf(f1[k * LDF + r], xr[k * C + j], a0);
+                a1 = fmaf(f1[(k + 1) * LDF + r], xr[(k + 1) * C + j], a1);
+            }
+            if (k < C) a0 = fmaf(f1[k * LDF + r], xr[k * C + j], a0);
+        }
+        f2[r * LDF + j] = -(a0 + a1);
+    }
+    __syncthreads();
+#endif
+    // q kᵀ → f1, k kᵀ → xr (f32)
+    for (int tt = warp; tt < 32; tt += 8) {
+        const int which = tt >> 4, tr = (tt >> 2) & 3, tc = tt & 3;
+        FC acc;
+        wmma::fill_fragment(acc, 0.0f);
+        if (tc <= tr) {
+            #pragma unroll
+            for (int e = 0; e < DK; e += 16) {
+                FA a;
+                FBc b;
+                wmma::load_matrix_sync(a, (which ? K : Q) + (row0 + tr * 16) * DK + e, DK);
+                wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+        }
+        if (which) wmma::store_matrix_sync(xr + tr * 16 * C + tc * 16, acc, C, wmma::mem_row_major);
+        else wmma::store_matrix_sync(f1 + tr * 16 * LDF + tc * 16, acc, LDF, wmma::mem_row_major);
+    }
+    __syncthreads();
+#if DELTA
+    // D = dA (strict lower): dβ, Q = D ⊙ A into dγ, B = D·β_i·E in place
+    for (int i = tid; i < C * C; i += 256) {
+        const int r = i / C, j = i % C;
+        if (j < r) {
+            const float e = __expf(gam[r] - gam[j]);
+            const float d = f2[r * LDF + j], mk = xr[r * C + j];
+            atomicAdd(&dbet[r], d * mk * e);
+            const float qv = d * bet[r] * mk * e;
+            atomicAdd(&dgam[r], qv);
+            atomicAdd(&dgam[j], -qv);
+            f2[r * LDF + j] = d * bet[r] * e;
+        } else {
+            f2[r * LDF + j] = 0.0f;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < C * C; i += 256) {
+        const int r = i / C, j = i % C;
+        bsb[r * LDT + j] = __float2bfloat16(f2[r * LDF + j] + f2[j * LDF + r]);
+    }
+#else
+    for (int i = tid; i < C * C; i += 256) bsb[(i / C) * LDT + i % C] = __float2bfloat16(0.0f);
+#endif
+    __syncthreads();
+    // dA_qk = dO·V'ᵀ (lower incl tiles) → f2
+    {
+        const bf* vp = Vn;  // V' (U without the delta term)
+        for (int tt = warp; tt < 16; tt += 8) {
+            const int tr = tt >> 2, tc = tt & 3;
+            FC acc;
+            wmma::fill_fragment(acc, 0.0f);
+            if (tc <= tr) {
+                #pragma unroll
+                for (int e = 0; e < DV; e += 16) {
+                    FA a;
+                    FBc b;
+                    wmma::load_matrix_sync(a, DO + (row0 + tr * 16) * DV + e, DV);
+                    wmma::load_matrix_sync(b, vp + (row0 + tc * 16) * DV + e, DV);
+                    wmma::mma_sync(acc, a, b, acc);
+                }
+            }
+            wmma::store_matrix_sync(f2 + tr * 16 * LDF + tc * 16, acc, LDF, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+    // P = dA_qk ⊙ A_qk into dγ; G1 = scale·dA_qk ⊙ E (incl lower)
+    for (int i = tid; i < C * C; i += 256) {
+        const int r = i / C, j = i % C;
+        float g = 0.0f;
+        if (j <= r) {
+            const float e = __expf(gam[r] - gam[j]);
+            const float da = f2[r * LDF + j];
+            const float pv = da * (float)SCALE * f1[r * LDF + j] * e;
+            atomicAdd(&dgam[r], pv);
+            atomicAdd(&dgam[j], -pv);
+            g = (float)SCALE * da * e;
+        }
+        g1b[r * LDT + j] = __float2bfloat16(g);
+    }
+    __syncthreads();
+    // outputs; staging over f1/f2 (3 tiles a warp)
+    stg = f1 + warp * 768;
+    // dk = G1ᵀ·q + (B+Bᵀ)·k + β e^γ·Tᵀ·dW + e^{γ_C−γ}·V'·dS_endᵀ   [C × DK]
+    for (int tt = warp; tt < 4 * (DK / 16); tt += 8) {
+        const int tr = tt & 3, tcol = tt >> 2;
+        FC am, akb, akg;
+        wmma::fill_fragment(am, 0.0f);
+        wmma::fill_fragment(akb, 0.0f);
+        wmma::fill_fragment(akg, 0.0f);
+        #pragma unroll
+        for (int e = 0; e < C; e += 16) {
+            FAc a;
+            FBr b;
+            wmma::load_matrix_sync(a, g1b + e * LDT + tr * 16, LDT);
+            wmma::load_matrix_sync(b, Q + (row0 + e) * DK + tcol * 16, DK);
+            wmma::mma_sync(am, a, b, am);
+            FA a2;
+            wmma::load_matrix_sync(a2, bsb + tr * 16 * LDT + e, LDT);
+            wmma::load_matrix_sync(b, K + (row0 + e) * DK + tcol * 16, DK);
+            wmma::mma_sync(am, a2, b, am);
+#if DELTA
+            wmma::load_matrix_sync(a, tb + e * LDT + tr * 16, LDT);
+            wmma::load_matrix_sync(b, dwb + e * LDK + tcol * 16, LDK);
+            wmma::mma_sync(akb, a, b, akb);
+#endif
+        }
+        {
+            const bf* vp = Vn;  // V' (U without the delta term)
+            #pragma unroll
+            for (int e = 0; e < DV; e += 16) {
+                FA a;
+                FBc b;
+                wmma::load_matrix_sync(a, vp + (row0 + tr * 16) * DV + e, DV);
+                wmma::load_matrix_sync(b, dse + (size_t)(tcol * 16) * DV + e, DV);
+                wmma::mma_sync(akg, a, b, akg);
+            }
+        }
+        wmma::store_matrix_sync(stg, am, 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(stg + 256, akb, 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(stg + 512, akg, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
+            const float kv = __bfloat162float(K[(row0 + r) * DK + x]);
+            const float eg = __expf(gam[r]), ec = __expf(glast - gam[r]);
+            const float kb = stg[256 + e], kg = stg[512 + e];
+            DK_[(row0 + r) * DK + x] = stg[e] + bet[r] * eg * kb + ec * kg;
+            const float rk = ec * kg * kv;
+            atomicAdd(&dbet[r], eg * kb * kv);
+            atomicAdd(&dgam[r], bet[r] * eg * kb * kv - rk);
+            atomicAdd(&red[1], rk);
+        }
+        __syncwarp();
+    }
+    // dq = scale·e^γ·dO·S₀ᵀ + G1·k   [C × DK]
+    for (int tt = warp; tt < 4 * (DK / 16); tt += 8) {
+        const int tr = tt & 3, tcol = tt >> 2;
+        FC aq, ag;
+        wmma::fill_fragment(aq, 0.0f);
+        wmma::fill_fragment(ag, 0.0f);
+        #pragma unroll
+        for (int e = 0; e < DV; e += 16) {
+            FA a;
+            FBc b;
+            wmma::load_matrix_sync(a, DO + (row0 + tr * 16) * DV + e, DV);
+            wmma::load_matrix_sync(b, s0 + (size_t)(tcol * 16) * DV + e, DV);
+            wmma::mma_sync(aq, a, b, aq);
+        }
+        #pragma unroll
+        for (int e = 0; e < C; e += 16) {
+            FA a;
+            FBr b;
+            wmma::load_matrix_sync(a, g1b + tr * 16 * LDT + e, LDT);
+            wmma::load_matrix_sync(b, K + (row0 + e) * DK + tcol * 16, DK);
+            wmma::mma_sync(ag, a, b, ag);
+        }
+        wmma::store_matrix_sync(stg, aq, 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(stg + 256, ag, 16, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
+            const float sg = (float)SCALE * __expf(gam[r]);
+            DQ[(row0 + r) * DK + x] = sg * stg[e] + stg[256 + e];
+            atomicAdd(&dgam[r], sg * stg[e] * __bfloat162float(Q[(row0 + r) * DK + x]));
+        }
+        __syncwarp();
+    }
+    // dv = β·Tᵀ·dV'   [C × DV]  (no delta: dv = β·dV')
+    for (int tt = warp; tt < 4 * (DV / 16); tt += 8) {
+        const int tr = tt & 3, tcol = tt >> 2;
+        FC av;
+        wmma::fill_fragment(av, 0.0f);
+#if DELTA
+        #pragma unroll
+        for (int e = 0; e < C; e += 16) {
+            if (e + 15 < tr * 16) continue;
+            FAc a;
+            FBr b;
+            wmma::load_matrix_sync(a, tb + e * LDT + tr * 16, LDT);
+            wmma::load_matrix_sync(b, DVn + (row0 + e) * DV + tcol * 16, DV);
+            wmma::mma_sync(av, a, b, av);
+        }
+        wmma::store_matrix_sync(stg, av, 16, wmma::mem_row_major);
+        __syncwarp();
+#endif
+        for (int e = lane; e < 256; e += 32) {
+            const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
+#if DELTA
+            const float dvb = stg[e];
+#else
+            const float dvb = __bfloat162float(DVn[(row0 + r) * DV + x]);
+#endif
+            DV_[(row0 + r) * DV + x] = bet[r] * dvb;
+            atomicAdd(&dbet[r], dvb * __bfloat162float(V[(row0 + r) * DV + x]));
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+    // d γ_C, then d log α = reverse running sum of dγ over the chunk
+    if (warp == 0) {
+        if (lane == 0) dgam[C - 1] += __expf(glast) * red[0] + red[1];
+        __syncwarp();
+        const float a = dgam[C - 1 - 2 * lane], b = dgam[C - 2 - 2 * lane];
+        float s = a + b;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float n = __shfl_up_sync(0xffffffffu, s, o);
+            if (lane >= o) s += n;
+        }
+        const float ex = s - a - b;
+        // rows C−1−2·lane (gets ex + a) and C−2−2·lane (gets s)
+        const int r1 = C - 1 - 2 * lane, r2 = C - 2 - 2 * lane;
+#if GATE
+        DA[row0 + r1] = (ex + a) / AL[row0 + r1];
+        DA[row0 + r2] = s / AL[row0 + r2];
+#endif
+#if BETA
+        DB[row0 + r1] = dbet[r1];
+        DB[row0 + r2] = dbet[r2];
+#endif
+    }
+}
+"#;
+
 impl ChunkedScan {
-    fn defines(&self) -> String {
+    fn defines(&self, save_t: bool) -> String {
         format!(
-            "#define T {}\n#define C {CHUNK}\n#define DK {}\n#define DV {}\n#define DELTA {}\n#define GATE {}\n#define BETA {}\n#define SCALE {:e}\n",
+            "#define T {}\n#define C {CHUNK}\n#define DK {}\n#define DV {}\n#define DELTA {}\n#define GATE {}\n#define BETA {}\n#define SCALE {:e}\n#define SAVE_T {}\n",
             self.t,
             self.n,
             self.m,
             self.delta as u8,
             self.alpha.is_some() as u8,
             self.beta.is_some() as u8,
-            self.scale
+            self.scale,
+            save_t as u8
         )
     }
 
@@ -542,6 +1072,12 @@ impl ChunkedScan {
     /// γ_C | H V'`; readout: `q k γ H V' | o` (`V'` is `U` without the
     /// delta term).
     pub fn kernels(&self, bv: usize) -> [ScanLaunch; 3] {
+        self.kernels_saving(bv, false)
+    }
+
+    /// [`kernels`](Self::kernels), the per-chunk kernel also writing `T`
+    /// (f32 `[H, T/C, C, C]`, its last argument) for the backward.
+    pub fn kernels_saving(&self, bv: usize, save_t: bool) -> [ScanLaunch; 3] {
         assert!(self.t % CHUNK == 0, "chunked scan: T = {} not a multiple of {CHUNK}", self.t);
         assert!(self.n % 64 == 0 && self.n <= 128, "chunked scan: n = {}", self.n);
         assert!(
@@ -549,7 +1085,7 @@ impl ChunkedScan {
             "chunked scan: m = {}, bv {bv}",
             self.m
         );
-        let d = self.defines();
+        let d = self.defines(save_t);
         let (c, n) = (CHUNK, self.n);
         let smem1 = 2 * c * (c + 4) * 4 + 2 * c * 4;
         let smem2 = (n * (bv + 8) + c * (bv + 8)) * 2 + c * 4 + 4 * 256 * 4;
@@ -577,6 +1113,48 @@ impl ChunkedScan {
                 block: 256,
                 smem: smem3 as u32,
             },
+        ]
+    }
+}
+
+impl ChunkedScan {
+    /// Scratch of the backward, as element counts: f32 `T` `[H, T/C, C,
+    /// C]` (written by [`kernels_saving`](Self::kernels_saving)), bf16
+    /// `A_qk` `[H, T, C]`, bf16 `dS_end` per chunk `[H, T/C, n, m]`, bf16
+    /// `dV'` `[H, T, m]`.
+    pub fn backward_scratch(&self) -> [usize; 4] {
+        let (rows, chunks) = (self.heads * self.t, self.heads * (self.t / CHUNK));
+        [chunks * CHUNK * CHUNK, rows * CHUNK, chunks * self.n * self.m, rows * self.m]
+    }
+
+    /// The backward: the reverse scan of the state cotangent (derived:
+    /// the transposed chunk map) and the per-chunk gradients. Arguments —
+    /// `A_qk`: `q k γ | Aqk`; state: `q k W Aqk dO γ γ_C | dS_end dV'`;
+    /// grad: `q k v α β γ γ_C T S dS_end dO V' dV' | dq dk dv dα dβ`
+    /// (f32 gradients; `V'` is `U` without the delta term). Needs the
+    /// forward's `W`, states `S`, `V'`, `γ`, `γ_C`, and `T` from
+    /// [`kernels_saving`](Self::kernels_saving).
+    pub fn backward_kernels(&self, bv: usize) -> [ScanLaunch; 3] {
+        assert!(self.n == 128 && self.m == 128, "chunked scan backward: n = m = 128 only");
+        let d = self.defines(false);
+        let c = CHUNK;
+        let ldb = bv + 8;
+        let smem0 = c * 4 + 4 * 256 * 4;
+        let smem1 = (self.n * ldb + 2 * c * ldb) * 2 + c * 4 + 4 * 512 * 4;
+        let smem2 = 2 * c * (c + 4) * 4 + c * (c + 8) * 4 + c * (c + 8) * 2 + c * (self.n + 8) * 2 + 4 * c * 4 + 16;
+        let src = |smem: usize, extra: &str, body: &str| {
+            format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{extra}{PRELUDE}{body}")
+        };
+        let chunks = ((self.t / c) as u32, self.heads as u32, 1);
+        [
+            ScanLaunch { source: src(smem0, "", BWD_AQK), grid: chunks, block: 128, smem: smem0 as u32 },
+            ScanLaunch {
+                source: src(smem1, &format!("#define BV {bv}\n"), BWD_STATE),
+                grid: ((self.m / bv) as u32, self.heads as u32, 1),
+                block: 128,
+                smem: smem1 as u32,
+            },
+            ScanLaunch { source: src(smem2, "", BWD_GRAD), grid: chunks, block: 256, smem: smem2 as u32 },
         ]
     }
 }
