@@ -310,7 +310,8 @@ fn main() {
         Some("gdn") => Mode::Gdn,
         Some("ssd") => Mode::Ssd,
         Some("lin") => Mode::Lin,
-        _ => panic!("usage: scan_bench gdn|ssd|lin H T [N M BV]"),
+        Some("coder") => Mode::Gdn,
+        _ => panic!("usage: scan_bench gdn|ssd|lin H T [N M BV] | coder T N"),
     };
     let num = |i: usize, d: usize| a.get(i).map_or(d, |s| s.parse().unwrap());
     let (h, t, n, m, bv) = (
@@ -321,6 +322,11 @@ fn main() {
         num(6, 32),
     );
     let dev = CudaDevice::new(0).expect("cuda device");
+    if a.get(1).map(String::as_str) == Some("coder") {
+        let t: usize = a.get(2).map_or(256, |s| s.parse().unwrap());
+        let n: usize = a.get(3).map_or(t, |s| s.parse().unwrap());
+        return coder_check(&dev, t, n);
+    }
     if a.iter().any(|x| x == "--bwd") {
         return backward(&dev, mode, h, t, n, m, bv);
     }
@@ -481,5 +487,169 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
         per.join("/"),
         errs.join(" "),
         dev.name
+    );
+}
+
+/// `scan_bench coder T N`: the tang-llm coder layout (`ChunkedScan::coder`, 32 v heads, 16 k
+/// heads, d 128) on synthetic GDN prep rows: N live rows of a T-row window starting at row 3 of
+/// Y, a random initial state. Checks Y and the final state against the f64 recurrence.
+pub fn coder_check(dev: &CudaDevice, t: usize, n: usize) {
+    use tang_compile::tensor::cuda_scan::ChunkedScan;
+    let (hv, hk, d) = (32usize, 16usize, 128usize);
+    let xrow = 2 * hk * d + hv * d + 2 * hv;
+    let mut u = rng(3);
+    let mut x = vec![0f32; t * xrow];
+    for r in 0..t {
+        let row = &mut x[r * xrow..(r + 1) * xrow];
+        for h in 0..2 * hk {
+            let v: Vec<f64> = (0..d).map(|_| u() - 0.5).collect();
+            let s = v.iter().map(|a| a * a).sum::<f64>().sqrt();
+            for i in 0..d {
+                row[h * d + i] = (v[i] / s) as f32;
+            }
+        }
+        for i in 0..hv * d {
+            row[2 * hk * d + i] = (4.0 * (u() - 0.5)) as f32;
+        }
+        for h in 0..hv {
+            row[2 * hk * d + hv * d + h] = (-0.3 * u()).exp() as f32;
+            row[2 * hk * d + hv * d + hv + h] = u() as f32;
+        }
+    }
+    let s0: Vec<f32> = (0..d * hv * d)
+        .map(|_| (0.2 * (u() - 0.5)) as f32)
+        .collect();
+    let r0 = 3usize;
+    let plan = ChunkedScan::coder(hv, hk, d);
+    let tp = t.next_multiple_of(64);
+    let s = &dev.stream;
+    let xs = s.memcpy_stod(&x).unwrap();
+    let st = s.memcpy_stod(&s0).unwrap();
+    let stab = s
+        .memcpy_stod(&[{
+            use tang_gpu::cuda::cudarc::driver::DevicePtr;
+            st.device_ptr(s).0
+        }])
+        .unwrap();
+    let seg = s.memcpy_stod(&[r0 as u32, n as u32, 0, 0]).unwrap();
+    let y = s.alloc_zeros::<f32>((r0 + t) * hv * d).unwrap();
+    let bufs: Vec<CudaSlice<u8>> = plan
+        .coder_scratch(tp)
+        .iter()
+        .map(|&b| s.alloc_zeros::<u8>(b).unwrap())
+        .collect();
+    let ls = plan.coder_kernels(32);
+    let gr = plan.coder_grids(tp, 32);
+    let tn = tp as u32;
+    let null = 0u64;
+    for (i, l) in ls.iter().enumerate() {
+        let f = dev.function(&l.source);
+        let cfg = LaunchConfig {
+            grid_dim: gr[i],
+            block_dim: (l.block, 1, 1),
+            shared_mem_bytes: l.smem,
+        };
+        let b = &bufs;
+        let mut lb = s.launch_builder(&f);
+        match i {
+            0 => {
+                lb.arg(&xs)
+                    .arg(&seg)
+                    .arg(&b[0])
+                    .arg(&b[1])
+                    .arg(&b[2])
+                    .arg(&b[3])
+                    .arg(&b[4]);
+            }
+            1 => {
+                lb.arg(&b[1])
+                    .arg(&b[2])
+                    .arg(&b[3])
+                    .arg(&b[4])
+                    .arg(&b[5])
+                    .arg(&b[6])
+                    .arg(&b[9])
+                    .arg(&b[10])
+                    .arg(&null);
+            }
+            2 => {
+                lb.arg(&b[5])
+                    .arg(&b[6])
+                    .arg(&b[1])
+                    .arg(&b[9])
+                    .arg(&b[10])
+                    .arg(&b[7])
+                    .arg(&b[8])
+                    .arg(&stab)
+                    .arg(&seg);
+            }
+            _ => {
+                lb.arg(&b[0])
+                    .arg(&b[1])
+                    .arg(&b[9])
+                    .arg(&b[7])
+                    .arg(&b[8])
+                    .arg(&null)
+                    .arg(&null)
+                    .arg(&y)
+                    .arg(&seg);
+            }
+        }
+        lb.arg(&tn);
+        unsafe { lb.launch(cfg) }.expect("launch");
+        dev.sync();
+    }
+    let yg = s.memcpy_dtov(&y).unwrap();
+    let sg = s.memcpy_dtov(&st).unwrap();
+    // f64 reference
+    let scale = 1.0 / (d as f64).sqrt();
+    let (mut ey, mut my, mut es, mut ms, mut nan) = (0f64, 0f64, 0f64, 0f64, 0usize);
+    for h in 0..hv {
+        let k_h = h / (hv / hk);
+        let mut sm: Vec<f64> = (0..d * d)
+            .map(|i| s0[((i / d) * hv + h) * d + i % d] as f64)
+            .collect();
+        for r in 0..n {
+            let row = &x[r * xrow..(r + 1) * xrow];
+            let q = &row[k_h * d..(k_h + 1) * d];
+            let k = &row[hk * d + k_h * d..hk * d + (k_h + 1) * d];
+            let v = &row[2 * hk * d + h * d..2 * hk * d + (h + 1) * d];
+            let (a, bb) = (
+                row[2 * hk * d + hv * d + h] as f64,
+                row[2 * hk * d + hv * d + hv + h] as f64,
+            );
+            sm.iter_mut().for_each(|z| *z *= a);
+            for c in 0..d {
+                let sk: f64 = (0..d).map(|i| sm[i * d + c] * k[i] as f64).sum();
+                let dl = bb * (v[c] as f64 - sk);
+                for i in 0..d {
+                    sm[i * d + c] += k[i] as f64 * dl;
+                }
+            }
+            for c in 0..d {
+                let o = scale * (0..d).map(|i| sm[i * d + c] * q[i] as f64).sum::<f64>();
+                let g = yg[(r0 + r) * hv * d + h * d + c] as f64;
+                if !g.is_finite() {
+                    nan += 1;
+                }
+                ey = ey.max((g - o).abs());
+                my = my.max(o.abs());
+            }
+        }
+        for i in 0..d {
+            for c in 0..d {
+                let g = sg[(i * hv + h) * d + c] as f64;
+                if !g.is_finite() {
+                    nan += 1;
+                }
+                es = es.max((g - sm[i * d + c]).abs());
+                ms = ms.max(sm[i * d + c].abs());
+            }
+        }
+    }
+    println!(
+        "coder T={t} live={n}: Y rel err {:.2e}, final state rel err {:.2e}, non-finite {nan}",
+        ey / my,
+        es / ms
     );
 }
