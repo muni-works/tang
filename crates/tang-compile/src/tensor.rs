@@ -476,7 +476,7 @@ impl Monoid {
                 _ => MonoidKind::Other,
             };
         }
-        if self.identity[0] == f64::NEG_INFINITY {
+        if self.identity[0] <= -1e30 {
             MonoidKind::OnlineSoftmax
         } else {
             MonoidKind::Other

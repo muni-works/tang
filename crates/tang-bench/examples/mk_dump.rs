@@ -12,6 +12,12 @@ fn main() {
     let (g, outs) = compiled_decode(&dg, true);
     let opts = decode_opts(&dg, &outs);
     let p = g.to_cuda_decode(&outs, &opts).program;
+    if let Ok(dir) = std::env::var("MK_KERNELS") {
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, k) in p.kernels.iter().enumerate() {
+            std::fs::write(format!("{dir}/k{i:03}.cu"), &k.source).unwrap();
+        }
+    }
     let plan = slot_plan(&p, &outs, &opts.inplace);
     let slot = |t| {
         let s = p.storage(t);

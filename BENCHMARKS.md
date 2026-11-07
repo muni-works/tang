@@ -3149,6 +3149,79 @@ int8 dot products; tang dequantizes every nibble to f32 and FMAs, and recomputes
 element. That is the next schedule to derive (an int8 activation-quantization map before the
 GEMV, then a dp4a body), along with per-kernel rows/split choices through the autotuner.
 
+### Closing on llama.cpp: Qwen3-8B decode on the 3090 (CUDA defaults now 6.76 ms)
+
+nsys (`--cuda-graph-trace=node`) per decode step showed the CUDA graph has no gaps (3.7 µs over
+548 kernels); the time is the kernels. Per layer at 7.69 ms: q|k|v 33 µs (46% of 936 GB/s),
+o 16.8 (60%), gate|up 73.5 (82%), down 40 (76%), ~14 tiny kernels ~22 µs, and the attention
+score kernel 13.9 µs even at 50 tokens of context. Changes, each now the CUDA decode default:
+
+| step | len 64 | len 4096 |
+|---|---|---|
+| #160 (rows 4, split down ×4) | 7.80 ms | 9.09 ms |
+| norms materialized once instead of recomputed in every GEMV lane, rows 8, split-K every 4-bit GEMV under 16384 rows (`split_gemvs`) | 7.22 | 8.43 |
+| attention score kernel stops at the runtime length (`dyn_dim` ignored extent-1 dims, so its bound `len + p0 − p3` never qualified and 2048 blocks of empty warps ran) | 6.81 | 8.36 |
+| register dim chosen by a load-bytes model (P·V tiles `d` and shares the f32 probabilities instead of tiling heads and re-reading them per `d`: 30 → ~17 µs at 4k), warps 2 | **6.76** | **8.07** |
+
+Correctness (31 forced rows vs CPU f32): max |err| 3.71e-2, mean 1.50e-3, argmax 31/31.
+
+Back to back with llama.cpp (`llama-bench -n 128 -fa on`, Q4_0 GGUF from the same weights):
+
+| | short | d1024 | d4096 |
+|---|---|---|---|
+| llama.cpp Q4_0 | 149.4 tok/s | 145.3 | 134.9 |
+| tang IR, device step | 148.0 | 141.0 | 124.0 |
+| tang IR, end to end (run + 8-byte readback) | 146.3–147.9 | — | — |
+
+Tied at short context, 92% at 4k. Tried and not kept: f16 activations (no faster at rows 8;
+NaN, the transpiled map path does not write f16), splitting attention (now slower), small-kernel
+persistent segments (6.81 vs 6.76 ms), rows 12/16, warps 8. Left: the ~14 tiny kernels per layer
+(~0.8 ms, need real fusion — a 1-block reduction recomputed in its reader), the q|k|v and o GEMVs
+at ~70%, and attention at 4k (scores 17.6 µs ≈ 480 GB/s).
+
+Update (same session, back to back): the final vocabulary argmax was one block (32.4 µs); it now splits into 128
+chunks (6.3 µs; `TANG_SPLIT_WIDE=0` keeps it whole). llama.cpp Q4_0 149.4 / 145.3 / 134.9 tok/s vs tang
+148.7 / 141.4 / 124.2 (device step; end to end 148.9–149.2 at short). Remaining non-GEMV time at short context:
+~584 kernels under 5 µs = 1.09 ms per step (norm stats/maps, split combines, q/k-norm + rope + KV writes, softmax).
+At 4k, attention is ~46 µs per layer (scores 17.9, max 3.0, sum 2.2, P·V 22.5) against ~19 µs to read K and V once:
+a fused split-KV attention (one pass, online softmax) is the next step there. Splitting more warps per group
+(`TANG_KS_GROUPS`) or splitting attention K is slower.
+
+Attention experiments (all opt-in, none kept as default; 64 / 1024 / 4096, default 6.72 / 7.08 / 8.07 ms):
+P·V-only split-K ×4 (`TANG_SPLIT_ATTN=4 TANG_SPLIT_ATTN_MIN_POINTS=1024`) 6.80 / 7.17 / 7.97 (P·V 22.5 → 18.4 + 1.8 µs);
+16-byte f16 loads (`TANG_DECODE_VEC=8`) 6.75 / 7.10 / 8.12; max and Σexp as one online-softmax `(m, l)` reduction
+(`TANG_ONLINE_ML=1`, 31/31) 6.76 / 7.07 / 7.99. The scores and P·V kernels are each near 480–500 GB/s: what is
+left at long context is one pass that computes q·k once per key and shares it across the 128 output dims
+(scores in shared memory, online softmax, P·V), which the warp-reduction emitter cannot express yet.
+
+### Derived single-pass decode attention (`shared_reduction`, opt-in: `TANG_FUSED_ATTN=1 TANG_ATTN_SPLIT=P`)
+
+The builder can write decode attention as one online-softmax reduction over the keys per output (t, kvh, r, c)
+— state (m, Σp·v_c, Σp), element (s, v_c, 1), then acc / l — with the scores a sum reduction it reads. A schedule
+rule inlines a sum read by an online-softmax fold, and a new decode lowering handles any reduction whose
+inlined producer ignores its last point dim: per chunk of keys, the producer once per (register-dim value, key)
+into shared memory (its key-invariant args — q — hoisted per block, rows as 16-byte vectors), the chunk max and
+p = exp(e₀ − m) once per key, then each thread folds Σ p·g for 8 consecutive c (one 16-byte V load per key,
+keys split over 8 lanes, partial sums added by shuffles) with one monoid combine per chunk. The GQA heads are the
+register dim (one K/V read serves all four). Split-KV is `split_reduction` (the online-softmax combine). The V
+cache is key-major under this form. Nothing in the lowering names attention.
+
+Correct: `qwen_decode tiny` (GPU vs interpreter, prefill and decode) 4.8e-5 / 3.3e-4, caches within 1 ulp;
+Qwen3-8B 31/31 argmax, max |err| 3.24e-2. Not faster yet (ms, 64 / 1024 / 4096):
+
+| | 64 | 1024 | 4096 |
+|---|---|---|---|
+| default (4 attention kernels per layer) | 6.73 | 7.07 | 8.05 |
+| fused, split 16 | 7.39 | 8.72 | 9.19–9.92 |
+| fused, split 32 | 7.78 | 8.38–8.55 | 9.33–9.52 |
+| fused, split 64 | 7.88 | 7.90 | 9.40–9.54 |
+
+Per layer at 4k the fused kernel is 85 µs + a 7 µs combine (split 32) against ~40 µs for the four kernels; at
+length 64 it is still ~50 µs with only a few live blocks: each block walks its keys in serial rounds of
+dependent loads, and the split-KV combine alone (32 chunks × 4096 outputs × 3 slots) costs what the old
+short-context attention did. What it needs next: chunks sized to the live length (split chosen per step, not
+per capacity), more independent loads in flight per round, and the combine folded into the finalize map.
+
 ## Fused attention backward on Hopper (H200 SXM, bf16, kernel-only)
 
 The derived backward as one kernel per key block (`tensor_cuda_attn_bwd.rs`).
