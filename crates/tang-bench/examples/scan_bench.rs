@@ -203,11 +203,9 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
         }
         2 => {
             b.arg(q).arg(kk).arg(gr).arg(&sc[2]).arg(vn).arg(&r.out);
+            b.arg(r.b16.first().unwrap_or(&r.dout));
         }
         3 => {
-            b.arg(q).arg(kk).arg(gr).arg(&r.b16[0]);
-        }
-        4 => {
             b.arg(q).arg(kk).arg(&sc[0]).arg(&r.b16[0]).arg(&r.dout).arg(gr).arg(gc);
             b.arg(&r.b16[1]).arg(&r.b16[2]);
         }
@@ -376,14 +374,14 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
     dev.sync();
     let total = median(dev, || launch(dev, &r));
     let fwd = median(dev, || (0..3).for_each(|k| launch_k(dev, &r, k)));
-    let per: Vec<String> = (3..6).map(|k| format!("{:.3}", median(dev, || launch_k(dev, &r, k)))).collect();
+    let per: Vec<String> = (3..5).map(|k| format!("{:.3}", median(dev, || launch_k(dev, &r, k)))).collect();
     let name = match mode {
         Mode::Gdn => "gdn",
         Mode::Ssd => "ssd",
         Mode::Lin => "lin",
     };
     println!(
-        "{name} H={h} T={t} n={n} m={m} bv={bv} fwd+bwd {total:.3} ms (fwd {fwd:.3}, bwd aqk/state/grad {}) rel_err {} ({})",
+        "{name} H={h} T={t} n={n} m={m} bv={bv} fwd+bwd {total:.3} ms (fwd {fwd:.3}, bwd state/grad {}) rel_err {} ({})",
         per.join("/"),
         errs.join(" "),
         dev.name

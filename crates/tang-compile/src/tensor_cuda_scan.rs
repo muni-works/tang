@@ -435,7 +435,7 @@ extern "C" __global__ void __launch_bounds__(128) main0(
 const OUT: &str = r#"
 extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ Q, const bf* __restrict__ K, const float* __restrict__ GR,
-    const bf* __restrict__ Hs, const bf* __restrict__ Vn, bf* __restrict__ O) {
+    const bf* __restrict__ Hs, const bf* __restrict__ Vn, bf* __restrict__ O, bf* __restrict__ Ao) {
     extern __shared__ __align__(16) unsigned char smem[];
     bf* qs = (bf*)smem;                       // [C][LDK]
     bf* ab = qs + C * LDK;                    // [C][LDT]
@@ -468,12 +468,20 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             __syncwarp();
             for (int e = lane; e < 256; e += 32) {
                 const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
-                ab[r * LDT + j] = __float2bfloat16(j <= r ? stg[e] * __expf(gm[r] - gm[j]) : 0.0f);
+                const float v = j <= r ? stg[e] * __expf(gm[r] - gm[j]) : 0.0f;
+                ab[r * LDT + j] = __float2bfloat16(v);
+#if SAVE_T
+                Ao[(row0 + r) * C + j] = __float2bfloat16((float)SCALE * v);
+#endif
             }
             __syncwarp();
         } else {
-            for (int e = lane; e < 256; e += 32)
+            for (int e = lane; e < 256; e += 32) {
                 ab[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = __float2bfloat16(0.0f);
+#if SAVE_T
+                Ao[(row0 + tr * 16 + e / 16) * C + tc * 16 + e % 16] = __float2bfloat16(0.0f);
+#endif
+            }
         }
     }
     __syncthreads();
@@ -512,45 +520,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
 }
 "#;
 
-/// Backward kernel 1: `A_qk = scale·tril(q kᵀ ⊙ e^{γᵢ−γⱼ})` per chunk
-/// (bf16 `[H, T, C]`), for the reverse state scan. Grid `(T/C, H)`, 128
-/// threads.
-const BWD_AQK: &str = r#"
-extern "C" __global__ void __launch_bounds__(128) main0(
-    const bf* __restrict__ Q, const bf* __restrict__ K, const float* __restrict__ GR, bf* __restrict__ Ao) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    float* gm = (float*)smem;
-    float* stg = gm + C + (threadIdx.x >> 5) * 256;
-    const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const size_t row0 = (size_t)h * T + (size_t)c * C;
-    if (tid < C) gm[tid] = GR[row0 + tid];
-    __syncthreads();
-    for (int tt = warp; tt < 16; tt += 4) {
-        const int tr = tt >> 2, tc = tt & 3;
-        FC acc;
-        wmma::fill_fragment(acc, 0.0f);
-        if (tc <= tr) {
-            #pragma unroll
-            for (int e = 0; e < DK; e += 16) {
-                FA a;
-                FBc b;
-                wmma::load_matrix_sync(a, Q + (row0 + tr * 16) * DK + e, DK);
-                wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
-                wmma::mma_sync(acc, a, b, acc);
-            }
-        }
-        wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
-        __syncwarp();
-        for (int e = lane; e < 256; e += 32) {
-            const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
-            Ao[(row0 + r) * C + j] = __float2bfloat16(j <= r ? (float)SCALE * stg[e] * __expf(gm[r] - gm[j]) : 0.0f);
-        }
-        __syncwarp();
-    }
-}
-"#;
-
-/// Backward kernel 2: the reverse scan of the state cotangent with the
+/// Backward kernel 1: the reverse scan of the state cotangent with the
 /// transposed chunk map. Per chunk, from the last: write `dS_end` (bf16),
 /// `dV' = e^{γ_C−γ}·(k·dS) + A_qkᵀ·dO`, then `dS ← e^{γ_C}·dS − Wᵀ·dV' +
 /// qᵀ·(scale·e^{γ} dO)`. Grid `(DV/BV, H)`, 128 threads.
@@ -574,10 +544,35 @@ extern "C" __global__ void __launch_bounds__(128) main0(
     for (int i = 0; i < RT; i++)
         #pragma unroll
         for (int j = 0; j < NTC; j++) wmma::fill_fragment(st[i][j], 0.0f);
+    // this chunk's k row tile, and Wᵀ / qᵀ tiles of the warp's state rows,
+    // prefetched a chunk ahead into registers
+    FA kf[DK / 16];
+    FAc wf[RT][C / 16], qf[RT][C / 16];
+    float gcn = 0.0f, grn = 0.0f;
+    auto fetch = [&](int c, FA* k, FAc (*w)[C / 16], FAc (*q)[C / 16], float& g1, float& g2) {
+        const size_t r0 = (size_t)h * T + (size_t)c * C;
+        #pragma unroll
+        for (int e = 0; e < DK / 16; e++) wmma::load_matrix_sync(k[e], K + (r0 + warp * 16) * DK + e * 16, DK);
+        #pragma unroll
+        for (int i = 0; i < RT; i++)
+            #pragma unroll
+            for (int e = 0; e < C / 16; e++) {
+#if DELTA
+                wmma::load_matrix_sync(w[i][e], Wo + (r0 + e * 16) * DK + (warp * RT + i) * 16, DK);
+#endif
+                wmma::load_matrix_sync(q[i][e], Q + (r0 + e * 16) * DK + (warp * RT + i) * 16, DK);
+            }
+        g1 = GC[h * NT + c];
+        g2 = tid < C ? GR[r0 + tid] : 0.0f;
+    };
+    fetch(NT - 1, kf, wf, qf, gcn, grn);
     for (int c = NT - 1; c >= 0; c--) {
         const size_t row0 = (size_t)h * T + (size_t)c * C;
-        const float glast = GC[h * NT + c];
-        if (tid < C) gm[tid] = GR[row0 + tid];
+        const float glast = gcn;
+        if (tid < C) gm[tid] = grn;
+        FA kn[DK / 16];
+        FAc wn[RT][C / 16], qn[RT][C / 16];
+        if (c > 0) fetch(c - 1, kn, wn, qn, gcn, grn);
         bf* dhs = DHs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
         for (int i = 0; i < RT; i++)
@@ -602,11 +597,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             wmma::fill_fragment(a2, 0.0f);
             #pragma unroll
             for (int e = 0; e < DK; e += 16) {
-                FA a;
                 FBr b;
-                wmma::load_matrix_sync(a, K + (row0 + tr * 16) * DK + e, DK);
                 wmma::load_matrix_sync(b, sb + e * LDB + tcol * 16, LDB);
-                wmma::mma_sync(a1, a, b, a1);
+                wmma::mma_sync(a1, kf[e / 16], b, a1);
             }
             // A_qkᵀ is upper: rows tr need columns e ≥ tr of A_qk
             for (int e = tr * 16; e < C; e += 16) {
@@ -644,24 +637,32 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 for (int x = 0; x < st[i][j].num_elements; x++) st[i][j].x[x] *= gc;
                 #pragma unroll
                 for (int e = 0; e < C; e += 16) {
-                    FAc a;
                     FBr b;
 #if DELTA
-                    wmma::load_matrix_sync(a, Wo + (row0 + e) * DK + (warp * RT + i) * 16, DK);
                     wmma::load_matrix_sync(b, vng + e * LDB + j * 16, LDB);
-                    wmma::mma_sync(st[i][j], a, b, st[i][j]);
+                    wmma::mma_sync(st[i][j], wf[i][e / 16], b, st[i][j]);
 #endif
-                    wmma::load_matrix_sync(a, Q + (row0 + e) * DK + (warp * RT + i) * 16, DK);
                     wmma::load_matrix_sync(b, dog + e * LDB + j * 16, LDB);
-                    wmma::mma_sync(st[i][j], a, b, st[i][j]);
+                    wmma::mma_sync(st[i][j], qf[i][e / 16], b, st[i][j]);
                 }
             }
+        if (c > 0) {
+            #pragma unroll
+            for (int e = 0; e < DK / 16; e++) kf[e] = kn[e];
+            #pragma unroll
+            for (int i = 0; i < RT; i++)
+                #pragma unroll
+                for (int e = 0; e < C / 16; e++) {
+                    wf[i][e] = wn[i][e];
+                    qf[i][e] = qn[i][e];
+                }
+        }
         __syncthreads();
     }
 }
 "#;
 
-/// Backward kernel 3: per chunk, everything else. With `S₀` (forward
+/// Backward kernel 2: per chunk, everything else. With `S₀` (forward
 /// states), `dS_end`, `dV'`, `dO`, `V'`, `W` and the saved `T`:
 /// `dW = −dV'·S₀ᵀ`, `dT = (dV'·vᵀ)diag(β) + (dW·kᵀ)diag(β e^γ)`,
 /// `dA = −Tᵀ·dT·Tᵀ`, then `dq`, `dk`, `dv`, `dβ` and `dα` through the
@@ -1153,9 +1154,9 @@ impl ChunkedScan {
 
     /// The three launches: per-chunk transform, state scan, readout.
     /// `bv` is the state column block of the scan (16, 32 or 64).
-    /// Arguments, in order — prep: `k v α β | W U γ γ_C`; state: `W U k γ
-    /// γ_C | H V'`; readout: `q k γ H V' | o` (`V'` is `U` without the
-    /// delta term).
+    /// Arguments, in order — prep: `k v α β | W U γ γ_C T`; state: `W U k
+    /// γ γ_C | H V'`; readout: `q k γ H V' | o A_qk` (`V'` is `U` without
+    /// the delta term; `T` and `A_qk` are written only when saving).
     pub fn kernels(&self, bv: usize) -> [ScanLaunch; 3] {
         self.kernels_saving(bv, false)
     }
@@ -1214,33 +1215,35 @@ impl ChunkedScan {
 
     /// The backward: the reverse scan of the state cotangent (derived:
     /// the transposed chunk map) and the per-chunk gradients. Arguments —
-    /// `A_qk`: `q k γ | Aqk`; state: `q k W Aqk dO γ γ_C | dS_end dV'`;
-    /// grad: `q k v α β γ γ_C T S dS_end dO V' dV' | dq dk dv dα dβ`
-    /// (bf16 `dq dk dv`, f32 `dα dβ`; `V'` is `U` without the delta term). Needs the
-    /// forward's `W`, states `S`, `V'`, `γ`, `γ_C`, and `T` from
-    /// [`kernels_saving`](Self::kernels_saving).
-    pub fn backward_kernels(&self, bv: usize) -> [ScanLaunch; 3] {
+    /// state: `q k W Aqk dO γ γ_C | dS_end dV'`; grad: `q k v α β γ γ_C T
+    /// S dS_end dO V' dV' | dq dk dv dα dβ` (bf16 `dq dk dv`, f32 `dα
+    /// dβ`; `V'` is `U` without the delta term). Needs the forward run
+    /// with [`kernels_saving`](Self::kernels_saving) (`T`, `A_qk`) and its
+    /// `W`, states `S`, `V'`, `γ`, `γ_C`.
+    pub fn backward_kernels(&self, bv: usize) -> [ScanLaunch; 2] {
         assert!(self.n == 128 && self.m == 128, "chunked scan backward: n = m = 128 only");
         let d = self.defines(false);
         let c = CHUNK;
         let ldb = bv + 8;
-        let smem0 = c * 4 + 4 * 256 * 4;
         let smem1 = (self.n * ldb + 2 * c * ldb) * 2 + c * 4 + 4 * 512 * 4;
         let smem2 = 2 * c * (c + 4) * 4 + c * (c + 8) * 4 + c * (c + 8) * 2 + c * (self.n + 8) * 2 + 4 * c * 4 + 16 + 8 * 256 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
             let x = std::env::var("TANG_SCAN_DEFS").unwrap_or_default().replace(';', "\n");
             format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{x}\n{extra}{PRELUDE}{body}")
         };
-        let chunks = ((self.t / c) as u32, self.heads as u32, 1);
         [
-            ScanLaunch { source: src(smem0, "", BWD_AQK), grid: chunks, block: 128, smem: smem0 as u32 },
             ScanLaunch {
                 source: src(smem1, &format!("#define BV {bv}\n"), BWD_STATE),
                 grid: ((self.m / bv) as u32, self.heads as u32, 1),
                 block: 128,
                 smem: smem1 as u32,
             },
-            ScanLaunch { source: src(smem2, "", BWD_GRAD), grid: chunks, block: 256, smem: smem2 as u32 },
+            ScanLaunch {
+                source: src(smem2, "", BWD_GRAD),
+                grid: ((self.t / c) as u32, self.heads as u32, 1),
+                block: 256,
+                smem: smem2 as u32,
+            },
         ]
     }
 }
