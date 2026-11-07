@@ -143,6 +143,9 @@ enum Val {
     /// A value already computed into a variable (an inlined reduction
     /// of an in-place update, evaluated before the body).
     Var(String),
+    /// Element `addr` of staged producer `i`'s shared-memory copy
+    /// (`staged_map`).
+    Staged(usize, Addr),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -323,7 +326,9 @@ impl TensorGraph {
                 None if tiles.contains(&root) => mma(),
                 None => mma()
                     .or_else(|| lw.shared_reduction(root))
+                    .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
+                    .or_else(|| lw.staged_map(root))
                     .or_else(|| lw.point_map(root)),
             };
             // TANG_CL_LOG=1: which lowering each reduction got (prefill)
@@ -525,6 +530,14 @@ impl super::TNode {
     }
 }
 
+/// A split reduction's combine fused into its partial (`split_fused`):
+/// the combine node, the map it is the epilogue of (if any), the parts.
+struct Fix {
+    c: usize,
+    e: Option<usize>,
+    parts: usize,
+}
+
 struct Lowering<'a> {
     g: &'a TensorGraph,
     reads: &'a [usize],
@@ -645,6 +658,7 @@ fn val_uses(v: &Val, leaves: &[Leaf], d: usize) -> bool {
         Val::Iota(f) => f.coefs[d] != 0,
         Val::Map { args, .. } => args.iter().any(|a| val_uses(a, leaves, d)),
         Val::Var(_) => false,
+        Val::Staged(_, a) => a.coefs[d] != 0,
     }
 }
 
@@ -804,6 +818,7 @@ impl Lowering<'_> {
     ) -> String {
         match v {
             Val::Var(name) => name.clone(),
+            Val::Staged(i, a) => format!("sm{i}[{}]", addr_expr(a, coords)),
             Val::Leaf(i) => leaf(*i),
             Val::Iota(f) => format!("(float)({})", form_expr(f, coords)),
             Val::Map { body, out, args } => {
@@ -1477,6 +1492,76 @@ impl Lowering<'_> {
 
     /// A reduction (or a map that is its epilogue) as warp kernels.
     fn warp_reduction(&self, root: usize) -> Option<Kernel> {
+        self.warp_reduction_fix(root, None)
+    }
+
+    /// A split reduction (`split_reduction`: a partial over `[parts, …]`
+    /// and a combine summing the parts, perhaps the epilogue of a map)
+    /// as one kernel: the partial's warp reduction writes its part to a
+    /// module-scope scratch, and the warp that finishes a point group's
+    /// last part (a per-group arrival counter) sums the parts and runs
+    /// the combine and its epilogue. The combine is a dependent launch
+    /// otherwise. Taken when the schedule inlines the partial
+    /// (`TANG_SPLIT_FUSE=1` in the Qwen decode schedule).
+    fn split_fused(&self, root: usize) -> Option<Kernel> {
+        if std::env::var("TANG_SPLIT_FUSE").as_deref() == Ok("0") {
+            return None;
+        }
+        let g = self.g;
+        let rc = g.comp_at(root)?;
+        let is_combine = |c: &super::Comp| -> Option<usize> {
+            let m = c.monoid.as_ref()?;
+            if m.kind() != super::MonoidKind::Sum
+                || c.red.len() != 1
+                || c.tuple != 0
+                || c.body_outs.len() != 1
+                || c.args.len() != 1
+            {
+                return None;
+            }
+            let p = c.args[0].src.n();
+            let pc = g.comp_at(p)?;
+            let k = c.points().len();
+            // the split's view: (part, points…) from (points…, part)
+            let mut forms = vec![super::Form::unit(k + 1, k)];
+            forms.extend((0..k).map(|d| super::Form::unit(k + 1, d)));
+            (g.nodes[p].inline
+                && pc.monoid.is_some()
+                && pc.tuple == 0
+                && c.args[0].view.forms == forms
+                && !c.args[0].view.guard
+                && c.args[0].view.gather.is_none()
+                && pc.out[0].n() == c.red[0].n())
+            .then_some(p)
+        };
+        let (c, e) = if rc.monoid.is_some() {
+            (root, None)
+        } else {
+            let cs: Vec<usize> = rc
+                .args
+                .iter()
+                .map(|a| a.src.n())
+                .filter(|&p| {
+                    g.nodes[p].inline && g.comp_at(p).is_some_and(|pc| pc.monoid.is_some())
+                })
+                .collect();
+            let [c] = cs[..] else { return None };
+            let cc = g.comp_at(c)?;
+            let k = cc.points().len();
+            if rc.points().len() != k
+                || g.epilogue_read(rc, c)? != super::View::identity(k, k).forms
+            {
+                return None;
+            }
+            (c, Some(root))
+        };
+        let cc = g.comp_at(c)?;
+        let p = is_combine(cc)?;
+        let parts = cc.red[0].n();
+        self.warp_reduction_fix(p, Some(&Fix { c, e, parts }))
+    }
+
+    fn warp_reduction_fix(&self, root: usize, fix: Option<&Fix>) -> Option<Kernel> {
         let g = self.g;
         let c = g.comp_at(root)?;
         let (red_node, epi) = if c.monoid.is_some() {
@@ -1706,12 +1791,60 @@ impl Lowering<'_> {
                 }
             }
         }
-        let rt = reg.map_or(1, |r| r.1);
-        let on_reg = |cd: &Cond| reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0);
+        // a second register dim when it cuts the streamed bytes by a
+        // quarter more (attention's P·V: the GQA heads share V, a run of
+        // output dims shares the probabilities); 4-bit GEMVs keep one.
+        // `TANG_REG2=0` disables it
+        let mut reg2: Option<(usize, usize)> = None;
+        if let Some((d1, t1)) = reg {
+            if std::env::var("TANG_REG2").as_deref() != Ok("0")
+                && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            {
+                let bytes = |l: &Leaf| match l.pack {
+                    Some(Packing::U4) => 0.5,
+                    Some(Packing::Bf16 | Packing::F16) => 2.0,
+                    None => 4.0,
+                };
+                let cost = |d2: Option<(usize, usize)>| -> f64 {
+                    leaves
+                        .iter()
+                        .filter(|l| (pk..rank).any(|r| l.addr.coefs[r] != 0))
+                        .map(|l| {
+                            let mut b = bytes(l);
+                            if l.addr.coefs[d1] == 0 {
+                                b /= t1 as f64;
+                            }
+                            if let Some((d, t)) = d2 {
+                                if l.addr.coefs[d] == 0 {
+                                    b /= t as f64;
+                                }
+                            }
+                            b
+                        })
+                        .sum()
+                };
+                let base = cost(None);
+                reg2 = (0..pk)
+                    .filter(|&d| d != d1 && pts[d] > 1 && free(d))
+                    .flat_map(|d| [2usize, 4, 8].into_iter().map(move |t| (d, t)))
+                    .filter(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= 16)
+                    .min_by(|a, b| cost(Some(*a)).total_cmp(&cost(Some(*b))))
+                    .filter(|&c| cost(Some(c)) < 0.75 * base);
+            }
+        }
+        let (t1, t2) = (reg.map_or(1, |r| r.1), reg2.map_or(1, |r| r.1));
+        let rt = t1 * t2;
+        let on_reg = |cd: &Cond| {
+            reg.is_some_and(|(d, _)| cd.coefs[d] != 0.0)
+                || reg2.is_some_and(|(d, _)| cd.coefs[d] != 0.0)
+        };
         // a runtime scalar of a bound is loaded per point group: it may not
         // vary along the register dim
         let rt_on_reg = |cd: &Cond| {
-            reg.is_some_and(|(d, _)| cd.rt.iter().any(|&(_, i)| leaves[i].addr.coefs[d] != 0))
+            [reg, reg2]
+                .iter()
+                .flatten()
+                .any(|&(d, _)| cd.rt.iter().any(|&(_, i)| leaves[i].addr.coefs[d] != 0))
         };
         if point_conds
             .iter()
@@ -1735,19 +1868,54 @@ impl Lowering<'_> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(512);
-        let ks = if groups < ks_below { 8.max(warps) } else { 1 };
+        let chunks_inner = ri / vec;
+        let n_chunks: usize = red[..red.len() - 1].iter().product::<usize>() * chunks_inner;
+        // (only a reduction long enough to give each warp 32 chunks)
+        let ks = if groups < ks_below && n_chunks >= 256 {
+            8.max(warps)
+        } else {
+            1
+        };
         let threads = if ks > 1 { 32 * ks } else { 32 * warps };
-        let gpb = threads / 32 / ks;
+        // lanes per group: a short reduction (a split's combine over 4
+        // partials, attention's 128-wide q·k) shares a warp among
+        // 32 / lpg groups, each lane over ~4 chunks (`TANG_SUBWARP=0`: a
+        // warp per group)
+        // (a 4-bit weight's 32-wide chunks keep a warp per group: its
+        // lanes stream the weight rows)
+        let lpg = if ks == 1
+            && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            && std::env::var("TANG_SUBWARP").as_deref() != Ok("0")
+        {
+            n_chunks.div_ceil(4).next_power_of_two().clamp(1, 32)
+        } else {
+            32
+        };
+        let gpw = 32 / lpg;
+        let gpb = threads / 32 / ks * gpw;
         let blocks = if !point_conds.is_empty() && ks == 1 {
             // a grid-stride loop over the live groups
             groups.div_ceil(gpb).min(2048)
         } else {
             groups.div_ceil(gpb)
         };
-        let chunks_inner = ri / vec;
-        let n_chunks: usize = red[..red.len() - 1].iter().product::<usize>() * chunks_inner;
 
         let w_out = epi.map_or(w, |e| e.width());
+        // the fused split: one warp per group (no block split), the part
+        // axis (dim 0) not tiled, no live-group bound
+        if let Some(f) = fix {
+            if ks != 1
+                || lpg != 32
+                || w != 1
+                || epi.is_some()
+                || !point_conds.is_empty()
+                || pts[0] != f.parts
+                || reg.is_some_and(|(d, _)| d == 0)
+                || reg2.is_some_and(|(d, _)| d == 0)
+            {
+                return None;
+            }
+        }
         let mut s = String::new();
         writeln!(
             s,
@@ -1756,13 +1924,22 @@ impl Lowering<'_> {
         .unwrap();
         writeln!(
             s,
-            "// {groups} groups x {rt} points, {} reduce in chunks of {vec}, {ks} warps per group",
-            n_chunks * vec
+            "// {groups} groups x {rt} points, {} reduce in chunks of {vec}, {ks} warps per group{}",
+            n_chunks * vec,
+            if lpg < 32 {
+                format!(", {lpg} lanes per group")
+            } else {
+                String::new()
+            }
         )
         .unwrap();
         writeln!(s, "#define TANG_TILES {blocks}").unwrap();
         writeln!(s, "#define TANG_THREADS {threads}").unwrap();
         s.push_str(PRELUDE);
+        if fix.is_some() {
+            writeln!(s, "__device__ float tang_part[{n_points}];").unwrap();
+            writeln!(s, "__device__ unsigned tang_ctr[{}];", groups / pts[0]).unwrap();
+        }
         let mut params: Vec<String> = self
             .reads
             .iter()
@@ -1820,12 +1997,22 @@ impl Lowering<'_> {
             writeln!(s, "    const int ks = 0;").unwrap();
             writeln!(
                 s,
-                "    for (int grp = blockIdx.x * {gpb} + warp; grp < {limit}; grp += gridDim.x * {gpb}) {{"
+                "    for (int grp0 = blockIdx.x * {gpb} + warp * {gpw}; grp0 < {limit}; grp0 += gridDim.x * {gpb}) {{"
             )
             .unwrap();
+            // a sub-group past the limit still takes part in the shuffles
+            writeln!(
+                s,
+                "    const int sl = lane & {}, gv = grp0 + lane / {lpg};",
+                lpg - 1
+            )
+            .unwrap();
+            writeln!(s, "    const bool valid = gv < {limit};").unwrap();
+            writeln!(s, "    const int grp = valid ? gv : grp0;").unwrap();
         } else {
             writeln!(s, "    const int grp = blockIdx.x;").unwrap();
-            writeln!(s, "    const int ks = warp;").unwrap();
+            writeln!(s, "    const int ks = warp, sl = lane;").unwrap();
+            writeln!(s, "    const bool valid = true;").unwrap();
         }
         // group -> point coords (the register dim in steps of rt)
         let mut rem = "grp".to_string();
@@ -1834,24 +2021,38 @@ impl Lowering<'_> {
             .filter(|&d| Some(d) != dyn_dim)
             .chain(dyn_dim)
             .collect();
-        for d in order {
-            let n = if reg.is_some_and(|(r, _)| r == d) {
-                pts[d] / rt
+        let tile = |d: usize| {
+            if reg.is_some_and(|(r, _)| r == d) {
+                t1
+            } else if reg2.is_some_and(|(r, _)| r == d) {
+                t2
             } else {
-                pts[d]
-            };
-            let mul = if reg.is_some_and(|(r, _)| r == d) {
-                format!(" * {rt}")
+                1
+            }
+        };
+        for d in order {
+            let n = pts[d] / tile(d);
+            let mul = if tile(d) > 1 {
+                format!(" * {}", tile(d))
             } else {
                 String::new()
             };
             writeln!(s, "    const int p{d} = (({rem}) % {n}){mul};").unwrap();
             rem = format!("({rem}) / {n}");
         }
+        // register point r = (r1, r2) = (r / t2, r % t2)
+        let d1 = reg.map(|r| r.0);
+        let d2 = reg2.map(|r| r.0);
         let mut coords: Vec<String> = (0..pk)
             .map(|d| {
-                if reg.is_some_and(|(r, _)| r == d) {
-                    format!("(p{d} + r)")
+                if Some(d) == d1 {
+                    if t2 > 1 {
+                        format!("(p{d} + r / {t2})")
+                    } else {
+                        format!("(p{d} + r)")
+                    }
+                } else if Some(d) == d2 {
+                    format!("(p{d} + r % {t2})")
                 } else {
                     format!("p{d}")
                 }
@@ -1885,9 +2086,9 @@ impl Lowering<'_> {
                     )
                 })
                 .collect();
-            writeln!(s, "    const bool live = {};", all.join(" && ")).unwrap();
+            writeln!(s, "    const bool live = valid && {};", all.join(" && ")).unwrap();
         } else {
-            writeln!(s, "    const bool live = true;").unwrap();
+            writeln!(s, "    const bool live = valid;").unwrap();
         }
         if let Some(cd) = &red_cond {
             // konst + rt + points + a·x > 0 on the reduce coord x
@@ -1929,8 +2130,8 @@ impl Lowering<'_> {
         }
         writeln!(
             s,
-            "    for (int c = {lo_chunk} + lane + 32 * ks; c < {hi_chunk}; c += {}) {{",
-            32 * ks
+            "    for (int c = {lo_chunk} + sl + {lpg} * ks; c < {hi_chunk}; c += {}) {{",
+            lpg * ks
         )
         .unwrap();
         // chunk -> outer reduce coords and the inner base
@@ -1941,10 +2142,30 @@ impl Lowering<'_> {
             rem = format!("({rem}) / {}", red[d]);
         }
         // preloads
-        let dep_r = |l: &Leaf| reg.is_some_and(|(d, _)| l.addr.coefs[d] != 0);
-        let at0: Vec<String> = coords.iter().map(|x| x.replace("(kb + e)", "kb")).collect();
+        let dep1 = |l: &Leaf| d1.is_some_and(|d| l.addr.coefs[d] != 0);
+        let dep2 = |l: &Leaf| d2.is_some_and(|d| l.addr.coefs[d] != 0);
+        // a leaf's copies: one per register point of the tiled dims it reads
+        let nr_of = |l: &Leaf| match (dep1(l), dep2(l)) {
+            (true, true) => rt,
+            (true, false) => t1,
+            (false, true) => t2,
+            (false, false) => 1,
+        };
+        // its coords while loading copy r
+        let leaf_at0 = |l: &Leaf| -> Vec<String> {
+            let mut c: Vec<String> = coords.iter().map(|x| x.replace("(kb + e)", "kb")).collect();
+            // (a leaf reading one tiled dim: copy r is that dim's r; the
+            // other dim's coefficient is 0)
+            if !(dep1(l) && dep2(l)) {
+                for d in [d1, d2].into_iter().flatten() {
+                    c[d] = format!("(p{d} + r)");
+                }
+            }
+            c
+        };
         for (i, l) in leaves.iter().enumerate() {
-            let nr = if dep_r(l) { rt } else { 1 };
+            let nr = nr_of(l);
+            let at0 = leaf_at0(l);
             match class[i] {
                 0 => {
                     writeln!(s, "        float h{i}[{nr}];").unwrap();
@@ -2004,7 +2225,15 @@ impl Lowering<'_> {
         writeln!(s, "        for (int r = 0; r < {rt}; r++) {{").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int e = 0; e < {vec}; e++) {{").unwrap();
-        let ri_ = |l: &Leaf| if dep_r(l) { "r" } else { "0" };
+        let ri_ = |l: &Leaf| -> String {
+            match (dep1(l), dep2(l)) {
+                (true, true) => "r".into(),
+                (true, false) if t2 > 1 => format!("(r / {t2})"),
+                (true, false) => "r".into(),
+                (false, true) => format!("(r % {t2})"),
+                (false, false) => "0".into(),
+            }
+        };
         let leaf_expr = |i: usize| -> String {
             let l = &leaves[i];
             match class[i] {
@@ -2042,7 +2271,7 @@ impl Lowering<'_> {
 
         // shuffle combine
         writeln!(s, "    #pragma unroll").unwrap();
-        writeln!(s, "    for (int off = 16; off > 0; off >>= 1) {{").unwrap();
+        writeln!(s, "    for (int off = {}; off > 0; off >>= 1) {{", lpg / 2).unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int r = 0; r < {rt}; r++) {{").unwrap();
         let others: Vec<String> = (0..w).map(|k| format!("o{k}")).collect();
@@ -2094,7 +2323,7 @@ impl Lowering<'_> {
         // epilogue and write: lane r writes register point r
         writeln!(s, "    #pragma unroll").unwrap();
         writeln!(s, "    for (int r = 0; r < {rt}; r++) {{").unwrap();
-        writeln!(s, "        if (lane != r) continue;").unwrap();
+        writeln!(s, "        if (!valid || sl != r % {lpg}) continue;").unwrap();
         let pcoords: Vec<String> = coords[..pk].to_vec();
         let vals: Vec<String> = match epi {
             Some(ec) => {
@@ -2125,10 +2354,74 @@ impl Lowering<'_> {
             flat = format!("({flat}) * {np} + {}", pcoords[d]);
         }
         writeln!(s, "        const int o = {flat};").unwrap();
+        let dst = if fix.is_some() { "tang_part" } else { "out" };
         for (slot, v) in vals.iter().enumerate() {
-            writeln!(s, "        out[o * {w_out} + {slot}] = {v};").unwrap();
+            writeln!(s, "        {dst}[o * {w_out} + {slot}] = {v};").unwrap();
         }
         writeln!(s, "    }}").unwrap();
+        if let Some(f) = fix {
+            // the last part of this group to arrive sums them all
+            let gr = groups / pts[0];
+            let rest: usize = pts[1..].iter().product();
+            writeln!(s, "    __threadfence();").unwrap();
+            writeln!(s, "    unsigned lastw = 0u;").unwrap();
+            writeln!(
+                s,
+                "    if (lane == 0 && valid) lastw = atomicAdd(&tang_ctr[grp % {gr}], 1u) == {}u;",
+                f.parts - 1
+            )
+            .unwrap();
+            writeln!(s, "    lastw = __shfl_sync(0xffffffffu, lastw, 0);").unwrap();
+            writeln!(s, "    if (lastw) {{").unwrap();
+            writeln!(s, "    __threadfence();").unwrap();
+            writeln!(s, "    #pragma unroll").unwrap();
+            writeln!(s, "    for (int r = 0; r < {rt}; r++) {{").unwrap();
+            writeln!(s, "        if (sl != r % {lpg}) continue;").unwrap();
+            let ccoords: Vec<String> = pcoords[1..].to_vec();
+            let mut cflat = "0".to_string();
+            for (d, &np) in pts[1..].iter().enumerate() {
+                cflat = format!("({cflat}) * {np} + {}", ccoords[d]);
+            }
+            writeln!(s, "        const int oc = {cflat};").unwrap();
+            writeln!(s, "        float v = 0.0f;").unwrap();
+            writeln!(
+                s,
+                "        for (int q = 0; q < {}; q++) v += __ldcg(&tang_part[q * {rest} + oc]);",
+                f.parts
+            )
+            .unwrap();
+            let cvals: Vec<String> = match f.e {
+                Some(e) => {
+                    let ec = g.comp_at(e)?;
+                    let mut eleaves = Vec::new();
+                    let mut evals = Vec::new();
+                    for a in &ec.args {
+                        if a.src.n() == f.c {
+                            evals.push("v".to_string());
+                            continue;
+                        }
+                        let tv = self.tree(a, pk - 1, &mut eleaves)?;
+                        let mut ctr = 200usize;
+                        let el = |i: usize| {
+                            let l: &Leaf = &eleaves[i];
+                            load(l.buf, l.pack, &addr_expr(&l.addr, &ccoords))
+                        };
+                        evals.push(self.emit_val(&mut s, &tv, &ccoords, "        ", &mut ctr, &el));
+                    }
+                    emit(&mut s, &ec.body, &ec.body_outs, "z_", "        ", &|v| {
+                        evals[v as usize].clone()
+                    })
+                }
+                None => vec!["v".to_string()],
+            };
+            let wc = cvals.len();
+            for (slot, v) in cvals.iter().enumerate() {
+                writeln!(s, "        out[oc * {wc} + {slot}] = {v};").unwrap();
+            }
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    if (lane == 0) tang_ctr[grp % {gr}] = 0u;").unwrap();
+            writeln!(s, "    }}").unwrap();
+        }
         if ks == 1 {
             writeln!(s, "    }}").unwrap();
         }
@@ -2265,6 +2558,285 @@ impl Lowering<'_> {
         })
     }
 
+    /// Whether the staged producers fit: Sum or Max of width 1 with a
+    /// reduce space, at most 4096 outputs in all.
+    fn staged_ok(&self, staged: &[usize]) -> Option<()> {
+        let mut total = 0usize;
+        for &p in staged {
+            let pc = self.g.comp_at(p)?;
+            let kind = pc.monoid.as_ref()?.kind();
+            if !matches!(kind, super::MonoidKind::Sum | super::MonoidKind::Max) || pc.red.is_empty()
+            {
+                return None;
+            }
+            total += numel(pc.points());
+        }
+        (total <= 4096).then_some(())
+    }
+
+    /// The staged producers into `__shared__ float sm{i}[…]` — one warp
+    /// per output point, lanes over its reduce space — then a block
+    /// barrier (emitted before any thread may return).
+    fn emit_staged(
+        &self,
+        s: &mut String,
+        staged: &[usize],
+        threads: usize,
+        ctr: &mut usize,
+    ) -> Option<()> {
+        let g = self.g;
+        writeln!(
+            s,
+            "    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;"
+        )
+        .unwrap();
+        for (i, &p) in staged.iter().enumerate() {
+            let pc = g.comp_at(p)?;
+            let m = pc.monoid.as_ref()?;
+            let sum = m.kind() == super::MonoidKind::Sum;
+            let ppts = fixed(pc.points());
+            let pred = fixed(&pc.red);
+            let (ppk, prank) = (ppts.len(), ppts.len() + pred.len());
+            let pn: usize = ppts.iter().product();
+            let rn: usize = pred.iter().product();
+            let mut pleaves = Vec::new();
+            let pargs = pc
+                .args
+                .iter()
+                .map(|a| self.tree(a, prank, &mut pleaves))
+                .collect::<Option<Vec<_>>>()?;
+            // warps per point: all of them share a point when there are
+            // few (an RMSNorm's one), partials combined through smem
+            let nw = threads / 32;
+            let mut wpp = 1;
+            while wpp * 2 * pn <= nw {
+                wpp *= 2;
+            }
+            let groups = nw / wpp;
+            writeln!(s, "    __shared__ float sm{i}[{pn}];").unwrap();
+            if wpp > 1 {
+                writeln!(s, "    __shared__ float smp{i}[{nw}];").unwrap();
+            }
+            writeln!(
+                s,
+                "    for (int q = warp / {wpp}; q < {pn}; q += {groups}) {{"
+            )
+            .unwrap();
+            let id = flit(m.identity[0]);
+            writeln!(s, "        float acc = {id};").unwrap();
+            writeln!(
+                s,
+                "        for (int r = lane + 32 * (warp % {wpp}); r < {rn}; r += {}) {{",
+                32 * wpp
+            )
+            .unwrap();
+            let mut rem = "q".to_string();
+            for d in (0..ppk).rev() {
+                writeln!(s, "        const int c{d} = ({rem}) % {};", ppts[d]).unwrap();
+                rem = format!("({rem}) / {}", ppts[d]);
+            }
+            let mut rem = "r".to_string();
+            for d in (0..pred.len()).rev() {
+                writeln!(s, "        const int c{} = ({rem}) % {};", ppk + d, pred[d]).unwrap();
+                rem = format!("({rem}) / {}", pred[d]);
+            }
+            let pcoords: Vec<String> = (0..prank).map(|d| format!("c{d}")).collect();
+            let el = |k: usize| {
+                let l: &Leaf = &pleaves[k];
+                load(l.buf, l.pack, &addr_expr(&l.addr, &pcoords))
+            };
+            let vals: Vec<String> = pargs
+                .iter()
+                .map(|a| self.emit_val(s, a, &pcoords, "        ", ctr, &el))
+                .collect();
+            *ctr += 1;
+            let y = emit(
+                s,
+                &pc.body,
+                &pc.body_outs,
+                &format!("r{}_", *ctr),
+                "        ",
+                &|v| vals[v as usize].clone(),
+            );
+            if sum {
+                writeln!(s, "        acc += {};", y[0]).unwrap();
+            } else {
+                writeln!(s, "        acc = fmaxf(acc, {});", y[0]).unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        for (int o = 16; o > 0; o >>= 1) {{").unwrap();
+            writeln!(
+                s,
+                "            float v = __shfl_xor_sync(0xffffffffu, acc, o);"
+            )
+            .unwrap();
+            if sum {
+                writeln!(s, "            acc += v;").unwrap();
+            } else {
+                writeln!(s, "            acc = fmaxf(acc, v);").unwrap();
+            }
+            writeln!(s, "        }}").unwrap();
+            if wpp > 1 {
+                writeln!(s, "        if (lane == 0) smp{i}[warp] = acc;").unwrap();
+                writeln!(s, "    }}").unwrap();
+                writeln!(s, "    __syncthreads();").unwrap();
+                writeln!(s, "    if (threadIdx.x < {pn}) {{").unwrap();
+                writeln!(s, "        float acc = smp{i}[threadIdx.x * {wpp}];").unwrap();
+                writeln!(s, "        for (int k = 1; k < {wpp}; k++) {{").unwrap();
+                let v = format!("smp{i}[threadIdx.x * {wpp} + k]");
+                if sum {
+                    writeln!(s, "            acc += {v};").unwrap();
+                } else {
+                    writeln!(s, "            acc = fmaxf(acc, {v});").unwrap();
+                }
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "        sm{i}[threadIdx.x] = acc;").unwrap();
+                writeln!(s, "    }}").unwrap();
+            } else {
+                writeln!(s, "        if (lane == 0) sm{i}[q] = acc;").unwrap();
+                writeln!(s, "    }}").unwrap();
+            }
+        }
+        writeln!(s, "    __syncthreads();").unwrap();
+        Some(())
+    }
+
+    /// The value tree of `a` like [`Self::tree`], with an inlined
+    /// reduction of width 1 (the *staged producer*) read as an element of
+    /// a shared-memory copy of its whole output: `staged` collects the
+    /// producers ([`Val::Staged`]).
+    fn tree_staged(
+        &self,
+        a: &Arg,
+        rank: usize,
+        leaves: &mut Vec<Leaf>,
+        staged: &mut Vec<usize>,
+    ) -> Option<Val> {
+        if a.view.guard {
+            return None;
+        }
+        let j = a.src.n();
+        if matches!(self.g.nodes[j].op, Op::Iota(_)) || self.is_buffer(j) {
+            return self.tree(a, rank, leaves);
+        }
+        let mc = self.g.comp_at(j)?;
+        if !self.g.nodes[j].inline || mc.width() != 1 || mc.tuple != 0 {
+            return None;
+        }
+        if mc.monoid.is_some() {
+            let i = staged.iter().position(|&p| p == j).unwrap_or_else(|| {
+                staged.push(j);
+                staged.len() - 1
+            });
+            return Some(Val::Staged(i, self.g.flat_addr(a, rank)));
+        }
+        let args = mc
+            .args
+            .iter()
+            .map(|s| {
+                let view = s.view.compose(&a.view, rank);
+                self.tree_staged(&Arg { src: s.src, view }, rank, leaves, staged)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Val::Map {
+            body: mc.body.clone(),
+            out: mc.body_outs[0],
+            args,
+        })
+    }
+
+    /// A map that reads small inlined reductions (an RMSNorm's sum of
+    /// squares, per-head q/k-norm statistics): every block first computes
+    /// each such producer's whole output into shared memory — one warp
+    /// per producer point, lanes over its reduce space, a shuffle tree —
+    /// then evaluates its own points reading them from there. The
+    /// producer is recomputed per block instead of launched as a kernel
+    /// of its own (a decode step's statistics are a few thousand
+    /// elements; the launch and the dependency cost more).
+    /// `TANG_STAGED_MAP=0` disables it.
+    fn staged_map(&self, root: usize) -> Option<Kernel> {
+        if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("0") {
+            return None;
+        }
+        let g = self.g;
+        let c = g.comp_at(root)?;
+        if c.monoid.is_some()
+            || self.packed.contains_key(&root)
+            || g.nodes[root].precision.storage != super::Format::F32
+        {
+            return None;
+        }
+        let pts = fixed(c.points());
+        let pk = pts.len();
+        let w = c.width();
+        let mut leaves = Vec::new();
+        let mut staged = Vec::new();
+        let args = c
+            .args
+            .iter()
+            .map(|a| self.tree_staged(a, pk, &mut leaves, &mut staged))
+            .collect::<Option<Vec<_>>>()?;
+        if staged.is_empty() {
+            return None;
+        }
+        self.staged_ok(&staged)?;
+        let n: usize = pts.iter().product();
+        let threads = 256usize;
+        let blocks = n.div_ceil(threads);
+        let mut s = String::new();
+        writeln!(
+            s,
+            "// Auto-generated by tang-compile: map with staged reductions (decode)"
+        )
+        .unwrap();
+        writeln!(s, "#define TANG_TILES {blocks}").unwrap();
+        writeln!(s, "#define TANG_THREADS {threads}").unwrap();
+        s.push_str(PRELUDE);
+        let mut params: Vec<String> = self
+            .reads
+            .iter()
+            .map(|&j| format!("const float* __restrict__ b{j}"))
+            .collect();
+        params.push("float* __restrict__ out".into());
+        params.push("unsigned count".into());
+        writeln!(
+            s,
+            "extern \"C\" __global__ void __launch_bounds__({threads}) main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        let mut ctr = 0usize;
+        self.emit_staged(&mut s, &staged, threads, &mut ctr)?;
+        writeln!(s, "    const int t = blockIdx.x * {threads} + threadIdx.x;").unwrap();
+        writeln!(s, "    if (t >= {n}) return;").unwrap();
+        let mut rem = "t".to_string();
+        for d in (0..pk).rev() {
+            writeln!(s, "    const int p{d} = ({rem}) % {};", pts[d]).unwrap();
+            rem = format!("({rem}) / {}", pts[d]);
+        }
+        let coords: Vec<String> = (0..pk).map(|d| format!("p{d}")).collect();
+        let el = |i: usize| {
+            let l: &Leaf = &leaves[i];
+            load(l.buf, l.pack, &addr_expr(&l.addr, &coords))
+        };
+        let vals: Vec<String> = args
+            .iter()
+            .map(|a| self.emit_val(&mut s, a, &coords, "    ", &mut ctr, &el))
+            .collect();
+        let y = emit(&mut s, &c.body, &c.body_outs, "x_", "    ", &|v| {
+            vals[v as usize].clone()
+        });
+        for (slot, v) in y.iter().enumerate() {
+            writeln!(s, "    out[t * {w} + {slot}] = {v};").unwrap();
+        }
+        writeln!(s, "}}").unwrap();
+        Some(Kernel {
+            source: s,
+            threads,
+            blocks,
+        })
+    }
+
     /// `out = select(c₁, select(c₂, …y…, old), old)` written over `old`'s
     /// buffer (the donor `donor`): only the points where every `cᵢ` holds
     /// are visited, bounded along the one coordinate the conditions read.
@@ -2312,6 +2884,9 @@ impl Lowering<'_> {
             a
         };
         let mut leaves = Vec::new();
+        // small reductions under the args (the roped key's norm
+        // statistics) are staged in shared memory (`staged_map`)
+        let mut staged = Vec::new();
         let args = c
             .args
             .iter()
@@ -2320,10 +2895,13 @@ impl Lowering<'_> {
                 if red.is_some_and(|(r, _)| r == ai) {
                     Some(Val::Var(String::new()))
                 } else {
-                    self.tree(&widen(a), rank, &mut leaves)
+                    self.tree_staged(&widen(a), rank, &mut leaves, &mut staged)
                 }
             })
             .collect::<Option<Vec<_>>>()?;
+        if !staged.is_empty() {
+            self.staged_ok(&staged)?;
+        }
         // the reduction's args are over its own space: the points, then its coord
         let red_args = match red {
             Some((_, rc)) => Some(
@@ -2431,6 +3009,10 @@ impl Lowering<'_> {
             params.join(", ")
         )
         .unwrap();
+        let mut ctr = 0usize;
+        if !staged.is_empty() {
+            self.emit_staged(&mut s, &staged, threads, &mut ctr)?;
+        }
         writeln!(s, "    const int t = blockIdx.x * {threads} + threadIdx.x;").unwrap();
         writeln!(s, "    if (t >= {rest}) return;").unwrap();
         let mut rem = "t".to_string();
@@ -2457,7 +3039,6 @@ impl Lowering<'_> {
             }
         }
         writeln!(s, "    for (int p{dp} = lo; p{dp} < hi; p{dp}++) {{").unwrap();
-        let mut ctr = 0usize;
         let all_pts: Vec<usize> = (0..pk).collect();
         let mut value = |s: &mut String, coords: &[String], prefix: &str| {
             let el = |i: usize| {
@@ -2515,7 +3096,7 @@ impl Lowering<'_> {
             let vals: Vec<String> = args
                 .iter()
                 .map(|a| match a {
-                    Val::Var(_) => red_val.clone().unwrap(),
+                    Val::Var(n) if n.is_empty() => red_val.clone().unwrap(),
                     _ => self.emit_val(s, a, coords, "        ", &mut ctr, &el),
                 })
                 .collect();

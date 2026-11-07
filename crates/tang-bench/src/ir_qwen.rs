@@ -1369,6 +1369,136 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             g.set_inline(TensorId::from_index(i), false);
         }
     }
+    // CUDA decode, opt-in (TANG_SPLIT_FUSE=1): a split reduction's partial
+    // read only by its combine (a sum over the parts) is inlined there and
+    // the two run as one kernel (`split_fused`: the warp that finishes a
+    // group's last part sums them). Correct, but slower on the 3090 (the
+    // per-warp fence and arrival counter cost more than the combine launch
+    // in a CUDA graph: 6.86 vs 6.71 ms at 64), and a partial that lowers
+    // with a block split (few groups: the tiny model) has no fused form
+    if dg.seq == 1 && half_tiles && std::env::var("TANG_SPLIT_FUSE").as_deref() == Ok("1") {
+        use tang_compile::tensor::MonoidKind;
+        let n = g.nodes().len();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if let Some(c) = g.comp_at(i) {
+                for a in &c.args {
+                    readers[a.src.index()].push(i);
+                }
+            }
+        }
+        for ci in 0..n {
+            let Some(c) = g.comp_at(ci) else { continue };
+            if c.monoid.as_ref().map(|m| m.kind()) != Some(MonoidKind::Sum)
+                || c.red.len() != 1
+                || c.args.len() != 1
+                || c.tuple != 0
+            {
+                continue;
+            }
+            let p = c.args[0].src.index();
+            let Some(pc) = g.comp_at(p) else { continue };
+            let parts = c.red[0].n();
+            let split_shaped = pc.monoid.is_some()
+                && pc.tuple == 0
+                && pc.out.first().map(|d| d.n()) == Some(parts)
+                && pc.out.len() == c.out.len() + 1;
+            if split_shaped
+                && !g.nodes()[p].inline
+                && readers[p] == [ci]
+                && !outs.iter().any(|o| o.index() == p)
+            {
+                g.set_inline(TensorId::from_index(p), true);
+            }
+        }
+    }
+    // CUDA decode: a small Sum/Max reduction (RMSNorm's sum of squares,
+    // per-head q/k-norm statistics) read only by maps that are kernels of
+    // their own is recomputed inside each of them, staged once per block
+    // in shared memory (`staged_map`), instead of launched on its own
+    if dg.seq == 1 && half_tiles && std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+        use tang_compile::tensor::{numel, MonoidKind};
+        let n = g.nodes().len();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if let Some(c) = g.comp_at(i) {
+                for a in &c.args {
+                    readers[a.src.index()].push(i);
+                }
+            }
+        }
+        let protected: Vec<usize> = outs.iter().map(|t| t.index()).collect();
+        let cache_nodes: Vec<usize> = caches
+            .iter()
+            .flat_map(|t| [t.index(), g.storage(*t).index()])
+            .collect();
+        // a map read only by in-place cache updates (the roped key) is
+        // evaluated in them
+        for (i, rd) in readers.iter().enumerate() {
+            let Some(c) = g.comp_at(i) else { continue };
+            if c.monoid.is_none()
+                && c.tuple == 0
+                && !g.nodes()[i].inline
+                && !protected.contains(&i)
+                && !rd.is_empty()
+                && rd.iter().all(|r| cache_nodes.contains(r))
+            {
+                g.set_inline(TensorId::from_index(i), true);
+            }
+        }
+        // the non-inline comps a value reaches through inline maps
+        fn finals(g: &TensorGraph, readers: &[Vec<usize>], i: usize, out: &mut Vec<usize>) -> bool {
+            for &r in &readers[i] {
+                let Some(rc) = g.comp_at(r) else { return false };
+                if rc.monoid.is_some() {
+                    return false;
+                }
+                if g.nodes()[r].inline {
+                    if !finals(g, readers, r, out) {
+                        return false;
+                    }
+                } else if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+            true
+        }
+        for p in 0..n {
+            let Some(pc) = g.comp_at(p) else { continue };
+            let kind = pc.monoid.as_ref().map(|m| m.kind());
+            if !matches!(kind, Some(MonoidKind::Sum | MonoidKind::Max))
+                || g.nodes()[p].inline
+                || protected.contains(&p)
+                || pc.body_outs.len() != 1
+                || pc.tuple != 0
+                || numel(&pc.out) > 1024
+            {
+                continue;
+            }
+            let mut fs = Vec::new();
+            if readers[p].is_empty() || !finals(&g, &readers, p, &mut fs) {
+                continue;
+            }
+            // recomputed per consumer block: bounded work (the norms'
+            // statistics, not softmax's max over the keys)
+            let work = numel(&pc.out) * numel(&pc.red);
+            // (an in-place cache update visits one row of its longest dim)
+            let blocks = |f: usize| {
+                let out = &g.comp_at(f).unwrap().out;
+                let n = numel(out);
+                let n = if cache_nodes.contains(&f) {
+                    n / out.iter().map(|d| d.n()).max().unwrap_or(1)
+                } else {
+                    n
+                };
+                n.div_ceil(256)
+            };
+            if work > 1 << 16 || fs.iter().any(|&f| work * blocks(f) > 1 << 21) {
+                continue;
+            }
+            g.set_inline(TensorId::from_index(p), true);
+        }
+    }
     if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
         // prefill: the dequantized weights stored f16, so the matmuls run
         // on f16 tensor cores (the f32 activations are converted while
