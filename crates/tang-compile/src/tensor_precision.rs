@@ -99,7 +99,10 @@ impl Format {
     /// Whether this is a block format (its rounding is per block, not per
     /// element, and its buffer is not an array of one element type).
     pub fn is_block(self) -> bool {
-        matches!(self, Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32)
+        matches!(
+            self,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32
+        )
     }
 
     /// 32-bit words a buffer of `len` elements takes.

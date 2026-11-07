@@ -475,6 +475,7 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
         Some(IntMma {
             stage: Stage::Gemv,
             ksplit: 1,
+            pos_tile: t.min(8) as u32,
         }),
     );
     g.set_inline(xq, true);

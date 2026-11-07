@@ -279,6 +279,9 @@ impl TensorGraph {
             None
         };
         if s.stage == Stage::Gemv {
+            if s.pos_tile > 1 && wa.view.gather.is_some() {
+                return Err("pos_tile > 1 needs an ungathered weight".into());
+            }
             let wp = param(wi)?;
             let xp = if fused.is_some() {
                 String::new()
@@ -300,6 +303,7 @@ impl TensorGraph {
                 wp: &wp,
                 xp: &xp,
                 fused: fused.as_deref(),
+                ptile: (s.pos_tile.max(1) as usize).min(npos),
             }));
         }
         if b.per != 256 {
@@ -609,6 +613,8 @@ struct GemvShape<'a> {
     xp: &'a str,
     /// the inlined producer's prologue ([`TensorGraph::gemv_prologue`])
     fused: Option<&'a str>,
+    /// positions a block (one weight read for all of them)
+    ptile: usize,
 }
 
 /// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
@@ -617,6 +623,9 @@ struct GemvShape<'a> {
 /// warp, 8 warps a block, one position a block. Same scaling as the MMA
 /// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
 fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
+    if g.b.per == 32 && g.ptile > 1 {
+        return gemv_kernel_q8_0_tiled(g);
+    }
     if g.b.per == 32 {
         return gemv_kernel_q8_0(g);
     }
@@ -831,4 +840,113 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     )
     .unwrap();
     (src, 256, g.npos * row_blocks)
+}
+
+/// [`gemv_kernel_q8_0`] with `ptile` positions a block: each lane loads a
+/// weight block once and dots it with every position's activations (the
+/// decode window's rows share the weight traffic).
+fn gemv_kernel_q8_0_tiled(g: &GemvShape) -> (String, usize, usize) {
+    let pt = g.ptile;
+    let units = g.k / 128;
+    let lanes = units.next_power_of_two().clamp(1, 32);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let row_bytes = g.k / 32 * 34;
+    let ptiles = g.npos.div_ceil(pt);
+    let (k, kb) = (g.k, g.k / 32);
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let xsrc = match g.fused {
+        Some(pro) => {
+            let pro = pro
+                .replace("tang_sx[", &format!("(tang_sx + tang_j * {k})["))
+                .replace("tang_ss[", &format!("(tang_ss + tang_j * {kb})["));
+            format!(
+                "    __shared__ __align__(16) signed char tang_sx[{pk}];\n    __shared__ float2 tang_ss[{pkb}];\n    for (int tang_j = 0; tang_j < np; tang_j++) {{ const long long P = pos0 + tang_j;\n{decode}{xkey_decl}{pro}    }}\n    __syncthreads();\n    const signed char* xcj[{pt}]; const float2* xsj[{pt}];\n    #pragma unroll\n    for (int j = 0; j < {pt}; j++) {{ xcj[j] = tang_sx + j * {k}; xsj[j] = tang_ss + j * {kb}; }}\n",
+                pk = pt * k,
+                pkb = pt * kb,
+                decode = g.decode,
+            )
+        }
+        None => format!(
+            "    const signed char* xcj[{pt}]; const float2* xsj[{pt}];\n    #pragma unroll\n    for (int j = 0; j < {pt}; j++) {{\n        long long xr = 0;\n        if (j < np) {{ const long long P = pos0 + j;\n{decode}{xkey_decl}          xr = ({x_off}); }}\n        xcj[j] = (const signed char*)({xp}) + xr;\n        xsj[j] = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;\n    }}\n",
+            decode = g.decode,
+            x_off = g.x_off,
+            xp = g.xp,
+            x_total = g.x_total,
+        ),
+    };
+    let xld = if g.fused.is_some() { "*" } else { "__ldg" };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    if g.fused.is_some() {
+        src.push_str(
+            "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
+        );
+    }
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int ptl = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (ptl >= {ptiles}) return;
+    const int pos0 = ptl * {pt}, np = min({pt}, {npos} - pos0);
+    const bool live = r < {rows};
+    const unsigned char* wr;
+    {{ const long long P = pos0;
+{decode}      const long long KEY = {wkey}; (void)KEY;
+      wr = (const unsigned char*)({wp}) + ({w_off}) / 32 * 34 + (size_t)(live ? r : 0) * {row_bytes}; }}
+{xsrc}    float acc[{pt}];
+    #pragma unroll
+    for (int j = 0; j < {pt}; j++) acc[j] = 0.f;
+    if (live) {{
+        for (int u = u0; u < {units}; u += {lanes}) {{
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {{
+                const int blk = 4 * u + b;
+                const unsigned short* bp = (const unsigned short*)(wr + (size_t)blk * 34);
+                const float d = tang_h2f_bits(__ldg(bp));
+                unsigned q[8];
+                #pragma unroll
+                for (int w = 0; w < 8; w++) q[w] = (unsigned)__ldg(bp + 1 + 2 * w) | ((unsigned)__ldg(bp + 2 + 2 * w) << 16);
+                #pragma unroll
+                for (int j = 0; j < {pt}; j++) {{
+                    if (j < np) {{
+                        const int4* xv = (const int4*)(xcj[j] + blk * 32);
+                        const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
+                        int dot = 0;
+                        #pragma unroll
+                        for (int w = 0; w < 8; w++) dot = __dp4a((int)q[w], w & 4 ? (&x4[1].x)[w & 3] : (&x4[0].x)[w & 3], dot);
+                        const float2 xd = {xld}(xsj[j] + blk);
+                        acc[j] = fmaf(d * xd.x, (float)dot, acc[j]);
+                    }}
+                }}
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int j = 0; j < {pt}; j++) {{
+        float a = acc[j];
+        #pragma unroll
+        for (int o = {lanes} / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (live && u0 == 0 && j < np) out[(long long)(pos0 + j) * {rows} + r] = a;
+    }}
+}}
+"#,
+        params = params.join(", "),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        wp = g.wp,
+        w_off = g.w_off,
+    )
+    .unwrap();
+    (src, 256, ptiles * row_blocks)
 }
