@@ -36,10 +36,11 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The defaults; `wide` is the engine's wide window width (0: none).
+    /// The defaults; `wide` is the engine's wide window width (0: none). Full chunks are a
+    /// whole wide window (wider windows give each expert more tokens).
     pub fn defaults(wide: usize) -> Self {
         let (full, slice, max_chunk) = if wide > 0 {
-            (2048.min(wide), 1024.min(wide), 2048.min(wide))
+            (wide, 1024.min(wide), wide)
         } else {
             (256, 64, 256)
         };
