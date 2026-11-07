@@ -1421,10 +1421,23 @@ impl Program {
                     } else {
                         0
                     };
-                let variants: Vec<WgslProgram> = std::iter::once(None)
-                    .chain((0..n).map(Some))
-                    .map(|v| g.to_cuda_variant(outputs, v))
-                    .collect();
+                let sm = match rt {
+                    Runtime::Cuda(d) => d
+                        .arch
+                        .trim_start_matches("sm_")
+                        .trim_end_matches('a')
+                        .parse()
+                        .unwrap_or(0),
+                    #[allow(unreachable_patterns)]
+                    _ => 0,
+                };
+                let variants: Vec<WgslProgram> =
+                    tang_compile::tensor::cuda::with_cuda_sm(sm, || {
+                        std::iter::once(None)
+                            .chain((0..n).map(Some))
+                            .map(|v| g.to_cuda_variant(outputs, v))
+                            .collect()
+                    });
                 Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)
             }
             // one lowering on OpenCL

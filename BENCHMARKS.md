@@ -3384,6 +3384,34 @@ The `wgmma` kernel is 1.1–1.27× the `mma.sync` one. It reaches 0.81–0.96× 
 
 Raw log: `docs/bench/hopper-h200-d256-and-wgmma-bwd.log`.
 
+## Warp-specialized and d=256 attention backward (H200 SXM, bf16, kernel-only)
+
+Same harness as above (`attn_bwd_check`, `hopper_attention`), fused kernel vs `torch.nn.functional.scaled_dot_product_attention` backward. All variants agree with the unfused program to 3e-3–1.1e-2 rel (`docs/bench/hopper-h200-attn-bwd-ws-d256.log`).
+
+Fused kernel, ms, per variant (7 = wgmma + producer warpgroup, 8 = wgmma, 9/10 = mma.sync):
+
+| case | ws (7) | wg (8) | mma (9) |
+|---|---|---|---|
+| bh=64 n=1k d=64 causal | 0.268 | 0.195 | 0.208 |
+| bh=16 n=2k d=128 | 0.371 | 0.416 | 0.463 |
+| bh=8 n=4k d=128 causal | 0.599 | 0.583 | 0.677 |
+| bh=2 n=2k d=256 | 0.231 | 0.231 | 0.330 |
+
+The producer warpgroup wins at d=128 non-causal (1.12×) and loses at d=64, where it spills (ptxas budgets 168 regs for 384 threads). Autotune picks per shape.
+
+Fused d=256 backward (new; previously unfused), kernel vs SDPA:
+
+| case | tang kernel | SDPA bwd | ratio |
+|---|---|---|---|
+| bh=128 n=1k | 1.97 ms | 1.73 ms | 0.88× |
+| bh=32 n=4k | 7.04 ms | 5.68 ms | 0.81× |
+| bh=8 n=16k | 27.4 ms | 21.6 ms | 0.79× |
+| bh=128 n=1k causal | 1.11 ms | 1.14 ms | 1.03× |
+| bh=32 n=4k causal | 3.59 ms | 3.16 ms | 0.88× |
+| bh=8 n=16k causal | 13.4 ms | 10.8 ms | 0.80× |
+
+d=128 n=16k: kernel 19.8 ms (non-causal), 10.8 ms (causal). Two blocks/SM is not reachable at 256 consumer threads (needs ≤128 regs; dV/dK accumulators alone are 128 at d=128). Softmax/GEMM overlap not done yet.
+
 ## Scans: chunked delta rule, SSD and linear attention (RTX 3090, H200 SXM; bf16, kernel-only)
 
 `delta_scan` + `scan_readout` in tensor IR, lowered by `chunked_scan_plan`

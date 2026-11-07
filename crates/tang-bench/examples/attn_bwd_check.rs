@@ -67,7 +67,21 @@ fn main() {
         let mut res = Vec::new();
         for fused in [true, false] {
             std::env::set_var("TANG_NO_ATTN_BWD", if fused { "0" } else { "1" });
-            let prog = g.to_cuda_variant(&outs, variant);
+            let sm: u32 = std::env::var("SM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(match &rt {
+                    Runtime::Cuda(d) => d
+                        .arch
+                        .trim_start_matches("sm_")
+                        .trim_end_matches('a')
+                        .parse()
+                        .unwrap_or(0),
+                    #[allow(unreachable_patterns)]
+                    _ => 0,
+                });
+            let prog =
+                tang_compile::tensor::cuda::with_cuda_sm(sm, || g.to_cuda_variant(&outs, variant));
             let fk = prog
                 .kernels
                 .iter()
