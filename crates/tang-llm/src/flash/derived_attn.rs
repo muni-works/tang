@@ -202,6 +202,7 @@ pub enum Role {
     Pos,
 }
 
+#[cfg(feature = "cuda")]
 fn define(src: &str, name: &str) -> Option<u32> {
     src.lines()
         .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
