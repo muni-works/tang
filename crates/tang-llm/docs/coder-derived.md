@@ -88,3 +88,23 @@ numbers. Order of the remaining work, by what unblocks the most:
 - Startup already spends ~120 s building kernels: keep added compile time small, or cache the PTX
   under `/workspace/zest/kernels`.
 - Behind a switch, off by default. Gates: flash-wide-check, batch-check N=8 bitwise, a continuation case.
+
+## Part 2 (2026-11-07): `TANG_CODER_DERIVED=moe`
+
+- `derived_ops::moe_block`: one decode window's MoE layer after the router, as one graph — top-k
+  routing, gathered Q4_K/Q5_K gate and up GEMVs (x int8 per 32), SwiGLU int8, gathered Q5_K down,
+  Q8_0 shared expert (dp4a at T=1, int8 tensor cores past that), combine, residual, next norm. Then
+  `engine_q8` writes the next layer's int8 activations in the hand kernels' layout (codes as Q8x32,
+  then f32 scales over the scale pairs; `mxq` got 1/8 more bytes for that).
+  GPU check vs a plain-Rust reference (`examples/coder_derived_moe.rs`, 3090): max rel err 2.6e-7
+  (T=1) to 5.6e-7 (T=16). 512 experts / top-10, µs a layer on the 3090: T=1 92, T=2 137, T=8 295,
+  T=16 523. 13–16 kernels, ~0.4 s to build a shape.
+- `coder.rs`: `enqueue_moe` runs it after the (still hand) router when `TANG_CODER_DERIVED` names
+  `moe` or `all`, outside wide windows and `shared_par`. A shape that fails to build (Q6_K down: one
+  layer; any lowering error) falls back to the hand kernels for that shape only and says so once.
+  Narrow shapes (T=1..MAX_T × each layer's formats) are built at load, since nothing builds
+  inside a graph capture; batch-window shapes are built on first use outside a capture, else
+  they run on the hand kernels.
+- Not run on the model yet: the 80B GGUF needs the H200. Gates to run there: flash-wide-check
+  (3k/8k, int8 + bf16 KV), greedy equal, batch-check N=8, cached-prefix continuation, plus
+  decode tok/s at T=1/8/16/48 against the hand engine.
