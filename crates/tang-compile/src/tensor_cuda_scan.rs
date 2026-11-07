@@ -547,9 +547,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
     // this chunk's k row tile, and Wᵀ / qᵀ tiles of the warp's state rows,
     // prefetched a chunk ahead into registers
     FA kf[DK / 16];
-    FAc wf[RT][C / 16], qf[RT][C / 16];
+    FAc qf[RT][C / 16];
     float gcn = 0.0f, grn = 0.0f;
-    auto fetch = [&](int c, FA* k, FAc (*w)[C / 16], FAc (*q)[C / 16], float& g1, float& g2) {
+    auto fetch = [&](int c, FA* k, FAc (*q)[C / 16], float& g1, float& g2) {
         const size_t r0 = (size_t)h * T + (size_t)c * C;
         #pragma unroll
         for (int e = 0; e < DK / 16; e++) wmma::load_matrix_sync(k[e], K + (r0 + warp * 16) * DK + e * 16, DK);
@@ -557,22 +557,19 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         for (int i = 0; i < RT; i++)
             #pragma unroll
             for (int e = 0; e < C / 16; e++) {
-#if DELTA
-                wmma::load_matrix_sync(w[i][e], Wo + (r0 + e * 16) * DK + (warp * RT + i) * 16, DK);
-#endif
                 wmma::load_matrix_sync(q[i][e], Q + (r0 + e * 16) * DK + (warp * RT + i) * 16, DK);
             }
         g1 = GC[h * NT + c];
         g2 = tid < C ? GR[r0 + tid] : 0.0f;
     };
-    fetch(NT - 1, kf, wf, qf, gcn, grn);
+    fetch(NT - 1, kf, qf, gcn, grn);
     for (int c = NT - 1; c >= 0; c--) {
         const size_t row0 = (size_t)h * T + (size_t)c * C;
         const float glast = gcn;
         if (tid < C) gm[tid] = grn;
         FA kn[DK / 16];
-        FAc wn[RT][C / 16], qn[RT][C / 16];
-        if (c > 0) fetch(c - 1, kn, wn, qn, gcn, grn);
+        FAc qn[RT][C / 16];
+        if (c > 0) fetch(c - 1, kn, qn, gcn, grn);
         bf* dhs = DHs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
         for (int i = 0; i < RT; i++)
@@ -639,8 +636,10 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 for (int e = 0; e < C; e += 16) {
                     FBr b;
 #if DELTA
+                    FAc wa;
+                    wmma::load_matrix_sync(wa, Wo + (row0 + e) * DK + (warp * RT + i) * 16, DK);
                     wmma::load_matrix_sync(b, vng + e * LDB + j * 16, LDB);
-                    wmma::mma_sync(st[i][j], wf[i][e / 16], b, st[i][j]);
+                    wmma::mma_sync(st[i][j], wa, b, st[i][j]);
 #endif
                     wmma::load_matrix_sync(b, dog + e * LDB + j * 16, LDB);
                     wmma::mma_sync(st[i][j], qf[i][e / 16], b, st[i][j]);
@@ -652,10 +651,7 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             #pragma unroll
             for (int i = 0; i < RT; i++)
                 #pragma unroll
-                for (int e = 0; e < C / 16; e++) {
-                    wf[i][e] = wn[i][e];
-                    qf[i][e] = qn[i][e];
-                }
+                for (int e = 0; e < C / 16; e++) qf[i][e] = qn[i][e];
         }
         __syncthreads();
     }
