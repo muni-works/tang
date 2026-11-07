@@ -324,45 +324,55 @@ extern "C" __global__ void __launch_bounds__(128) main0(
 "#;
 
 /// Kernel 3: the readout, in parallel over chunks: `o = scale·(e^{γ}
-/// q·S_c + tril(q kᵀ ⊙ e^{γᵢ−γⱼ})·V')`. Grid `(T/C, H, DV/64)`, 128
-/// threads; operands from global, `q kᵀ` recomputed here.
+/// q·S_c + tril(q kᵀ ⊙ e^{γᵢ−γⱼ})·V')`. Grid `(T/C, H)`, 256 threads;
+/// `q` staged in shared memory (it feeds every tile), `k`, `S_c`, `V'`
+/// fragments from global; `q kᵀ` recomputed here.
 const OUT: &str = r#"
-#define BO 64
-extern "C" __global__ void __launch_bounds__(128) main0(
+extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ Q, const bf* __restrict__ K, const float* __restrict__ GR,
     const bf* __restrict__ Hs, const bf* __restrict__ Vn, bf* __restrict__ O) {
     extern __shared__ __align__(16) unsigned char smem[];
-    float* af = (float*)smem;                 // [C][LDF]
-    bf* ab = (bf*)(af + C * LDF);             // [C][LDT]
+    bf* qs = (bf*)smem;                       // [C][LDK]
+    bf* ab = qs + C * LDK;                    // [C][LDT]
     float* gm = (float*)(ab + C * LDT);       // [C]
     float* stg = gm + C + (threadIdx.x >> 5) * 512;
-    const int c = blockIdx.x, h = blockIdx.y, vb = blockIdx.z * BO, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t row0 = (size_t)h * T + (size_t)c * C;
     const bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
+    for (int i = tid; i < C * DK / 8; i += 256) {
+        const int r = i / (DK / 8), x = (i % (DK / 8)) * 8;
+        *(uint4*)&qs[r * LDK + x] = *(const uint4*)&Q[(row0 + r) * DK + x];
+    }
     if (tid < C) gm[tid] = GR[row0 + tid];
-    for (int tt = warp; tt < 16; tt += 4) {
+    __syncthreads();
+    // masked q kᵀ: the 10 lower tiles over 8 warps, each straight to bf16
+    for (int tt = warp; tt < 16; tt += 8) {
         const int tr = tt >> 2, tc = tt & 3;
-        FC acc;
-        wmma::fill_fragment(acc, 0.0f);
         if (tc <= tr) {
+            FC acc;
+            wmma::fill_fragment(acc, 0.0f);
             #pragma unroll
             for (int e = 0; e < DK; e += 16) {
                 FA a;
                 FBc b;
-                wmma::load_matrix_sync(a, Q + (row0 + tr * 16) * DK + e, DK);
+                wmma::load_matrix_sync(a, qs + tr * 16 * LDK + e, LDK);
                 wmma::load_matrix_sync(b, K + (row0 + tc * 16) * DK + e, DK);
                 wmma::mma_sync(acc, a, b, acc);
             }
+            wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
+                ab[r * LDT + j] = __float2bfloat16(j <= r ? stg[e] * __expf(gm[r] - gm[j]) : 0.0f);
+            }
+            __syncwarp();
+        } else {
+            for (int e = lane; e < 256; e += 32)
+                ab[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = __float2bfloat16(0.0f);
         }
-        wmma::store_matrix_sync(af + tr * 16 * LDF + tc * 16, acc, LDF, wmma::mem_row_major);
     }
     __syncthreads();
-    for (int i = tid; i < C * C; i += 128) {
-        const int r = i / C, j = i % C;
-        ab[r * LDT + j] = __float2bfloat16(j <= r ? af[r * LDF + j] * __expf(gm[r] - gm[j]) : 0.0f);
-    }
-    __syncthreads();
-    for (int tt = warp; tt < 4 * (BO / 16); tt += 4) {
+    for (int tt = warp; tt < 4 * (DV / 16); tt += 8) {
         const int tr = tt & 3, tcol = tt >> 2;
         FC acc, acc2;
         wmma::fill_fragment(acc, 0.0f);
@@ -371,15 +381,15 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         for (int e = 0; e < DK; e += 16) {
             FA a;
             FBr b;
-            wmma::load_matrix_sync(a, Q + (row0 + tr * 16) * DK + e, DK);
-            wmma::load_matrix_sync(b, hs + (size_t)e * DV + vb + tcol * 16, DV);
+            wmma::load_matrix_sync(a, qs + tr * 16 * LDK + e, LDK);
+            wmma::load_matrix_sync(b, hs + (size_t)e * DV + tcol * 16, DV);
             wmma::mma_sync(acc, a, b, acc);
         }
         for (int e = 0; e <= tr * 16; e += 16) {
             FA a;
             FBr b;
             wmma::load_matrix_sync(a, ab + tr * 16 * LDT + e, LDT);
-            wmma::load_matrix_sync(b, Vn + (row0 + e) * DV + vb + tcol * 16, DV);
+            wmma::load_matrix_sync(b, Vn + (row0 + e) * DV + tcol * 16, DV);
             wmma::mma_sync(acc2, a, b, acc2);
         }
         wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
@@ -390,7 +400,7 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             const float g = __expf(gm[r]);
             const float o0 = (float)SCALE * (g * stg[rr * 16 + cc] + stg[256 + rr * 16 + cc]);
             const float o1 = (float)SCALE * (g * stg[rr * 16 + cc + 1] + stg[256 + rr * 16 + cc + 1]);
-            *(__nv_bfloat162*)&O[(row0 + r) * DV + vb + tcol * 16 + cc] = __floats2bfloat162_rn(o0, o1);
+            *(__nv_bfloat162*)&O[(row0 + r) * DV + tcol * 16 + cc] = __floats2bfloat162_rn(o0, o1);
         }
         __syncwarp();
     }
@@ -444,7 +454,7 @@ impl ChunkedScan {
         let (c, n) = (CHUNK, self.n);
         let smem1 = 2 * c * (c + 4) * 4 + 2 * c * 4 + 3 * 256 * 4;
         let smem2 = (n * (bv + 8) + c * (bv + 8)) * 2 + c * 4 + 4 * 256 * 4;
-        let smem3 = c * (c + 4) * 4 + c * (c + 8) * 2 + c * 4 + 4 * 512 * 4;
+        let smem3 = (c * (n + 8) + c * (c + 8)) * 2 + c * 4 + 8 * 512 * 4;
         let src = |smem: usize, extra: &str, body: &str| {
             format!("#define TANG_SMEM {smem}\n{INCLUDES}{d}{extra}{PRELUDE}{body}")
         };
@@ -463,8 +473,8 @@ impl ChunkedScan {
             },
             ScanLaunch {
                 source: src(smem3, "", OUT),
-                grid: ((self.t / c) as u32, self.heads as u32, (self.m / 64) as u32),
-                block: 128,
+                grid: ((self.t / c) as u32, self.heads as u32, 1),
+                block: 256,
                 smem: smem3 as u32,
             },
         ]
