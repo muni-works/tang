@@ -3284,3 +3284,37 @@ Same method and checks as above; 16k tokens per config, 2048 hidden (8 heads); r
 | true | 16384 | 391 | 295 |
 
 Raw log: `docs/bench/hopper-h200-d256-and-wgmma-bwd.log`. FA3 was not run at d=256.
+
+## Attention backward on wgmma (H200 SXM, bf16, kernel-only)
+
+This adds a `wgmma` variant of the fused backward from #170, the third kernel option the autotuner can pick on Hopper.
+- **Layout:** two consumer warpgroups of 64 keys each share the staged Q and dO/l tiles. Shared tiles use the 128-byte swizzle.
+- **Operands:** S, dP and dQ read both operands from shared memory. dV and dK take P and dS straight from the map's registers (wgmma's register-A form).
+- **dQ:** each warpgroup adds its partial with one bulk async reduce per chunk.
+
+The variant matches the unfused program to 4–9e-3 on every check case, and every config is within 2.4–6.1e-3 of the f64 reference.
+- **Columns:** "kernel" is the variant the tuner picked. The next two are the fused kernel's own TFLOP/s before (`mma.sync`, #170) and now; "program" is the whole fwd+bwd program.
+- **Units:** TFLOP/s, backward convention (2.5× the forward FLOPs).
+- **Baselines:** SDPA from `docs/bench/hopper-h200-baselines.log`.
+
+| d | causal | N | kernel | mma.sync kernel (#170) | this kernel | SDPA bwd | program |
+|---|---|---|---|---|---|---|---|
+| 64 | false | 1024 | mma | 169 | 172 | 216 | 82 |
+| 64 | false | 4096 | wgmma | 182 | 201 | 269 | 131 |
+| 64 | false | 16384 | wgmma | 184 | 205 | 287 | 152 |
+| 64 | true | 1024 | mma | 142 | 144 | 155 | 54 |
+| 64 | true | 4096 | wgmma | 169 | 179 | 233 | 103 |
+| 64 | true | 16384 | wgmma | 185 | 197 | 274 | 136 |
+| 128 | false | 1024 | wgmma | 174 | 206 | 227 | 92 |
+| 128 | false | 4096 | wgmma | 194 | 239 | 286 | 154 |
+| 128 | false | 16384 | wgmma | 195 | 247 | 304 | 187 |
+| 128 | true | 1024 | wgmma | 151 | 163 | 169 | 58 |
+| 128 | true | 4096 | wgmma | 187 | 214 | 254 | 122 |
+| 128 | true | 16384 | wgmma | 215 | 258 | 308 | 180 |
+
+The `wgmma` kernel is 1.1–1.27× the `mma.sync` one. It reaches 0.81–0.96× SDPA's backward at d=128 and 0.69–0.93× at d=64; at d=64, 1k the tuner keeps `mma.sync`. What remains vs FA3:
+- a producer warpgroup with TMA (staging is still cp.async by the consumers);
+- intra-warpgroup overlap of the softmax with the next chunk's GEMMs;
+- 254 registers, so one block per SM.
+
+Raw log: `docs/bench/hopper-h200-d256-and-wgmma-bwd.log`.
