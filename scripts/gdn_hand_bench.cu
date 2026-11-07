@@ -23,7 +23,7 @@ template <class T> T* dev(size_t n, float lo, float hi) {
 int main(int argc, char** argv) {
     for (int ai = 1; ai < argc; ai++) {
         const unsigned t = atoi(argv[ai]);
-        const unsigned stride = GDN_PROJ;
+        const unsigned stride = GDN_B + GDN_HV;
         float* P = dev<float>((size_t)t * stride, -0.5f, 0.5f);
         float* H0 = dev<float>(3 * GDN_CONV, -0.5f, 0.5f);
         float* S = dev<float>((size_t)GDN_HV * 128 * 128, -0.01f, 0.01f);
