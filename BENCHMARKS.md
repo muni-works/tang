@@ -3605,3 +3605,28 @@ once), so the graphed steps run the derived kernels; I did not inspect the captu
 No nsys on the image, so per-kernel attribution inside the derived layer comes from
 `examples/coder_derived_moe.rs` (`PER_KERNEL=1`): top-k 13 µs, gate and up GEMVs, 14 kernels.
 Pod time this round ≈ 45 min ($4), terminated.
+
+### Round 3 (third H200, `crates/tang-llm/docs/bench/derived-moe/r3/`)
+
+Changes: `y` not materialized unless kept (one kernel a layer fewer); a parallel rank-count top-k
+was tried and left opt-in (`TANG_DMOE_TOPK=rank`: no faster at T=1, slower at T=48).
+
+| gate | result |
+|---|---|
+| batch-check N=8 | PASS bitwise (checksum 601bcc0313fe017a, same as round 1's last) |
+| wide-check 3000, int8 KV | **FAIL**: KL 2.81e-4 vs bar 2.0e-4; greedy equal (32 tokens) |
+| wide-check 8000, int8 KV | PASS: KL 1.98e-5 (bar 3.2e-5), greedy equal |
+| batch-check N=48 tolerance | derived PASS 99.24% / mean 0.153; hand 99.00% / 0.142 |
+
+| streams | hand ms | derived ms |
+|---|---|---|
+| 1 | 4.11 | 5.17 |
+| 8 | 9.92 | 11.41 |
+| 16 | 15.91 | 15.71 |
+| 32 | 23.60 | 23.37 |
+| 48 | 30.15 | 32.18 |
+
+The 3000 KL regression (4.06e-5 on the round-1 build) is new since the first gate run; the narrow
+path changed since then in its reduction orders (the norm's sum of squares split across a block,
+x quantized by a writer kernel). Not bisected yet. The 8000 KL improved. Decode is unchanged within noise.
+Pod ≈ 45 min ($4), terminated.

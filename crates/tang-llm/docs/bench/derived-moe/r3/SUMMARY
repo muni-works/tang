@@ -1,0 +1,34 @@
+coder: derived MoE: 8 of 16 shapes built in 9.5 s
+  teacher-forced max KL(narrow || wide) over 32 steps: 2.81e-4 (bar 2.0e-4)
+wide-check 3000: FAIL (next token equal, 32 decoded tokens equal, logits differ in 4861950 of 4861952)
+  teacher-forced max KL(narrow || wide) over 32 steps: 1.98e-5 (bar 3.2e-5)
+wide-check 8000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861950 of 4861952)
+Error: wide-check failed
+coder: derived MoE: 8 of 16 shapes built in 7.3 s
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+batch-check: PASS (bitwise) (logits checksum 601bcc0313fe017a)
+batch 1: 5.16 ms a step, 194 tok/s aggregate, 194 tok/s a stream (context ~1380)
+batch 2: 5.96 ms a step, 336 tok/s aggregate, 168 tok/s a stream (context ~1380)
+batch 4: 7.63 ms a step, 524 tok/s aggregate, 131 tok/s a stream (context ~1380)
+batch 8: 11.41 ms a step, 701 tok/s aggregate, 88 tok/s a stream (context ~1380)
+batch-check tolerance: tokens agree 99.00% (2373/2397, same history), max |dlogit| 10.0505, mean 1.42e-1 (bar: 99%, mean <= 0.2)
+batch-check: FAIL (logits checksum 4c1cc97f3193e028)
+batch 1: 4.11 ms a step, 243 tok/s aggregate, 243 tok/s a stream (context ~1380)
+batch 2: 4.80 ms a step, 416 tok/s aggregate, 208 tok/s a stream (context ~1380)
+batch 4: 6.57 ms a step, 608 tok/s aggregate, 152 tok/s a stream (context ~1380)
+batch 8: 9.92 ms a step, 807 tok/s aggregate, 101 tok/s a stream (context ~1380)
+batch 16: 15.91 ms a step, 1006 tok/s aggregate, 63 tok/s a stream (context ~1380)
+batch 32: 23.60 ms a step, 1356 tok/s aggregate, 42 tok/s a stream (context ~1380)
+batch 48: 30.15 ms a step, 1592 tok/s aggregate, 33 tok/s a stream (context ~1380)
+Error: batch-check failed
+coder: derived MoE: 8 of 16 shapes built in 7.2 s
+batch-check tolerance: tokens agree 99.24% (2361/2379, same history), max |dlogit| 8.4876, mean 1.53e-1 (bar: 99%, mean <= 0.2)
+batch-check: PASS (tolerance) (logits checksum c7c0e6de0a36dbed)
+batch 1: 5.17 ms a step, 193 tok/s aggregate, 193 tok/s a stream (context ~1380)
+batch 2: 5.96 ms a step, 336 tok/s aggregate, 168 tok/s a stream (context ~1380)
+batch 4: 7.63 ms a step, 524 tok/s aggregate, 131 tok/s a stream (context ~1380)
+batch 8: 11.41 ms a step, 701 tok/s aggregate, 88 tok/s a stream (context ~1380)
+batch 16: 15.71 ms a step, 1018 tok/s aggregate, 64 tok/s a stream (context ~1380)
+batch 32: 23.37 ms a step, 1369 tok/s aggregate, 43 tok/s a stream (context ~1380)
+batch 48: 32.18 ms a step, 1492 tok/s aggregate, 31 tok/s a stream (context ~1380)
+DONE
