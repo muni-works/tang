@@ -1380,7 +1380,7 @@ impl ChunkedScan {
     /// A_qk(unused) | Y SEG`.
     pub fn coder_kernels(&self, bv: usize) -> [ScanLaunch; 4] {
         let hk = self.coder.expect("coder layout");
-        assert!(self.n == 128 && self.m == 128 && self.heads % hk == 0);
+        assert!(self.n == 128 && self.m == 128 && self.heads.is_multiple_of(hk));
         let [p, s, o] = self.kernels_saving(bv, false);
         let d = self.defines(false);
         let glue = ScanLaunch {

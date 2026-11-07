@@ -39,3 +39,7 @@ cram-codec = { path = "../cram-codec" }
 # Metal on the Mac, CUDA on a GPU box: either feature (the example cfg-picks the device)
 name = "kvdec_bench"
 required-features = []
+
+[[example]]
+name = "dump_coder_gdn"
+required-features = ["cuda"]
