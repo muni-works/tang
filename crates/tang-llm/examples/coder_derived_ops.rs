@@ -165,7 +165,12 @@ fn main() {
             let bad: Vec<usize> = (0..t)
                 .filter(|&ti| (0..N).any(|i| (d[ti * N + i] - want_x[ti * N + i]).abs() > 1e-3))
                 .collect();
-            eprintln!("add_norm T={t}: err r {er:.2e} x {ex:.2e}; bad rows {bad:?}");
+            let cpu: Vec<f32> = r0.iter().zip(&y).map(|(a, b)| a + b).collect();
+            eprintln!(
+                "add_norm T={t}: err r {er:.2e} x {ex:.2e}; bad rows {bad:?}; vs cpu: derived {:.2e} hand {:.2e}",
+                max_rel(&b_ro.read::<f32>(0, t * N).unwrap(), &cpu),
+                max_rel(&want_r, &cpu)
+            );
         }
         let err = er.max(ex);
         // timing: the hand kernel adds in place, so time it on a copy (values drift; the time does not)
