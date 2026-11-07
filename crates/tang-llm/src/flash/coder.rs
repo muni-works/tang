@@ -1053,6 +1053,61 @@ struct Wide {
     xq: B,
     /// Split-K partials of the batch module's dense MMA (`DMMA_PART` f32; empty elsewhere).
     part: B,
+    /// `TANG_CODER_GDN=chunked`: the GDN recurrence as tang's chunked scan (GPU 0).
+    gdnc: Option<GdnChunked>,
+}
+
+/// State column block of the chunked GDN state scan.
+const GDNC_BV: usize = 32;
+
+/// `TANG_CODER_GDN=chunked` (off by default): wide windows run the GDN recurrence as the
+/// chunked scan of `tang_compile::tensor::cuda_scan` (`ChunkedScan::coder`) instead of
+/// `fl_gdn_wide` — per 64-token chunk a WY/UT transform on tensor cores, then a sequential scan
+/// of the f32 state over chunks, then the readout. Same inputs (`fl_gdn_wide_prep`'s rows), the
+/// slot's f32 state in and out, the same `Y` rows; fp16 operands. Needs
+/// `TANG_CODER_GDN_STATE=f32` (the default).
+struct GdnChunked {
+    f: [Fun; 4],
+    smem: [u32; 4],
+    block: [u32; 4],
+    bufs: Vec<B>,
+    plan: tang_compile::tensor::cuda_scan::ChunkedScan,
+    _m: Vec<Module>,
+}
+
+impl GdnChunked {
+    fn enabled() -> bool {
+        env_is("TANG_CODER_GDN", "chunked") && !gdn_s16()
+    }
+
+    fn new(gpu: &Gpu, dev: &CudaComputeDevice, geo: &Geometry, rows: usize) -> Result<Self> {
+        let plan =
+            tang_compile::tensor::cuda_scan::ChunkedScan::coder(geo.gdn_hv, geo.gdn_hk, geo.gdn_d);
+        let ls = plan.coder_kernels(GDNC_BV);
+        let mut f: [Fun; 4] = [std::ptr::null_mut(); 4];
+        let mut ms = Vec::new();
+        for (i, l) in ls.iter().enumerate() {
+            let m = gpu
+                .module(&l.source)
+                .map_err(|e| anyhow!("chunked GDN kernel {i}: {e}"))?;
+            f[i] = m.func("main0").map_err(|e| anyhow!("{e}"))?;
+            ms.push(m);
+        }
+        let tp = rows.next_multiple_of(tang_compile::tensor::cuda_scan::CHUNK);
+        let bufs = plan
+            .coder_scratch(tp)
+            .iter()
+            .map(|&b| dev.alloc_f32(b.div_ceil(4)))
+            .collect();
+        Ok(Self {
+            f,
+            smem: [ls[0].smem, ls[1].smem, ls[2].smem, ls[3].smem],
+            block: [ls[0].block, ls[1].block, ls[2].block, ls[3].block],
+            bufs,
+            plan,
+            _m: ms,
+        })
+    }
 }
 
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
@@ -2641,6 +2696,7 @@ impl Coder {
             proj,
             xq,
             part: self.dev.alloc_f32(DMMA_PART),
+            gdnc: None,
         });
         Ok(())
     }
@@ -2734,6 +2790,11 @@ impl Coder {
             proj,
             xq,
             part: self.dev.alloc_f32(1),
+            gdnc: if GdnChunked::enabled() {
+                Some(GdnChunked::new(&self.gpu, &self.dev, &self.geo, rows)?)
+            } else {
+                None
+            },
         });
         // The peer's own wide set: the same kernels compiled on its context, its scratch
         // and staging, sized by its layers.
@@ -2787,6 +2848,7 @@ impl Coder {
                 proj: prj,
                 xq: pxq,
                 part: p.dev.alloc_f32(1),
+                gdnc: None,
             });
             p.ctx.sync()?;
         }
@@ -4202,14 +4264,58 @@ impl Coder {
                     0,
                     tang_moe::args![htab, p, sd, dt, sa, seg, eps, wc, x],
                 );
-                self.launch_on(
-                    v.stream,
-                    v.k.gdn_wide,
-                    (self.geo.gdn_hv as u32, 2, 1),
-                    256,
-                    0,
-                    tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
-                );
+                if let Some(c) = v.wide.and_then(|w| w.gdnc.as_ref()) {
+                    // the chunked scan: glue (X rows -> head-major, padded), WY/UT per chunk,
+                    // state scan over chunks (the slot's f32 state in and out), readout into Y
+                    let tp = (t as usize).next_multiple_of(tang_compile::tensor::cuda_scan::CHUNK);
+                    let gr = c.plan.coder_grids(tp, GDNC_BV);
+                    let a: Vec<u64> = c.bufs.iter().map(|b| v.dev.buffer_addr(b)).collect();
+                    let (cq, ck_, cv, cal, cbe, cw, cu, chs, cvn, cg, cgc) = (
+                        a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10],
+                    );
+                    let (tn, null) = (tp as u32, 0u64);
+                    self.launch_on(
+                        v.stream,
+                        c.f[0],
+                        gr[0],
+                        c.block[0],
+                        c.smem[0],
+                        tang_moe::args![x, seg, cq, ck_, cv, cal, cbe, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[1],
+                        gr[1],
+                        c.block[1],
+                        c.smem[1],
+                        tang_moe::args![ck_, cv, cal, cbe, cw, cu, cg, cgc, null, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[2],
+                        gr[2],
+                        c.block[2],
+                        c.smem[2],
+                        tang_moe::args![cw, cu, ck_, cg, cgc, chs, cvn, stab, seg, tn],
+                    );
+                    self.launch_on(
+                        v.stream,
+                        c.f[3],
+                        gr[3],
+                        c.block[3],
+                        c.smem[3],
+                        tang_moe::args![cq, ck_, cg, chs, cvn, null, null, y, seg, tn],
+                    );
+                } else {
+                    self.launch_on(
+                        v.stream,
+                        v.k.gdn_wide,
+                        (self.geo.gdn_hv as u32, 2, 1),
+                        256,
+                        0,
+                        tang_moe::args![stab, htab, p, sd, dt, sa, y, seg, eps, wc, x],
+                    );
+                }
                 self.launch_on(
                     v.stream,
                     v.k.gdn_wide_norm,

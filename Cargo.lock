@@ -6367,6 +6367,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tang-ad",
+ "tang-compile",
  "tang-compute",
  "tang-moe",
  "tang-otel",

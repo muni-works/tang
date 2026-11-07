@@ -28,6 +28,7 @@ mtp-train = ["dep:tang-ad", "dep:tang-train", "dep:tang-tensor"]
 
 [dependencies]
 tang-compute = { workspace = true }
+tang-compile = { workspace = true }
 cram-codec = { workspace = true }
 # kernel verification harness (shadow checks, NaN poisoning, attribution; docs/kernel-verify.md)
 tang-verify = { workspace = true }

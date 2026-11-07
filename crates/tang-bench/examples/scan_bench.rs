@@ -123,6 +123,9 @@ struct Run {
     /// dq dk dv (bf16), dα dβ (f32)
     g16: Vec<CudaSlice<u16>>,
     grads: Vec<CudaSlice<f32>>,
+    /// T as the trailing kernel argument, and a null pointer for unused ones
+    tn: u32,
+    null: u64,
 }
 
 fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize, dout: Option<&[f64]>) -> Run {
@@ -203,6 +206,8 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize, dout: Option
         dout,
         g16,
         grads,
+        tn: plan.t as u32,
+        null: 0,
     }
 }
 
@@ -225,7 +230,12 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
     match k {
         0 => {
             b.arg(kk).arg(v).arg(&r.gates[0]).arg(&r.gates[1]);
-            b.arg(&sc[0]).arg(&sc[1]).arg(gr).arg(gc).arg(&r.ts);
+            b.arg(&sc[0])
+                .arg(&sc[1])
+                .arg(gr)
+                .arg(gc)
+                .arg(&r.ts)
+                .arg(&r.tn);
         }
         1 => {
             b.arg(&sc[0])
@@ -235,10 +245,12 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
                 .arg(gc)
                 .arg(&sc[2])
                 .arg(&sc[3]);
+            b.arg(&r.null).arg(&r.null).arg(&r.tn);
         }
         2 => {
             b.arg(q).arg(kk).arg(gr).arg(&sc[2]).arg(vn).arg(&r.out);
             b.arg(r.b16.first().unwrap_or(&r.dout));
+            b.arg(&r.null).arg(&r.null).arg(&r.tn);
         }
         3 => {
             b.arg(q)
@@ -248,7 +260,7 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
                 .arg(&r.dout)
                 .arg(gr)
                 .arg(gc);
-            b.arg(&r.b16[1]).arg(&r.b16[2]);
+            b.arg(&r.b16[1]).arg(&r.b16[2]).arg(&r.tn);
         }
         _ => {
             b.arg(q)
@@ -270,6 +282,7 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
             for x in &r.grads {
                 b.arg(x);
             }
+            b.arg(&r.tn);
         }
     }
     unsafe { b.launch(*cfg) }.expect("launch");

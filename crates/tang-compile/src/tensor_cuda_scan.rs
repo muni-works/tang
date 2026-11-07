@@ -45,6 +45,8 @@ pub struct ChunkedScan {
     pub v: TensorId,
     pub alpha: Option<TensorId>,
     pub beta: Option<TensorId>,
+    /// `Some(k_heads)`: the tang-llm coder layout ([`ChunkedScan::coder`]).
+    pub coder: Option<usize>,
 }
 
 /// One launch of the chunked schedule.
@@ -58,10 +60,25 @@ pub struct ScanLaunch {
     pub smem: u32,
 }
 
-const INCLUDES: &str = "#include <mma.h>\n#include <cuda_bf16.h>\n";
+const INCLUDES: &str = "#include <mma.h>\n#include <cuda_bf16.h>\n#include <cuda_fp16.h>\n";
 
 const PRELUDE: &str = r#"using namespace nvcuda;
+#if USE_F16
+// fp16 operands (10-bit mantissa) for inputs bounded in magnitude (normalized q, k)
+typedef __half bf;
+typedef __half2 bf2;
+#define F2B(x) __float2half(x)
+#define B2F(x) __half2float(x)
+#define F2B2(a, b) __floats2half2_rn(a, b)
+#else
 typedef __nv_bfloat16 bf;
+typedef __nv_bfloat162 bf2;
+#define F2B(x) __float2bfloat16(x)
+#define B2F(x) __bfloat162float(x)
+#define F2B2(a, b) __floats2bfloat162_rn(a, b)
+#endif
+#define LO2F(v) __low2float(v)
+#define HI2F(v) __high2float(v)
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, bf, wmma::row_major> FA;
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, bf, wmma::col_major> FAc;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, bf, wmma::row_major> FBr;
@@ -138,7 +155,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ K, const bf* __restrict__ V,
     const float* __restrict__ AL, const float* __restrict__ BE,
     bf* __restrict__ Wo, bf* __restrict__ Uo, float* __restrict__ GR, float* __restrict__ GC,
-    float* __restrict__ TS) {
+    float* __restrict__ TS, const unsigned Tn) {
     extern __shared__ __align__(16) unsigned char smem[];
     float* sa = (float*)smem;      // [C][LDF]  A, then bf16 T' / T'' and staging
     float* tm = sa + C * LDF;      // [C][LDF]  T
@@ -231,7 +248,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     bf* ost = (bf*)tm;
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        t2[r * LDT + j] = __float2bfloat16(tm[r * LDF + j] * bet[j]);
+        t2[r * LDT + j] = F2B(tm[r * LDF + j] * bet[j]);
     }
     __syncthreads();
     auto tri = [&](int ld, int ncols, bf* out) {
@@ -250,17 +267,17 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             __syncwarp();
             for (int e = lane; e < 128; e += 32) {
                 const int rr = e >> 3, cc = (e & 7) * 2;
-                __nv_bfloat162 v2 = __floats2bfloat162_rn(stg[rr * 16 + cc], stg[rr * 16 + cc + 1]);
-                *(__nv_bfloat162*)&out[(row0 + tr * 16 + rr) * ncols + tcol * 16 + cc] = v2;
+                bf2 v2 = F2B2(stg[rr * 16 + cc], stg[rr * 16 + cc + 1]);
+                *(bf2*)&out[(row0 + tr * 16 + rr) * ncols + tcol * 16 + cc] = v2;
             }
             __syncwarp();
         }
     };
     for (int i = tid; i < C * DK / 2; i += 256) {
         const int r = i / (DK / 2), x = (i % (DK / 2)) * 2;
-        const __nv_bfloat162 v = *(const __nv_bfloat162*)&K[(row0 + r) * DK + x];
+        const bf2 v = *(const bf2*)&K[(row0 + r) * DK + x];
         const float g = __expf(gam[r]);
-        *(__nv_bfloat162*)&ost[r * LDK + x] = __floats2bfloat162_rn(__low2float(v) * g, __high2float(v) * g);
+        *(bf2*)&ost[r * LDK + x] = F2B2(LO2F(v) * g, HI2F(v) * g);
     }
     __syncthreads();
 #ifndef XNOTRI
@@ -279,9 +296,9 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     __syncthreads();
     for (int i = tid; i < C * DV / 2; i += 256) {
         const int r = i / (DV / 2), x = (i % (DV / 2)) * 2;
-        const __nv_bfloat162 v = *(const __nv_bfloat162*)&V[(row0 + r) * DV + x];
-        *(__nv_bfloat162*)&Uo[(row0 + r) * DV + x] =
-            __floats2bfloat162_rn(__low2float(v) * bet[r], __high2float(v) * bet[r]);
+        const bf2 v = *(const bf2*)&V[(row0 + r) * DV + x];
+        *(bf2*)&Uo[(row0 + r) * DV + x] =
+            F2B2(LO2F(v) * bet[r], HI2F(v) * bet[r]);
     }
 #endif
 }
@@ -298,7 +315,8 @@ const STATE: &str = r#"
 #define NTC (BV / 16)
 extern "C" __global__ void __launch_bounds__(128) main0(
     const bf* __restrict__ Wo, const bf* __restrict__ Uo, const bf* __restrict__ K,
-    const float* __restrict__ GR, const float* __restrict__ GC, bf* __restrict__ Hs, bf* __restrict__ Vn) {
+    const float* __restrict__ GR, const float* __restrict__ GC, bf* __restrict__ Hs, bf* __restrict__ Vn,
+    const unsigned long long* __restrict__ Stab, const unsigned* __restrict__ SEG, const unsigned Tn) {
     extern __shared__ __align__(16) unsigned char smem[];
     bf* sb = (bf*)smem;                // [DK][LDB]
     bf* vn = sb + DK * LDB;            // [C][LDB]  e^{γ_C−γ}·V'
@@ -311,20 +329,29 @@ extern "C" __global__ void __launch_bounds__(128) main0(
     for (int i = 0; i < RT; i++)
         #pragma unroll
         for (int j = 0; j < NTC; j++) wmma::fill_fragment(st[i][j], 0.0f);
+#if CODER
+    // the slot's f32 state S[(row·HEADS + h)·DV + col] is the initial state
+    float* SX = (float*)Stab[SEG[2]];
+    #pragma unroll
+    for (int i = 0; i < RT; i++)
+        #pragma unroll
+        for (int j = 0; j < NTC; j++)
+            wmma::load_matrix_sync(st[i][j], SX + ((size_t)((warp * RT + i) * 16) * HEADS + h) * DV + vb + j * 16, HEADS * DV, wmma::mem_row_major);
+#endif
     // this chunk's W row tile (warp's rows) and k column tiles, prefetched
     // a chunk ahead into registers
     FA wf[DK / 16];
     FAc kf[RT][C / 16];
     float gcn = 0.0f, grn = 0.0f;
-    __nv_bfloat162 uf[NTC][4];
-    auto fetch = [&](int c, FA* w, FAc (*k)[C / 16], float& g1, float& g2, __nv_bfloat162 (*u)[4]) {
+    bf2 uf[NTC][4];
+    auto fetch = [&](int c, FA* w, FAc (*k)[C / 16], float& g1, float& g2, bf2 (*u)[4]) {
         const size_t r0 = (size_t)h * T + (size_t)c * C;
         #pragma unroll
         for (int j = 0; j < NTC; j++)
             #pragma unroll
             for (int q = 0; q < 4; q++) {
                 const int e = lane + 32 * q;
-                u[j][q] = *(const __nv_bfloat162*)&Uo[(r0 + warp * 16 + (e >> 3)) * DV + vb + j * 16 + (e & 7) * 2];
+                u[j][q] = *(const bf2*)&Uo[(r0 + warp * 16 + (e >> 3)) * DV + vb + j * 16 + (e & 7) * 2];
             }
 #if DELTA
         #pragma unroll
@@ -346,7 +373,7 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         if (tid < C) gm[tid] = __expf(glast - grn);
         FA wn[DK / 16];
         FAc kn[RT][C / 16];
-        __nv_bfloat162 un[NTC][4];
+        bf2 un[NTC][4];
         if (c + 1 < NT) fetch(c + 1, wn, kn, gcn, grn, un);
         bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
@@ -357,9 +384,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 __syncwarp();
                 for (int e = lane; e < 128; e += 32) {
                     const int r = (warp * RT + i) * 16 + (e >> 3), x = j * 16 + (e & 7) * 2;
-                    const __nv_bfloat162 v = __floats2bfloat162_rn(stg[(e >> 3) * 16 + (e & 7) * 2], stg[(e >> 3) * 16 + (e & 7) * 2 + 1]);
-                    *(__nv_bfloat162*)&sb[r * LDB + x] = v;
-                    *(__nv_bfloat162*)&hs[(size_t)r * DV + vb + x] = v;
+                    const bf2 v = F2B2(stg[(e >> 3) * 16 + (e & 7) * 2], stg[(e >> 3) * 16 + (e & 7) * 2 + 1]);
+                    *(bf2*)&sb[r * LDB + x] = v;
+                    *(bf2*)&hs[(size_t)r * DV + vb + x] = v;
                 }
                 __syncwarp();
             }
@@ -384,16 +411,16 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 const int e = lane + 32 * q;
                 const int rr = e >> 3, cc = (e & 7) * 2;
                 const int r = tr * 16 + rr, x = tcol * 16 + cc;
-                const __nv_bfloat162 u = uf[tcol][q];
+                const bf2 u = uf[tcol][q];
 #if DELTA
-                const float v0 = __low2float(u) - stg[rr * 16 + cc], v1 = __high2float(u) - stg[rr * 16 + cc + 1];
-                const __nv_bfloat162 v = __floats2bfloat162_rn(v0, v1);
-                *(__nv_bfloat162*)&Vn[(row0 + r) * DV + vb + x] = v;
+                const float v0 = LO2F(u) - stg[rr * 16 + cc], v1 = HI2F(u) - stg[rr * 16 + cc + 1];
+                const bf2 v = F2B2(v0, v1);
+                *(bf2*)&Vn[(row0 + r) * DV + vb + x] = v;
 #else
-                const __nv_bfloat162 v = u;
+                const bf2 v = u;
 #endif
                 const float g = gm[r];
-                *(__nv_bfloat162*)&vn[r * LDB + x] = __floats2bfloat162_rn(__low2float(v) * g, __high2float(v) * g);
+                *(bf2*)&vn[r * LDB + x] = F2B2(LO2F(v) * g, HI2F(v) * g);
             }
             __syncwarp();
         }
@@ -425,6 +452,13 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         }
         __syncthreads();
     }
+#if CODER
+    #pragma unroll
+    for (int i = 0; i < RT; i++)
+        #pragma unroll
+        for (int j = 0; j < NTC; j++)
+            wmma::store_matrix_sync(SX + ((size_t)((warp * RT + i) * 16) * HEADS + h) * DV + vb + j * 16, st[i][j], HEADS * DV, wmma::mem_row_major);
+#endif
 }
 "#;
 
@@ -435,7 +469,8 @@ extern "C" __global__ void __launch_bounds__(128) main0(
 const OUT: &str = r#"
 extern "C" __global__ void __launch_bounds__(256) main0(
     const bf* __restrict__ Q, const bf* __restrict__ K, const float* __restrict__ GR,
-    const bf* __restrict__ Hs, const bf* __restrict__ Vn, bf* __restrict__ O, bf* __restrict__ Ao) {
+    const bf* __restrict__ Hs, const bf* __restrict__ Vn, bf* __restrict__ O, bf* __restrict__ Ao,
+    float* __restrict__ Y, const unsigned* __restrict__ SEG, const unsigned Tn) {
     extern __shared__ __align__(16) unsigned char smem[];
     bf* qs = (bf*)smem;                       // [C][LDK]
     bf* ab = qs + C * LDK;                    // [C][LDT]
@@ -469,17 +504,17 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             for (int e = lane; e < 256; e += 32) {
                 const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
                 const float v = j <= r ? stg[e] * __expf(gm[r] - gm[j]) : 0.0f;
-                ab[r * LDT + j] = __float2bfloat16(v);
+                ab[r * LDT + j] = F2B(v);
 #if SAVE_T
-                Ao[(row0 + r) * C + j] = __float2bfloat16((float)SCALE * v);
+                Ao[(row0 + r) * C + j] = F2B((float)SCALE * v);
 #endif
             }
             __syncwarp();
         } else {
             for (int e = lane; e < 256; e += 32) {
-                ab[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = __float2bfloat16(0.0f);
+                ab[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = F2B(0.0f);
 #if SAVE_T
-                Ao[(row0 + tr * 16 + e / 16) * C + tc * 16 + e % 16] = __float2bfloat16(0.0f);
+                Ao[(row0 + tr * 16 + e / 16) * C + tc * 16 + e % 16] = F2B(0.0f);
 #endif
             }
         }
@@ -513,7 +548,12 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             const float g = __expf(gm[r]);
             const float o0 = (float)SCALE * (g * stg[rr * 16 + cc] + stg[256 + rr * 16 + cc]);
             const float o1 = (float)SCALE * (g * stg[rr * 16 + cc + 1] + stg[256 + rr * 16 + cc + 1]);
-            *(__nv_bfloat162*)&O[(row0 + r) * DV + tcol * 16 + cc] = __floats2bfloat162_rn(o0, o1);
+#if CODER
+            const unsigned t = c * C + r;
+            if (t < SEG[1]) *(float2*)&Y[((size_t)SEG[0] + t) * (HEADS * DV) + h * DV + tcol * 16 + cc] = make_float2(o0, o1);
+#else
+            *(bf2*)&O[(row0 + r) * DV + tcol * 16 + cc] = F2B2(o0, o1);
+#endif
         }
         __syncwarp();
     }
@@ -530,7 +570,7 @@ const BWD_STATE: &str = r#"
 extern "C" __global__ void __launch_bounds__(128) main0(
     const bf* __restrict__ Q, const bf* __restrict__ K, const bf* __restrict__ Wo,
     const bf* __restrict__ Ao, const bf* __restrict__ DO, const float* __restrict__ GR,
-    const float* __restrict__ GC, bf* __restrict__ DHs, bf* __restrict__ DVn) {
+    const float* __restrict__ GC, bf* __restrict__ DHs, bf* __restrict__ DVn, const unsigned Tn) {
     extern __shared__ __align__(16) unsigned char smem[];
     bf* sb = (bf*)smem;                // [DK][LDB]  dS
     bf* vng = sb + DK * LDB;           // [C][LDB]   −dV'
@@ -579,9 +619,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 __syncwarp();
                 for (int e = lane; e < 128; e += 32) {
                     const int r = (warp * RT + i) * 16 + (e >> 3), x = j * 16 + (e & 7) * 2;
-                    const __nv_bfloat162 v = __floats2bfloat162_rn(stg[(e >> 3) * 16 + (e & 7) * 2], stg[(e >> 3) * 16 + (e & 7) * 2 + 1]);
-                    *(__nv_bfloat162*)&sb[r * LDB + x] = v;
-                    *(__nv_bfloat162*)&dhs[(size_t)r * DV + vb + x] = v;
+                    const bf2 v = F2B2(stg[(e >> 3) * 16 + (e & 7) * 2], stg[(e >> 3) * 16 + (e & 7) * 2 + 1]);
+                    *(bf2*)&sb[r * LDB + x] = v;
+                    *(bf2*)&dhs[(size_t)r * DV + vb + x] = v;
                 }
                 __syncwarp();
             }
@@ -616,11 +656,11 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 const float g = __expf(glast - gm[r]);
                 const float d0 = g * stg[rr * 16 + cc] + stg[256 + rr * 16 + cc];
                 const float d1 = g * stg[rr * 16 + cc + 1] + stg[256 + rr * 16 + cc + 1];
-                *(__nv_bfloat162*)&DVn[(row0 + r) * DV + vb + x] = __floats2bfloat162_rn(d0, d1);
-                *(__nv_bfloat162*)&vng[r * LDB + x] = __floats2bfloat162_rn(-d0, -d1);
-                const __nv_bfloat162 dd = *(const __nv_bfloat162*)&DO[(row0 + r) * DV + vb + x];
+                *(bf2*)&DVn[(row0 + r) * DV + vb + x] = F2B2(d0, d1);
+                *(bf2*)&vng[r * LDB + x] = F2B2(-d0, -d1);
+                const bf2 dd = *(const bf2*)&DO[(row0 + r) * DV + vb + x];
                 const float sg = (float)SCALE * __expf(gm[r]);
-                *(__nv_bfloat162*)&dog[r * LDB + x] = __floats2bfloat162_rn(__low2float(dd) * sg, __high2float(dd) * sg);
+                *(bf2*)&dog[r * LDB + x] = F2B2(LO2F(dd) * sg, HI2F(dd) * sg);
             }
             __syncwarp();
         }
@@ -679,7 +719,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     const float* __restrict__ GC, const float* __restrict__ TS, const bf* __restrict__ Hs,
     const bf* __restrict__ DHs, const bf* __restrict__ DO, const bf* __restrict__ Vn,
     const bf* __restrict__ DVn, bf* __restrict__ DQ, bf* __restrict__ DK_,
-    bf* __restrict__ DV_, float* __restrict__ DA, float* __restrict__ DB) {
+    bf* __restrict__ DV_, float* __restrict__ DA, float* __restrict__ DB, const unsigned Tn) {
     extern __shared__ __align__(16) unsigned char smem[];
     float* f1 = (float*)smem;                    // [C][LDF]  T, then q kᵀ; then staging
     float* f2 = f1 + C * LDF;                    // [C][LDF]  dT, dA, B, dA_qk; then staging
@@ -714,7 +754,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     for (int i = tid; i < C * C; i += 256) {
         const float t = TS[((size_t)h * NT + c) * C * C + i];
         f1[(i / C) * LDF + i % C] = t;
-        tb[(i / C) * LDT + i % C] = __float2bfloat16(t);
+        tb[(i / C) * LDT + i % C] = F2B(t);
     }
 #endif
     __syncthreads();
@@ -722,8 +762,8 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     {
         float acc = 0.0f;
         for (int i = tid; i < DK * DV / 2; i += 256) {
-            const __nv_bfloat162 a = ((const __nv_bfloat162*)dse)[i], b = ((const __nv_bfloat162*)s0)[i];
-            acc = fmaf(__low2float(a), __low2float(b), fmaf(__high2float(a), __high2float(b), acc));
+            const bf2 a = ((const bf2*)dse)[i], b = ((const bf2*)s0)[i];
+            acc = fmaf(LO2F(a), LO2F(b), fmaf(HI2F(a), HI2F(b), acc));
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
@@ -747,7 +787,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
         __syncwarp();
         for (int e = lane; e < 256; e += 32)
-            dwb[(tr * 16 + e / 16) * LDK + tcol * 16 + e % 16] = __float2bfloat16(-stg[e]);
+            dwb[(tr * 16 + e / 16) * LDK + tcol * 16 + e % 16] = F2B(-stg[e]);
         __syncwarp();
     }
     __syncthreads();
@@ -794,7 +834,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     {
         bf* dtb = (bf*)xr;
         bf* xb = dtb + C * LDT;
-        for (int i = tid; i < C * C; i += 256) dtb[(i / C) * LDT + i % C] = __float2bfloat16(f2[(i / C) * LDF + i % C]);
+        for (int i = tid; i < C * C; i += 256) dtb[(i / C) * LDT + i % C] = F2B(f2[(i / C) * LDF + i % C]);
         __syncthreads();
         for (int tt = warp; tt < 16; tt += 8) {
             const int tr = tt >> 2, tc = tt & 3;
@@ -810,7 +850,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             }
             wmma::store_matrix_sync(stg1, acc, 16, wmma::mem_row_major);
             __syncwarp();
-            for (int e = lane; e < 256; e += 32) xb[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = __float2bfloat16(stg1[e]);
+            for (int e = lane; e < 256; e += 32) xb[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = F2B(stg1[e]);
             __syncwarp();
         }
         __syncthreads();
@@ -886,10 +926,10 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     __syncthreads();
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        bsb[r * LDT + j] = __float2bfloat16(f2[r * LDF + j] + f2[j * LDF + r]);
+        bsb[r * LDT + j] = F2B(f2[r * LDF + j] + f2[j * LDF + r]);
     }
 #else
-    for (int i = tid; i < C * C; i += 256) bsb[(i / C) * LDT + i % C] = __float2bfloat16(0.0f);
+    for (int i = tid; i < C * C; i += 256) bsb[(i / C) * LDT + i % C] = F2B(0.0f);
 #endif
     __syncthreads();
     // dA_qk = dO·V'ᵀ (lower incl tiles) → f2
@@ -927,7 +967,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     }
     for (int i = tid; i < C * C; i += 256) {
         const int r = i / C, j = i % C;
-        g1b[r * LDT + j] = __float2bfloat16(j <= r ? (float)SCALE * f2[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f);
+        g1b[r * LDT + j] = F2B(j <= r ? (float)SCALE * f2[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f);
     }
     __syncthreads();
     // outputs: q, k staged over f1/f2 (dead now), one accumulator staged at a time
@@ -991,7 +1031,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
             const float eg = __expf(gam[r]), kb = stg[e];
             acc[q] += bet[r] * eg * kb;
-            const float bk = hsum16(eg * kb * __bfloat162float(ks[r * LDK + x]));
+            const float bk = hsum16(eg * kb * B2F(ks[r * LDK + x]));
             if ((lane & 15) == 0) {
                 atomicAdd(&dbet[r], bk);
                 atomicAdd(&dgam[r], bet[r] * bk);
@@ -1006,8 +1046,8 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             const int e = lane + 32 * q;
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
             const float ec = __expf(glast - gam[r]), kg = stg[e];
-            DK_[(row0 + r) * DK + x] = __float2bfloat16(acc[q] + ec * kg);
-            const float rk = hsum16(ec * kg * __bfloat162float(ks[r * LDK + x]));
+            DK_[(row0 + r) * DK + x] = F2B(acc[q] + ec * kg);
+            const float rk = hsum16(ec * kg * B2F(ks[r * LDK + x]));
             if ((lane & 15) == 0) {
                 atomicAdd(&dgam[r], -rk);
                 rsum += rk;
@@ -1050,8 +1090,8 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             const int e = lane + 32 * q;
             const int r = tr * 16 + e / 16, x = tcol * 16 + e % 16;
             const float sg = (float)SCALE * __expf(gam[r]);
-            DQ[(row0 + r) * DK + x] = __float2bfloat16(sg * stg[e] + acc[q]);
-            const float t = hsum16(sg * stg[e] * __bfloat162float(qs[r * LDK + x]));
+            DQ[(row0 + r) * DK + x] = F2B(sg * stg[e] + acc[q]);
+            const float t = hsum16(sg * stg[e] * B2F(qs[r * LDK + x]));
             if ((lane & 15) == 0) atomicAdd(&dgam[r], t);
         }
         __syncwarp();
@@ -1081,10 +1121,10 @@ extern "C" __global__ void __launch_bounds__(256) main0(
 #if DELTA
             const float dvb = stg[e];
 #else
-            const float dvb = __bfloat162float(DVn[(row0 + r) * DV + x]);
+            const float dvb = B2F(DVn[(row0 + r) * DV + x]);
 #endif
-            DV_[(row0 + r) * DV + x] = __float2bfloat16(bet[r] * dvb);
-            const float t = hsum16(dvb * __bfloat162float(V[(row0 + r) * DV + x]));
+            DV_[(row0 + r) * DV + x] = F2B(bet[r] * dvb);
+            const float t = hsum16(dvb * B2F(V[(row0 + r) * DV + x]));
             if ((lane & 15) == 0) atomicAdd(&dbet[r], t);
         }
         __syncwarp();
@@ -1117,11 +1157,47 @@ extern "C" __global__ void __launch_bounds__(256) main0(
 }
 "#;
 
+/// The coder glue: the GDN prep's rows (`X[t][XROW]`: q `[HK][128]`, k
+/// `[HK][128]`, v `[HEADS][128]`, α `[HEADS]`, β `[HEADS]`, f32) as the scan's
+/// head-major operands, each v head reading k head `h / (HEADS / HK)`; rows
+/// `SEG[1]..Tn` padded with an identity step (α = 1, β = 0, q = k = v = 0).
+/// Grid `(Tn, HEADS)`, 128 threads.
+const CODER_GLUE: &str = r#"
+#define XROW (2 * HK * DK + HEADS * DV + 2 * HEADS)
+extern "C" __global__ void __launch_bounds__(128) main0(
+    const float* __restrict__ X, const unsigned* __restrict__ SEG, bf* __restrict__ Q,
+    bf* __restrict__ K, bf* __restrict__ V, float* __restrict__ AL, float* __restrict__ BE,
+    const unsigned Tn) {
+    const unsigned t = blockIdx.x, h = blockIdx.y, x = threadIdx.x, hk = h / (HEADS / HK);
+    const bool live = t < SEG[1];
+    const float* xr = X + (size_t)t * XROW;
+    const size_t o = ((size_t)h * T + t);
+    Q[o * DK + x] = F2B(live ? xr[hk * DK + x] : 0.0f);
+    K[o * DK + x] = F2B(live ? xr[HK * DK + hk * DK + x] : 0.0f);
+    V[o * DV + x] = F2B(live ? xr[2 * HK * DK + h * DV + x] : 0.0f);
+    if (x == 0) {
+        AL[o] = live ? xr[2 * HK * DK + HEADS * DV + h] : 1.0f;
+        BE[o] = live ? xr[2 * HK * DK + HEADS * DV + HEADS + h] : 0.0f;
+    }
+}
+"#;
+
 impl ChunkedScan {
     fn defines(&self, save_t: bool) -> String {
-        format!(
+        let t = match self.coder {
+            Some(_) => "Tn".to_string(),
+            None => self.t.to_string(),
+        };
+        let coder = match self.coder {
+            Some(hk) => format!(
+                "#define CODER 1\n#define USE_F16 1\n#define HK {hk}\n#define HEADS {}\n",
+                self.heads
+            ),
+            None => "#define CODER 0\n#define HEADS 1\n".to_string(),
+        };
+        coder + &format!(
             "#define T {}\n#define C {CHUNK}\n#define DK {}\n#define DV {}\n#define DELTA {}\n#define GATE {}\n#define BETA {}\n#define SCALE {:e}\n#define SAVE_T {}\n",
-            self.t,
+            t,
             self.n,
             self.m,
             self.delta as u8,
@@ -1270,6 +1346,84 @@ impl ChunkedScan {
     }
 }
 
+impl ChunkedScan {
+    /// The gated delta rule in tang-llm's coder layout: `heads` v heads of
+    /// width `d` reading `k_heads` q/k heads, the GDN prep's f32 rows as
+    /// input (through [`CODER_GLUE`]), the slot's f32 state as the initial
+    /// state (written back at the end), f32 output rows `Y[t][heads·d]`
+    /// from row `SEG[0]` (scale `d^−½`), fp16 operands, the window length a
+    /// kernel argument.
+    pub fn coder(heads: usize, k_heads: usize, d: usize) -> Self {
+        let none = TensorId::from_index(0);
+        ChunkedScan {
+            heads,
+            t: 0,
+            n: d,
+            m: d,
+            delta: true,
+            scale: 1.0 / (d as f64).sqrt(),
+            q: none,
+            k: none,
+            v: none,
+            alpha: Some(none),
+            beta: Some(none),
+            coder: Some(k_heads),
+        }
+    }
+
+    /// The coder layout's four launches (grids from [`coder_grids`](Self::coder_grids)).
+    /// Arguments, each ending in `Tn` (the window padded to 64, u32) —
+    /// glue: `X SEG | Q K V α β`; prep: `K V α β | W U γ γ_C TS(unused)`;
+    /// state: `W U K γ γ_C | H V' Stab SEG`; readout: `Q K γ H V' O(unused)
+    /// A_qk(unused) | Y SEG`.
+    pub fn coder_kernels(&self, bv: usize) -> [ScanLaunch; 4] {
+        let hk = self.coder.expect("coder layout");
+        assert!(self.n == 128 && self.m == 128 && self.heads % hk == 0);
+        let [p, s, o] = self.kernels_saving(bv, false);
+        let d = self.defines(false);
+        let glue = ScanLaunch {
+            source: format!("{INCLUDES}{d}{PRELUDE}{CODER_GLUE}"),
+            grid: (0, 0, 0),
+            block: 128,
+            smem: 0,
+        };
+        [glue, p, s, o]
+    }
+
+    /// Grids of [`coder_kernels`](Self::coder_kernels) for a window padded
+    /// to `tp` rows (a multiple of 64).
+    pub fn coder_grids(&self, tp: usize, bv: usize) -> [(u32, u32, u32); 4] {
+        let (h, nt) = (self.heads as u32, (tp / CHUNK) as u32);
+        [
+            (tp as u32, h, 1),
+            (nt, h, 1),
+            ((self.m / bv) as u32, h, 1),
+            (nt, h, 1),
+        ]
+    }
+
+    /// Scratch of the coder layout for windows of up to `tp` padded rows,
+    /// in bytes: `Q K V` (fp16), `α β` (f32), `W U` (fp16), states `H`
+    /// (fp16 `[heads, tp/64, n, m]`), `V'` (fp16), `γ` `γ_C` (f32).
+    pub fn coder_scratch(&self, tp: usize) -> [usize; 11] {
+        let rows = self.heads * tp;
+        let (n, m) = (self.n, self.m);
+        [
+            rows * n * 2,
+            rows * n * 2,
+            rows * m * 2,
+            rows * 4,
+            rows * 4,
+            rows * n * 2,
+            rows * m * 2,
+            self.heads * (tp / CHUNK) * n * m * 2,
+            rows * m * 2,
+            rows * 4,
+            self.heads * (tp / CHUNK) * 4,
+        ]
+    }
+}
+
 impl TensorGraph {
     /// The chunked plan of `o` when it is `scan_readout(delta_scan(…),
     /// q, scale)` over graph inputs laid out `[H, T, ·]` (the scan dim
@@ -1328,6 +1482,7 @@ impl TensorGraph {
             v,
             alpha,
             beta,
+            coder: None,
         })
     }
 }
