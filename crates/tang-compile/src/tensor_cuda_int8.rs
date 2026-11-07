@@ -94,6 +94,27 @@ __device__ __forceinline__ void tang_mma_s8(int* d, const unsigned* a, unsigned 
 }
 "#;
 
+/// Q8_0 unit loader: four 34-byte blocks (136 bytes, 8-aligned) as 17
+/// aligned `uint2` loads, then each block's f16 scale and 8 code words.
+pub(super) const Q8_0_UNIT: &str = r#"
+__device__ __forceinline__ void tang_q8_0_unit(const unsigned char* p, float* d, unsigned (*q)[8]) {
+    unsigned w[34];
+    #pragma unroll
+    for (int i = 0; i < 17; i++) { const uint2 v = __ldg((const uint2*)p + i); w[2 * i] = v.x; w[2 * i + 1] = v.y; }
+    d[0] = tang_h2f_bits((unsigned short)(w[0] & 0xFFFFu));
+    d[1] = tang_h2f_bits((unsigned short)(w[8] >> 16));
+    d[2] = tang_h2f_bits((unsigned short)(w[17] & 0xFFFFu));
+    d[3] = tang_h2f_bits((unsigned short)(w[25] >> 16));
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        q[0][i] = __funnelshift_r(w[i], w[i + 1], 16);
+        q[1][i] = w[9 + i];
+        q[2][i] = __funnelshift_r(w[17 + i], w[18 + i], 16);
+        q[3][i] = w[26 + i];
+    }
+}
+"#;
+
 /// The Q8x32 store of a one-thread-per-point kernel: 32 consecutive points
 /// are one warp (the caller checks the point count is a multiple of 32).
 pub(super) const Q8X32_STORE: &str = r#"
@@ -781,6 +802,7 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     let xld = if g.fused.is_some() { "*" } else { "__ldg" };
     let mut src = String::new();
     src.push_str(HELPERS);
+    src.push_str(Q8_0_UNIT);
     if g.fused.is_some() {
         src.push_str(
             "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
@@ -805,22 +827,21 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
 {xsrc}    float acc = 0.f;
     if (live) {{
         for (int u = u0; u < {units}; u += {lanes}) {{
+            float dd[4]; unsigned qq[4][8];
+            tang_q8_0_unit(wr + (size_t)u * 136, dd, qq);
             #pragma unroll
             for (int b = 0; b < 4; b++) {{
                 const int blk = 4 * u + b;
-                const unsigned short* bp = (const unsigned short*)(wr + (size_t)blk * 34);
-                const float d = tang_h2f_bits(__ldg(bp));
                 const int4* xv = (const int4*)(xc + blk * 32);
                 const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
                 int dot = 0;
                 #pragma unroll
                 for (int w = 0; w < 8; w++) {{
-                    const unsigned q = (unsigned)__ldg(bp + 1 + 2 * w) | ((unsigned)__ldg(bp + 2 + 2 * w) << 16);
                     const int xw = w & 4 ? (&x4[1].x)[w & 3] : (&x4[0].x)[w & 3];
-                    dot = __dp4a((int)q, xw, dot);
+                    dot = __dp4a((int)qq[b][w], xw, dot);
                 }}
                 const float2 xd = {xld}(xs + blk);
-                acc = fmaf(d * xd.x, (float)dot, acc);
+                acc = fmaf(dd[b] * xd.x, (float)dot, acc);
             }}
         }}
     }}
@@ -884,6 +905,7 @@ fn gemv_kernel_q8_0_tiled(g: &GemvShape) -> (String, usize, usize) {
     let xld = if g.fused.is_some() { "*" } else { "__ldg" };
     let mut src = String::new();
     src.push_str(HELPERS);
+    src.push_str(Q8_0_UNIT);
     if g.fused.is_some() {
         src.push_str(
             "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
@@ -907,14 +929,13 @@ fn gemv_kernel_q8_0_tiled(g: &GemvShape) -> (String, usize, usize) {
     for (int j = 0; j < {pt}; j++) acc[j] = 0.f;
     if (live) {{
         for (int u = u0; u < {units}; u += {lanes}) {{
+            float dd[4]; unsigned qq[4][8];
+            tang_q8_0_unit(wr + (size_t)u * 136, dd, qq);
             #pragma unroll
             for (int b = 0; b < 4; b++) {{
                 const int blk = 4 * u + b;
-                const unsigned short* bp = (const unsigned short*)(wr + (size_t)blk * 34);
-                const float d = tang_h2f_bits(__ldg(bp));
-                unsigned q[8];
-                #pragma unroll
-                for (int w = 0; w < 8; w++) q[w] = (unsigned)__ldg(bp + 1 + 2 * w) | ((unsigned)__ldg(bp + 2 + 2 * w) << 16);
+                const float d = dd[b];
+                const unsigned* q = qq[b];
                 #pragma unroll
                 for (int j = 0; j < {pt}; j++) {{
                     if (j < np) {{
