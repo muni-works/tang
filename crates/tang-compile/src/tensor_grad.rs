@@ -559,7 +559,7 @@ impl TensorGraph {
             body_outs: vec![out],
             monoid: (!free.is_empty()).then(Monoid::sum),
         })
-        .map(|id| {
+        .inspect(|id| {
             // a dim gathered as `a[key[x]]`, key sorted and x reduced here:
             // only x's run with key == the dim's coord contributes
             let seg = arg.view.gather.as_ref().and_then(|g| {
@@ -577,7 +577,6 @@ impl TensorGraph {
                 Some(Segment { red, key, point: d })
             });
             self.nodes[id.n()].segment = seg;
-            id
         })
     }
 }
