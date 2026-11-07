@@ -838,7 +838,11 @@ pub fn moe_block(m: MoeShape) -> Spec {
     };
     let routed_mma = if sorted {
         IntMma {
-            stage: if envn("TANG_DMOE_FRAG", 0) == 1 { Stage::Fragment } else { Stage::Mma },
+            stage: if envn("TANG_DMOE_FRAG", 0) == 1 {
+                Stage::Fragment
+            } else {
+                Stage::Mma
+            },
             ksplit: envn("TANG_DMOE_KSPLIT", 1) as u32,
             pos_tile: 1,
         }

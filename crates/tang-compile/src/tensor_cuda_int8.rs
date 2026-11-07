@@ -715,6 +715,13 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
             return Err("ksplit > 1 needs rows a multiple of a block's rows".into());
         }
         let _ = (wp, x_total);
+        // stage each warp's 16 weight rows × one super-block through shared memory with
+        // coalesced 16-byte loads (lanes otherwise read 4 bytes each, a row apart)
+        let src = if std::env::var("TANG_INT8_NOSTAGE").is_ok() {
+            src
+        } else {
+            stage_kquant_tiles(&src, b.bytes, k / 256 * b.bytes)
+        };
         Ok((src, 256, npos * row_blocks))
     }
 
@@ -1170,4 +1177,43 @@ fn gemv_kernel_q8_0_tiled(g: &GemvShape) -> (String, usize, usize) {
     )
     .unwrap();
     (src, 256, ptiles * row_blocks)
+}
+
+/// Rewrite the k-quant MMA kernel to read its A operands from a per-warp
+/// shared tile (16 rows × one `bb`-byte super-block), filled by coalesced
+/// 16-byte loads at the top of each super-block step.
+fn stage_kquant_tiles(src: &str, bb: usize, row_bytes: usize) -> String {
+    let head = "        const unsigned char* ba = wa + sb * ";
+    let Some(at) = src.find(head) else {
+        return src.to_string();
+    };
+    let line_end = at + src[at..].find('\n').unwrap() + 1;
+    let line2_end = line_end + src[line_end..].find('\n').unwrap() + 1;
+    let fill = format!(
+        "        __syncwarp();\n        for (int i = lane; i < {n16}; i += 32) {{ const int rr = i / {per}, cc = i % {per}; ((uint4*)(tang_ws[warp] + rr * {bb}))[cc] = __ldg((const uint4*)(wa0 + (size_t)rr * {row_bytes} + (size_t)sb * {bb}) + cc); }}\n        __syncwarp();\n        const unsigned char* ba = tang_ws[warp] + gq * {bb};\n        const unsigned char* bq = tang_ws[warp] + (gq + 8) * {bb};\n",
+        n16 = 16 * bb / 16,
+        per = bb / 16,
+    );
+    let mut out = String::with_capacity(src.len() + 1024);
+    out.push_str(&src[..at]);
+    out.push_str(&fill);
+    out.push_str(&src[line2_end..]);
+    let out = out
+        .replace("__ldg((const unsigned*)ba)", "(*(const unsigned*)ba)")
+        .replace("__ldg((const unsigned*)bq)", "(*(const unsigned*)bq)")
+        .replace("__ldg((const unsigned*)(ba", "(*(const unsigned*)(ba")
+        .replace("__ldg((const unsigned*)(bq", "(*(const unsigned*)(bq")
+        .replace("__ldg((const uint2*)(ba", "(*(const uint2*)(ba")
+        .replace("__ldg((const uint2*)(bq", "(*(const uint2*)(bq");
+    // the tile and the warp's first row
+    let decl = "    const unsigned char* wa = wbase + ";
+    match out.find(decl) {
+        Some(d) => format!(
+            "{}    __shared__ __align__(16) unsigned char tang_ws[8][{tile}];\n    const unsigned char* wa0 = wbase + (size_t)r0 * {row_bytes};\n{}",
+            &out[..d],
+            &out[d..],
+            tile = 16 * bb,
+        ),
+        None => src.to_string(),
+    }
 }
