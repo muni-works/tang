@@ -4835,6 +4835,14 @@ impl Coder {
         {
             return false;
         }
+        let contiguous = |a: &Experts, b: &Experts, ne: usize| {
+            b.w.base == a.w.base + a.w.estride * ne as u64
+        };
+        if !contiguous(&layer.gate, &layer.up, self.hp.n_expert)
+            || !contiguous(&layer.sh_gate, &layer.sh_up, 1)
+        {
+            return false;
+        }
         let key: DMoeKey = (t, self.tw(), tys.0, tys.2, keep_y);
         let v = self.stage_view(wi);
         let mut cache = self.dmoe.borrow_mut();
@@ -4877,6 +4885,8 @@ impl Coder {
             y,
             r,
             x,
+            layer.gate.w.base,
+            layer.sh_gate.w.base,
         ];
         d.moe.launch(v.stream, &ext).expect("derived MoE launch");
         d.codes
@@ -7038,16 +7048,24 @@ fn load_layer(
         ],
     )?;
     ensure!(router.rows == hp.n_expert + 1, "{pre} router rows");
-    let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
-    let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
+    let (sh_gate, sh_up) = upload_pair(
+        &dev,
+        &g,
+        &info(&t("ffn_gate_shexp.weight"))?,
+        &info(&t("ffn_up_shexp.weight"))?,
+    )?;
     let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
     ensure!(
         sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
         "{pre}: the shared expert's FF must equal the routed experts' ({})",
         hp.n_ff_exp
     );
-    let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
-    let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
+    let (gate, up) = upload_pair(
+        &dev,
+        &g,
+        &info(&t("ffn_gate_exps.weight"))?,
+        &info(&t("ffn_up_exps.weight"))?,
+    )?;
     let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
     Ok(Layer {
         attn_norm: vecf(&t("attn_norm.weight"))?,
@@ -7221,6 +7239,46 @@ fn upload_dense(
 
 /// A `[n_expert][rows][k]` expert tensor into VRAM in its GGUF type (Q8_0 when the expert
 /// kernels don't decode it).
+/// Gate and up stacks in one buffer, up right after gate (the derived MoE reads both in one
+/// launch through the gate pointer); separate buffers when either isn't a plain native stack.
+fn upload_pair(
+    dev: &CudaComputeDevice,
+    g: &Gguf,
+    a: &TensorInfo,
+    b: &TensorInfo,
+) -> Result<(Experts, Experts)> {
+    let native = |t: &TensorInfo| native_id(t.ty).filter(|&id| id != 0 && id != 30).is_some();
+    let tcx = |t: &TensorInfo| {
+        tcx_on() && matches!(t.ty, GgmlType::Q4K | GgmlType::Q5K)
+            && t.dims[1] % 16 == 0
+            && t.dims[0] % 256 == 0
+    };
+    if a.ty != b.ty || a.dims != b.dims || !native(a) || tcx(a) {
+        return Ok((upload_experts(dev, g, a)?, upload_experts(dev, g, b)?));
+    }
+    let (ba, bb) = (g.bytes(a), g.bytes(b));
+    let rb = a.row_bytes()?;
+    let mut bytes = Vec::with_capacity(ba.len() + bb.len() + 16);
+    bytes.extend_from_slice(ba);
+    bytes.extend_from_slice(bb);
+    bytes.extend_from_slice(&[0u8; 16]);
+    let w = dev.upload_bytes(&bytes);
+    let base = dev.buffer_addr(&w);
+    let rows = a.dims[1] as usize;
+    let ty = native_id(a.ty).unwrap();
+    let ex = |base: u64| ExW {
+        base,
+        estride: (rows * rb) as u64,
+        ty: ty as i32,
+        row_bytes: rb as i32,
+    };
+    let (wa, wb) = (ex(base), ex(base + ba.len() as u64));
+    Ok((
+        Experts { w: wa, _w: w, _t: None, t: wa },
+        Experts { w: wb, _w: dev.upload_bytes(&[0u8; 16]), _t: None, t: wb },
+    ))
+}
+
 fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<Experts> {
     ensure!(
         t.dims.len() == 3 || t.dims.len() == 2,
