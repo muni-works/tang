@@ -1295,7 +1295,7 @@ pub fn aa(args: &[String]) -> Result<()> {
     ensure!(!files.is_empty(), "--ids-files A,B,..");
     a.opts.max_ctx = a.opts.max_ctx.max(4096);
     let mut e = load_coder(&a)?;
-    auto_wide(&mut e, 2048);
+    auto_wide(&mut e, 4096);
     let mut row = |e: &mut Coder, name: &str, ids: &[u32], draft: &str| -> Result<f64> {
         let (out, _, prefill_s, secs, sp) = decode_spec(e, ids, a.n, a.chunk, draft)?;
         let tps = sp.tokens as f64 / secs;
