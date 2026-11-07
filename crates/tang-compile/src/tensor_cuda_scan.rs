@@ -170,18 +170,28 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     for (int bi = 1; bi < C / 16; bi++) {
         for (int e = tid; e < bi * 256; e += 256) {
             const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
-            float acc = 0.0f;
-            for (int k = bj * 16; k < bi * 16; k++)
-                acc = fmaf(sa[(bi * 16 + r) * LDF + k], tm[k * LDF + bj * 16 + cc], acc);
-            xs[e] = acc;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            const float* ar = sa + (bi * 16 + r) * LDF;
+            for (int k = bj * 16; k < bi * 16; k += 4) {
+                a0 = fmaf(ar[k], tm[k * LDF + bj * 16 + cc], a0);
+                a1 = fmaf(ar[k + 1], tm[(k + 1) * LDF + bj * 16 + cc], a1);
+                a2 = fmaf(ar[k + 2], tm[(k + 2) * LDF + bj * 16 + cc], a2);
+                a3 = fmaf(ar[k + 3], tm[(k + 3) * LDF + bj * 16 + cc], a3);
+            }
+            xs[e] = (a0 + a1) + (a2 + a3);
         }
         __syncthreads();
         for (int e = tid; e < bi * 256; e += 256) {
             const int bj = e >> 8, r = (e >> 4) & 15, cc = e & 15;
-            float acc = 0.0f;
-            for (int k = 0; k <= r; k++)
-                acc = fmaf(tm[(bi * 16 + r) * LDF + bi * 16 + k], xs[(bj << 8) + k * 16 + cc], acc);
-            tm[(bi * 16 + r) * LDF + bj * 16 + cc] = -acc;
+            float a0 = 0.0f, a1 = 0.0f;
+            const float* tr_ = tm + (bi * 16 + r) * LDF + bi * 16;
+            int k = 0;
+            for (; k + 1 <= r; k += 2) {
+                a0 = fmaf(tr_[k], xs[(bj << 8) + k * 16 + cc], a0);
+                a1 = fmaf(tr_[k + 1], xs[(bj << 8) + (k + 1) * 16 + cc], a1);
+            }
+            if (k <= r) a0 = fmaf(tr_[k], xs[(bj << 8) + k * 16 + cc], a0);
+            tm[(bi * 16 + r) * LDF + bj * 16 + cc] = -(a0 + a1);
         }
         __syncthreads();
     }
@@ -268,11 +278,34 @@ extern "C" __global__ void __launch_bounds__(128) main0(
     for (int i = 0; i < RT; i++)
         #pragma unroll
         for (int j = 0; j < NTC; j++) wmma::fill_fragment(st[i][j], 0.0f);
+    // this chunk's W row tile (warp's rows) and k column tiles, prefetched
+    // a chunk ahead into registers
+    FA wf[DK / 16];
+    FAc kf[RT][C / 16];
+    float gcn = 0.0f, grn = 0.0f;
+    auto fetch = [&](int c, FA* w, FAc (*k)[C / 16], float& g1, float& g2) {
+        const size_t r0 = (size_t)h * T + (size_t)c * C;
+#if DELTA
+        #pragma unroll
+        for (int e = 0; e < DK / 16; e++) wmma::load_matrix_sync(w[e], Wo + (r0 + warp * 16) * DK + e * 16, DK);
+#endif
+        #pragma unroll
+        for (int i = 0; i < RT; i++)
+            #pragma unroll
+            for (int e = 0; e < C / 16; e++)
+                wmma::load_matrix_sync(k[i][e], K + (r0 + e * 16) * DK + (warp * RT + i) * 16, DK);
+        g1 = GC[h * NT + c];
+        g2 = tid < C ? GR[r0 + tid] : 0.0f;
+    };
+    fetch(0, wf, kf, gcn, grn);
     for (int c = 0; c < NT; c++) {
         const size_t row0 = (size_t)h * T + (size_t)c * C;
-        const float glast = GC[h * NT + c];
+        const float glast = gcn;
         const float gc = __expf(glast);
-        if (tid < C) gm[tid] = __expf(glast - GR[row0 + tid]);
+        if (tid < C) gm[tid] = __expf(glast - grn);
+        FA wn[DK / 16];
+        FAc kn[RT][C / 16];
+        if (c + 1 < NT) fetch(c + 1, wn, kn, gcn, grn);
         bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
         for (int i = 0; i < RT; i++)
@@ -296,11 +329,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             wmma::fill_fragment(acc, 0.0f);
             #pragma unroll
             for (int e = 0; e < DK; e += 16) {
-                FA a;
                 FBr b;
-                wmma::load_matrix_sync(a, Wo + (row0 + tr * 16) * DK + e, DK);
                 wmma::load_matrix_sync(b, sb + e * LDB + tcol * 16, LDB);
-                wmma::mma_sync(acc, a, b, acc);
+                wmma::mma_sync(acc, wf[e / 16], b, acc);
             }
             wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
 #endif
@@ -330,13 +361,19 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 for (int x = 0; x < st[i][j].num_elements; x++) st[i][j].x[x] *= gc;
                 #pragma unroll
                 for (int e = 0; e < C; e += 16) {
-                    FAc a;
                     FBr b;
-                    wmma::load_matrix_sync(a, K + (row0 + e) * DK + (warp * RT + i) * 16, DK);
                     wmma::load_matrix_sync(b, vn + e * LDB + j * 16, LDB);
-                    wmma::mma_sync(st[i][j], a, b, st[i][j]);
+                    wmma::mma_sync(st[i][j], kf[i][e / 16], b, st[i][j]);
                 }
             }
+        if (c + 1 < NT) {
+            #pragma unroll
+            for (int e = 0; e < DK / 16; e++) wf[e] = wn[e];
+            #pragma unroll
+            for (int i = 0; i < RT; i++)
+                #pragma unroll
+                for (int e = 0; e < C / 16; e++) kf[i][e] = kn[i][e];
+        }
         __syncthreads();
     }
 }
