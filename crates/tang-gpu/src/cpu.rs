@@ -136,6 +136,7 @@ impl CpuProgram {
                 Format::Q4K | Format::Q5K | Format::Q8x32 => {
                     panic!("block formats run only on the CUDA int8 lowering")
                 }
+                _ => panic!("fp8 storage lowers only on sm90 CUDA"),
             }
         }
     }
@@ -165,6 +166,7 @@ impl CpuProgram {
                     .iter()
                     .map(|h| f32::from_bits((*h as u32) << 16))
                     .collect(),
+                _ => panic!("fp8 storage lowers only on sm90 CUDA"),
             }
         }
     }

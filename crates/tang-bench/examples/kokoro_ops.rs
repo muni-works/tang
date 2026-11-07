@@ -1154,6 +1154,9 @@ fn fmt_prec(p: Precision) -> String {
         Format::F32 => "f32",
         Format::F16 => "f16",
         Format::BF16 => "bf16",
+        Format::E4M3(_) => "e4m3",
+        Format::E5M2(_) => "e5m2",
+        Format::Fp8Accum => "fp8acc",
         Format::Q4K => "q4k",
         Format::Q5K => "q5k",
         Format::Q8x32 => "q8x32",
@@ -1369,6 +1372,7 @@ fn precision_main(device: &GpuDevice, cache: &mut KernelCache, only: Option<Stri
                             Precision {
                                 storage: Format::F32,
                                 accum: Format::F16,
+                                operand: Format::F32,
                             },
                         );
                         let e = v.precision_error(sin, &outs);

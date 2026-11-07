@@ -1,0 +1,82 @@
+name, utilization.gpu [%], memory.used [MiB], clocks.max.sm [MHz], power.limit [W]
+NVIDIA H200, 0 %, 0 MiB, 1980 MHz, 700.00 W
+# util before: 0 %
+tang fwd bh=512 n=1024 d=64 causal=false: 0.594 ms 231.6 TFLOP/s rel_err 3.37e-3 (1 kernels)
+sdpa fwd bh=512 n=1024 d=64 causal=False: 0.471 ms 292.0 TFLOP/s rel_err 3.37e-03
+sdpa bwd bh=512 n=1024 d=64 causal=False: 1.598 ms 215.0 TFLOP/s rel_err dq 3.63e-03 dk 3.25e-03 dv 3.03e-03
+# util before: 0 %
+tang fwd bh=256 n=2048 d=64 causal=false: 1.051 ms 261.4 TFLOP/s rel_err 2.76e-3 (1 kernels)
+sdpa fwd bh=256 n=2048 d=64 causal=False: 0.908 ms 302.7 TFLOP/s rel_err 2.76e-03
+sdpa bwd bh=256 n=2048 d=64 causal=False: 2.762 ms 248.8 TFLOP/s rel_err dq 4.58e-03 dk 3.89e-03 dv 2.97e-03
+# util before: 6 %
+tang fwd bh=128 n=4096 d=64 causal=false: 1.968 ms 279.3 TFLOP/s rel_err 2.53e-3 (1 kernels)
+sdpa fwd bh=128 n=4096 d=64 causal=False: 1.776 ms 309.6 TFLOP/s rel_err 2.23e-03
+sdpa bwd bh=128 n=4096 d=64 causal=False: 5.111 ms 268.9 TFLOP/s rel_err dq 4.11e-03 dk 4.47e-03 dv 3.13e-03
+# util before: 16 %
+tang fwd bh=64 n=8192 d=64 causal=false: 3.803 ms 289.1 TFLOP/s rel_err 3.01e-3 (1 kernels)
+sdpa fwd bh=64 n=8192 d=64 causal=False: 3.509 ms 313.3 TFLOP/s rel_err 2.93e-03
+sdpa bwd bh=64 n=8192 d=64 causal=False: 9.800 ms 280.5 TFLOP/s rel_err dq 3.14e-03 dk 3.05e-03 dv 2.84e-03
+# util before: 26 %
+tang fwd bh=32 n=16384 d=64 causal=false: 7.475 ms 294.2 TFLOP/s rel_err 3.30e-3 (1 kernels)
+sdpa fwd bh=32 n=16384 d=64 causal=False: 6.980 ms 315.0 TFLOP/s rel_err 3.06e-03
+sdpa bwd bh=32 n=16384 d=64 causal=False: 19.174 ms 286.7 TFLOP/s rel_err dq 3.42e-03 dk 2.75e-03 dv 3.15e-03
+# util before: 3 %
+tang fwd bh=512 n=1024 d=64 causal=true: 0.447 ms 153.7 TFLOP/s rel_err 2.64e-3 (1 kernels)
+sdpa fwd bh=512 n=1024 d=64 causal=True: 0.310 ms 221.8 TFLOP/s rel_err 2.64e-03
+sdpa bwd bh=512 n=1024 d=64 causal=True: 1.113 ms 154.4 TFLOP/s rel_err dq 3.73e-03 dk 2.97e-03 dv 2.49e-03
+# util before: 4 %
+tang fwd bh=256 n=2048 d=64 causal=true: 0.718 ms 191.4 TFLOP/s rel_err 1.59e-3 (1 kernels)
+sdpa fwd bh=256 n=2048 d=64 causal=True: 0.523 ms 262.8 TFLOP/s rel_err 1.59e-03
+sdpa bwd bh=256 n=2048 d=64 causal=True: 1.733 ms 198.3 TFLOP/s rel_err dq 3.02e-03 dk 3.55e-03 dv 2.67e-03
+# util before: 6 %
+tang fwd bh=128 n=4096 d=64 causal=true: 1.275 ms 215.7 TFLOP/s rel_err 2.45e-3 (1 kernels)
+sdpa fwd bh=128 n=4096 d=64 causal=True: 0.971 ms 283.2 TFLOP/s rel_err 2.45e-03
+sdpa bwd bh=128 n=4096 d=64 causal=True: 2.952 ms 232.8 TFLOP/s rel_err dq 4.26e-03 dk 2.69e-03 dv 2.75e-03
+# util before: 3 %
+tang fwd bh=64 n=8192 d=64 causal=true: 2.378 ms 231.2 TFLOP/s rel_err 2.41e-3 (1 kernels)
+sdpa fwd bh=64 n=8192 d=64 causal=True: 1.852 ms 296.9 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=64 n=8192 d=64 causal=True: 5.382 ms 255.4 TFLOP/s rel_err dq 2.92e-03 dk 2.36e-03 dv 2.28e-03
+# util before: 0 %
+tang fwd bh=32 n=16384 d=64 causal=true: 4.479 ms 245.5 TFLOP/s rel_err 2.38e-3 (1 kernels)
+sdpa fwd bh=32 n=16384 d=64 causal=True: 3.632 ms 302.7 TFLOP/s rel_err 2.38e-03
+sdpa bwd bh=32 n=16384 d=64 causal=True: 10.043 ms 273.7 TFLOP/s rel_err dq 4.78e-03 dk 4.86e-03 dv 2.49e-03
+# util before: 3 %
+tang fwd bh=256 n=1024 d=128 causal=false: 0.443 ms 310.2 TFLOP/s rel_err 3.32e-3 (1 kernels)
+sdpa fwd bh=256 n=1024 d=128 causal=False: 0.411 ms 334.3 TFLOP/s rel_err 3.20e-03
+sdpa bwd bh=256 n=1024 d=128 causal=False: 1.520 ms 226.1 TFLOP/s rel_err dq 3.22e-03 dk 3.48e-03 dv 2.87e-03
+# util before: 4 %
+tang fwd bh=128 n=2048 d=128 causal=false: 0.762 ms 360.6 TFLOP/s rel_err 2.86e-3 (1 kernels)
+sdpa fwd bh=128 n=2048 d=128 causal=False: 0.789 ms 348.4 TFLOP/s rel_err 2.83e-03
+sdpa bwd bh=128 n=2048 d=128 causal=False: 2.603 ms 264.0 TFLOP/s rel_err dq 2.38e-03 dk 3.25e-03 dv 3.28e-03
+# util before: 0 %
+tang fwd bh=64 n=4096 d=128 causal=false: 1.401 ms 392.5 TFLOP/s rel_err 3.68e-3 (1 kernels)
+sdpa fwd bh=64 n=4096 d=128 causal=False: 1.551 ms 354.4 TFLOP/s rel_err 3.68e-03
+sdpa bwd bh=64 n=4096 d=128 causal=False: 4.813 ms 285.6 TFLOP/s rel_err dq 3.08e-03 dk 3.64e-03 dv 3.46e-03
+# util before: 3 %
+tang fwd bh=32 n=8192 d=128 causal=false: 2.695 ms 408.0 TFLOP/s rel_err 2.64e-3 (1 kernels)
+sdpa fwd bh=32 n=8192 d=128 causal=False: 3.067 ms 358.6 TFLOP/s rel_err 2.57e-03
+sdpa bwd bh=32 n=8192 d=128 causal=False: 9.241 ms 297.4 TFLOP/s rel_err dq 2.41e-03 dk 2.90e-03 dv 2.84e-03
+# util before: 23 %
+tang fwd bh=16 n=16384 d=128 causal=false: 5.276 ms 416.8 TFLOP/s rel_err 2.78e-3 (1 kernels)
+sdpa fwd bh=16 n=16384 d=128 causal=False: 6.114 ms 359.7 TFLOP/s rel_err 2.78e-03
+sdpa bwd bh=16 n=16384 d=128 causal=False: 18.127 ms 303.3 TFLOP/s rel_err dq 4.05e-03 dk 3.24e-03 dv 3.66e-03
+# util before: 3 %
+tang fwd bh=256 n=1024 d=128 causal=true: 0.324 ms 212.1 TFLOP/s rel_err 2.41e-3 (1 kernels)
+sdpa fwd bh=256 n=1024 d=128 causal=True: 0.274 ms 251.2 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=256 n=1024 d=128 causal=True: 1.023 ms 167.9 TFLOP/s rel_err dq 3.19e-03 dk 3.57e-03 dv 2.57e-03
+# util before: 4 %
+tang fwd bh=128 n=2048 d=128 causal=true: 0.505 ms 272.0 TFLOP/s rel_err 1.90e-3 (1 kernels)
+sdpa fwd bh=128 n=2048 d=128 causal=True: 0.482 ms 285.0 TFLOP/s rel_err 1.90e-03
+sdpa bwd bh=128 n=2048 d=128 causal=True: 1.595 ms 215.4 TFLOP/s rel_err dq 4.94e-03 dk 4.26e-03 dv 2.54e-03
+# util before: 6 %
+tang fwd bh=64 n=4096 d=128 causal=true: 0.874 ms 314.6 TFLOP/s rel_err 1.98e-3 (1 kernels)
+sdpa fwd bh=64 n=4096 d=128 causal=True: 0.899 ms 305.7 TFLOP/s rel_err 1.98e-03
+sdpa bwd bh=64 n=4096 d=128 causal=True: 2.711 ms 253.5 TFLOP/s rel_err dq 4.77e-03 dk 5.11e-03 dv 2.00e-03
+# util before: 18 %
+tang fwd bh=32 n=8192 d=128 causal=true: 1.596 ms 344.4 TFLOP/s rel_err 2.17e-3 (1 kernels)
+sdpa fwd bh=32 n=8192 d=128 causal=True: 1.711 ms 321.4 TFLOP/s rel_err 2.17e-03
+sdpa bwd bh=32 n=8192 d=128 causal=True: 4.916 ms 279.6 TFLOP/s rel_err dq 2.40e-03 dk 4.73e-03 dv 3.29e-03
+# util before: 0 %
+tang fwd bh=16 n=16384 d=128 causal=true: 2.912 ms 377.6 TFLOP/s rel_err 2.62e-3 (1 kernels)
+sdpa fwd bh=16 n=16384 d=128 causal=True: 3.358 ms 327.4 TFLOP/s rel_err 2.62e-03
+sdpa bwd bh=16 n=16384 d=128 causal=True: 8.946 ms 307.3 TFLOP/s rel_err dq 3.54e-03 dk 3.61e-03 dv 2.40e-03
