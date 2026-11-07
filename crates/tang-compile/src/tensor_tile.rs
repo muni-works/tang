@@ -529,7 +529,7 @@ impl Ctx<'_> {
         }
         let node = &self.g.nodes[j];
         match &node.op {
-            Op::Input(_) => {
+            Op::Input(_) | Op::Scan(_) => {
                 let addr = flat(coords, &fixed(&node.shape));
                 Val::Expr(self.buffer_read(j, addr))
             }
@@ -701,7 +701,7 @@ impl Ctx<'_> {
                 let pk = src_shape.len() - self.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
                 let direct = match &self.g.nodes[a.src.n()].op {
-                    Op::Input(_) | Op::Reshape(_) => true,
+                    Op::Input(_) | Op::Reshape(_) | Op::Scan(_) => true,
                     Op::Comp(_) => self.reads.contains(&a.src.n()),
                     Op::Iota(_) => false,
                     Op::Operator(o) => panic!(
@@ -743,7 +743,7 @@ impl Ctx<'_> {
     fn tuple_rank(&self, j: usize) -> usize {
         match &self.g.nodes[j].op {
             Op::Comp(c) => c.tuple,
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => 0,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => 0,
         }
     }
 }

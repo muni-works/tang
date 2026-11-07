@@ -352,6 +352,7 @@ impl TensorGraph {
                 let (len, input) = match &self.nodes[i].op {
                     Op::Input(k) => (numel(&self.nodes[i].shape), Some(*k)),
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
+                    Op::Scan(_) => (numel(&self.nodes[i].shape), None),
                     Op::Iota(_) | Op::Reshape(_) => unreachable!(),
                     Op::Operator(o) => panic!(
                         "operator node `{}` has no device lowering; evaluate it on the host",
@@ -373,8 +374,14 @@ impl TensorGraph {
             .collect();
 
         let kernels = (0..n)
-            .filter(|&i| needs_buffer(i) && self.comp_at(i).is_some())
-            .map(|i| self.kernel_for(i, target))
+            .filter(|&i| {
+                needs_buffer(i)
+                    && (self.comp_at(i).is_some() || matches!(self.nodes[i].op, Op::Scan(_)))
+            })
+            .map(|i| match self.nodes[i].op {
+                Op::Scan(_) => self.scan_kernel(i),
+                _ => self.kernel_for(i, target),
+            })
             .collect();
 
         WgslProgram {
@@ -402,7 +409,7 @@ impl TensorGraph {
             let descend = match &self.nodes[j].op {
                 Op::Comp(_) => j == i || self.nodes[j].inline,
                 Op::Reshape(_) => true,
-                Op::Input(_) | Op::Iota(_) => false,
+                Op::Input(_) | Op::Iota(_) | Op::Scan(_) => false,
                 Op::Operator(o) => panic!(
                     "operator node `{}` has no device lowering; evaluate it on the host",
                     o.op.name()
@@ -672,7 +679,7 @@ impl TensorGraph {
             .collect::<Vec<_>>()
             .join(", ");
         match &node.op {
-            Op::Input(_) => {
+            Op::Input(_) | Op::Scan(_) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 let v = load(
                     node.precision.storage,
@@ -1051,7 +1058,7 @@ fn emit_scalar_fn(s: &mut String, name: &str, g: &ExprGraph, outs: &[ExprId], n_
     writeln!(s, "}}\n").unwrap();
 }
 
-fn emit_combine(s: &mut String, j: usize, m: &Monoid, accum: Format) {
+pub(super) fn emit_combine(s: &mut String, j: usize, m: &Monoid, accum: Format) {
     let w = m.width;
     writeln!(
         s,
@@ -1134,7 +1141,7 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
 
 /// Element type of the output buffer: packed f16 halves of one word are
 /// written by different threads, so the word is atomic.
-fn out_ty(f: Format) -> &'static str {
+pub(super) fn out_ty(f: Format) -> &'static str {
     match f {
         Format::F16 if dialect() == Dialect::Wgsl && !native_f16() => "atomic<u32>",
         f => elem_ty(f),
