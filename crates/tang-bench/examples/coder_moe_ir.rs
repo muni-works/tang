@@ -447,6 +447,7 @@ fn schedule(l: &mut Layer, stage: Stage, ksplit: (u32, u32)) {
         Some(IntMma {
             stage,
             ksplit: ksplit.0,
+            pos_tile: 1,
         }),
     );
     g.set_int_mma(
@@ -454,6 +455,7 @@ fn schedule(l: &mut Layer, stage: Stage, ksplit: (u32, u32)) {
         Some(IntMma {
             stage,
             ksplit: ksplit.1,
+            pos_tile: 1,
         }),
     );
     // the narrow GEMV quantizes its own activations: x → Q8x32 and SwiGLU →

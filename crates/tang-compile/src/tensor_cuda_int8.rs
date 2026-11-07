@@ -26,6 +26,8 @@ use super::{Format, IntMma, Op, Stage, TensorGraph, TensorId, View};
 /// Byte layout of a GGUF k-quant super-block of 256.
 struct Blk {
     bytes: usize,
+    /// Elements a block (256 for the k-quants, 32 for Q8_0).
+    per: usize,
     /// Offset of the 4-bit codes.
     qs: usize,
     five: bool,
@@ -33,13 +35,21 @@ struct Blk {
 
 fn blk(f: Format) -> Option<Blk> {
     match f {
+        Format::Q8_0 => Some(Blk {
+            bytes: 34,
+            per: 32,
+            qs: 2,
+            five: false,
+        }),
         Format::Q4K => Some(Blk {
             bytes: 144,
+            per: 256,
             qs: 16,
             five: false,
         }),
         Format::Q5K => Some(Blk {
             bytes: 176,
+            per: 256,
             qs: 48,
             five: true,
         }),
@@ -81,6 +91,27 @@ __device__ __forceinline__ void tang_mma_s8(int* d, const unsigned* a, unsigned 
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
                    "r"(0), "r"(0), "r"(0), "r"(0));
+}
+"#;
+
+/// Q8_0 unit loader: four 34-byte blocks (136 bytes, 8-aligned) as 17
+/// aligned `uint2` loads, then each block's f16 scale and 8 code words.
+pub(super) const Q8_0_UNIT: &str = r#"
+__device__ __forceinline__ void tang_q8_0_unit(const unsigned char* p, float* d, unsigned (*q)[8]) {
+    unsigned w[34];
+    #pragma unroll
+    for (int i = 0; i < 17; i++) { const uint2 v = __ldg((const uint2*)p + i); w[2 * i] = v.x; w[2 * i + 1] = v.y; }
+    d[0] = tang_h2f_bits((unsigned short)(w[0] & 0xFFFFu));
+    d[1] = tang_h2f_bits((unsigned short)(w[8] >> 16));
+    d[2] = tang_h2f_bits((unsigned short)(w[17] & 0xFFFFu));
+    d[3] = tang_h2f_bits((unsigned short)(w[25] >> 16));
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        q[0][i] = __funnelshift_r(w[i], w[i + 1], 16);
+        q[1][i] = w[9 + i];
+        q[2][i] = __funnelshift_r(w[17 + i], w[18 + i], 16);
+        q[3][i] = w[26 + i];
+    }
 }
 "#;
 
@@ -146,7 +177,7 @@ impl TensorGraph {
         let storage = |t: TensorId| self.nodes[t.n()].precision.storage;
         let wi = (0..c.args.len())
             .find(|&a| blk(storage(c.args[a].src)).is_some())
-            .ok_or("no Q4K / Q5K operand")?;
+            .ok_or("no Q4K / Q5K / Q8_0 operand")?;
         let xi = (0..c.args.len())
             .find(|&a| storage(c.args[a].src) == Format::Q8x32)
             .ok_or("no Q8x32 operand")?;
@@ -269,6 +300,9 @@ impl TensorGraph {
             None
         };
         if s.stage == Stage::Gemv {
+            if s.pos_tile > 1 && wa.view.gather.is_some() {
+                return Err("pos_tile > 1 needs an ungathered weight".into());
+            }
             let wp = param(wi)?;
             let xp = if fused.is_some() {
                 String::new()
@@ -290,9 +324,213 @@ impl TensorGraph {
                 wp: &wp,
                 xp: &xp,
                 fused: fused.as_deref(),
+                ptile: (s.pos_tile.max(1) as usize).min(npos),
             }));
         }
         let ksplit = s.ksplit as usize;
+        if b.per == 32 {
+            let nb = k / 32;
+            if ![1, 2, 4, 8].contains(&ksplit) || nb % ksplit != 0 {
+                return Err(format!("ksplit {ksplit} must divide 8 and k / 32"));
+            }
+            let tiles_per_block = 8 / ksplit;
+            let row_blocks = rows.div_ceil(16 * tiles_per_block);
+            let (wp, xp) = (param(wi)?, param(xi)?);
+            let params: Vec<String> = (0..reads.len())
+                .map(|i| format!("const float* __restrict__ q{i}"))
+                .collect();
+            let reduce = if ksplit > 1 {
+                if !rows.is_multiple_of(16 * tiles_per_block) {
+                    return Err("ksplit > 1 needs rows a multiple of a block's rows".into());
+                }
+                format!(
+                    "    __shared__ float4 red_s[8][32];\n    red_s[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);\n    __syncthreads();\n    if (ks != 0) return;\n    for (int j = 1; j < {ksplit}; j++) {{ const float4 v = red_s[warp + j][lane]; acc[0] += v.x; acc[1] += v.y; acc[2] += v.z; acc[3] += v.w; }}"
+                )
+            } else {
+                String::new()
+            };
+            let nt = (s.pos_tile.max(1) as usize)
+                .div_ceil(8)
+                .min(npos.div_ceil(8));
+            if wa.view.gather.is_none() && xkey.is_none() && (k / 128) % ksplit == 0 {
+                // dense: a block takes `nt` position tiles, the A fragments loaded once
+                let groups = npos.div_ceil(8 * nt);
+                let mut src = String::new();
+                src.push_str(HELPERS);
+                write!(
+                    src,
+                    r#"__device__ __forceinline__ unsigned tang_ld32h(const unsigned char* p) {{
+    const unsigned short* h = (const unsigned short*)p;
+    return (unsigned)__ldg(h) | ((unsigned)__ldg(h + 1) << 16);
+}}
+__device__ __forceinline__ unsigned tang_s32h(const unsigned char* p) {{
+    const unsigned short* h = (const unsigned short*)p;
+    return (unsigned)h[0] | ((unsigned)h[1] << 16);
+}}
+extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
+    const int grp = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int ks = warp % {ksplit}, r0 = (rb * {tiles_per_block} + warp / {ksplit}) * 16;
+    if (grp >= {groups} || r0 >= {rows}) return;
+    const int pos0 = grp * {pg};
+    const unsigned char* wbase;
+    {{ const long long P = pos0;
+{decode}      const long long KEY = {wkey}; (void)KEY;
+      wbase = (const unsigned char*)({wp}) + ({w_off}) / 32 * 34; }}
+    const unsigned char* wa = wbase + (size_t)(r0 + gq) * {row_bytes};
+    const unsigned char* wb = wbase + (size_t)(r0 + gq + 8) * {row_bytes};
+    auto xrow = [&](int j) -> long long {{
+        const long long P = min(pos0 + j, {npos} - 1);
+{decode}        return ({x_off});
+    }};
+    const signed char* xcodes = (const signed char*)({xp});
+    const float2* xsc = (const float2*)((const unsigned char*)({xp}) + {x_total});
+    const signed char* xbp[{nt}]; long long xa_[{nt}], xb_[{nt}];
+    #pragma unroll
+    for (int t = 0; t < {nt}; t++) {{
+        xbp[t] = xcodes + xrow(8 * t + gq);
+        xa_[t] = xrow(8 * t + 2 * tig) / 32; xb_[t] = xrow(8 * t + 2 * tig + 1) / 32;
+    }}
+    float acc[{nt}][4];
+    #pragma unroll
+    for (int t = 0; t < {nt}; t++) {{ acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f; }}
+    // a warp's 16 rows × one unit (four 34-byte blocks, 136 bytes, 8-aligned)
+    // staged through shared memory by coalesced 8-byte loads
+    __shared__ __align__(8) unsigned char tang_ws[8][16 * 136];
+    unsigned char* ws = tang_ws[warp];
+    const unsigned char* wrow0 = wbase + (size_t)r0 * {row_bytes};
+    for (int u = ks * {nu_per}; u < (ks + 1) * {nu_per}; u++) {{
+        __syncwarp();
+        #pragma unroll
+        for (int i = lane; i < 272; i += 32) {{
+            const int rr = i / 17, ww = i % 17;
+            ((uint2*)(ws + rr * 136))[ww] = __ldg((const uint2*)(wrow0 + (size_t)rr * {row_bytes} + (size_t)u * 136) + ww);
+        }}
+        __syncwarp();
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {{
+            const int blk = 4 * u + b;
+            const unsigned char* pa = ws + gq * 136 + b * 34;
+            const unsigned char* pb = ws + (gq + 8) * 136 + b * 34;
+            const float da = tang_h2f_bits(*(const unsigned short*)pa), db = tang_h2f_bits(*(const unsigned short*)pb);
+            unsigned a[4];
+            a[0] = tang_s32h(pa + 2 + tig * 4); a[2] = tang_s32h(pa + 18 + tig * 4);
+            a[1] = tang_s32h(pb + 2 + tig * 4); a[3] = tang_s32h(pb + 18 + tig * 4);
+            #pragma unroll
+            for (int t = 0; t < {nt}; t++) {{
+                const signed char* xs_ = xbp[t] + blk * 32;
+                const unsigned b0 = __ldg((const unsigned*)(xs_ + tig * 4)), b1 = __ldg((const unsigned*)(xs_ + 16 + tig * 4));
+                int d[4];
+                tang_mma_s8(d, a, b0, b1);
+                const float2 x0 = __ldg(xsc + xa_[t] + blk), x1 = __ldg(xsc + xb_[t] + blk);
+                acc[t][0] = fmaf(da * x0.x, (float)d[0], acc[t][0]);
+                acc[t][1] = fmaf(da * x1.x, (float)d[1], acc[t][1]);
+                acc[t][2] = fmaf(db * x0.x, (float)d[2], acc[t][2]);
+                acc[t][3] = fmaf(db * x1.x, (float)d[3], acc[t][3]);
+            }}
+        }}
+    }}
+{reduce_nt}
+    #pragma unroll
+    for (int t = 0; t < {nt}; t++) {{
+        const int pa_ = pos0 + 8 * t + 2 * tig;
+        const long long o0 = (long long)pa_ * {rows} + r0 + gq;
+        if (pa_ < {npos}) {{ out[o0] = acc[t][0]; out[o0 + 8] = acc[t][2]; }}
+        if (pa_ + 1 < {npos}) {{ out[o0 + {rows}] = acc[t][1]; out[o0 + {rows} + 8] = acc[t][3]; }}
+    }}
+}}
+"#,
+                    params = params.join(", "),
+                    row_bytes = k / 32 * 34,
+                    pg = 8 * nt,
+                    nu_per = k / 128 / ksplit,
+                    reduce_nt = if ksplit > 1 {
+                        format!("    __shared__ float4 red_s[8][32];\n    #pragma unroll\n    for (int t = 0; t < {nt}; t++) {{\n        __syncthreads();\n        red_s[warp][lane] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);\n        __syncthreads();\n        if (ks == 0) for (int j = 1; j < {ksplit}; j++) {{ const float4 v = red_s[warp + j][lane]; acc[t][0] += v.x; acc[t][1] += v.y; acc[t][2] += v.z; acc[t][3] += v.w; }}\n    }}\n    if (ks != 0) return;")
+                    } else {
+                        String::new()
+                    },
+                )
+                .unwrap();
+                return Ok((src, 256, groups * row_blocks));
+            }
+            let mut src = String::new();
+            src.push_str(HELPERS);
+            write!(
+                src,
+                r#"__device__ __forceinline__ unsigned tang_ld32h(const unsigned char* p) {{
+    const unsigned short* h = (const unsigned short*)p;
+    return (unsigned)__ldg(h) | ((unsigned)__ldg(h + 1) << 16);
+}}
+extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
+    const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int ks = warp % {ksplit}, r0 = (rb * {tiles_per_block} + warp / {ksplit}) * 16;
+    if (pos >= {npos}) return;
+    long long key0;
+    {{ const long long P = pos;
+{decode}      key0 = {wkey}; }}
+    if (pos % 8 != 0) {{
+        const long long P = pos - 1;
+{decode}        if ({wkey} == key0) return;
+    }}
+    int m = 1;
+    while (m < 8 - pos % 8 && pos + m < {npos}) {{
+        const long long P = pos + m;
+{decode}        if ({wkey} != key0) break;
+        m++;
+    }}
+    if (r0 >= {rows}) return;
+    const long long KEY = key0;
+    const unsigned char* wbase;
+    {{ const long long P = pos;
+{decode}      wbase = (const unsigned char*)({wp}) + ({w_off}) / 32 * 34; }}
+    const unsigned char* wa = wbase + (size_t)min(r0 + gq, {rows} - 1) * {row_bytes};
+    const unsigned char* wb = wbase + (size_t)min(r0 + gq + 8, {rows} - 1) * {row_bytes};
+    auto xrow = [&](int j) -> long long {{
+        const long long P = pos + (j < m ? j : 0);
+{decode}{xkey_decl}        return ({x_off});
+    }};
+    const signed char* xcodes = (const signed char*)({xp});
+    const float2* xsc = (const float2*)((const unsigned char*)({xp}) + {x_total});
+    const signed char* xb = xcodes + xrow(gq);
+    const long long xa_ = xrow(2 * tig) / 32, xb_ = xrow(2 * tig + 1) / 32;
+    float acc[4] = {{0.f, 0.f, 0.f, 0.f}};
+    #pragma unroll 4
+    for (int blk = ks * {nb_per}; blk < (ks + 1) * {nb_per}; blk++) {{
+        const unsigned char* pa = wa + blk * 34;
+        const unsigned char* pb = wb + blk * 34;
+        const float da = tang_h2f_bits(__ldg((const unsigned short*)pa)), db = tang_h2f_bits(__ldg((const unsigned short*)pb));
+        unsigned a[4];
+        a[0] = tang_ld32h(pa + 2 + tig * 4); a[2] = tang_ld32h(pa + 18 + tig * 4);
+        a[1] = tang_ld32h(pb + 2 + tig * 4); a[3] = tang_ld32h(pb + 18 + tig * 4);
+        const signed char* xs_ = xb + blk * 32;
+        const unsigned b0 = __ldg((const unsigned*)(xs_ + tig * 4)), b1 = __ldg((const unsigned*)(xs_ + 16 + tig * 4));
+        int d[4];
+        tang_mma_s8(d, a, b0, b1);
+        const float2 x0 = __ldg(xsc + xa_ + blk), x1 = __ldg(xsc + xb_ + blk);
+        acc[0] = fmaf(da * x0.x, (float)d[0], acc[0]);
+        acc[1] = fmaf(da * x1.x, (float)d[1], acc[1]);
+        acc[2] = fmaf(db * x0.x, (float)d[2], acc[2]);
+        acc[3] = fmaf(db * x1.x, (float)d[3], acc[3]);
+    }}
+{reduce}
+    const long long o0 = (long long)(pos + 2 * tig) * {rows} + r0 + gq;
+    const bool ra = r0 + gq < {rows}, rbv = r0 + gq + 8 < {rows};
+    if (2 * tig < m) {{ if (ra) out[o0] = acc[0]; if (rbv) out[o0 + 8] = acc[2]; }}
+    if (2 * tig + 1 < m) {{ if (ra) out[o0 + {rows}] = acc[1]; if (rbv) out[o0 + {rows} + 8] = acc[3]; }}
+}}
+"#,
+                params = params.join(", "),
+                row_bytes = k / 32 * 34,
+                nb_per = nb / ksplit,
+                xkey_decl = match &xkey {
+                    Some(e) => format!("        const long long XKEY = {e};\n"),
+                    None => String::new(),
+                },
+            )
+            .unwrap();
+            return Ok((src, 256, npos * row_blocks));
+        }
         if ![1, 2, 4, 8].contains(&ksplit) || (k / 256) % ksplit != 0 {
             return Err(format!("ksplit {ksplit} must divide 8 and k / 256"));
         }
@@ -477,6 +715,13 @@ impl TensorGraph {
             return Err("ksplit > 1 needs rows a multiple of a block's rows".into());
         }
         let _ = (wp, x_total);
+        // stage each warp's 16 weight rows × one super-block through shared memory with
+        // coalesced 16-byte loads (lanes otherwise read 4 bytes each, a row apart)
+        let src = if std::env::var("TANG_INT8_NOSTAGE").is_ok() {
+            src
+        } else {
+            stage_kquant_tiles(&src, b.bytes, k / 256 * b.bytes)
+        };
         Ok((src, 256, npos * row_blocks))
     }
 
@@ -596,6 +841,8 @@ struct GemvShape<'a> {
     xp: &'a str,
     /// the inlined producer's prologue ([`TensorGraph::gemv_prologue`])
     fused: Option<&'a str>,
+    /// positions a block (one weight read for all of them)
+    ptile: usize,
 }
 
 /// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
@@ -604,6 +851,12 @@ struct GemvShape<'a> {
 /// warp, 8 warps a block, one position a block. Same scaling as the MMA
 /// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
 fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
+    if g.b.per == 32 && g.ptile > 1 {
+        return gemv_kernel_q8_0_tiled(g);
+    }
+    if g.b.per == 32 {
+        return gemv_kernel_q8_0(g);
+    }
     let units = g.k / 128;
     // half-super-blocks a lane (more loads in flight a lane), then lanes a row
     let upl: usize = std::env::var("TANG_GEMV_UPL")
@@ -722,4 +975,245 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     )
     .unwrap();
     (src, 256, g.npos * row_blocks)
+}
+
+/// [`Stage::Gemv`] on GGUF Q8_0 weights: a lane takes 128 columns (four
+/// 34-byte blocks) at a time, `dot(w codes, x codes) · d_w · d_x` a block on
+/// `dp4a`. Blocks are 2-byte aligned, so codes are loaded as halfwords.
+fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
+    let units = g.k / 128;
+    let lanes = units.next_power_of_two().clamp(1, 32);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let row_bytes = g.k / 32 * 34;
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let xsrc = match g.fused {
+        Some(pro) => format!(
+            "    __shared__ __align__(16) signed char tang_sx[{k}];\n    __shared__ float2 tang_ss[{kb}];\n    {{ const long long P = pos;\n{decode}{xkey_decl}{pro}    }}\n    __syncthreads();\n    (void)xr;\n    const signed char* xc = tang_sx;\n    const float2* xs = tang_ss;\n",
+            k = g.k,
+            kb = g.k / 32,
+            decode = g.decode,
+        ),
+        None => format!(
+            "    const signed char* xc = (const signed char*)({xp}) + xr;\n    const float2* xs = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;\n",
+            xp = g.xp,
+            x_total = g.x_total,
+        ),
+    };
+    let xld = if g.fused.is_some() { "*" } else { "__ldg" };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    src.push_str(Q8_0_UNIT);
+    if g.fused.is_some() {
+        src.push_str(
+            "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
+        );
+    }
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (pos >= {npos}) return;
+    const bool live = r < {rows};
+    long long KEY, xr;
+    {{ const long long P = pos;
+{decode}      KEY = {wkey};
+{xkey_decl}      xr = ({x_off}); }}
+    const unsigned char* wbase;
+    {{ const long long P = pos;
+{decode}      wbase = (const unsigned char*)({wp}) + ({w_off}) / 32 * 34; }}
+    const unsigned char* wr = wbase + (size_t)(live ? r : 0) * {row_bytes};
+{xsrc}    float acc = 0.f;
+    if (live) {{
+        for (int u = u0; u < {units}; u += {lanes}) {{
+            float dd[4]; unsigned qq[4][8];
+            tang_q8_0_unit(wr + (size_t)u * 136, dd, qq);
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {{
+                const int blk = 4 * u + b;
+                const int4* xv = (const int4*)(xc + blk * 32);
+                const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
+                int dot = 0;
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {{
+                    const int xw = w & 4 ? (&x4[1].x)[w & 3] : (&x4[0].x)[w & 3];
+                    dot = __dp4a((int)qq[b][w], xw, dot);
+                }}
+                const float2 xd = {xld}(xs + blk);
+                acc = fmaf(dd[b] * xd.x, (float)dot, acc);
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int o = {lanes} / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (live && u0 == 0) out[(long long)pos * {rows} + r] = acc;
+}}
+"#,
+        params = params.join(", "),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        x_off = g.x_off,
+        wp = g.wp,
+        w_off = g.w_off,
+    )
+    .unwrap();
+    (src, 256, g.npos * row_blocks)
+}
+
+/// [`gemv_kernel_q8_0`] with `ptile` positions a block: each lane loads a
+/// weight block once and dots it with every position's activations (the
+/// decode window's rows share the weight traffic).
+fn gemv_kernel_q8_0_tiled(g: &GemvShape) -> (String, usize, usize) {
+    let pt = g.ptile;
+    let units = g.k / 128;
+    let lanes = units.next_power_of_two().clamp(1, 32);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let row_bytes = g.k / 32 * 34;
+    let ptiles = g.npos.div_ceil(pt);
+    let (k, kb) = (g.k, g.k / 32);
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let xsrc = match g.fused {
+        Some(pro) => {
+            let pro = pro
+                .replace("tang_sx[", &format!("(tang_sx + tang_j * {k})["))
+                .replace("tang_ss[", &format!("(tang_ss + tang_j * {kb})["));
+            format!(
+                "    __shared__ __align__(16) signed char tang_sx[{pk}];\n    __shared__ float2 tang_ss[{pkb}];\n    for (int tang_j = 0; tang_j < np; tang_j++) {{ const long long P = pos0 + tang_j;\n{decode}{xkey_decl}{pro}    }}\n    __syncthreads();\n    const signed char* xcj[{pt}]; const float2* xsj[{pt}];\n    #pragma unroll\n    for (int j = 0; j < {pt}; j++) {{ xcj[j] = tang_sx + j * {k}; xsj[j] = tang_ss + j * {kb}; }}\n",
+                pk = pt * k,
+                pkb = pt * kb,
+                decode = g.decode,
+            )
+        }
+        None => format!(
+            "    const signed char* xcj[{pt}]; const float2* xsj[{pt}];\n    #pragma unroll\n    for (int j = 0; j < {pt}; j++) {{\n        long long xr = 0;\n        if (j < np) {{ const long long P = pos0 + j;\n{decode}{xkey_decl}          xr = ({x_off}); }}\n        xcj[j] = (const signed char*)({xp}) + xr;\n        xsj[j] = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;\n    }}\n",
+            decode = g.decode,
+            x_off = g.x_off,
+            xp = g.xp,
+            x_total = g.x_total,
+        ),
+    };
+    let xld = if g.fused.is_some() { "*" } else { "__ldg" };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    src.push_str(Q8_0_UNIT);
+    if g.fused.is_some() {
+        src.push_str(
+            "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
+        );
+    }
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int ptl = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (ptl >= {ptiles}) return;
+    const int pos0 = ptl * {pt}, np = min({pt}, {npos} - pos0);
+    const bool live = r < {rows};
+    const unsigned char* wr;
+    {{ const long long P = pos0;
+{decode}      const long long KEY = {wkey}; (void)KEY;
+      wr = (const unsigned char*)({wp}) + ({w_off}) / 32 * 34 + (size_t)(live ? r : 0) * {row_bytes}; }}
+{xsrc}    float acc[{pt}];
+    #pragma unroll
+    for (int j = 0; j < {pt}; j++) acc[j] = 0.f;
+    if (live) {{
+        for (int u = u0; u < {units}; u += {lanes}) {{
+            float dd[4]; unsigned qq[4][8];
+            tang_q8_0_unit(wr + (size_t)u * 136, dd, qq);
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {{
+                const int blk = 4 * u + b;
+                const float d = dd[b];
+                const unsigned* q = qq[b];
+                #pragma unroll
+                for (int j = 0; j < {pt}; j++) {{
+                    if (j < np) {{
+                        const int4* xv = (const int4*)(xcj[j] + blk * 32);
+                        const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
+                        int dot = 0;
+                        #pragma unroll
+                        for (int w = 0; w < 8; w++) dot = __dp4a((int)q[w], w & 4 ? (&x4[1].x)[w & 3] : (&x4[0].x)[w & 3], dot);
+                        const float2 xd = {xld}(xsj[j] + blk);
+                        acc[j] = fmaf(d * xd.x, (float)dot, acc[j]);
+                    }}
+                }}
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int j = 0; j < {pt}; j++) {{
+        float a = acc[j];
+        #pragma unroll
+        for (int o = {lanes} / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (live && u0 == 0 && j < np) out[(long long)(pos0 + j) * {rows} + r] = a;
+    }}
+}}
+"#,
+        params = params.join(", "),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        wp = g.wp,
+        w_off = g.w_off,
+    )
+    .unwrap();
+    (src, 256, ptiles * row_blocks)
+}
+
+/// Rewrite the k-quant MMA kernel to read its A operands from a per-warp
+/// shared tile (16 rows × one `bb`-byte super-block), filled by coalesced
+/// 16-byte loads at the top of each super-block step.
+fn stage_kquant_tiles(src: &str, bb: usize, row_bytes: usize) -> String {
+    let head = "        const unsigned char* ba = wa + sb * ";
+    let Some(at) = src.find(head) else {
+        return src.to_string();
+    };
+    let line_end = at + src[at..].find('\n').unwrap() + 1;
+    let line2_end = line_end + src[line_end..].find('\n').unwrap() + 1;
+    let fill = format!(
+        "        __syncwarp();\n        for (int i = lane; i < {n16}; i += 32) {{ const int rr = i / {per}, cc = i % {per}; ((uint4*)(tang_ws[warp] + rr * {bb}))[cc] = __ldg((const uint4*)(wa0 + (size_t)rr * {row_bytes} + (size_t)sb * {bb}) + cc); }}\n        __syncwarp();\n        const unsigned char* ba = tang_ws[warp] + gq * {bb};\n        const unsigned char* bq = tang_ws[warp] + (gq + 8) * {bb};\n",
+        n16 = 16 * bb / 16,
+        per = bb / 16,
+    );
+    let mut out = String::with_capacity(src.len() + 1024);
+    out.push_str(&src[..at]);
+    out.push_str(&fill);
+    out.push_str(&src[line2_end..]);
+    let out = out
+        .replace("__ldg((const unsigned*)ba)", "(*(const unsigned*)ba)")
+        .replace("__ldg((const unsigned*)bq)", "(*(const unsigned*)bq)")
+        .replace("__ldg((const unsigned*)(ba", "(*(const unsigned*)(ba")
+        .replace("__ldg((const unsigned*)(bq", "(*(const unsigned*)(bq")
+        .replace("__ldg((const uint2*)(ba", "(*(const uint2*)(ba")
+        .replace("__ldg((const uint2*)(bq", "(*(const uint2*)(bq");
+    // the tile and the warp's first row
+    let decl = "    const unsigned char* wa = wbase + ";
+    match out.find(decl) {
+        Some(d) => format!(
+            "{}    __shared__ __align__(16) unsigned char tang_ws[8][{tile}];\n    const unsigned char* wa0 = wbase + (size_t)r0 * {row_bytes};\n{}",
+            &out[..d],
+            &out[d..],
+            tile = 16 * bb,
+        ),
+        None => src.to_string(),
+    }
 }

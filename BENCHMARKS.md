@@ -3474,3 +3474,159 @@ column, token by token; Qwen3-Coder-Next GDN: 32 v heads, 16 k heads, d 128;
 | H200 | 4k | 2.49 | **0.62** |
 | | 16k | 9.91 | **2.33** |
 | | 64k | 39.69 | **9.14** |
+
+## Coder-Next: per-op hand vs derived (RTX 3090, kernel-only)
+
+First step toward `TANG_CODER_DERIVED=all` (plan and inventory: `crates/tang-llm/docs/coder-derived.md`).
+Ops written as naive IR graphs in `crates/tang-llm/src/flash/derived_ops.rs`, lowered by tang-compile,
+NVRTC-compiled and launched on raw device buffers (the engine's calling convention). Engine shapes:
+hidden 2048, 512 experts, top-10. `cargo run --release -p tang-llm --features cuda --example coder_derived_ops 1 2 8`
+on mew (RTX 3090, shared GPU, `flock`). Time = min µs per launch over 50 × 20 warm launches.
+Error = max |Δ| / max |want| against the hand kernel (route: weights; ids compared exactly).
+
+| op | hand kernel | T | hand µs | derived µs | derived kernels | max rel err |
+|---|---|---|---|---|---|---|
+| residual add + RMSNorm | `cx_norm_q8` | 1 | 5.99 | 5.89 | 3 | 0 |
+| | | 8 | 6.20 | 6.50 | 3 | 1.4e-7 |
+| MoE combine + residual + RMSNorm | `cx_moe_add_norm` | 1 | 5.68 | 7.88 | 4 | 1.2e-7 |
+| softmax top-10 routing | `cx_route` | 1 | 10.60 | 12.29 | 2 | 1.5e-7, ids equal |
+| | | 8 | 11.01 | 12.54 | 2 | 2.2e-7, ids equal |
+
+The hand kernels also write the int8 activations, which the derived ones do not yet (that output
+is in the IR's `Q8x32` layout, not the engine's), so these rows compare unequal work in the hand
+kernel's favour. Derived `add_norm` at T=64 equals a CPU reference exactly. At T ≥ 8 the hand
+`cx_moe_add_norm` / `cx_norm_q8` results in this harness were not reproducible (my launch of the
+hand kernel, not the derived op), so those rows are left out.
+
+Dense Q8_0 GEMV (new `Format::Q8_0` in the IR, `Stage::Gemv`, x → int8 quantized in the prologue at
+T=1 and by a writer kernel past that; `IntMma::pos_tile` = T shares one weight read), against a CPU
+reference on the same int8-rounded activations (err ≤ 1.3e-7 everywhere):
+
+| rows × k | T=1 µs (GB/s) | T=2 | T=8 |
+|---|---|---|---|
+| 4096 × 2048 | 17.7 (503) | 20.3 (438) | 44.9 (199) |
+| 2048 × 4096 | 21.0 (424) | 20.7 (430) | 47.8 (186) |
+| 151936 × 2048 (LM head) | 383 (862) | 392 (844) | 1189 (278) |
+
+T=1/2 on the LM head is 92% of the 3090's 936 GB/s. T=8 is compute/register-bound (next step in
+the plan). No H200 or end-to-end numbers yet: nothing here is wired into the engine.
+
+Update (same day): prod decodes at T≈8–45 (`serve --batch 45` + MTP), so T ≥ 2 now runs on int8
+tensor cores. `Format::Q8_0` on the `IntMma` MMA stage: a block holds 16 rows × `pos_tile` positions
+(all T up to 64, one weight read), each warp stages its 16 rows × 136-byte unit through shared memory
+with coalesced 8-byte loads, ksplit 2. Same 3090, same reference check (err ≤ 3.8e-7):
+
+| rows × k | T=1 (dp4a) | T=2 | T=8 | T=16 | T=48 |
+|---|---|---|---|---|---|
+| 4096 × 2048 | 17.7 µs | 18.2 | 18.4 (485 GB/s) | 23.0 | 45.2 |
+| 2048 × 4096 | 21.0 | 25.8 | 26.2 (340) | 37.6 | 76.8 |
+| 151936 × 2048 (LM head) | 383 (862) | 487 (679) | 459 (720) | 426 (775) | 834 (396) |
+
+Before this, T=8 on the LM head took 1189 µs (278 GB/s); T=48 took 26.5 ms on the GEMV path. At T=48
+the B fragments (one global load a tile a block step) are now the limit — next: stage x per unit too.
+
+## Coder-Next: `TANG_CODER_DERIVED=moe` on the model (H200 SXM, RunPod secure, 2026-11-07)
+
+Qwen3-Coder-Next UD-Q4_K_XL. 47 of 48 MoE layers run the derived block (`derived_ops::moe_block`):
+routing, gathered Q4_K/Q5_K experts, Q8_0 shared expert, combine, residual and next norm, plus the
+int8 re-layout for the hand attention/GDN kernels. The router GEMV is still hand, and so is one
+layer (its down stack is Q6_K, which the IR has no format for yet; it falls back per shape).
+Prompt: the first 4.2 KB of `coder_kernels.rs` with a refactor instruction, 1,380 chat tokens, cycled
+to 3k/8k by wide-check (the gates' `refactor.ids` was not available on this pod; on a 50k-token
+non-repeating prompt, **hand fails the wide-check bars too** (KL 3.0e-2 at 3k), so the bars assume a
+cycled prompt).
+
+Gates (all PASS):
+
+| gate | hand | derived MoE |
+|---|---|---|
+| wide-check 3000, int8 KV (KL bar 2.0e-4) | 6.74e-5, greedy equal | 4.06e-5, greedy equal |
+| wide-check 8000, int8 KV (bar 3.2e-5) | 9.08e-6 | 2.70e-5 |
+| wide-check 3000 / 8000, bf16 KV | — | 5.59e-5 / 1.63e-5, greedy equal |
+| batch-check N=8 | PASS bitwise | PASS bitwise |
+| continuation (`serve --batch 8`, int8 KV) | — | warm 1,380-token prefix + 4,663-token extension: 48-token greedy reply equal to a second server's (which reused 1,377 tokens from the persisted prefix cache, not 0) |
+
+Decode step (`flash-batch-check`, context ~1,380, 64 steps):
+
+| streams | hand ms | derived ms (first) | derived ms (after fixes) |
+|---|---|---|---|
+| 1 | 4.04 | 6.35 | 5.04 |
+| 2 | 4.74 | 6.79 | 5.84 |
+| 4 | 6.53 | 8.76 | 7.54 |
+| 8 | 9.82 | 12.71 | 11.27 |
+| 16 | 15.88 | — | 16.71 |
+| 32 | 23.49 | — | 27.21 |
+| 48 | 29.99 | — | 37.89 |
+
+16–48 streams are the batch module (64 rows), where the hand experts run on int8 tensor cores
+(`cx_moe_*_q`) and the derived routed experts are still one dp4a GEMV per (token, expert) pair. That
+is the gap at 32–48 (−16% / −21% throughput); the IntMma stage with gathered weights (sorted pairs,
+as `coder_moe_ir` does for wide windows) is the fix. batch-check N=48 tolerance: derived 99.27% /
+mean 0.150 (PASS); hand 99.00% / 0.142 on this prompt (FAIL by the bar's strict inequality). The batch
+shapes (T=16/32/48) built lazily outside capture in 1.2 s each.
+
+The fixes: the RMSNorm sum of squares ran as one thread per row (27 µs a layer), and every GEMV
+block re-quantized x in its prologue (x is now written once). Per layer on the H200 at T=1 (512 experts,
+top-10, `examples/coder_derived_moe.rs`): 90 → 60 µs. What is left at T=1: the top-k reduction is 13 µs
+in one block (the hand `cx_route` is one warp), and 14 kernels against the hand path's ~4.
+Startup: the derived shapes build in 6.3 s at load.
+Pod time: ~1.4 h at $5.29/hr (≈ $7.50), pod terminated.
+
+### Round 2: routed experts sorted by expert on int8 tensor cores (H200, second pod)
+
+From 16 rows the (token, expert) pairs are sorted by expert (IR comps) and gate/up/down run on the
+`IntMma` MMA stage with gathered weights; the k-quant MMA lowering stages each warp's 16-row
+super-block tile through shared memory (coalesced 16-byte loads). Same prompt and command as above,
+a different H200 host (hand re-measured on it):
+
+| streams | hand ms | derived ms (round 1) | derived ms (round 2) |
+|---|---|---|---|
+| 1 | 4.08 | 5.04 | 5.11 |
+| 8 | 9.91 | 11.27 | 11.33 |
+| 16 | 15.96 | 16.71 | **15.65** |
+| 32 | 23.64 | 27.21 | **23.30** |
+| 48 | 30.21 | 37.89 | 31.53 |
+
+batch-check N=48 tolerance: derived 99.24% / mean 0.153 PASS (hand 99.00% / 0.142 on this prompt).
+Batch shapes build in 1.6–1.9 s each (21 + 2 kernels).
+
+Profile (`TANG_CODER_PROF=1 --eager`, 32 steps, logs in `crates/tang-llm/docs/bench/derived-moe/`): the
+MoE stages, summed over 32 steps (hand: route + moe_gu + moe_down + moe_add_norm on 48 layers;
+derived: `moe_derived` on 47 layers + the hand stages on the Q6_K layer):
+
+| streams | hand MoE ms | derived MoE ms | per step |
+|---|---|---|---|
+| 1 | 84.0 | 117.6 | +1.05 ms |
+| 8 | 205.4 | 257.5 | +1.63 ms |
+
+Everything outside the MoE layer matches (same kernels). So the N=1 gap is the derived layer itself:
+~77 µs a layer vs ~55 hand in eager mode. The derived shapes build at load or on first use outside a capture (the log shows each build
+once), so the graphed steps run the derived kernels; I did not inspect the captured graphs node by node.
+No nsys on the image, so per-kernel attribution inside the derived layer comes from
+`examples/coder_derived_moe.rs` (`PER_KERNEL=1`): top-k 13 µs, gate and up GEMVs, 14 kernels.
+Pod time this round ≈ 45 min ($4), terminated.
+
+### Round 3 (third H200, `crates/tang-llm/docs/bench/derived-moe/r3/`)
+
+Changes: `y` not materialized unless kept (one kernel a layer fewer); a parallel rank-count top-k
+was tried and left opt-in (`TANG_DMOE_TOPK=rank`: no faster at T=1, slower at T=48).
+
+| gate | result |
+|---|---|
+| batch-check N=8 | PASS bitwise (checksum 601bcc0313fe017a, same as round 1's last) |
+| wide-check 3000, int8 KV | **FAIL**: KL 2.81e-4 vs bar 2.0e-4; greedy equal (32 tokens) |
+| wide-check 8000, int8 KV | PASS: KL 1.98e-5 (bar 3.2e-5), greedy equal |
+| batch-check N=48 tolerance | derived PASS 99.24% / mean 0.153; hand 99.00% / 0.142 |
+
+| streams | hand ms | derived ms |
+|---|---|---|
+| 1 | 4.11 | 5.17 |
+| 8 | 9.92 | 11.41 |
+| 16 | 15.91 | 15.71 |
+| 32 | 23.60 | 23.37 |
+| 48 | 30.15 | 32.18 |
+
+The 3000 KL regression (4.06e-5 on the round-1 build) is new since the first gate run; the narrow
+path changed since then in its reduction orders (the norm's sum of squares split across a block,
+x quantized by a writer kernel). Not bisected yet. The 8000 KL improved. Decode is unchanged within noise.
+Pod ≈ 45 min ($4), terminated.
