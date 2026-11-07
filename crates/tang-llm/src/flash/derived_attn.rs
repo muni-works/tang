@@ -180,6 +180,116 @@ fn tile_reductions(g: &mut TensorGraph) {
     }
 }
 
+/// One compiled window kernel and how to launch it.
+#[cfg(feature = "cuda")]
+pub struct Kernel {
+    pub f: cudarc::driver::sys::CUfunction,
+    _m: tang_moe::gpu::Module,
+    /// Each parameter's role, in parameter order (then `out`, `count`).
+    pub params: Vec<Role>,
+    pub threads: u32,
+    pub tiles: u32,
+    pub smem: u32,
+    pub count: u32,
+}
+
+/// What a kernel parameter points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Q,
+    K,
+    V,
+    Pos,
+}
+
+fn define(src: &str, name: &str) -> Option<u32> {
+    src.lines()
+        .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// The CUDA source of the window kernel for `s` and the roles of its
+/// parameters: lowering variant `TANG_CODER_ATTN_VARIANT` if set, else the
+/// first variant that lowers to one Hopper (`wgmma`) flash kernel.
+pub fn source(s: AttnShape) -> Result<(String, Vec<Role>, u32), String> {
+    let (g, a) = scheduled(s);
+    let forced: Option<usize> = std::env::var("TANG_CODER_ATTN_VARIANT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let candidates: Vec<usize> = match forced {
+        Some(v) => vec![v],
+        None => (0..64).collect(),
+    };
+    for v in candidates {
+        let p = g.to_cuda_variant(&[a.o], Some(v));
+        let [k] = &p.kernels[..] else { continue };
+        if !k.source.contains("TANG_TILES") || (forced.is_none() && !k.source.contains("wgmma")) {
+            continue;
+        }
+        let roles = k
+            .reads
+            .iter()
+            .map(|&r| match r {
+                r if r == a.q => Ok(Role::Q),
+                r if r == a.k => Ok(Role::K),
+                r if r == a.v => Ok(Role::V),
+                r if r == a.pos => Ok(Role::Pos),
+                r => Err(format!("unexpected read {r:?}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((k.source.clone(), roles, k.count));
+    }
+    Err(format!("{s:?}: no variant lowers to one flash kernel"))
+}
+
+#[cfg(feature = "cuda")]
+impl Kernel {
+    /// Generate, compile (NVRTC, `sm_90a`: `wgmma` is arch-specific) and load
+    /// the window kernel for `s`.
+    pub fn build(gpu: &tang_moe::gpu::Gpu, s: AttnShape) -> anyhow::Result<Self> {
+        use anyhow::anyhow;
+        let (src, params, count) = source(s).map_err(|e| anyhow!(e))?;
+        let (threads, tiles, smem) = (
+            define(&src, "TANG_THREADS").ok_or_else(|| anyhow!("no TANG_THREADS"))?,
+            define(&src, "TANG_TILES").ok_or_else(|| anyhow!("no TANG_TILES"))?,
+            define(&src, "TANG_SMEM").unwrap_or(0),
+        );
+        let include = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("sm_90a"),
+            include_paths: vec![format!("{include}/include")],
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(&src, opts)
+            .map_err(|e| anyhow!("nvrtc (derived attention {s:?}): {e:?}"))?
+            .to_src();
+        let m = gpu.module_from_ptx(&ptx).map_err(|e| anyhow!("{e}"))?;
+        let f = m.func("main0").map_err(|e| anyhow!("{e}"))?;
+        if smem > 48 * 1024 {
+            unsafe {
+                tang_moe::gpu::check(
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        f,
+                        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem as i32,
+                    ),
+                    "cuFuncSetAttribute",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
+        Ok(Kernel {
+            f,
+            _m: m,
+            params,
+            threads,
+            tiles,
+            smem,
+            count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +387,23 @@ mod tests {
             }
         }
         eprintln!("native variants {native:?}");
+        if let Ok(dir) = std::env::var("DA_DUMP") {
+            for &v in &native {
+                let p = g.to_cuda_variant(&[a.o], Some(v));
+                let k = &p.kernels[0];
+                std::fs::write(format!("{dir}/v{v}.cu"), &k.source).unwrap();
+                eprintln!(
+                    "v{v}: reads {:?} wg {} count {} bufs {:?}",
+                    k.reads,
+                    k.workgroup_size,
+                    k.count,
+                    p.buffers
+                        .iter()
+                        .map(|b| (b.node.index(), b.format))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         let p = g.to_cuda_variant(&[a.o], native.first().copied());
         assert!(
             p.kernels.iter().any(|k| k.source.contains("TANG_TILES")),

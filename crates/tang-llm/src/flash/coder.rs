@@ -206,6 +206,10 @@ struct Variants {
     /// the default (H200: 1.66× at 30k, 2.15× at 54k); `TANG_CODER_ATTN=splitk` for split-K.
     /// Not bitwise: gated by `flash-wide-check`'s greedy + KL bar.
     attn_fa2: bool,
+    /// Wide windows run attention as the kernel derived from the tensor IR (flash/derived_attn.rs:
+    /// the Hopper flash lowering of the naive window attention; `TANG_CODER_ATTN=derived`, sm_90
+    /// only). Not bitwise with FA2 (gated by flash-wide-check's KL bar).
+    attn_derived: bool,
     /// Batch decode windows (past `MAX_T` rows) run the dense layers and experts as the
     /// tensor-core GEMMs too (`TANG_CODER_BGEMM=1`). Not bitwise; off by default.
     bgemm: bool,
@@ -249,6 +253,7 @@ impl Default for Variants {
             wgemm_gu: true,
             wgemm_down: true,
             attn_fa2: false,
+            attn_derived: false,
             bgemm: false,
             stream: true,
             mma_gu: true,
@@ -288,6 +293,7 @@ impl Variants {
             wgemm_gu: !env_is("TANG_CODER_WGEMM", "down"),
             wgemm_down: !env_is("TANG_CODER_WGEMM", "gu"),
             attn_fa2: !env_is("TANG_CODER_ATTN", "splitk"),
+            attn_derived: env_is("TANG_CODER_ATTN", "derived"),
             bgemm: env_is("TANG_CODER_BGEMM", "1"),
             stream: !env_is("TANG_CODER_MOE_STREAM", "0"),
             dmma: !env_is("TANG_CODER_DMMA", "0"),
@@ -637,6 +643,9 @@ struct Kern {
     part: Fun,
     merge: Fun,
     fa2: Fun,
+    da_q: Fun,
+    da_kv: Fun,
+    da_un: Fun,
     gdn_step: Fun,
     gdn_commit: Fun,
     gdn_step_seg: Fun,
@@ -714,6 +723,9 @@ impl Kern {
             part: f("cx_attn_part")?,
             merge: f("cx_attn_merge")?,
             fa2: f("cx_attn_fa2")?,
+            da_q: f("cx_attn_dq")?,
+            da_kv: f("cx_attn_dkv")?,
+            da_un: f("cx_attn_dunpack")?,
             gdn_step: self.gdn_step,
             gdn_commit: self.gdn_commit,
             gdn_step_seg: self.gdn_step_seg,
@@ -837,6 +849,9 @@ impl Kern {
             part: f(cm, "cx_attn_part")?,
             merge: f(cm, "cx_attn_merge")?,
             fa2: f(cm, "cx_attn_fa2")?,
+            da_q: f(cm, "cx_attn_dq")?,
+            da_kv: f(cm, "cx_attn_dkv")?,
+            da_un: f(cm, "cx_attn_dunpack")?,
             gdn_step: f(fm, "fl_gdn_conv_step")?,
             gdn_commit: f(fm, "fl_gdn_conv_commit")?,
             gdn_step_seg: f(fm, "fl_gdn_conv_step_seg")?,
@@ -1059,6 +1074,16 @@ struct Wide {
 /// grows with rows × context).
 const WIDE_ATTN_ROWS: usize = 32;
 
+/// `TANG_CODER_ATTN=derived` state: compiled window kernels by padded key count, and the fp16
+/// operands / output they read and write (sized for the wide window and `max_ctx` keys).
+#[derive(Default)]
+struct DerivedAttn {
+    kernels: HashMap<usize, super::derived_attn::Kernel>,
+    /// q16, k16, v16, pos, o
+    bufs: Option<[B; 5]>,
+    failed: bool,
+}
+
 /// Batch modules: an expert's pairs (the shared expert's above all: every row's) run as groups
 /// of at most this many (`CX_GCHUNK`), so no expert is one long serial group.
 const BATCH_GCHUNK: usize = 8;
@@ -1257,6 +1282,8 @@ pub struct Coder {
     pub load_report: String,
     /// `TANG_CODER_PROF=1` (eager windows): GPU time per stage, by name, summed.
     prof: Option<std::cell::RefCell<Prof>>,
+    /// `TANG_CODER_ATTN=derived`: the window kernels by padded key count and their scratch.
+    derived: std::cell::RefCell<DerivedAttn>,
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
@@ -1578,6 +1605,7 @@ impl Coder {
             last_commit_ms: 0.0,
             last_tree: (0, 0),
             load_report,
+            derived: Default::default(),
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
@@ -3213,6 +3241,9 @@ impl Coder {
             (k.part, "attn_part"),
             (k.merge, "attn_merge"),
             (k.fa2, "attn_fa2"),
+            (k.da_q, "attn_dpack"),
+            (k.da_kv, "attn_dpack"),
+            (k.da_un, "attn_dunpack"),
             (k.gdn_step, "gdn_conv_step"),
             (k.gdn_commit, "gdn_commit"),
             (k.gdn_step_seg, "gdn_conv_step"),
@@ -3852,6 +3883,163 @@ impl Coder {
         (ns > 0).then_some(ns)
     }
 
+    /// The derived attention of a wide window of `t` rows (stage `w`): build the fp16 operands,
+    /// run the window kernel for the padded key count (compiled on first use), write its output
+    /// as one split of the partials, merge. `false` (nothing launched): use FA2 instead (not
+    /// stage 0, a peer stage, no kernel, or partials that wouldn't fit).
+    #[allow(clippy::too_many_arguments)]
+    fn run_derived(
+        &self,
+        w: usize,
+        t: usize,
+        q: u64,
+        kt: u64,
+        vt: u64,
+        rows: u64,
+        part: u64,
+        proj: u64,
+        st: i32,
+        attn: u64,
+    ) -> bool {
+        use super::derived_attn::{AttnShape, Kernel, Role, KEY_STEP};
+        let hp = &self.hp;
+        let (nkv, g, hd) = (hp.n_head_kv, hp.n_head / hp.n_head_kv, hp.head_dim);
+        let tw = self.wide_rows();
+        let keys = self.wide_pos0.get() + t;
+        let n_pad = keys.next_multiple_of(KEY_STEP);
+        let part_cap = WIDE_ATTN_ROWS * (self.max_ctx / ck::attn_chunk());
+        if w != 0
+            || tw == 0
+            || t > tw
+            || n_pad > self.max_ctx.next_multiple_of(KEY_STEP)
+            || t > part_cap
+        {
+            return false;
+        }
+        let mut da = self.derived.borrow_mut();
+        if da.failed {
+            return false;
+        }
+        if da.bufs.is_none() {
+            let kmax = self.max_ctx.next_multiple_of(KEY_STEP);
+            let f16 = |n: usize| self.dev.alloc_f32(n.div_ceil(2));
+            da.bufs = Some([
+                f16(nkv * g * tw * hd),
+                f16(nkv * kmax * hd),
+                f16(nkv * kmax * hd),
+                self.dev.alloc_f32(g * tw),
+                self.dev.alloc_f32(nkv * g * tw * hd),
+            ]);
+        }
+        let da = &mut *da;
+        if let std::collections::hash_map::Entry::Vacant(slot) = da.kernels.entry(n_pad) {
+            let s = AttnShape {
+                t: tw,
+                n_pad,
+                nkv,
+                g,
+                hd,
+            };
+            let t0 = Instant::now();
+            match Kernel::build(&self.gpu, s) {
+                Ok(k) => {
+                    eprintln!(
+                        "coder: derived attention for {n_pad} keys: {} blocks × {} threads, {} B smem, built in {:.1} s",
+                        k.tiles,
+                        k.threads,
+                        k.smem,
+                        t0.elapsed().as_secs_f64()
+                    );
+                    slot.insert(k);
+                }
+                Err(e) => {
+                    eprintln!("coder: no derived attention ({e}); FA2 instead");
+                    da.failed = true;
+                    return false;
+                }
+            }
+        }
+        let [q16, k16, v16, pos, o] = da
+            .bufs
+            .as_ref()
+            .unwrap()
+            .each_ref()
+            .map(|b| self.dev.buffer_addr(b));
+        let k = &da.kernels[&n_pad];
+        let stream = self.stream_on(w);
+        let kn = self.kn_on(w);
+        let (ti, twi, npi) = (t as i32, tw as i32, n_pad as i32);
+        let blocks = |n: usize| n.div_ceil(256) as u32;
+        unsafe {
+            self.launch_on(
+                stream,
+                kn.da_q,
+                (blocks(nkv * g * tw * hd), 1, 1),
+                256,
+                0,
+                tang_moe::args![q, rows, ti, twi, q16, pos],
+            );
+            self.launch_on(
+                stream,
+                kn.da_kv,
+                (blocks(nkv * n_pad * hd), 1, 1),
+                256,
+                0,
+                tang_moe::args![kt, vt, rows, ti, npi, k16, v16],
+            );
+            let ptrs: Vec<u64> = k
+                .params
+                .iter()
+                .map(|r| match r {
+                    Role::Q => q16,
+                    Role::K => k16,
+                    Role::V => v16,
+                    Role::Pos => pos,
+                })
+                .collect();
+            let mut vals: Vec<u64> = ptrs;
+            vals.push(o);
+            let count = k.count;
+            let mut args: Vec<*mut std::ffi::c_void> = vals
+                .iter_mut()
+                .map(|p| p as *mut u64 as *mut std::ffi::c_void)
+                .collect();
+            let mut count_v = count;
+            args.push(&mut count_v as *mut u32 as *mut std::ffi::c_void);
+            gpu::launch(
+                k.f,
+                (k.tiles, 1, 1),
+                (k.threads, 1, 1),
+                k.smem,
+                stream,
+                &mut args,
+            )
+            .expect("derived attention launch");
+            if let Some(p) = &self.prof {
+                let ev = gpu::Event::new(true).expect("event");
+                ev.record(stream).expect("record");
+                p.borrow_mut().marks.push(("attn_derived", ev));
+            }
+            self.launch_on(
+                stream,
+                kn.da_un,
+                (blocks(t * nkv * g * (hd + 2)), 1, 1),
+                256,
+                0,
+                tang_moe::args![o, ti, twi, part],
+            );
+            self.launch_on(
+                stream,
+                kn.merge,
+                (t as u32, hp.n_head as u32, 1),
+                hd as u32,
+                0,
+                tang_moe::args![part, 1i32, proj, st, attn],
+            );
+        }
+        true
+    }
+
     // ---- the window
 
     fn enqueue_inputs(&self, t: usize) {
@@ -4013,7 +4201,12 @@ impl Coder {
                     }
                 }
             };
-            if let Some(ns) = self.fa2_splits(w, t) {
+            if self.var.attn_derived
+                && self.in_wide.get()
+                && self.run_derived(w, t, q, kt, vt, rows, part, proj, st, attn)
+            {
+                // done: the derived kernel, then the merge as one split
+            } else if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
                 let run_fa2 = || unsafe {
