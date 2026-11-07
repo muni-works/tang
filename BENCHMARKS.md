@@ -3571,3 +3571,21 @@ top-10, `examples/coder_derived_moe.rs`): 90 → 60 µs. What is left at T=1: th
 in one block (the hand `cx_route` is one warp), and 14 kernels against the hand path's ~4.
 Startup: the derived shapes build in 6.3 s at load.
 Pod time: ~1.4 h at $5.29/hr (≈ $7.50), pod terminated.
+
+### Round 2: routed experts sorted by expert on int8 tensor cores (H200, second pod)
+
+From 16 rows the (token, expert) pairs are sorted by expert (IR comps) and gate/up/down run on the
+`IntMma` MMA stage with gathered weights; the k-quant MMA lowering stages each warp's 16-row
+super-block tile through shared memory (coalesced 16-byte loads). Same prompt and command as above,
+a different H200 host (hand re-measured on it):
+
+| streams | hand ms | derived ms (round 1) | derived ms (round 2) |
+|---|---|---|---|
+| 1 | 4.08 | 5.04 | 5.11 |
+| 8 | 9.91 | 11.27 | 11.33 |
+| 16 | 15.96 | 16.71 | **15.65** |
+| 32 | 23.64 | 27.21 | **23.30** |
+| 48 | 30.21 | 37.89 | 31.53 |
+
+batch-check N=48 tolerance: derived 99.24% / mean 0.153 PASS (hand 99.00% / 0.142 on this prompt).
+Batch shapes build in 1.6–1.9 s each (21 + 2 kernels).
