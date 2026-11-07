@@ -3589,3 +3589,19 @@ a different H200 host (hand re-measured on it):
 
 batch-check N=48 tolerance: derived 99.24% / mean 0.153 PASS (hand 99.00% / 0.142 on this prompt).
 Batch shapes build in 1.6–1.9 s each (21 + 2 kernels).
+
+Profile (`TANG_CODER_PROF=1 --eager`, 32 steps, logs in `crates/tang-llm/docs/bench/derived-moe/`): the
+MoE stages, summed over 32 steps (hand: route + moe_gu + moe_down + moe_add_norm on 48 layers;
+derived: `moe_derived` on 47 layers + the hand stages on the Q6_K layer):
+
+| streams | hand MoE ms | derived MoE ms | per step |
+|---|---|---|---|
+| 1 | 84.0 | 117.6 | +1.05 ms |
+| 8 | 205.4 | 257.5 | +1.63 ms |
+
+Everything outside the MoE layer matches (same kernels). So the N=1 gap is the derived layer itself:
+~77 µs a layer vs ~55 hand in eager mode. Graph capture checked: the derived shapes build at load
+or outside capture, and the graphed decode steps above are within 0.1 ms of eager minus launch time.
+No nsys on the image, so per-kernel attribution inside the derived layer comes from
+`examples/coder_derived_moe.rs` (`PER_KERNEL=1`): top-k 13 µs, gate and up GEMVs, 14 kernels.
+Pod time this round ≈ 45 min ($4), terminated.
