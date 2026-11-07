@@ -194,7 +194,11 @@ pub fn minimize_lbfgs<E>(
 
         let mut hit_failure = false;
         let accepted = loop {
-            let mut trial: Vec<f64> = x.iter().zip(&direction).map(|(t, d)| t + step * d).collect();
+            let mut trial: Vec<f64> = x
+                .iter()
+                .zip(&direction)
+                .map(|(t, d)| t + step * d)
+                .collect();
             project_box(&mut trial, &options.bounds);
             let displacement: Vec<f64> = trial.iter().zip(&x).map(|(a, b)| a - b).collect();
             let moved = displacement.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
@@ -229,7 +233,11 @@ pub fn minimize_lbfgs<E>(
             if history.len() == options.memory {
                 history.remove(0);
             }
-            history.push(Pair { rho: 1.0 / sy, s, y });
+            history.push(Pair {
+                rho: 1.0 / sy,
+                s,
+                y,
+            });
         }
         x = t;
         value = j;
@@ -251,7 +259,10 @@ mod tests {
     fn rosen(p: &[f64]) -> Result<(f64, Vec<f64>), ()> {
         let (x, y) = (p[0], p[1]);
         let v = (1.0 - x) * (1.0 - x) + 100.0 * (y - x * x) * (y - x * x);
-        let g = vec![-2.0 * (1.0 - x) - 400.0 * x * (y - x * x), 200.0 * (y - x * x)];
+        let g = vec![
+            -2.0 * (1.0 - x) - 400.0 * x * (y - x * x),
+            200.0 * (y - x * x),
+        ];
         Ok((v, g))
     }
 

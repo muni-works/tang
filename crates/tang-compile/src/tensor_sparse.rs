@@ -15,18 +15,19 @@
 //!   function theorem, one more solve with `Aᵀ` (`λ = A⁻ᵀ·x̄`, `b̄ = λ`) and
 //!   the outer-product cotangent `Ā[r,c] = −λ[r]·x[c]` on the pattern, a
 //!   gather comprehension.
-//! - **[`IndexedGather`]** is `out[i] = src[index[i]]` with a known inverse
-//!   map. A gathered view differentiates to a dense gated scatter (see
-//!   `tensor_grad.rs`), quadratic in size; with the inverse lists in hand
-//!   the adjoint is a gather instead, linear. Assembly (element → node,
-//!   parameter → element) uses it.
+//! - **[`IndexedGather`]** is `out[i] = src[index[i]]` whose adjoint is a
+//!   native scatter-add ([`IndexedScatter`]). A gathered view differentiates
+//!   to a dense gated sum (see `tensor_grad.rs`), quadratic in size; the
+//!   operator pair is linear.
+//! - **[`SparseMatVec`]** is `y = S·x` for a fixed sparse `S` (assembly
+//!   and incidence maps), adjoint `Sᵀ·ȳ`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tang::Scalar;
 use tang_expr::ExprId;
-use tang_sparse::{CsrMatrix, Ic0, Jacobi, PcgOptions, PcgSolution, PcgStatus, Preconditioner};
+use tang_sparse::{CsrMatrix, Ic0, Jacobi, PcgOptions, PcgSolution, PcgStatus};
 
 use super::{err, Arg, Dim, Monoid, Operator, ShapeError, TensorGraph, TensorId, View};
 
@@ -132,7 +133,9 @@ pub fn dot(g: &mut TensorGraph, a: TensorId, b: TensorId) -> Result<TensorId, Sh
             view: View::pick(2, &[Some(1)]),
         },
     ];
-    g.comp(&[Dim::Fixed(1)], &[n], args, Some(Monoid::sum()), |v| vec![v[0] * v[1]])
+    g.comp(&[Dim::Fixed(1)], &[n], args, Some(Monoid::sum()), |v| {
+        vec![v[0] * v[1]]
+    })
 }
 
 /// `a + s·b` with `s` a `[1]` tensor broadcast over `a`'s `[n]`.
@@ -222,11 +225,19 @@ fn ic0_tables(ic: &Ic0) -> Ic0Tables {
     };
     let mut lower_levels = vec![0usize; n];
     for i in 0..n {
-        lower_levels[i] = lrows[i].iter().map(|&(j, _)| lower_levels[j] + 1).max().unwrap_or(0);
+        lower_levels[i] = lrows[i]
+            .iter()
+            .map(|&(j, _)| lower_levels[j] + 1)
+            .max()
+            .unwrap_or(0);
     }
     let mut upper_levels = vec![0usize; n];
     for i in (0..n).rev() {
-        upper_levels[i] = urows[i].iter().map(|&(j, _)| upper_levels[j] + 1).max().unwrap_or(0);
+        upper_levels[i] = urows[i]
+            .iter()
+            .map(|&(j, _)| upper_levels[j] + 1)
+            .max()
+            .unwrap_or(0);
     }
     Ic0Tables {
         lower: ell(&lrows),
@@ -320,7 +331,11 @@ impl PcgProgram {
                     let d = g.input(&[n]);
                     let z = g
                         .map(&[r, d], |v| {
-                            <ExprId as Scalar>::select(v[1] * v[1], v[0] / v[1], ExprId::from_f64(0.0))
+                            <ExprId as Scalar>::select(
+                                v[1] * v[1],
+                                v[0] / v[1],
+                                ExprId::from_f64(0.0),
+                            )
                         })
                         .map_err(|e| e.0)?;
                     (z, vec![tang_sparse::csr_diagonal(a)])
@@ -346,7 +361,10 @@ impl PcgProgram {
                     for lev in 0..t.n_upper {
                         z = tri_level(&mut g, z, w_, ui.0, ui.1, dg, ul, lev).map_err(|e| e.0)?;
                     }
-                    (z, vec![lv, lc, uv, uc, t.diag, t.lower_levels, t.upper_levels])
+                    (
+                        z,
+                        vec![lv, lc, uv, uc, t.diag, t.lower_levels, t.upper_levels],
+                    )
                 }
             };
             let rz = dot(&mut g, r, z).map_err(|e| e.0)?;
@@ -372,7 +390,11 @@ impl PcgProgram {
     }
 
     fn run_apply(&self, d: &[f64]) -> (Vec<f64>, f64) {
-        let ins = [self.a_inputs[0].clone(), self.a_inputs[1].clone(), d.to_vec()];
+        let ins = [
+            self.a_inputs[0].clone(),
+            self.a_inputs[1].clone(),
+            d.to_vec(),
+        ];
         let mut o = self.apply.0.eval(&ins, &self.apply.1);
         let dad = o[1][0];
         (o.swap_remove(0), dad)
@@ -415,10 +437,10 @@ impl PcgProgram {
                 return done(x, iter, residual_rel, PcgStatus::Breakdown);
             }
             let alpha = rz / dad;
-            let mut o = self.update.0.eval(
-                &[x, r, d.clone(), ad, vec![alpha]],
-                &self.update.1,
-            );
+            let mut o = self
+                .update
+                .0
+                .eval(&[x, r, d.clone(), ad, vec![alpha]], &self.update.1);
             residual_rel = o[2][0].sqrt() / b_norm;
             r = o.swap_remove(1);
             x = o.swap_remove(0);
@@ -618,48 +640,32 @@ impl Operator for LinearSolve {
     }
 }
 
-/// `out[i…] = src[index[i…]]` for a 1-D `src`, with the inverse lists that
-/// make the adjoint a gather. `index` entries `< 0` read 0 (padding).
+/// `out[i…] = src[index[i…]]` for a 1-D `src` of length `m`; `index`
+/// entries `< 0` read 0 (padding).
 ///
-/// Inputs: `[src (m), index (shape), inverse (m, w)]`, where row `j` of
-/// `inverse` lists the flat output positions that read `src[j]`, padded
-/// with −1. Output: `index`'s shape. Build the index/inverse pair with
-/// [`IndexedGather::tables`].
-pub struct IndexedGather;
+/// Inputs: `[src (m), index (any shape)]`. Output: `index`'s shape. Its
+/// adjoint is [`IndexedScatter`], a native scatter-add in O(size): a
+/// gathered *view* would differentiate to a dense gated sum instead (see
+/// `tensor_grad.rs`), quadratic in size.
+pub struct IndexedGather {
+    pub m: usize,
+}
 
 impl IndexedGather {
-    /// `(inverse, width)` for `index` over a source of length `m`.
-    pub fn tables(index: &[i64], m: usize) -> (Vec<f64>, usize) {
-        let mut lists: Vec<Vec<usize>> = vec![Vec::new(); m];
-        for (p, &j) in index.iter().enumerate() {
-            if j >= 0 {
-                lists[j as usize].push(p);
-            }
-        }
-        let w = lists.iter().map(|l| l.len()).max().unwrap_or(0).max(1);
-        let mut inv = vec![-1.0; m * w];
-        for (j, l) in lists.iter().enumerate() {
-            for (s, &p) in l.iter().enumerate() {
-                inv[j * w + s] = p as f64;
-            }
-        }
-        (inv, w)
-    }
-
     /// Append the node.
     pub fn apply(
         g: &mut TensorGraph,
         src: TensorId,
         index: TensorId,
-        inverse: TensorId,
     ) -> Result<TensorId, ShapeError> {
         let m = g.shape(src).to_vec();
-        let inv = g.shape(inverse).to_vec();
-        if m.len() != 1 || inv.len() != 2 || inv[0] != m[0] {
-            return err(format!("IndexedGather: src {m:?}, inverse {inv:?}"));
-        }
+        let [Dim::Fixed(m)] = m[..] else {
+            return err(format!(
+                "IndexedGather: src must be 1-D and bound, got {m:?}"
+            ));
+        };
         let shape = g.shape(index).to_vec();
-        Ok(g.operator(Arc::new(IndexedGather), &[src, index, inverse], &shape))
+        Ok(g.operator(Arc::new(IndexedGather { m }), &[src, index], &shape))
     }
 }
 
@@ -672,7 +678,7 @@ impl Operator for IndexedGather {
         let src = inputs[0];
         inputs[1]
             .iter()
-            .map(|&j| if j < 0.0 { 0.0 } else { src[j.round() as usize] })
+            .map(|&j| if j < 0.0 { 0.0 } else { src[j as usize] })
             .collect()
     }
 
@@ -683,30 +689,120 @@ impl Operator for IndexedGather {
         _output: TensorId,
         cot: TensorId,
     ) -> Result<Vec<Option<TensorId>>, ShapeError> {
-        let inv = g.shape(inputs[2]).to_vec();
-        // src̄[j] = Σ_s cot[inverse[j,s]], padding (−1) read as 0
-        let flat = g.reshape(cot, &[super::numel(g.shape(cot))])?;
-        let mut view = View::pick(2, &[None]).gather(0, 1, 1);
-        view.guard = true;
-        let args = vec![
-            Arg {
-                src: flat,
-                view,
-            },
-            Arg {
-                src: inputs[2],
-                view: View::identity(2, 2),
-            },
-        ];
-        let d = g.comp(&[inv[0]], &[inv[1]], args, Some(Monoid::sum()), |v| vec![v[0]])?;
-        Ok(vec![Some(d), None, None])
+        let d = g.operator(
+            Arc::new(IndexedScatter { m: self.m }),
+            &[cot, inputs[1]],
+            &[self.m],
+        );
+        Ok(vec![Some(d), None])
+    }
+}
+
+/// `out[j] = Σ_{p : index[p] = j} x[p]`, the adjoint of [`IndexedGather`].
+/// Inputs `[x, index]` of one shape; output `(m)`. Contributions to each
+/// `j` are added in increasing `p`. Its own adjoint is the gather.
+pub struct IndexedScatter {
+    pub m: usize,
+}
+
+impl Operator for IndexedScatter {
+    fn name(&self) -> &str {
+        "IndexedScatter"
+    }
+
+    fn forward(&self, inputs: &[&[f64]]) -> Vec<f64> {
+        let mut out = vec![0.0; self.m];
+        for (&x, &j) in inputs[0].iter().zip(inputs[1]) {
+            if j >= 0.0 {
+                out[j as usize] += x;
+            }
+        }
+        out
+    }
+
+    fn backward(
+        &self,
+        g: &mut TensorGraph,
+        inputs: &[TensorId],
+        _output: TensorId,
+        cot: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError> {
+        let shape = g.shape(inputs[1]).to_vec();
+        let d = g.operator(
+            Arc::new(IndexedGather { m: self.m }),
+            &[cot, inputs[1]],
+            &shape,
+        );
+        Ok(vec![Some(d), None])
+    }
+}
+
+/// `y = S·x` for a fixed sparse matrix `S` (CSR): an assembly or
+/// incidence map. Input `[x (ncols)]`, output `(nrows)`. Its adjoint is
+/// `x̄ = Sᵀ·ȳ`, another `SparseMatVec` with the transpose; both are
+/// O(nnz) native loops. Element-to-node assembly, parameter broadcast and
+/// per-row sums of link quantities are all one of these.
+pub struct SparseMatVec {
+    pub s: Arc<CsrMatrix<f64>>,
+    /// `Sᵀ`, built once and shared with the adjoint node.
+    pub st: Arc<CsrMatrix<f64>>,
+}
+
+impl SparseMatVec {
+    pub fn new(s: CsrMatrix<f64>) -> Self {
+        let st = s.transpose();
+        Self {
+            s: Arc::new(s),
+            st: Arc::new(st),
+        }
+    }
+
+    /// Append the node: `S·x`.
+    pub fn apply(self, g: &mut TensorGraph, x: TensorId) -> Result<TensorId, ShapeError> {
+        if g.shape(x) != [self.s.ncols] {
+            return err(format!(
+                "SparseMatVec: x {:?}, S is {}x{}",
+                g.shape(x),
+                self.s.nrows,
+                self.s.ncols
+            ));
+        }
+        let n = self.s.nrows;
+        Ok(g.operator(Arc::new(self), &[x], &[n]))
+    }
+}
+
+impl Operator for SparseMatVec {
+    fn name(&self) -> &str {
+        "SparseMatVec"
+    }
+
+    fn forward(&self, inputs: &[&[f64]]) -> Vec<f64> {
+        let mut y = vec![0.0; self.s.nrows];
+        tang_sparse::csr_apply(&self.s, inputs[0], &mut y);
+        y
+    }
+
+    fn backward(
+        &self,
+        g: &mut TensorGraph,
+        _inputs: &[TensorId],
+        _output: TensorId,
+        cot: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError> {
+        let adj = SparseMatVec {
+            s: self.st.clone(),
+            st: self.s.clone(),
+        };
+        let n = adj.s.nrows;
+        Ok(vec![Some(g.operator(Arc::new(adj), &[cot], &[n]))])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tang_sparse::CooMatrix;
+    use tang_sparse::{CooMatrix, Preconditioner};
 
     fn laplace(n: usize, shift: f64) -> CsrMatrix<f64> {
         let mut c = CooMatrix::new(n * n, n * n);
@@ -770,12 +866,11 @@ mod tests {
             };
             assert!(ir.converged() && native.converged(), "{p:?}");
             assert_eq!(ir.iterations, native.iterations, "{p:?}");
-            let err = ir
-                .x
-                .iter()
-                .zip(&native.x)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max);
+            let err =
+                ir.x.iter()
+                    .zip(&native.x)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
             assert!(err < 1e-12, "{p:?}: {err}");
         }
     }
@@ -789,7 +884,11 @@ mod tests {
         let (z, _) = prog.run_precond(&r);
         let mut want = vec![0.0; 25];
         ic.apply(&r, &mut want);
-        let err = z.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let err = z
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         assert!(err < 1e-14, "{err}");
     }
 
@@ -825,7 +924,13 @@ mod tests {
             let cols_f: Vec<f64> = pattern.cols.iter().map(|&c| c as f64).collect();
             let wv: Vec<f64> = (0..n).map(|i| 1.0 + 0.1 * i as f64).collect();
             let inputs = |v: &[f64], bb: &[f64]| {
-                vec![v.to_vec(), bb.to_vec(), rows_f.clone(), cols_f.clone(), wv.clone()]
+                vec![
+                    v.to_vec(),
+                    bb.to_vec(),
+                    rows_f.clone(),
+                    cols_f.clone(),
+                    wv.clone(),
+                ]
             };
             let b0 = rhs(n);
             let out = g.eval(&inputs(&a.values, &b0), &[grads[0], grads[1]]);
@@ -836,28 +941,66 @@ mod tests {
                 p[k] += h;
                 m[k] -= h;
                 let fd = (jv(&p, &b0) - jv(&m, &b0)) / (2.0 * h);
-                assert!((fd - out[0][k]).abs() < 1e-6 * (1.0 + fd.abs()), "{precond:?} A[{k}]");
+                assert!(
+                    (fd - out[0][k]).abs() < 1e-6 * (1.0 + fd.abs()),
+                    "{precond:?} A[{k}]"
+                );
             }
             for i in [0, n - 1] {
                 let (mut p, mut m) = (b0.clone(), b0.clone());
                 p[i] += h;
                 m[i] -= h;
                 let fd = (jv(&a.values, &p) - jv(&a.values, &m)) / (2.0 * h);
-                assert!((fd - out[1][i]).abs() < 1e-6 * (1.0 + fd.abs()), "{precond:?} b[{i}]");
+                assert!(
+                    (fd - out[1][i]).abs() < 1e-6 * (1.0 + fd.abs()),
+                    "{precond:?} b[{i}]"
+                );
             }
             assert!(ls.records().iter().any(|r| r.transpose));
+            // the fusion pass keeps operator inputs materialized
+            let (fused, outs) = g.substitute_maps(&[grads[0], grads[1], j]);
+            assert!(fused.nodes().len() < g.nodes().len());
+            let f = fused.eval(&inputs(&a.values, &b0), &outs);
+            assert_eq!(f[0], out[0]);
+            assert_eq!(f[1], out[1]);
         }
     }
 
     #[test]
-    fn indexed_gather_adjoint_is_a_gather() {
+    fn sparse_matvec_adjoint_is_the_transpose() {
+        let mut c = CooMatrix::new(3, 4);
+        for (r, k, v) in [
+            (0, 1, 2.0),
+            (0, 3, -1.0),
+            (1, 0, 0.5),
+            (2, 1, 1.0),
+            (2, 2, 3.0),
+        ] {
+            c.push(r, k, v);
+        }
+        let mut g = TensorGraph::new();
+        let x = g.input(&[4]);
+        let w = g.input(&[3]);
+        let y = SparseMatVec::new(c.to_csr()).apply(&mut g, x).unwrap();
+        let wy = g.map(&[w, y], |v| v[0] * v[1]).unwrap();
+        let j = g.reduce(wy, 0, Monoid::sum()).unwrap();
+        let gx = g.backward(j, &[x]).unwrap()[0];
+        let o = g.eval(
+            &[vec![1.0, 2.0, 3.0, 4.0], vec![1.0, 10.0, 100.0]],
+            &[y, gx],
+        );
+        assert_eq!(o[0], vec![0.0, 0.5, 11.0]);
+        // Sᵀ·w
+        assert_eq!(o[1], vec![5.0, 102.0, 300.0, -1.0]);
+    }
+
+    #[test]
+    fn indexed_gather_adjoint_is_a_scatter() {
         let index: Vec<i64> = vec![2, 0, -1, 2, 1, 2];
-        let (inv, w) = IndexedGather::tables(&index, 3);
         let mut g = TensorGraph::new();
         let src = g.input(&[3]);
         let ix = g.input(&[2, 3]);
-        let iv = g.input(&[3, w]);
-        let out = IndexedGather::apply(&mut g, src, ix, iv).unwrap();
+        let out = IndexedGather::apply(&mut g, src, ix).unwrap();
         let wts = g.input(&[2, 3]);
         let p = g.map(&[out, wts], |v| v[0] * v[1]).unwrap();
         let s1 = g.reduce(p, 1, Monoid::sum()).unwrap();
@@ -866,7 +1009,6 @@ mod tests {
         let ins = vec![
             vec![10.0, 20.0, 30.0],
             index.iter().map(|&i| i as f64).collect(),
-            inv,
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         ];
         let o = g.eval(&ins, &[out, gs[0]]);

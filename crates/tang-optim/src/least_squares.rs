@@ -14,7 +14,6 @@
 //! rejecting or hitting a singular system grows it (`lambda_increase`), and λ
 //! passing `max_lambda` ends the run.
 
-
 use alloc::vec::Vec;
 use tang_la::{DMat, DVec};
 
@@ -129,7 +128,13 @@ pub fn levenberg_marquardt<Sys: LeastSquares + ?Sized>(
 
     for iteration in 0..config.max_iterations {
         if libm_sqrt(current_norm_sq) < config.tolerance {
-            return done(params, current_norm_sq, iteration, true, LmStatus::Converged);
+            return done(
+                params,
+                current_norm_sq,
+                iteration,
+                true,
+                LmStatus::Converged,
+            );
         }
 
         let (jtj, jtr_vec) = system.eval_jtj_jtr(params);
@@ -166,7 +171,10 @@ pub fn levenberg_marquardt<Sys: LeastSquares + ?Sized>(
 }
 
 enum Step {
-    Accepted { new_params: Vec<f64>, new_norm_sq: f64 },
+    Accepted {
+        new_params: Vec<f64>,
+        new_norm_sq: f64,
+    },
     Rejected,
     Singular,
 }
@@ -186,7 +194,11 @@ fn try_step<Sys: LeastSquares + ?Sized>(
     let Some(delta) = a.lu().solve(&(-jtr)) else {
         return Step::Singular;
     };
-    let mut new_params: Vec<f64> = params.iter().enumerate().map(|(i, &p)| p + delta[i]).collect();
+    let mut new_params: Vec<f64> = params
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| p + delta[i])
+        .collect();
     system.project(&mut new_params);
 
     let new_norm_sq = system.residual_norm_squared(&new_params);
@@ -204,7 +216,6 @@ fn try_step<Sys: LeastSquares + ?Sized>(
 fn libm_sqrt(x: f64) -> f64 {
     <f64 as tang::Scalar>::sqrt(x)
 }
-
 
 #[cfg(test)]
 mod tests {

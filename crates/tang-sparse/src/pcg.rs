@@ -363,13 +363,24 @@ mod tests {
             max_iters: 2000,
         };
         let x0 = vec![0.0; 400];
-        let j = pcg(|x, y| csr_apply(&a, x, y), &Jacobi::from_csr(&a), &b, &x0, &opts);
+        let j = pcg(
+            |x, y| csr_apply(&a, x, y),
+            &Jacobi::from_csr(&a),
+            &b,
+            &x0,
+            &opts,
+        );
         let ic = Ic0::new(&a).unwrap();
         let k = pcg(|x, y| csr_apply(&a, x, y), &ic, &b, &x0, &opts);
         assert!(j.converged() && k.converged());
         assert!(check(&a, &j.x, &b) < 1e-11 && check(&a, &k.x, &b) < 1e-11);
         // IC(0) earns its keep on a Laplacian.
-        assert!(k.iterations * 2 < j.iterations, "{} vs {}", k.iterations, j.iterations);
+        assert!(
+            k.iterations * 2 < j.iterations,
+            "{} vs {}",
+            k.iterations,
+            j.iterations
+        );
     }
 
     #[test]
@@ -386,15 +397,30 @@ mod tests {
         }
         let a = c.to_csr();
         let b: Vec<f64> = (0..n).map(|i| i as f64).collect();
-        let s = pcg(|x, y| csr_apply(&a, x, y), &Ic0::new(&a).unwrap(), &b, &vec![0.0; n], &PcgOptions::default());
+        let s = pcg(
+            |x, y| csr_apply(&a, x, y),
+            &Ic0::new(&a).unwrap(),
+            &b,
+            &vec![0.0; n],
+            &PcgOptions::default(),
+        );
         assert!(s.converged() && s.iterations <= 1);
     }
 
     #[test]
     fn zero_rhs_and_breakdown() {
         let a = laplace(4, 0.0);
-        let s = pcg(|x, y| csr_apply(&a, x, y), &Identity, &[0.0; 16], &[1.0; 16], &PcgOptions::default());
-        assert_eq!((s.status, s.iterations, s.x[0]), (PcgStatus::Converged, 0, 0.0));
+        let s = pcg(
+            |x, y| csr_apply(&a, x, y),
+            &Identity,
+            &[0.0; 16],
+            &[1.0; 16],
+            &PcgOptions::default(),
+        );
+        assert_eq!(
+            (s.status, s.iterations, s.x[0]),
+            (PcgStatus::Converged, 0, 0.0)
+        );
         let neg = |x: &[f64], y: &mut [f64]| y.iter_mut().zip(x).for_each(|(y, x)| *y = -x);
         let s = pcg(neg, &Identity, &[1.0; 4], &[0.0; 4], &PcgOptions::default());
         assert_eq!(s.status, PcgStatus::Breakdown);
