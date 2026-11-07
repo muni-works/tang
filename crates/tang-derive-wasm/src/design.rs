@@ -382,7 +382,12 @@ mod tests {
         }
         eprintln!("{lifted}/{total} variants lift");
         // the anchors: softmax attention and the gated delta rule must lift
-        assert!(judge("s", "j <= i", Norm::Softmax, n, d, true, true).unwrap().nxn == 0);
+        assert!(
+            judge("s", "j <= i", Norm::Softmax, n, d, true, true)
+                .unwrap()
+                .nxn
+                == 0
+        );
         assert!(scan_lifts(true, true, true, 4, 256, 128));
     }
 }
