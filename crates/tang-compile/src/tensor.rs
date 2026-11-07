@@ -2531,7 +2531,7 @@ impl TensorGraph {
                 })
                 .unwrap_or_default();
             let by = (256 / lanes).max(1) as u32;
-            if c.red.len() == 1 && (LANES..=128).contains(&lanes) && rows && !shared.is_empty() {
+            if c.red.len() == 1 && (LANES..=256).contains(&lanes) && rows && !shared.is_empty() {
                 // Rows × lanes per workgroup with the shared sub-computation
                 // staged cooperatively. Without one (a plain matmul) the
                 // tile has nothing to share and one thread per point wins.
