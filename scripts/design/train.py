@@ -3,7 +3,8 @@
 One GPT-style model per run; only the sequence mixer changes. Mixers:
 
   softmax         causal softmax attention (SDPA / FlashAttention)        baseline
-  mamba2          Mamba-2 SSD (fla)                                        baseline
+  ssd             Mamba-2 SSD core (fla chunk_simple_gla), gdn's wrapper   baseline
+  mamba2          fla Mamba2 layer (needs mamba_ssm kernels; fell back + OOM)
   gdn             gated delta net (fla)                                    baseline
   forget          s + c_i - c_j, softmax  (c = cumsum log sigmoid gate)    tang: lifts (fwd, dq dk dv)
   logdist         s - log(1 + i - j), softmax                               tang: lifts
@@ -87,25 +88,64 @@ class Attn(nn.Module):
             c = F.logsigmoid(self.fg(x).float()).transpose(1, 2).cumsum(-1)  # [B, H, T]
         if kind == "softmax":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        elif kind in ("forget", "softcap_forget", "logdist"):
-            if kind == "logdist":
-                mod = lambda s, b, h, i, j: s - torch.log1p((i - j).clamp(min=0).float())
-            elif kind == "forget":
-                mod = lambda s, b, h, i, j: s + (c[b, h, i] - c[b, h, j])
-            else:
-                mod = lambda s, b, h, i, j: 30 * torch.tanh(s / 30) + (c[b, h, i] - c[b, h, j])
+        elif kind == "logdist":
+            mod = lambda s, b, h, i, j: s - torch.log1p((i - j).clamp(min=0).float())
             y = flex(q, k, v, mod)
-        else:  # sigmoid family: no flash kernel in torch; explicit masked form
-            s = (q @ k.transpose(-1, -2)).float() * HD ** -0.5 - math.log(T)
+        else:
+            # explicit masked form: torch has no flash kernel for these (flex in
+            # torch 2.8 cannot backprop into the captured gate c)
+            s = (q @ k.transpose(-1, -2)).float() * HD ** -0.5
+            if kind == "softcap_forget":
+                s = 30 * torch.tanh(s / 30)
+            if kind.endswith("sigmoid"):
+                s = s - math.log(T)
             if self.gated:
                 s = s + c[..., :, None] - c[..., None, :]
             mask = torch.ones(T, T, device=x.device, dtype=torch.bool).tril()
-            w = torch.sigmoid(s).masked_fill(~mask, 0).to(v.dtype)
-            y = w @ v
+            if kind.endswith("sigmoid"):
+                w = torch.sigmoid(s).masked_fill(~mask, 0)
+            else:
+                w = torch.softmax(s.masked_fill(~mask, float("-inf")), -1)
+            y = w.to(v.dtype) @ v
         return self.o(y.transpose(1, 2).reshape(B, T, D))
 
 
+class SSD(nn.Module):
+    """Mamba-2's SSD core (scalar per-head decay, S_t = a_t S + k v^T) via fla's
+    chunk_simple_gla, with the same projections/conv/gate/norm as fla's
+    GatedDeltaNet so the only difference from `gdn` is the delta rule."""
+
+    def __init__(self):
+        super().__init__()
+        from fla.modules import ShortConvolution, FusedRMSNormGated
+        self.nh, self.dk, self.dv = D // 128, 128, 256
+        self.q = nn.Linear(D, self.nh * self.dk, bias=False)
+        self.k = nn.Linear(D, self.nh * self.dk, bias=False)
+        self.v = nn.Linear(D, self.nh * self.dv, bias=False)
+        self.a = nn.Linear(D, self.nh, bias=True)
+        self.g = nn.Linear(D, self.nh * self.dv, bias=False)
+        self.cq = ShortConvolution(self.nh * self.dk, 4, activation="silu")
+        self.ck = ShortConvolution(self.nh * self.dk, 4, activation="silu")
+        self.cv = ShortConvolution(self.nh * self.dv, 4, activation="silu")
+        self.norm = FusedRMSNormGated(self.dv)
+        self.o = nn.Linear(self.nh * self.dv, D, bias=False)
+
+    def forward(self, x):
+        from fla.ops.simple_gla import chunk_simple_gla
+        B = x.shape[0]
+        c = lambda conv, t: conv(t)[0]
+        q = F.normalize(c(self.cq, self.q(x)).view(B, T, self.nh, self.dk), dim=-1)
+        k = F.normalize(c(self.ck, self.k(x)).view(B, T, self.nh, self.dk), dim=-1)
+        v = c(self.cv, self.v(x)).view(B, T, self.nh, self.dv)
+        g = F.logsigmoid(self.a(x).float())  # log decay, [B, T, H]
+        o, _ = chunk_simple_gla(q, k, v, g, scale=self.dk ** -0.5)
+        o = self.norm(o, self.g(x).view(B, T, self.nh, self.dv))
+        return self.o(o.reshape(B, T, -1))
+
+
 def mixer(kind):
+    if kind == "ssd":
+        return SSD()
     if kind == "mamba2":
         from fla.layers import Mamba2
         return Mamba2(hidden_size=D, num_heads=2 * D // 64, head_dim=64, state_size=128,
