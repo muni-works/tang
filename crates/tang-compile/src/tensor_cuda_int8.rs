@@ -237,7 +237,11 @@ impl TensorGraph {
             }
         }
         let param = |a: usize| -> Result<String, String> {
-            let n = c.args[a].src.n();
+            // a reshape reads its source's buffer
+            let mut n = c.args[a].src.n();
+            while let Op::Reshape(src) = self.nodes[n].op {
+                n = src.n();
+            }
             reads
                 .iter()
                 .position(|&r| r == n)
