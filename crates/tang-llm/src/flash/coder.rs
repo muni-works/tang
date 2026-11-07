@@ -2818,6 +2818,44 @@ impl Coder {
             });
             p.ctx.sync()?;
         }
+        // TANG_CODER_ATTN=derived: compile the window kernels for every padded key count now
+        // (all cores), not on each count's first window.
+        if self.var.attn_derived && !env_is("TANG_CODER_ATTN_LAZY", "1") {
+            let hp = &self.hp;
+            let base = super::derived_attn::AttnShape {
+                t: rows,
+                n_pad: super::derived_attn::KEY_STEP,
+                nkv: hp.n_head_kv,
+                g: hp.n_head / hp.n_head_kv,
+                hd: hp.head_dim,
+            };
+            let t0 = Instant::now();
+            let built = super::derived_attn::prebuild(base, self.max_ctx);
+            let mut da = self.derived.borrow_mut();
+            da.kernels.clear();
+            let mut n = 0;
+            for c in built {
+                match c.and_then(|c| {
+                    let k = c.shape.n_pad;
+                    c.load(&self.gpu).map(|kk| (k, kk))
+                }) {
+                    Ok((k, kk)) => {
+                        da.kernels.insert(k, kk);
+                        n += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("coder: no derived attention ({e}); FA2 instead");
+                        da.failed = true;
+                        break;
+                    }
+                }
+            }
+            eprintln!(
+                "coder: derived attention: {n} window kernels (to {} keys) built in {:.1} s",
+                self.max_ctx,
+                t0.elapsed().as_secs_f64()
+            );
+        }
         Ok(())
     }
 

@@ -243,11 +243,23 @@ pub fn source(s: AttnShape) -> Result<(String, Vec<Role>, u32), String> {
     Err(format!("{s:?}: no variant lowers to one flash kernel"))
 }
 
+/// A window kernel compiled to PTX (no device needed), ready to load.
 #[cfg(feature = "cuda")]
-impl Kernel {
-    /// Generate, compile (NVRTC, `sm_90a`: `wgmma` is arch-specific) and load
-    /// the window kernel for `s`.
-    pub fn build(gpu: &tang_moe::gpu::Gpu, s: AttnShape) -> anyhow::Result<Self> {
+pub struct Compiled {
+    pub shape: AttnShape,
+    ptx: String,
+    params: Vec<Role>,
+    threads: u32,
+    tiles: u32,
+    smem: u32,
+    count: u32,
+}
+
+#[cfg(feature = "cuda")]
+impl Compiled {
+    /// Generate and compile (NVRTC, `sm_90a`: `wgmma` is arch-specific) the
+    /// window kernel for `s`. Thread-safe and device-free.
+    pub fn new(s: AttnShape) -> anyhow::Result<Self> {
         use anyhow::anyhow;
         let (src, params, count) = source(s).map_err(|e| anyhow!(e))?;
         let (threads, tiles, smem) = (
@@ -264,15 +276,29 @@ impl Kernel {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(&src, opts)
             .map_err(|e| anyhow!("nvrtc (derived attention {s:?}): {e:?}"))?
             .to_src();
-        let m = gpu.module_from_ptx(&ptx).map_err(|e| anyhow!("{e}"))?;
+        Ok(Compiled {
+            shape: s,
+            ptx,
+            params,
+            threads,
+            tiles,
+            smem,
+            count,
+        })
+    }
+
+    /// Load into the current context.
+    pub fn load(self, gpu: &tang_moe::gpu::Gpu) -> anyhow::Result<Kernel> {
+        use anyhow::anyhow;
+        let m = gpu.module_from_ptx(&self.ptx).map_err(|e| anyhow!("{e}"))?;
         let f = m.func("main0").map_err(|e| anyhow!("{e}"))?;
-        if smem > 48 * 1024 {
+        if self.smem > 48 * 1024 {
             unsafe {
                 tang_moe::gpu::check(
                     cudarc::driver::sys::cuFuncSetAttribute(
                         f,
                         cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        smem as i32,
+                        self.smem as i32,
                     ),
                     "cuFuncSetAttribute",
                 )
@@ -282,13 +308,52 @@ impl Kernel {
         Ok(Kernel {
             f,
             _m: m,
-            params,
-            threads,
-            tiles,
-            smem,
-            count,
+            params: self.params,
+            threads: self.threads,
+            tiles: self.tiles,
+            smem: self.smem,
+            count: self.count,
         })
     }
+}
+
+#[cfg(feature = "cuda")]
+impl Kernel {
+    /// [`Compiled::new`] then [`Compiled::load`].
+    pub fn build(gpu: &tang_moe::gpu::Gpu, s: AttnShape) -> anyhow::Result<Self> {
+        Compiled::new(s)?.load(gpu)
+    }
+}
+
+/// Compile the window kernels for every padded key count up to `max_keys`
+/// on all cores (the source generation and NVRTC are CPU work; a first
+/// window would otherwise wait ~0.6 s for each).
+#[cfg(feature = "cuda")]
+pub fn prebuild(base: AttnShape, max_keys: usize) -> Vec<anyhow::Result<Compiled>> {
+    let shapes: Vec<AttnShape> = (1..=max_keys.div_ceil(KEY_STEP))
+        .map(|i| AttnShape {
+            n_pad: i * KEY_STEP,
+            ..base
+        })
+        .collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(shapes.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<anyhow::Result<Compiled>>>> =
+        shapes.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&s) = shapes.get(i) else { break };
+                *out[i].lock().unwrap() = Some(Compiled::new(s));
+            });
+        }
+    });
+    out.into_iter()
+        .map(|m| m.into_inner().unwrap().unwrap())
+        .collect()
 }
 
 #[cfg(test)]
