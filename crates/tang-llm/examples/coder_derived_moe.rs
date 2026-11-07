@@ -175,14 +175,16 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
     let up = |v: &[u8]| DevBuf::from_slice(v).unwrap();
     let upf = |v: &[f32]| DevBuf::from_slice(v).unwrap();
     let z = |n: usize| DevBuf::zeroed_elems::<f32>(n).unwrap();
+    // gate ‖ up in one buffer (the engine's layout): wu / su point into it
+    let cat = |a: &[u8], b: &[u8]| [a, b].concat();
     let b = vec![
         upf(&x),
         upf(&lg),
-        up(&wg),
-        up(&wu),
+        up(&cat(&wg, &wu)),
+        up(&[0u8; 4]),
         up(&wd),
-        up(&sg),
-        up(&su),
+        up(&cat(&sg, &su)),
+        up(&[0u8; 4]),
         up(&sd),
         upf(&r),
         upf(&wn),
@@ -190,8 +192,12 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
         z(t * n),
         z(t * n),
     ];
+    let mut ptrs: Vec<u64> = b.iter().map(|b| b.ptr).collect();
+    ptrs[3] = ptrs[2] + wg.len() as u64;
+    ptrs[6] = ptrs[5] + sg.len() as u64;
+    ptrs.extend([ptrs[2], ptrs[5]]);
     let bufs = Bufs {
-        ptrs: b.iter().map(|b| b.ptr).collect(),
+        ptrs,
         y: 10,
         ro: 11,
         xo: 12,

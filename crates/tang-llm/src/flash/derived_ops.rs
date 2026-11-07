@@ -567,8 +567,8 @@ pub struct MoeShape {
 }
 
 /// External tensors of [`moe_block`], in launch order.
-pub const MOE_EXT: [&str; 13] = [
-    "x", "lg", "wg", "wu", "wd", "sg", "su", "sd", "r", "wn", "y", "r_out", "x_out",
+pub const MOE_EXT: [&str; 15] = [
+    "x", "lg", "wg", "wu", "wd", "sg", "su", "sd", "r", "wn", "y", "r_out", "x_out", "wgu", "sgu",
 ];
 
 /// A decode window's whole MoE layer, as the naive math: softmax top-k
@@ -577,7 +577,9 @@ pub const MOE_EXT: [&str; 13] = [
 /// (quantized per 32), down rows, the shared expert (Q8_0) the same way,
 /// then `y = Σ_j w_j·down_j + sigmoid(lg[ne])·shared`, `r_out = r + y`,
 /// `x_out = rmsnorm(r_out)·wn`. Ext as [`MOE_EXT`] (`r_out` may alias `r`,
-/// `x_out` may alias `x`: every read of them precedes the write).
+/// `x_out` may alias `x`: every read of them precedes the write). `wgu` / `sgu` are the
+/// gate and up stacks as one buffer (`wg ‖ wu`, `sg ‖ su`: up at gate + gate's bytes): the
+/// unsorted path reads gate and up rows in one launch (`TANG_DMOE_PAIR=0`: two).
 pub fn moe_block(m: MoeShape) -> Spec {
     let MoeShape {
         t,
@@ -600,6 +602,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
     let sd = g.input(&[n, ff]);
     let r = g.input(&[t, n]);
     let wn = g.input(&[n]);
+    let wgu = g.input(&[2, ne, ff, n]);
+    let sgu = g.input(&[2, ff, n]);
 
     let envn = |k: &str, d: usize| {
         std::env::var(k)
@@ -614,6 +618,9 @@ pub fn moe_block(m: MoeShape) -> Spec {
         sel(up, ExprId::ZERO, inner)
     };
     let sorted = t >= envn("TANG_DMOE_SORT_MIN", 16);
+    let pair = !sorted && envn("TANG_DMOE_PAIR", 1) == 1;
+    // the shared expert's tiled GEMV shares a weight read across positions: paired at one row only
+    let sh_pair = pair && t == 1;
     // `top3 [t, k, 2]`: the top-k monoid's (id, logit) pairs read in place (no column kernels;
     // unsorted path, `TANG_DMOE_TOPCOL=1` materializes the columns)
     let mut top3 = None;
@@ -765,9 +772,38 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        let eg = tag(gx(&mut g, wg), "ex_gate");
-        let eu = tag(gx(&mut g, wu), "ex_up");
-        let h = tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu");
+        let (eg, eu, h) = if pair {
+            // space [t, j, half, row | col]: gate and up rows in one launch
+            let id5 = match top3 {
+                Some(t3) => arg(t3, affine(5, &[(&[(0, 1)], 0), (&[(1, 1)], 0), (&[], 0)])),
+                None => arg(topi, View::pick(5, &[Some(0), Some(1)])),
+            };
+            let egu = g
+                .comp(
+                    &[t, k, 2, ff],
+                    &[n],
+                    vec![
+                        arg(
+                            wgu,
+                            View::pick(5, &[Some(2), None, Some(3), Some(4)]).gather(1, 2, 1),
+                        ),
+                        arg(xq, View::pick(5, &[Some(0), Some(4)])),
+                        id5,
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let half = |c: i64| affine(3, &[(&[(0, 1)], 0), (&[(1, 1)], 0), (&[], c), (&[(2, 1)], 0)]);
+            let h = g
+                .comp(&[t, k, ff], &[], vec![arg(egu, half(0)), arg(egu, half(1))], None, |v| vec![silu(v)])
+                .unwrap();
+            (tag(egu, "ex_gate_up"), egu, tag(h, "ex_silu"))
+        } else {
+            let eg = tag(gx(&mut g, wg), "ex_gate");
+            let eu = tag(gx(&mut g, wu), "ex_up");
+            (eg, eu, tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu"))
+        };
         let dn = g
             .comp(
                 &[t, k, n],
@@ -884,9 +920,30 @@ pub fn moe_block(m: MoeShape) -> Spec {
         )
         .unwrap()
     };
-    let shg = tag(dense(&mut g, sg, xq, ff, n), "sh_gate");
-    let shu = tag(dense(&mut g, su, xq, ff, n), "sh_up");
-    let sh = tag(g.map(&[shg, shu], silu).unwrap(), "sh_silu");
+    let (shg, shu, sh) = if sh_pair {
+        // space [t, half, row | col]
+        let sgu_out = g
+            .comp(
+                &[t, 2, ff],
+                &[n],
+                vec![
+                    arg(sgu, View::pick(4, &[Some(1), Some(2), Some(3)])),
+                    arg(xq, View::pick(4, &[Some(0), Some(3)])),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let half = |c: i64| affine(2, &[(&[(0, 1)], 0), (&[], c), (&[(1, 1)], 0)]);
+        let sh = g
+            .comp(&[t, ff], &[], vec![arg(sgu_out, half(0)), arg(sgu_out, half(1))], None, |v| vec![silu(v)])
+            .unwrap();
+        (tag(sgu_out, "sh_gate_up"), sgu_out, tag(sh, "sh_silu"))
+    } else {
+        let shg = tag(dense(&mut g, sg, xq, ff, n), "sh_gate");
+        let shu = tag(dense(&mut g, su, xq, ff, n), "sh_up");
+        (shg, shu, tag(g.map(&[shg, shu], silu).unwrap(), "sh_silu"))
+    };
     let shd = tag(dense(&mut g, sd, sh, n, ff), "sh_down");
 
     // combine: Σ_j wts[t, j] · dn[t, j, i]   space [t, i | j]
@@ -938,7 +995,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
     g.set_precision(wg, Precision::storage(m.gu));
     g.set_precision(wu, Precision::storage(m.gu));
     g.set_precision(wd, Precision::storage(m.down));
-    for w in [sg, su, sd] {
+    g.set_precision(wgu, Precision::storage(m.gu));
+    for w in [sg, su, sd, sgu] {
         g.set_precision(w, Precision::storage(Format::Q8_0));
     }
     for a in [xq, h, sh] {
@@ -991,11 +1049,11 @@ pub fn moe_block(m: MoeShape) -> Spec {
         g.set_inline(sh, true);
     }
     g.set_schedule(routed, 0, (0, 0, 0), (1, 1));
-    g.set_inline(wts, envn("TANG_DMOE_INLINE_W", 0) == 1);
-    g.set_inline(routed, envn("TANG_DMOE_INLINE_R", 0) == 1);
+    g.set_inline(wts, envn("TANG_DMOE_INLINE_W", 1) == 1);
+    g.set_inline(routed, envn("TANG_DMOE_INLINE_R", 1) == 1);
     Spec {
         g,
-        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo],
+        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo, wgu, sgu],
         outs: if m.keep_y {
             vec![y, ro, xo]
         } else {
