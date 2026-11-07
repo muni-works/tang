@@ -78,3 +78,13 @@ numbers. Order of the remaining work, by what unblocks the most:
 3. Decode attention: split-K with key-count buckets + a runtime-position KV scatter view.
 4. GDN decode step: in-place state outputs (or double-buffered state) + the conv ring.
 5. `Format::Q6K`, MTP head, embedding/copies.
+
+## Constraints for wiring it in (from the prod rollout, 2026-11-07)
+
+- An NVRTC/lowering failure falls back **per op** to the hand kernel, never disables a whole path
+  (tang#180: a silent chunked-GDN failure turned off wide prefill, 45k TTFT went to 105 s in prod).
+- Prod decodes with `serve --batch 45` + MTP: decode GEMVs run at T≈8–45, not T=1. Bench
+  T=8/16/48 on an H200 before proposing anything for prod. The 3090 T=8 number (278 GB/s) is the one that matters.
+- Startup already spends ~120 s building kernels: keep added compile time small, or cache the PTX
+  under `/workspace/zest/kernels`.
+- Behind a switch, off by default. Gates: flash-wide-check, batch-check N=8 bitwise, a continuation case.
