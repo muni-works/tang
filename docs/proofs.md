@@ -243,13 +243,13 @@ MB at 4 bytes/word.
   tile is not.** The scalar WGSL flash kernel stages 16 query rows per
   workgroup, so K and V are re-read `N/16` times (and the model does not
   credit skipped masked blocks). The best known schedule uses
-  `B = M/(4d)` (48 rows on a 3090 at d = 64) and is 4–6× lower than tang's
-  staged traffic; the remaining 6–20× to the lower bound is the
-  bound's unknown constant (Theorem 14 is tight only up to it). The
-  backward's 8 kernels add ≈ 4× more over FA-2's.
+  `B = M/(4d)` (48 rows on a 3090 at d = 64) and is 3.7–5.9× lower than tang's
+  staged traffic; the remaining 5–17× to the lower bound is the
+  bound's unknown constant (Theorem 14 is tight only up to it). For
+  fwd+bwd (8 kernels) tang's staged traffic is 6.5–9× FA-2's.
 * **MoE.** The token-major gather schedule (decode) meets the compulsory
   bound at T = 8. At prefill size the same schedule re-reads each
-  expert's slice per (token, slot) — 50× the bound — which is why the
+  expert's slice per (token, slot) — 44–54× the bound — which is why the
   prefill path sorts tokens by expert and reduces over segments (PR #168);
   that path is not modelled here.
 
