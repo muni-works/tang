@@ -843,7 +843,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
             } else {
                 Stage::Mma
             },
-            ksplit: envn("TANG_DMOE_KSPLIT", 1) as u32,
+            ksplit: envn("TANG_DMOE_KSPLIT", 2) as u32,
             pos_tile: 1,
         }
     } else {
