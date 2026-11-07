@@ -145,21 +145,21 @@ impl ComputeBuffer for CudaBuffer {
 
     fn to_vec(&self) -> Vec<f32> {
         match self.storage() {
-            CudaStorage::F32(s) => s.stream().memcpy_dtov(s).unwrap(),
+            CudaStorage::F32(s) => s.stream().clone_dtoh(s).unwrap(),
             CudaStorage::Bf16(s) => {
-                let u16_data: Vec<u16> = s.stream().memcpy_dtov(s).unwrap();
+                let u16_data: Vec<u16> = s.stream().clone_dtoh(s).unwrap();
                 u16_data.iter().map(|&b| bf16_to_f32(b)).collect()
             }
             // The raw repacked bytes, 4 per element (what the portable `upload_q2` stores).
             CudaStorage::Q2(q) => {
-                let bytes: Vec<u8> = q.data.stream().memcpy_dtov(&q.data).unwrap();
+                let bytes: Vec<u8> = q.data.stream().clone_dtoh(&q.data).unwrap();
                 crate::flash::words_of(&crate::flash::bytes_to_words(&bytes))
             }
             CudaStorage::Q4(q) => {
                 let stream = q.packed.stream();
-                let packed: Vec<u32> = stream.memcpy_dtov(&q.packed).unwrap();
-                let scales: Vec<u16> = stream.memcpy_dtov(&q.scales).unwrap();
-                let biases: Vec<u16> = stream.memcpy_dtov(&q.biases).unwrap();
+                let packed: Vec<u32> = stream.clone_dtoh(&q.packed).unwrap();
+                let scales: Vec<u16> = stream.clone_dtoh(&q.scales).unwrap();
+                let biases: Vec<u16> = stream.clone_dtoh(&q.biases).unwrap();
                 (0..self.len)
                     .map(|i| {
                         let v = (packed[i / 8] >> (4 * (i % 8))) & 0xf;
@@ -276,6 +276,29 @@ impl CudaComputeDevice {
                 );
             }
         }
+        Ok(CudaComputeDevice {
+            ctx,
+            stream,
+            cublas,
+            module_cache: RefCell::new(HashMap::new()),
+            mixed_precision: false,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
+        })
+    }
+
+    /// Borrow an existing cudarc context and stream (e.g. phyz-gpu's or the host
+    /// application's) so tang kernels and cuBLAS run on the caller's context, in order with
+    /// the caller's work on `stream`. f32 precision. Event tracking is left as the caller set
+    /// it (the owned constructors disable it; CUDA graph capture needs it off and a non-default
+    /// stream). `stream` must belong to `ctx`.
+    pub fn from_stream(
+        ctx: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, cudarc::cublas::result::CublasError> {
+        let cublas = CudaBlas::new(stream.clone())?;
         Ok(CudaComputeDevice {
             ctx,
             stream,
@@ -681,7 +704,7 @@ impl CudaComputeDevice {
     /// Upload data as f32 regardless of mixed_precision mode.
     /// Used for elementwise kernels and other f32-only operations.
     fn upload_f32(&self, data: &[f32]) -> CudaBuffer {
-        let slice = self.stream.memcpy_stod(data).unwrap();
+        let slice = self.stream.clone_htod(data).unwrap();
         Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
     }
 
@@ -1357,10 +1380,10 @@ impl ComputeDevice for CudaComputeDevice {
     fn upload(&self, data: &[f32]) -> CudaBuffer {
         if self.mixed_precision {
             let bf16_data: Vec<u16> = data.iter().map(|&v| f32_to_bf16(v)).collect();
-            let slice = self.stream.memcpy_stod(&bf16_data).unwrap();
+            let slice = self.stream.clone_htod(&bf16_data).unwrap();
             Self::make_buf_unpooled(CudaStorage::Bf16(slice), data.len())
         } else {
-            let slice = self.stream.memcpy_stod(data).unwrap();
+            let slice = self.stream.clone_htod(data).unwrap();
             Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
         }
     }
@@ -4619,7 +4642,7 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn download_bf16(&self, buf: &CudaBuffer) -> Vec<u16> {
         match buf.storage() {
-            CudaStorage::Bf16(s) => self.stream.memcpy_dtov(s).unwrap(),
+            CudaStorage::Bf16(s) => self.stream.clone_dtoh(s).unwrap(),
             _ => buf.to_vec().into_iter().map(f32_to_bf16).collect(),
         }
     }
@@ -5275,8 +5298,8 @@ impl ComputeDevice for CudaComputeDevice {
         let n_bufs = bufs.len() as u32;
 
         // Upload pointer and offset arrays to GPU
-        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
-        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+        let ptrs_gpu = self.stream.clone_htod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.clone_htod(&offsets).unwrap();
         let mut acc = self.stream.alloc_zeros::<f32>(1).unwrap();
 
         // Single fused kernel: all buffers in one launch
@@ -5362,8 +5385,8 @@ impl ComputeDevice for CudaComputeDevice {
             _records.push(record);
         }
 
-        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
-        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+        let ptrs_gpu = self.stream.clone_htod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.clone_htod(&offsets).unwrap();
 
         let cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -5387,7 +5410,7 @@ impl ComputeDevice for CudaComputeDevice {
         drop(_records);
 
         // Download norm for logging (memcpy_dtov syncs stream internally)
-        let norm_sq_val = self.stream.memcpy_dtov(norm_sq_buf.f32_data()).unwrap()[0];
+        let norm_sq_val = self.stream.clone_dtoh(norm_sq_buf.f32_data()).unwrap()[0];
         (norm_sq_val as f64).sqrt() as f32
     }
 }

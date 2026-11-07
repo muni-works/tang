@@ -60,7 +60,7 @@ tang = { workspace = true }
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 tang-otel = { workspace = true, optional = true }
-cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

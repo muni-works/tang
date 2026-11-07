@@ -49,7 +49,7 @@ struct Dev {
 
 impl Dev {
     fn up<T: cudarc::driver::DeviceRepr>(&self, v: &[T]) -> CudaSlice<T> {
-        self.stream.memcpy_stod(v).unwrap()
+        self.stream.clone_htod(v).unwrap()
     }
     fn zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
         &self,
@@ -62,7 +62,7 @@ impl Dev {
         p
     }
     fn down(&self, s: &CudaSlice<f32>) -> Vec<f32> {
-        self.stream.memcpy_dtov(s).unwrap()
+        self.stream.clone_dtoh(s).unwrap()
     }
 }
 
