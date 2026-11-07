@@ -1,0 +1,58 @@
+logs/wide_der.log:coder: no derived MoE for (1, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (2, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (3, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (4, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (5, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (6, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (7, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: no derived MoE for (8, 8, 13, 14, false) (down type 14); hand kernels
+logs/wide_der.log:coder: derived MoE: 8 of 16 shapes built in 8.5 s
+logs/wide_der.log:  teacher-forced max KL(narrow || wide) over 32 steps: 2.30e-5 (bar 2.0e-4)
+logs/wide_der.log:wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861949 of 4861952)
+logs/wide_der.log:  teacher-forced max KL(narrow || wide) over 32 steps: 1.28e-5 (bar 3.2e-5)
+logs/wide_der.log:wide-check 8000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861948 of 4861952)
+logs/b8_der.log:coder: no derived MoE for (1, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (2, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (3, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (4, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (5, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (6, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (7, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: no derived MoE for (8, 8, 13, 14, false) (down type 14); hand kernels
+logs/b8_der.log:coder: derived MoE: 8 of 16 shapes built in 6.4 s
+logs/b8_der.log:batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+logs/b8_der.log:batch-check: PASS (bitwise) (logits checksum 0e4e4af3f0bb966d)
+logs/b8_der.log:batch 1: 4.51 ms a step, 222 tok/s aggregate, 222 tok/s a stream (context ~1380)
+logs/b8_der.log:batch 2: 5.44 ms a step, 367 tok/s aggregate, 184 tok/s a stream (context ~1380)
+logs/b8_der.log:batch 4: 7.31 ms a step, 548 tok/s aggregate, 137 tok/s a stream (context ~1380)
+logs/b8_der.log:batch 8: 10.69 ms a step, 748 tok/s aggregate, 94 tok/s a stream (context ~1380)
+logs/b48_der.log:coder: no derived MoE for (1, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (2, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (3, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (4, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (5, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (6, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (7, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: no derived MoE for (8, 8, 13, 14, false) (down type 14); hand kernels
+logs/b48_der.log:coder: derived MoE: 8 of 16 shapes built in 6.4 s
+logs/b48_der.log:coder: derived MoE (48, 64, 12, 13, false): 19 + 2 kernels, built in 1.84 s
+logs/b48_der.log:batch-check tolerance: tokens agree 98.58% (1942/1970, same history), max |dlogit| 16.2508, mean 1.51e-1 (bar: 99%, mean <= 0.2)
+logs/b48_der.log:batch-check: FAIL (logits checksum aa623fd244e5d8d7)
+logs/b48_der.log:batch 1: 4.48 ms a step, 223 tok/s aggregate, 223 tok/s a stream (context ~1380)
+logs/b48_der.log:batch 2: 5.44 ms a step, 368 tok/s aggregate, 184 tok/s a stream (context ~1380)
+logs/b48_der.log:batch 4: 7.29 ms a step, 549 tok/s aggregate, 137 tok/s a stream (context ~1380)
+logs/b48_der.log:batch 8: 11.03 ms a step, 726 tok/s aggregate, 91 tok/s a stream (context ~1380)
+logs/b48_der.log:coder: derived MoE (16, 64, 12, 13, false): 19 + 2 kernels, built in 1.55 s
+logs/b48_der.log:batch 16: 15.58 ms a step, 1027 tok/s aggregate, 64 tok/s a stream (context ~1380)
+logs/b48_der.log:coder: derived MoE (32, 64, 12, 13, false): 19 + 2 kernels, built in 1.67 s
+logs/b48_der.log:batch 32: 23.18 ms a step, 1381 tok/s aggregate, 43 tok/s a stream (context ~1380)
+logs/b48_der.log:batch 48: 31.88 ms a step, 1505 tok/s aggregate, 31 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch-check tolerance: tokens agree 99.00% (2373/2397, same history), max |dlogit| 10.0505, mean 1.42e-1 (bar: 99%, mean <= 0.2)
+logs/b48_hand.log:batch-check: FAIL (logits checksum 4c1cc97f3193e028)
+logs/b48_hand.log:batch 1: 4.05 ms a step, 247 tok/s aggregate, 247 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 2: 4.77 ms a step, 419 tok/s aggregate, 210 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 4: 6.54 ms a step, 612 tok/s aggregate, 153 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 8: 9.81 ms a step, 815 tok/s aggregate, 102 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 16: 15.87 ms a step, 1008 tok/s aggregate, 63 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 32: 23.50 ms a step, 1362 tok/s aggregate, 43 tok/s a stream (context ~1380)
+logs/b48_hand.log:batch 48: 30.01 ms a step, 1599 tok/s aggregate, 33 tok/s a stream (context ~1380)

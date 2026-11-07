@@ -3667,3 +3667,31 @@ Decode ms a step (context ~1380):
 | 48 | 30.18 | 31.71 |
 
 Fusing gate|up+SiLU into one weight pass was not attempted this round.
+
+### Round 5: gate|up in one launch, fewer kernels (fifth H200, `crates/tang-llm/docs/bench/r5/`)
+
+Changes, all on the unsorted path (windows under 16 rows):
+- the top-k (id, logit) pairs are read in place, with no column kernels;
+- the routing weights and the expert combine are inlined;
+- gate and up rows come from one gate‖up buffer in one launch (the engine now uploads gate and up contiguously);
+- the shared expert's gate|up is also one launch at T=1.
+
+On the RTX 3090 example, kernels per layer drop from 16 to 10 at T=1 (73.7 → 63.0 µs) and from 18 to 13 at T=8 (286 → 268 µs).
+
+| gate | result |
+|---|---|
+| wide-check 3000 (int8) | PASS, KL 2.30e-5 (same as round 4) |
+| wide-check 8000 (int8) | PASS, KL 1.28e-5 |
+| batch-check N=8 | PASS, bitwise (checksum 0e4e4af3f0bb966d, same as round 4) |
+| batch-check N=48 | derived 98.58% / mean \|dlogit\| 0.151 (FAIL, checksum unchanged from round 4); hand in the same run 99.00% / 0.142 (also FAIL) |
+
+Decode ms a step, from the N=48 runs in the same pod session (context ~1380):
+
+| N | hand | derived r5 | derived r4 | gap r4 → r5 |
+|---|---|---|---|---|
+| 1 | 4.05 | 4.48 | 5.18 | 1.07 → 0.43 |
+| 8 | 9.81 | 11.03 | 11.42 | 1.51 → 1.22 |
+| 16 | 15.87 | 15.58 | 15.90 | derived 0.29 faster |
+| 48 | 30.01 | 31.88 | 31.71 | 1.53 → 1.87 (sorted path unchanged; run noise) |
+
+The b8 run measured derived N=8 at 10.69 ms, a gap of 0.88 ms. Windows of 16 rows and up (the sorted path) still run separate gate and up passes.
