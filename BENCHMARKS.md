@@ -3600,8 +3600,8 @@ derived: `moe_derived` on 47 layers + the hand stages on the Q6_K layer):
 | 8 | 205.4 | 257.5 | +1.63 ms |
 
 Everything outside the MoE layer matches (same kernels). So the N=1 gap is the derived layer itself:
-~77 µs a layer vs ~55 hand in eager mode. Graph capture checked: the derived shapes build at load
-or outside capture, and the graphed decode steps above are within 0.1 ms of eager minus launch time.
+~77 µs a layer vs ~55 hand in eager mode. The derived shapes build at load or on first use outside a capture (the log shows each build
+once), so the graphed steps run the derived kernels; I did not inspect the captured graphs node by node.
 No nsys on the image, so per-kernel attribution inside the derived layer comes from
 `examples/coder_derived_moe.rs` (`PER_KERNEL=1`): top-k 13 µs, gate and up GEMVs, 14 kernels.
 Pod time this round ≈ 45 min ($4), terminated.
