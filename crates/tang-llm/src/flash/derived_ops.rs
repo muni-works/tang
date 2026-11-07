@@ -590,8 +590,18 @@ pub fn moe_block(m: MoeShape) -> Spec {
             },
         )
         .unwrap();
-    let envn = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    g.set_schedule(top, envn("TANG_DMOE_TOPK_SPLIT", 256) as u32, (0, 0, 0), (1, 1));
+    let envn = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    g.set_schedule(
+        top,
+        envn("TANG_DMOE_TOPK_SPLIT", 256) as u32,
+        (0, 0, 0),
+        (1, 1),
+    );
     // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
     let mut wargs = vec![arg(g.iota(&[t, k], 1), View::identity(2, 2))];
     for j in 0..k {
@@ -616,43 +626,139 @@ pub fn moe_block(m: MoeShape) -> Spec {
         })
         .unwrap();
 
-    // routed experts: space [t, j, row | col], expert id = top[t, 2j]
+    // routed experts: unsorted (one GEMV a (token, expert) pair, the decode schedule) or, from
+    // `TANG_DMOE_SORT_MIN` rows (default 16), pairs sorted by expert so pairs sharing an expert
+    // are consecutive positions and share one weight read on the int8 tensor cores
+    let sorted = t >= envn("TANG_DMOE_SORT_MIN", 16);
     let xq = g.map(&[x], |v| v[0]).unwrap();
-    let id_view = affine(4, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]);
-    let gathered = |g: &mut TensorGraph, w: TensorId, src: TensorId, rows: usize, cols: usize| {
-        g.comp(
-            &[t, k, rows],
-            &[cols],
-            vec![
-                arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
-                arg(src, View::pick(4, &[Some(0), Some(1), Some(3)])),
-                arg(top, id_view.clone()),
-            ],
-            Some(Monoid::sum()),
-            |v| vec![v[0] * v[1]],
-        )
-        .unwrap()
-    };
-    // x is [t, n]: read it ignoring j
-    let gx = |g: &mut TensorGraph, w: TensorId| {
-        g.comp(
-            &[t, k, ff],
-            &[n],
-            vec![
-                arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
-                arg(xq, View::pick(4, &[Some(0), Some(3)])),
-                arg(top, id_view.clone()),
-            ],
-            Some(Monoid::sum()),
-            |v| vec![v[0] * v[1]],
-        )
-        .unwrap()
-    };
-    let eg = gx(&mut g, wg);
-    let eu = gx(&mut g, wu);
     let silu = |v: &[ExprId]| v[0] / (ExprId::ONE + (-v[0]).exp()) * v[1];
-    let h = g.map(&[eg, eu], silu).unwrap();
-    let dn = gathered(&mut g, wd, h, n, ff);
+    let (eg, eu, h, dn, rank) = if !sorted {
+        // space [t, j, row | col], expert id = top[t, 2j]
+        let id_view = affine(4, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]);
+        let gx = |g: &mut TensorGraph, w: TensorId| {
+            g.comp(
+                &[t, k, ff],
+                &[n],
+                vec![
+                    arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
+                    arg(xq, View::pick(4, &[Some(0), Some(3)])),
+                    arg(top, id_view.clone()),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap()
+        };
+        let eg = gx(&mut g, wg);
+        let eu = gx(&mut g, wu);
+        let h = g.map(&[eg, eu], silu).unwrap();
+        let dn = g
+            .comp(
+                &[t, k, n],
+                &[ff],
+                vec![
+                    arg(wd, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
+                    arg(h, View::pick(4, &[Some(0), Some(1), Some(3)])),
+                    arg(top, id_view.clone()),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        (eg, eu, h, dn, None)
+    } else {
+        let p = t * k;
+        let eq = |a: ExprId, b: ExprId| {
+            let (up, down) = (a - b, b - a);
+            tang_expr::with_graph(|eg| {
+                let inner = eg.select(down, ExprId::ZERO, ExprId::ONE);
+                eg.select(up, ExprId::ZERO, inner)
+            })
+        };
+        // sel[t, j] = expert id; key = sel·P + pair; rank = #keys below
+        let sel = g
+            .comp(
+                &[t, k],
+                &[],
+                vec![arg(top, affine(2, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]))],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let it = g.iota(&[t, k], 0);
+        let ik = g.iota(&[t, k], 1);
+        let key = g
+            .map(&[sel, it, ik], move |v| {
+                v[0] * ExprId::from_f64(p as f64) + v[1] * ExprId::from_f64(k as f64) + v[2]
+            })
+            .unwrap();
+        let rank = g
+            .comp(
+                &[t, k],
+                &[t, k],
+                vec![
+                    arg(key, View::pick(4, &[Some(0), Some(1)])),
+                    arg(key, View::pick(4, &[Some(2), Some(3)])),
+                ],
+                Some(Monoid::sum()),
+                |v| {
+                    let d = v[0] - v[1];
+                    vec![tang_expr::with_graph(|eg| {
+                        eg.select(d, ExprId::ONE, ExprId::ZERO)
+                    })]
+                },
+            )
+            .unwrap();
+        let ip = g.iota(&[p], 0);
+        let at_rank = |g: &mut TensorGraph, val: TensorId| {
+            g.comp(
+                &[p],
+                &[t, k],
+                vec![
+                    arg(rank, View::pick(3, &[Some(1), Some(2)])),
+                    arg(ip, View::pick(3, &[Some(0)])),
+                    arg(val, View::pick(3, &[Some(1), Some(2)])),
+                ],
+                Some(Monoid::sum()),
+                move |v| vec![eq(v[0], v[1]) * v[2]],
+            )
+            .unwrap()
+        };
+        let skey = at_rank(&mut g, sel);
+        let stok = at_rank(&mut g, it);
+        let gx = |g: &mut TensorGraph, w: TensorId| {
+            g.comp(
+                &[p, ff],
+                &[n],
+                vec![
+                    arg(w, View::pick(3, &[None, Some(1), Some(2)]).gather(0, 2, 1)),
+                    arg(xq, View::pick(3, &[None, Some(2)]).gather(0, 3, 1)),
+                    arg(skey, View::pick(3, &[Some(0)])),
+                    arg(stok, View::pick(3, &[Some(0)])),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap()
+        };
+        let eg = gx(&mut g, wg);
+        let eu = gx(&mut g, wu);
+        let h = g.map(&[eg, eu], silu).unwrap();
+        let dn = g
+            .comp(
+                &[p, n],
+                &[ff],
+                vec![
+                    arg(wd, View::pick(3, &[None, Some(1), Some(2)]).gather(0, 2, 1)),
+                    arg(h, View::pick(3, &[Some(0), Some(2)])),
+                    arg(skey, View::pick(3, &[Some(0)])),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        (eg, eu, h, dn, Some(rank))
+    };
 
     // shared expert: space [t, row | col]
     let dense = |g: &mut TensorGraph, w: TensorId, src: TensorId, rows: usize, cols: usize| {
@@ -674,8 +780,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
     let shd = dense(&mut g, sd, sh, n, ff);
 
     // combine: Σ_j wts[t, j] · dn[t, j, i]   space [t, i | j]
-    let routed = g
-        .comp(
+    let routed = match rank {
+        None => g.comp(
             &[t, n],
             &[k],
             vec![
@@ -684,8 +790,21 @@ pub fn moe_block(m: MoeShape) -> Spec {
             ],
             Some(Monoid::sum()),
             |v| vec![v[0] * v[1]],
-        )
-        .unwrap();
+        ),
+        // dn[rank[t, j], i]
+        Some(rank) => g.comp(
+            &[t, n],
+            &[k],
+            vec![
+                arg(wts, View::pick(3, &[Some(0), Some(2)])),
+                arg(dn, View::pick(3, &[None, Some(1)]).gather(0, 2, 1)),
+                arg(rank, View::pick(3, &[Some(0), Some(2)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        ),
+    }
+    .unwrap();
     let y = g
         .comp(
             &[t, n],
@@ -717,24 +836,34 @@ pub fn moe_block(m: MoeShape) -> Spec {
         ksplit: 1,
         pos_tile: 1,
     };
+    let routed_mma = if sorted {
+        IntMma {
+            stage: Stage::Mma,
+            ksplit: envn("TANG_DMOE_KSPLIT", 1) as u32,
+            pos_tile: 1,
+        }
+    } else {
+        gemv
+    };
     for c in [eg, eu, dn] {
-        g.set_int_mma(c, Some(gemv));
+        g.set_int_mma(c, Some(routed_mma));
     }
     // the shared expert: the dp4a GEMV with every row on one weight read, the same
     // accumulation order at any T (a token's outputs bitwise the same in any window);
     // `TANG_CODER_DMOE_MMA=1`: int8 tensor cores past one row (faster, not bitwise across T)
-    let shared = if t > 1 && std::env::var("TANG_CODER_DMOE_MMA").is_ok_and(|v| v == "1") {
-        IntMma {
-            stage: Stage::Mma,
-            ksplit: 2,
-            pos_tile: t.min(64) as u32,
-        }
-    } else {
-        IntMma {
-            pos_tile: t.min(8) as u32,
-            ..gemv
-        }
-    };
+    let shared =
+        if t > 1 && (sorted || std::env::var("TANG_CODER_DMOE_MMA").is_ok_and(|v| v == "1")) {
+            IntMma {
+                stage: Stage::Mma,
+                ksplit: 2,
+                pos_tile: t.min(64) as u32,
+            }
+        } else {
+            IntMma {
+                pos_tile: t.min(8) as u32,
+                ..gemv
+            }
+        };
     for c in [shg, shu, shd] {
         g.set_int_mma(c, Some(shared));
     }
@@ -745,7 +874,6 @@ pub fn moe_block(m: MoeShape) -> Spec {
         g.set_inline(sh, true);
     }
     g.set_schedule(routed, 0, (0, 0, 0), (1, 1));
-    let _ = gathered;
     Spec {
         g,
         ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo],
@@ -982,7 +1110,7 @@ mod moe_lowering {
     use super::*;
     #[test]
     fn moe_block_contractions_are_int8() {
-        for t in [1, 8] {
+        for t in [1, 8, 16, 48] {
             let l = moe_block(MoeShape {
                 t,
                 n: 2048,
