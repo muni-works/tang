@@ -61,6 +61,9 @@ mod gather_tests;
 pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]
 mod grad;
+#[path = "tensor_io.rs"]
+pub mod io;
+pub use io::{IoReport, KernelIo};
 #[path = "tensor_memplan.rs"]
 pub mod memplan;
 #[path = "tensor_modq.rs"]

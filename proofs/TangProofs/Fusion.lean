@@ -105,3 +105,15 @@ theorem substitute_map_sound₂ {r m s p : ℕ} {κ α γ δ β : Type*} [CommMo
   rw [View.read_map]
 
 end Tang
+
+namespace Tang
+
+/-- **Split / tiled reductions** (`split_reduction`, `schedule_split_k`,
+workgroup tree combines): reducing each chunk and then the partials gives
+the same value as reducing the whole, for any monoid (associativity alone;
+the chunks keep their order, so no commutativity is needed). -/
+theorem split_reduction {β : Type*} [Monoid β] (chunks : List (List β)) :
+    (chunks.map List.prod).prod = chunks.flatten.prod :=
+  (List.prod_flatten).symm
+
+end Tang
