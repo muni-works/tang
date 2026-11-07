@@ -179,17 +179,20 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
     unsafe { b.launch(*cfg) }.expect("launch");
 }
 
-/// Median ms of 20 runs of `f`.
+/// Mean ms of `f` over 20 back-to-back runs (one sync at the end, so
+/// host overhead is not counted), the best of 5 such batches.
 fn median(dev: &CudaDevice, mut f: impl FnMut()) -> f64 {
-    let mut times = Vec::new();
-    for _ in 0..20 {
-        let t0 = std::time::Instant::now();
-        f();
+    let mut best = f64::MAX;
+    for _ in 0..5 {
         dev.sync();
-        times.push(t0.elapsed().as_secs_f64() * 1e3);
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            f();
+        }
+        dev.sync();
+        best = best.min(t0.elapsed().as_secs_f64() * 1e3 / 20.0);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    times[10]
+    best
 }
 
 fn main() {
