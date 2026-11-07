@@ -484,7 +484,7 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
             ksplit: std::env::var("TANG_GEMV_KSPLIT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
+                .unwrap_or(if mma { 2 } else { 1 }),
             pos_tile: std::env::var("TANG_GEMV_PT")
                 .ok()
                 .and_then(|v| v.parse().ok())
