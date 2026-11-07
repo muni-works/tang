@@ -591,7 +591,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
         )
         .unwrap();
     let envn = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    g.set_schedule(top, envn("TANG_DMOE_TOPK_SPLIT", 256), (0, 0, 0), (1, 1));
+    g.set_schedule(top, envn("TANG_DMOE_TOPK_SPLIT", 256) as u32, (0, 0, 0), (1, 1));
     // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
     let mut wargs = vec![arg(g.iota(&[t, k], 1), View::identity(2, 2))];
     for j in 0..k {
