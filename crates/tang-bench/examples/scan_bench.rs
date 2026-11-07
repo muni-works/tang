@@ -116,7 +116,8 @@ struct Run {
     ts: CudaSlice<f32>,
     b16: Vec<CudaSlice<u16>>,
     dout: CudaSlice<u16>,
-    /// dq dk dv dα dβ (f32)
+    /// dq dk dv (bf16), dα dβ (f32)
+    g16: Vec<CudaSlice<u16>>,
     grads: Vec<CudaSlice<f32>>,
 }
 
@@ -136,13 +137,13 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize, dout: Option
     let b16 = if bwd { bs[1..].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect() } else { Vec::new() };
     let rows = plan.heads * plan.t;
     let dout = up16(dout.unwrap_or(&[0.0]));
-    let grads = if bwd {
-        [rows * plan.n, rows * plan.n, rows * plan.m, rows, rows]
-            .iter()
-            .map(|&n| s.alloc_zeros::<f32>(n).unwrap())
-            .collect()
+    let (g16, grads) = if bwd {
+        (
+            [rows * plan.n, rows * plan.n, rows * plan.m].iter().map(|&n| s.alloc_zeros::<u16>(n).unwrap()).collect(),
+            [rows, rows].iter().map(|&n| s.alloc_zeros::<f32>(n).unwrap()).collect(),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let mut ks: Vec<_> = plan.kernels_saving(bv, bwd).into_iter().collect();
     if bwd {
@@ -171,6 +172,7 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize, dout: Option
         ts,
         b16,
         dout,
+        g16,
         grads,
     }
 }
@@ -212,6 +214,9 @@ fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
         _ => {
             b.arg(q).arg(kk).arg(v).arg(&r.gates[0]).arg(&r.gates[1]).arg(gr).arg(gc);
             b.arg(&r.ts).arg(&sc[2]).arg(&r.b16[1]).arg(&r.dout).arg(vn).arg(&r.b16[2]);
+            for x in &r.g16 {
+                b.arg(x);
+            }
             for x in &r.grads {
                 b.arg(x);
             }
@@ -344,10 +349,14 @@ fn backward(dev: &CudaDevice, mode: Mode, h: usize, t: usize, n: usize, m: usize
     };
     let mut errs = Vec::new();
     for i in 0..used {
-        let got = dev.stream.memcpy_dtov(&r.grads[i]).unwrap();
+        let got: Vec<f64> = if i < 3 {
+            dev.stream.memcpy_dtov(&r.g16[i]).unwrap().into_iter().map(bf16_from_bits).collect()
+        } else {
+            dev.stream.memcpy_dtov(&r.grads[i - 3]).unwrap().into_iter().map(|x| x as f64).collect()
+        };
         let (mut e, mut mx) = (0f64, 0f64);
         for (x, y) in got.iter().zip(&want[i]) {
-            e = e.max((*x as f64 - y).abs());
+            e = e.max((x - y).abs());
             mx = mx.max(y.abs());
         }
         errs.push(format!("{}={:.1e}", names[i], e / mx));
