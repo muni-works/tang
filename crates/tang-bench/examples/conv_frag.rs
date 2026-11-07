@@ -26,6 +26,7 @@ fn main() {
         let xv = View {
             forms: vec![f(4, &[(2, 1)], 0), f(4, &[(1, 1), (3, d)], -d * 3)],
             guard: true,
+            gather: None,
         };
         let y = g
             .comp(
@@ -53,6 +54,7 @@ fn main() {
         let xv = View {
             forms: vec![f(5, &[(4, 1)], 0), f(5, &[(1, 1), (3, -1)], 0)],
             guard: true,
+            gather: None,
         };
         let wv = View {
             forms: vec![
@@ -61,6 +63,7 @@ fn main() {
                 f(5, &[(2, 1), (3, s as i64)], 0),
             ],
             guard: false,
+            gather: None,
         };
         let y = g
             .comp(
@@ -133,6 +136,7 @@ fn main() {
         let xv = View {
             forms: vec![f(4, &[(2, 1)], 0), f(4, &[(1, 1), (3, d)], -d * 3)],
             guard: true,
+            gather: None,
         };
         let y = g
             .comp(

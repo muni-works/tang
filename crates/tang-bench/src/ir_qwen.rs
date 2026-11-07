@@ -1039,6 +1039,14 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
+    // decode: split-K over the cache axis — attention's reductions over
+    // the `kctx` keys run as P partial chunks plus a combine with each
+    // one's own monoid (`TANG_DECODE_SPLIT=P`, off by default)
+    let (g, outs) = if dg.seq == 1 {
+        split_cache_axis(g, outs, dg.kctx, decode_split(dg.kctx))
+    } else {
+        (g, outs)
+    };
     // gate|up as one tuple-valued matmul: CUDA's tiles take it; Metal's
     // simdgroup tile takes one output, so a prefill there keeps them apart
     let (g, outs) = if dg.seq > 1 && !half_tiles {
@@ -1176,6 +1184,44 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
                 g.set_precision(TensorId::from_index(i), Precision::storage(Format::F16));
             }
         }
+    }
+    (g, outs)
+}
+
+/// Split-K parts for a decode step over `kctx` cache rows:
+/// `$TANG_DECODE_SPLIT` (default 1 = off). The chunks are sized off
+/// `kctx`, not the runtime length, so at short contexts most are empty
+/// and the split costs more than it gives (3090: −10% at 1k–16k with
+/// ctx 33k, +11% at 32k).
+pub fn decode_split(_kctx: usize) -> usize {
+    std::env::var("TANG_DECODE_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Every live reduction over exactly `kctx` keys (the cache axis) split
+/// into `parts` chunks ([`TensorGraph::split_reduction`]).
+pub fn split_cache_axis(
+    mut g: TensorGraph,
+    mut outs: Vec<TensorId>,
+    kctx: usize,
+    parts: usize,
+) -> (TensorGraph, Vec<TensorId>) {
+    if parts < 2 || !kctx.is_multiple_of(parts) {
+        return (g, outs);
+    }
+    loop {
+        // (eliminate_common and split_reduction leave no dead nodes)
+        let next = (0..g.nodes().len()).find(|&i| {
+            g.comp_at(i).is_some_and(|c| {
+                c.monoid.is_some() && c.red.len() == 1 && c.red[0].fixed() == Some(kctx)
+            })
+        });
+        let Some(i) = next else { break };
+        (g, outs) = g
+            .split_reduction(&outs, TensorId::from_index(i), parts)
+            .expect("split_reduction");
     }
     (g, outs)
 }
