@@ -283,7 +283,7 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
                 e.sync().unwrap();
                 b = b.min(e.since(&a).unwrap() as f64 * 1000.0);
             }
-            eprintln!("  T={t} ne={ne} kernel {i} {:?}: {b:.1} µs", op.shape(i));
+            eprintln!("  T={t} ne={ne} {i:2} {:<10} {:?}: {b:.1} µs", op.name(i), op.shape(i));
         }
     }
     println!(

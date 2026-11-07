@@ -19,6 +19,16 @@ use tang_compile::tensor::{
 };
 use tang_expr::ExprId;
 
+thread_local! {
+    static TAGS: std::cell::RefCell<Vec<(TensorId, &'static str)>> = Default::default();
+}
+
+/// Name a node for profiling (`Op::name`); kernels without a tag are named by node id.
+pub fn tag(t: TensorId, name: &'static str) -> TensorId {
+    TAGS.with(|v| v.borrow_mut().push((t, name)));
+    t
+}
+
 /// The math of an op, before lowering: graph, external tensors in launch
 /// pointer order, and the outputs to materialize.
 pub struct Spec {
@@ -39,6 +49,7 @@ pub struct Lowered {
 
 pub struct LKernel {
     pub source: String,
+    pub name: String,
     pub args: Vec<Slot>,
     pub grid: u32,
     pub block: u32,
@@ -100,8 +111,13 @@ impl Spec {
                 (Some(th), Some(ti)) => (th, ti),
                 _ => (k.workgroup_size, k.count.div_ceil(k.workgroup_size.max(1))),
             };
+            let node = resolve(k.node);
+            let name = TAGS
+                .with(|v| v.borrow().iter().find(|(t, _)| resolve(*t) == node).map(|x| x.1))
+                .map_or_else(|| format!("{node:?}"), str::to_string);
             kernels.push(LKernel {
                 source: k.source.clone(),
+                name,
                 args,
                 grid,
                 block,
@@ -109,6 +125,7 @@ impl Spec {
                 points: k.points,
             });
         }
+        TAGS.with(|v| v.borrow_mut().clear());
         Ok(Lowered { kernels, scratch })
     }
 }
@@ -129,6 +146,7 @@ mod gpu_impl {
         block: u32,
         smem: u32,
         points: u32,
+        name: String,
     }
 
     /// A lowered op loaded on the device, with its scratch.
@@ -168,6 +186,7 @@ mod gpu_impl {
                     block: k.block,
                     smem: k.smem,
                     points: k.points,
+                    name: k.name,
                 });
             }
             let scratch = l
@@ -186,6 +205,11 @@ mod gpu_impl {
         /// device address.
         pub fn launch(&self, s: &Stream, ext: &[u64]) -> anyhow::Result<()> {
             self.launch_range(s, ext, 0..self.ks.len())
+        }
+
+        /// Kernel `i`'s node name ([`tag`]).
+        pub fn name(&self, i: usize) -> &str {
+            &self.ks[i].name
         }
 
         /// Kernel `i`'s launch shape `(grid, block, smem)`.
@@ -286,6 +310,7 @@ fn rmsnorm(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024u32); // wide-check 3k KL: 0 4.06e-5, 64 1.84e-4, 128 5.86e-5, 256 2.81e-4, 512 4.40e-4, 1024 2.30e-5
+    tag(ss, "norm_ss");
     g.set_schedule(ss, split, (0, 0, 0), (1, 1));
     let (inv_n, eps) = (1.0 / n as f64, eps);
     g.comp(
@@ -477,7 +502,7 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
     let mut g = TensorGraph::new();
     let x = g.input(&[t, k]);
     let w = g.input(&[rows, k]);
-    let xq = g.map(&[x], |v| v[0]).unwrap();
+    let xq = tag(g.map(&[x], |v| v[0]).unwrap(), "xq");
     let out = g
         .comp(
             &[t, rows],
@@ -669,8 +694,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
             })
             .unwrap()
         };
-        let topi = pick_rank(&mut g, None);
-        let topv = pick_rank(&mut g, Some(lg));
+        let topi = tag(pick_rank(&mut g, None), "topi");
+        let topv = tag(pick_rank(&mut g, Some(lg)), "topv");
         // reductions split across threads (one thread a point would loop over every expert)
         g.set_schedule(
             rank,
@@ -707,7 +732,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
     // `TANG_DMOE_SORT_MIN` rows (default 16), pairs sorted by expert so pairs sharing an expert
     // are consecutive positions and share one weight read on the int8 tensor cores
     let sorted = t >= envn("TANG_DMOE_SORT_MIN", 16);
-    let xq = g.map(&[x], |v| v[0]).unwrap();
+    let xq = tag(g.map(&[x], |v| v[0]).unwrap(), "xq");
     let silu = |v: &[ExprId]| v[0] / (ExprId::ONE + (-v[0]).exp()) * v[1];
     let (eg, eu, h, dn, rank) = if !sorted {
         // space [t, j, row | col], expert id = top[t, 2j]
@@ -726,9 +751,9 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        let eg = gx(&mut g, wg);
-        let eu = gx(&mut g, wu);
-        let h = g.map(&[eg, eu], silu).unwrap();
+        let eg = tag(gx(&mut g, wg), "ex_gate");
+        let eu = tag(gx(&mut g, wu), "ex_up");
+        let h = tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu");
         let dn = g
             .comp(
                 &[t, k, n],
@@ -793,8 +818,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        let skey = at_rank(&mut g, sel);
-        let stok = at_rank(&mut g, it);
+        let skey = tag(at_rank(&mut g, sel), "sort_key");
+        let stok = tag(at_rank(&mut g, it), "sort_tok");
         let gx = |g: &mut TensorGraph, w: TensorId| {
             g.comp(
                 &[p, ff],
@@ -810,9 +835,9 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        let eg = gx(&mut g, wg);
-        let eu = gx(&mut g, wu);
-        let h = g.map(&[eg, eu], silu).unwrap();
+        let eg = tag(gx(&mut g, wg), "ex_gate");
+        let eu = tag(gx(&mut g, wu), "ex_up");
+        let h = tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu");
         let dn = g
             .comp(
                 &[p, n],
@@ -830,6 +855,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
     };
 
     // shared expert: space [t, row | col]
+    tag(dn, "ex_down");
+    tag(wts, "weights");
     let dense = |g: &mut TensorGraph, w: TensorId, src: TensorId, rows: usize, cols: usize| {
         g.comp(
             &[t, rows],
@@ -843,10 +870,10 @@ pub fn moe_block(m: MoeShape) -> Spec {
         )
         .unwrap()
     };
-    let shg = dense(&mut g, sg, xq, ff, n);
-    let shu = dense(&mut g, su, xq, ff, n);
-    let sh = g.map(&[shg, shu], silu).unwrap();
-    let shd = dense(&mut g, sd, sh, n, ff);
+    let shg = tag(dense(&mut g, sg, xq, ff, n), "sh_gate");
+    let shu = tag(dense(&mut g, su, xq, ff, n), "sh_up");
+    let sh = tag(g.map(&[shg, shu], silu).unwrap(), "sh_silu");
+    let shd = tag(dense(&mut g, sd, sh, n, ff), "sh_down");
 
     // combine: Σ_j wts[t, j] · dn[t, j, i]   space [t, i | j]
     let routed = match rank {
@@ -887,9 +914,11 @@ pub fn moe_block(m: MoeShape) -> Spec {
             |v| vec![v[0] + (ExprId::ONE + (-v[2]).exp()).recip() * v[1]],
         )
         .unwrap();
-    let ro = g.map(&[r, y], |v| v[0] + v[1]).unwrap();
+    tag(y, "y");
+    tag(routed, "routed");
+    let ro = tag(g.map(&[r, y], |v| v[0] + v[1]).unwrap(), "resid");
     g.set_inline(y, !m.keep_y && envn("TANG_DMOE_KEEP_Y", 0) == 0);
-    let xo = rmsnorm(&mut g, ro, wn, t, n, eps);
+    let xo = tag(rmsnorm(&mut g, ro, wn, t, n, eps), "norm");
 
     // schedule: storage formats, int8 contractions, x / SwiGLU quantized
     g.set_precision(wg, Precision::storage(m.gu));
