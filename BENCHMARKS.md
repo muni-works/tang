@@ -3079,3 +3079,11 @@ NaN, the transpiled map path does not write f16), splitting attention (now slowe
 persistent segments (6.81 vs 6.76 ms), rows 12/16, warps 8. Left: the ~14 tiny kernels per layer
 (~0.8 ms, need real fusion — a 1-block reduction recomputed in its reader), the q|k|v and o GEMVs
 at ~70%, and attention at 4k (scores 17.6 µs ≈ 480 GB/s).
+
+Update (same session, back to back): the final vocabulary argmax was one block (32.4 µs); it now splits into 128
+chunks (6.3 µs; `TANG_SPLIT_WIDE=0` keeps it whole). llama.cpp Q4_0 149.4 / 145.3 / 134.9 tok/s vs tang
+148.7 / 141.4 / 124.2 (device step; end to end 148.9–149.2 at short). Remaining non-GEMV time at short context:
+~584 kernels under 5 µs = 1.09 ms per step (norm stats/maps, split combines, q/k-norm + rope + KV writes, softmax).
+At 4k, attention is ~46 µs per layer (scores 17.9, max 3.0, sum 2.2, P·V 22.5) against ~19 µs to read K and V once:
+a fused split-KV attention (one pass, online softmax) is the next step there. Splitting more warps per group
+(`TANG_KS_GROUPS`) or splitting attention K is slower.

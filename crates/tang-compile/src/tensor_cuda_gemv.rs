@@ -1043,7 +1043,12 @@ impl Lowering<'_> {
         let n_points: usize = pts.iter().product();
         let groups = n_points / rt;
         // few groups: a block of warps splits each one's reduction
-        let ks = if groups < 512 { 8.max(warps) } else { 1 };
+        // (TANG_KS_GROUPS: the threshold, default 512)
+        let ks_below: usize = std::env::var("TANG_KS_GROUPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let ks = if groups < ks_below { 8.max(warps) } else { 1 };
         let threads = if ks > 1 { 32 * ks } else { 32 * warps };
         let gpb = threads / 32 / ks;
         let blocks = if !point_conds.is_empty() && ks == 1 {

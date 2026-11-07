@@ -1069,6 +1069,40 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         if target > 0 {
             (g, outs) = split_gemvs(g, outs, dg, target);
         }
+        // a reduction to a few points over a long axis (the argmax over
+        // the vocabulary: one block, 32 us on the 3090) split into up to
+        // 128 chunks (CUDA default; TANG_SPLIT_WIDE=0 keeps it whole)
+        if half_tiles && std::env::var("TANG_SPLIT_WIDE").as_deref() != Ok("0") {
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find_map(|i| {
+                    let c = g.comp_at(i)?;
+                    let n: usize = g.nodes()[i].shape.iter().map(|d| d.n()).product();
+                    if c.monoid.is_none()
+                        || c.tuple > 1
+                        || c.red.len() != 1
+                        || n > 64
+                        || c.red[0].n() < 65536
+                    {
+                        return None;
+                    }
+                    let k = c.red[0].n();
+                    let p = (1..=7)
+                        .rev()
+                        .map(|e| 1usize << e)
+                        .find(|&p| k % p == 0 && k / p >= 512)?;
+                    Some((i, p))
+                })
+            };
+            while let Some((t, p)) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), p) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
         // TANG_SPLIT_ATTN=P: the reductions over the KV cache (keys >=
         // 4096, no weight read) split-K into P chunks
         let attn: usize = std::env::var("TANG_SPLIT_ATTN")
