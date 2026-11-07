@@ -15,6 +15,7 @@ include = ["src/**/*", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "examples/*
 [dependencies]
 tang      = { workspace = true }
 tang-expr = { workspace = true }
+tang-sparse = { workspace = true }
 
 [dev-dependencies]
 # reference f32 -> f16 rounding for the GLSL decode prelude

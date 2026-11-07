@@ -84,6 +84,10 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_space.rs"]
 pub mod space;
+/// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
+/// `IndexedGather` operator nodes.
+#[path = "tensor_sparse.rs"]
+pub mod sparse;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
@@ -579,6 +583,50 @@ pub enum Op {
     /// affine (and `backward` can invert them as pick views).
     Reshape(TensorId),
     Comp(Comp),
+    /// An opaque operator: native code forward, a user-supplied adjoint
+    /// backward. See [`Operator`].
+    Operator(OperatorNode),
+}
+
+/// An opaque operator node: whole-tensor native code with its own
+/// adjoint. Solves, simulations and other steps that are not
+/// comprehensions (a sparse linear solve, a rollout) enter the graph as
+/// one of these; everything around them stays comprehensions.
+///
+/// The reference interpreter materializes every input, calls
+/// [`forward`](Operator::forward) once, and stores the result like any
+/// other buffer. [`TensorGraph::backward`] calls
+/// [`backward`](Operator::backward), which appends the adjoint to the
+/// graph: comprehensions, further operator nodes, or both (`LinearSolve`'s
+/// adjoint is a transposed solve followed by an outer-product
+/// comprehension). Device backends do not lower operator nodes; a graph
+/// containing one runs on the interpreter or splits around it.
+pub trait Operator: Send + Sync + std::panic::RefUnwindSafe {
+    /// Short name for debugging and graph dumps.
+    fn name(&self) -> &str;
+
+    /// The output, row-major, from the inputs (row-major, in
+    /// [`OperatorNode::inputs`] order).
+    fn forward(&self, inputs: &[&[f64]]) -> Vec<f64>;
+
+    /// Append the vector-Jacobian product to `g`: given the forward
+    /// node's inputs, its output and the output cotangent `cot`, return
+    /// each input's cotangent (`None` for inputs that are not
+    /// differentiable, such as an index pattern).
+    fn backward(
+        &self,
+        g: &mut TensorGraph,
+        inputs: &[TensorId],
+        output: TensorId,
+        cot: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError>;
+}
+
+/// [`Op::Operator`]: the operator and the tensors it reads.
+#[derive(Clone)]
+pub struct OperatorNode {
+    pub op: std::sync::Arc<dyn Operator>,
+    pub inputs: Vec<TensorId>,
 }
 
 #[derive(Clone)]
@@ -947,6 +995,32 @@ impl TensorGraph {
         Ok(TensorId(self.nodes.len() as u32 - 1))
     }
 
+    /// Append an [`Operator`] node reading `inputs`, with output `shape`.
+    pub fn operator<D: Into<Dim> + Copy>(
+        &mut self,
+        op: std::sync::Arc<dyn Operator>,
+        inputs: &[TensorId],
+        shape: &[D],
+    ) -> TensorId {
+        self.nodes.push(TNode {
+            op: Op::Operator(OperatorNode {
+                op,
+                inputs: inputs.to_vec(),
+            }),
+            shape: dims(shape),
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+            reg: (1, 1),
+            fragment: false,
+            int_mma: None,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            precision: Precision::default(),
+        });
+        TensorId(self.nodes.len() as u32 - 1)
+    }
+
     /// The node whose buffer holds `t`'s bytes: `t` itself, or the source
     /// behind a chain of reshapes.
     pub fn storage(&self, t: TensorId) -> TensorId {
@@ -961,6 +1035,7 @@ impl TensorGraph {
         match &self.nodes[i].op {
             Op::Comp(c) => c.args.iter().map(|a| a.src.n()).collect(),
             Op::Reshape(src) => vec![src.n()],
+            Op::Operator(o) => o.inputs.iter().map(|t| t.n()).collect(),
             Op::Input(_) | Op::Iota(_) => Vec::new(),
         }
     }
@@ -1262,7 +1337,7 @@ impl TensorGraph {
     pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
         }
     }
 
@@ -1577,6 +1652,14 @@ impl TensorGraph {
                 Op::Input(k) => Op::Input(*k),
                 Op::Iota(d) => Op::Iota(*d),
                 Op::Reshape(src) => Op::Reshape(TensorId(remap[src.n()].unwrap() as u32)),
+                Op::Operator(o) => Op::Operator(OperatorNode {
+                    op: o.op.clone(),
+                    inputs: o
+                        .inputs
+                        .iter()
+                        .map(|t| TensorId(remap[t.n()].unwrap() as u32))
+                        .collect(),
+                }),
                 Op::Comp(c) => {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
@@ -2134,6 +2217,11 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => *src = TensorId(remap[src.n()].unwrap() as u32),
+                Op::Operator(o) => {
+                    for t in &mut o.inputs {
+                        *t = TensorId(remap[t.n()].unwrap() as u32);
+                    }
+                }
                 Op::Input(_) | Op::Iota(_) => {}
             }
             ng.nodes.push(node);
@@ -2312,7 +2400,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => true,
+                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -2594,6 +2682,10 @@ impl TensorGraph {
                 }
             } else if let Op::Reshape(src) = &mut g.nodes[i].op {
                 *src = TensorId(redirect[src.n()] as u32);
+            } else if let Op::Operator(o) = &mut g.nodes[i].op {
+                for t in &mut o.inputs {
+                    *t = TensorId(redirect[t.n()] as u32);
+                }
             }
             let Op::Comp(c) = &g.nodes[i].op else {
                 continue;
@@ -3912,11 +4004,32 @@ impl TensorGraph {
                         body: c.body.compile_many(&c.body_outs),
                         combine: c.monoid.as_ref().map(|m| m.combine.compile_many(&m.outs)),
                     }),
-                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) => None,
                 })
                 .collect(),
         };
         for i in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
+            if let Op::Operator(o) = &self.nodes[i].op {
+                let ins: Vec<Vec<f64>> = o
+                    .inputs
+                    .iter()
+                    .map(|t| {
+                        indices(&fixed(&self.nodes[t.n()].shape))
+                            .map(|idx| ev.read(*t, &idx))
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[f64]> = ins.iter().map(|v| &v[..]).collect();
+                let out = o.op.forward(&refs);
+                assert_eq!(
+                    out.len(),
+                    numel(&self.nodes[i].shape),
+                    "operator `{}` returned the wrong number of values",
+                    o.op.name()
+                );
+                ev.bufs[i] = out;
+                continue;
+            }
             if let Some(c) = self.comp_at(i) {
                 let w = c.width();
                 let pts = fixed(c.points());
@@ -4048,6 +4161,7 @@ impl Evaluator<'_> {
                 }
             }
             Op::Iota(d) => idx[*d] as f64,
+            Op::Operator(_) => self.bufs[t.n()][flat_index(&fixed(&node.shape), idx)],
             Op::Reshape(src) => {
                 let flat = flat_index(&fixed(&node.shape), idx);
                 let src_shape = fixed(&self.g.nodes[src.n()].shape);
