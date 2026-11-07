@@ -500,6 +500,277 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
     }
 }
 
+/// Shapes and weight formats of one MoE layer for [`moe_block`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MoeShape {
+    pub t: usize,
+    pub n: usize,
+    pub ff: usize,
+    pub ne: usize,
+    pub k: usize,
+    /// Router logits row stride (`ne + 1`: the shared expert's gate last).
+    pub ls: usize,
+    /// gate / up expert stacks' format (Q4K or Q5K), down's (Q5K).
+    pub gu: Format,
+    pub down: Format,
+    pub eps_bits: u64,
+}
+
+/// External tensors of [`moe_block`], in launch order.
+pub const MOE_EXT: [&str; 13] = [
+    "x", "lg", "wg", "wu", "wd", "sg", "su", "sd", "r", "wn", "y", "r_out", "x_out",
+];
+
+/// A decode window's whole MoE layer, as the naive math: softmax top-k
+/// routing of the router logits `lg`, the routed experts' gate and up rows
+/// (gathered by expert id, k-quant weights, x quantized per 32), SwiGLU
+/// (quantized per 32), down rows, the shared expert (Q8_0) the same way,
+/// then `y = Σ_j w_j·down_j + sigmoid(lg[ne])·shared`, `r_out = r + y`,
+/// `x_out = rmsnorm(r_out)·wn`. Ext as [`MOE_EXT`] (`r_out` may alias `r`,
+/// `x_out` may alias `x`: every read of them precedes the write).
+pub fn moe_block(m: MoeShape) -> Spec {
+    let MoeShape {
+        t,
+        n,
+        ff,
+        ne,
+        k,
+        ls,
+        ..
+    } = m;
+    let eps = f64::from_bits(m.eps_bits);
+    let mut g = TensorGraph::new();
+    let x = g.input(&[t, n]);
+    let lg = g.input(&[t, ls]);
+    let wg = g.input(&[ne, ff, n]);
+    let wu = g.input(&[ne, ff, n]);
+    let wd = g.input(&[ne, n, ff]);
+    let sg = g.input(&[ff, n]);
+    let su = g.input(&[ff, n]);
+    let sd = g.input(&[n, ff]);
+    let r = g.input(&[t, n]);
+    let wn = g.input(&[n]);
+
+    // routing: top-k (id, logit) pairs, renormalized softmax weights
+    let ie = g.iota(&[t, ne], 1);
+    let top = g
+        .comp_tuple(
+            &[t, 2 * k],
+            &[ne],
+            vec![
+                arg(ie, View::identity(2, 2)),
+                arg(lg, View::pick(2, &[Some(0), Some(1)])),
+            ],
+            Some(Monoid::topk(k)),
+            |v| {
+                let mut o = vec![v[0], v[1]];
+                for _ in 1..k {
+                    o.push(ExprId::ZERO);
+                    o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                }
+                o
+            },
+        )
+        .unwrap();
+    g.set_schedule(top, 256, (0, 0, 0), (1, 1));
+    // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
+    let mut wargs = vec![arg(g.iota(&[t, k], 1), View::identity(2, 2))];
+    for j in 0..k {
+        wargs.push(arg(
+            top,
+            affine(2, &[(&[(0, 1)], 0), (&[], 2 * j as i64 + 1)]),
+        ));
+    }
+    let wts = g
+        .comp(&[t, k], &[], wargs, None, move |v| {
+            let sel = |c, a, b| tang_expr::with_graph(|eg| eg.select(c, a, b));
+            let ex: Vec<ExprId> = (0..k).map(|j| (v[1 + j] - v[1]).exp()).collect();
+            let norm = ex.iter().fold(ExprId::ZERO, |a, &b| a + b);
+            let mut acc = ExprId::ZERO;
+            for (j, &e) in ex.iter().enumerate() {
+                let d = v[0] - ExprId::from_f64(j as f64);
+                let hit = sel(d + ExprId::from_f64(0.5), ExprId::ONE, ExprId::ZERO)
+                    * sel(ExprId::from_f64(0.5) - d, ExprId::ONE, ExprId::ZERO);
+                acc = acc + hit * e;
+            }
+            vec![acc / norm]
+        })
+        .unwrap();
+
+    // routed experts: space [t, j, row | col], expert id = top[t, 2j]
+    let xq = g.map(&[x], |v| v[0]).unwrap();
+    let id_view = affine(4, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]);
+    let gathered = |g: &mut TensorGraph, w: TensorId, src: TensorId, rows: usize, cols: usize| {
+        g.comp(
+            &[t, k, rows],
+            &[cols],
+            vec![
+                arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
+                arg(src, View::pick(4, &[Some(0), Some(1), Some(3)])),
+                arg(top, id_view.clone()),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    };
+    // x is [t, n]: read it ignoring j
+    let gx = |g: &mut TensorGraph, w: TensorId| {
+        g.comp(
+            &[t, k, ff],
+            &[n],
+            vec![
+                arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
+                arg(xq, View::pick(4, &[Some(0), Some(3)])),
+                arg(top, id_view.clone()),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    };
+    let eg = gx(&mut g, wg);
+    let eu = gx(&mut g, wu);
+    let silu = |v: &[ExprId]| v[0] / (ExprId::ONE + (-v[0]).exp()) * v[1];
+    let h = g.map(&[eg, eu], silu).unwrap();
+    let dn = gathered(&mut g, wd, h, n, ff);
+
+    // shared expert: space [t, row | col]
+    let dense = |g: &mut TensorGraph, w: TensorId, src: TensorId, rows: usize, cols: usize| {
+        g.comp(
+            &[t, rows],
+            &[cols],
+            vec![
+                arg(w, View::pick(3, &[Some(1), Some(2)])),
+                arg(src, View::pick(3, &[Some(0), Some(2)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    };
+    let shg = dense(&mut g, sg, xq, ff, n);
+    let shu = dense(&mut g, su, xq, ff, n);
+    let sh = g.map(&[shg, shu], silu).unwrap();
+    let shd = dense(&mut g, sd, sh, n, ff);
+
+    // combine: Σ_j wts[t, j] · dn[t, j, i]   space [t, i | j]
+    let routed = g
+        .comp(
+            &[t, n],
+            &[k],
+            vec![
+                arg(wts, View::pick(3, &[Some(0), Some(2)])),
+                arg(dn, View::pick(3, &[Some(0), Some(2), Some(1)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap();
+    let y = g
+        .comp(
+            &[t, n],
+            &[],
+            vec![
+                arg(routed, View::identity(2, 2)),
+                arg(shd, View::identity(2, 2)),
+                arg(lg, affine(2, &[(&[(0, 1)], 0), (&[], ne as i64)])),
+            ],
+            None,
+            |v| vec![v[0] + (ExprId::ONE + (-v[2]).exp()).recip() * v[1]],
+        )
+        .unwrap();
+    let ro = g.map(&[r, y], |v| v[0] + v[1]).unwrap();
+    let xo = rmsnorm(&mut g, ro, wn, t, n, eps);
+
+    // schedule: storage formats, int8 contractions, x / SwiGLU quantized
+    g.set_precision(wg, Precision::storage(m.gu));
+    g.set_precision(wu, Precision::storage(m.gu));
+    g.set_precision(wd, Precision::storage(m.down));
+    for w in [sg, su, sd] {
+        g.set_precision(w, Precision::storage(Format::Q8_0));
+    }
+    for a in [xq, h, sh] {
+        g.set_precision(a, Precision::storage(Format::Q8x32));
+    }
+    let gemv = IntMma {
+        stage: Stage::Gemv,
+        ksplit: 1,
+        pos_tile: 1,
+    };
+    for c in [eg, eu, dn] {
+        g.set_int_mma(c, Some(gemv));
+    }
+    let shared = if t == 1 {
+        gemv
+    } else {
+        IntMma {
+            stage: Stage::Mma,
+            ksplit: 2,
+            pos_tile: t.min(64) as u32,
+        }
+    };
+    for c in [shg, shu, shd] {
+        g.set_int_mma(c, Some(shared));
+    }
+    // one row: every GEMV quantizes its own activations in its prologue
+    if t == 1 {
+        g.set_inline(xq, true);
+        g.set_inline(h, true);
+        g.set_inline(sh, true);
+    }
+    g.set_schedule(routed, 0, (0, 0, 0), (1, 1));
+    let _ = gathered;
+    Spec {
+        g,
+        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo],
+        outs: vec![y, ro, xo],
+        auto: false,
+    }
+}
+
+/// The engine's int8 activation layout for the next layer's hand kernels:
+/// codes `[rows][n]` (a `Format::Q8x32` buffer's codes are exactly that),
+/// then f32 scales at `rows · n`. Two ops, launched in order: `codes` (ext
+/// `[x, q]`, `q` at the buffer) then `scales` (ext `[x, d]`, `d` at the
+/// buffer + `rows · n`), which overwrites the Q8x32 scale pairs the first
+/// leaves past the codes.
+pub fn engine_q8(t: usize, n: usize) -> (Spec, Spec) {
+    let mut g = TensorGraph::new();
+    let x = g.input(&[t, n]);
+    let q = g.map(&[x], |v| v[0]).unwrap();
+    g.set_precision(q, Precision::storage(Format::Q8x32));
+    let codes = Spec {
+        g,
+        ext: vec![x, q],
+        outs: vec![q],
+        auto: true,
+    };
+    let mut g = TensorGraph::new();
+    let x = g.input(&[t, n]);
+    // space [t, b | i]: max |x[t, 32 b + i]| / 127
+    let d = g
+        .comp(
+            &[t, n / 32],
+            &[32],
+            vec![arg(
+                x,
+                affine(3, &[(&[(0, 1)], 0), (&[(1, 32), (2, 1)], 0)]),
+            )],
+            Some(Monoid::max()),
+            |v| vec![v[0].abs()],
+        )
+        .unwrap();
+    let d = g.map(&[d], |v| v[0] / ExprId::from_f64(127.0)).unwrap();
+    let scales = Spec {
+        g,
+        ext: vec![x, d],
+        outs: vec![d],
+        auto: true,
+    };
+    (codes, scales)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +897,20 @@ mod tests {
         }
     }
 
+    fn coder_moe(t: usize) -> MoeShape {
+        MoeShape {
+            t,
+            n: 2048,
+            ff: 512,
+            ne: 512,
+            k: 10,
+            ls: 513,
+            gu: Format::Q4K,
+            down: Format::Q5K,
+            eps_bits: 1e-6f64.to_bits(),
+        }
+    }
+
     #[test]
     fn ops_lower_to_cuda() {
         for (name, s) in [
@@ -637,6 +922,11 @@ mod tests {
             ("route", route(4, 512, 513, 10)),
             ("argmax", argmax(2, 151936)),
             ("gemv_q8_0", gemv_q8_0(1, 4096, 2048)),
+            ("gemv_q8_0 t8", gemv_q8_0(8, 4096, 2048)),
+            ("moe_block t1", moe_block(coder_moe(1))),
+            ("moe_block t8", moe_block(coder_moe(8))),
+            ("engine_q8 codes", engine_q8(8, 2048).0),
+            ("engine_q8 scales", engine_q8(8, 2048).1),
         ] {
             let l = s.lower().unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!l.kernels.is_empty(), "{name}");
@@ -659,6 +949,43 @@ mod dump {
                 "--- grid {} block {} smem {} points {} args {:?}\n{}",
                 k.grid, k.block, k.smem, k.points, k.args, k.source
             );
+        }
+    }
+}
+#[cfg(test)]
+mod moe_lowering {
+    use super::*;
+    #[test]
+    fn moe_block_contractions_are_int8() {
+        for t in [1, 8] {
+            let l = moe_block(MoeShape {
+                t,
+                n: 2048,
+                ff: 512,
+                ne: 512,
+                k: 10,
+                ls: 513,
+                gu: Format::Q4K,
+                down: Format::Q5K,
+                eps_bits: 1e-6f64.to_bits(),
+            })
+            .lower()
+            .unwrap();
+            let int8 = l
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("__dp4a") || k.source.contains("mma.sync"))
+                .count();
+            for (i, k) in l.kernels.iter().enumerate() {
+                eprintln!(
+                    "t{t} k{i}: grid {} block {} int8 {} q8x32w {}",
+                    k.grid,
+                    k.block,
+                    k.source.contains("__dp4a") || k.source.contains("mma.sync"),
+                    k.source.contains("tang_q8x32_store")
+                );
+            }
+            assert_eq!(int8, 6, "t={t}: six int8 contractions");
         }
     }
 }
