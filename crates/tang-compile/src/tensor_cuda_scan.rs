@@ -310,8 +310,16 @@ extern "C" __global__ void __launch_bounds__(128) main0(
     FA wf[DK / 16];
     FAc kf[RT][C / 16];
     float gcn = 0.0f, grn = 0.0f;
-    auto fetch = [&](int c, FA* w, FAc (*k)[C / 16], float& g1, float& g2) {
+    __nv_bfloat162 uf[NTC][4];
+    auto fetch = [&](int c, FA* w, FAc (*k)[C / 16], float& g1, float& g2, __nv_bfloat162 (*u)[4]) {
         const size_t r0 = (size_t)h * T + (size_t)c * C;
+        #pragma unroll
+        for (int j = 0; j < NTC; j++)
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const int e = lane + 32 * q;
+                u[j][q] = *(const __nv_bfloat162*)&Uo[(r0 + warp * 16 + (e >> 3)) * DV + vb + j * 16 + (e & 7) * 2];
+            }
 #if DELTA
         #pragma unroll
         for (int e = 0; e < DK / 16; e++) wmma::load_matrix_sync(w[e], Wo + (r0 + warp * 16) * DK + e * 16, DK);
@@ -324,7 +332,7 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         g1 = GC[h * NT + c];
         g2 = tid < C ? GR[r0 + tid] : 0.0f;
     };
-    fetch(0, wf, kf, gcn, grn);
+    fetch(0, wf, kf, gcn, grn, uf);
     for (int c = 0; c < NT; c++) {
         const size_t row0 = (size_t)h * T + (size_t)c * C;
         const float glast = gcn;
@@ -332,7 +340,8 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         if (tid < C) gm[tid] = __expf(glast - grn);
         FA wn[DK / 16];
         FAc kn[RT][C / 16];
-        if (c + 1 < NT) fetch(c + 1, wn, kn, gcn, grn);
+        __nv_bfloat162 un[NTC][4];
+        if (c + 1 < NT) fetch(c + 1, wn, kn, gcn, grn, un);
         bf* hs = Hs + ((size_t)h * NT + c) * DK * DV;
         #pragma unroll
         for (int i = 0; i < RT; i++)
@@ -349,8 +358,9 @@ extern "C" __global__ void __launch_bounds__(128) main0(
                 __syncwarp();
             }
         __syncthreads();
-        for (int tt = warp; tt < 4 * NTC; tt += 4) {
-            const int tr = tt & 3, tcol = tt >> 2;
+        #pragma unroll
+        for (int tcol = 0; tcol < NTC; tcol++) {
+            const int tr = warp;
 #if DELTA
             FC acc;
             wmma::fill_fragment(acc, 0.0f);
@@ -363,10 +373,12 @@ extern "C" __global__ void __launch_bounds__(128) main0(
             wmma::store_matrix_sync(stg, acc, 16, wmma::mem_row_major);
 #endif
             __syncwarp();
-            for (int e = lane; e < 128; e += 32) {
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const int e = lane + 32 * q;
                 const int rr = e >> 3, cc = (e & 7) * 2;
                 const int r = tr * 16 + rr, x = tcol * 16 + cc;
-                const __nv_bfloat162 u = *(const __nv_bfloat162*)&Uo[(row0 + r) * DV + vb + x];
+                const __nv_bfloat162 u = uf[tcol][q];
 #if DELTA
                 const float v0 = __low2float(u) - stg[rr * 16 + cc], v1 = __high2float(u) - stg[rr * 16 + cc + 1];
                 const __nv_bfloat162 v = __floats2bfloat162_rn(v0, v1);
@@ -396,6 +408,10 @@ extern "C" __global__ void __launch_bounds__(128) main0(
         if (c + 1 < NT) {
             #pragma unroll
             for (int e = 0; e < DK / 16; e++) wf[e] = wn[e];
+            #pragma unroll
+            for (int j = 0; j < NTC; j++)
+                #pragma unroll
+                for (int q = 0; q < 4; q++) uf[j][q] = un[j][q];
             #pragma unroll
             for (int i = 0; i < RT; i++)
                 #pragma unroll
