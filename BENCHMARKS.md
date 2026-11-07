@@ -3267,3 +3267,20 @@ The fused program is 4–8× faster than the 9-kernel one.
 - **Why the gap:** `mma.sync` m16n8k16 tops out well below Hopper's `wgmma`. FA3's backward uses `wgmma` with warp-specialized TMA producers. The next step is moving the same recognized kernel onto `wgmma`.
 
 Raw logs: `docs/bench/hopper-h200-attn-bwd-fused*.log`.
+
+## d=256 attention forward on Hopper (H200 SXM, bf16, kernel-only)
+
+At head dim 256 `schedule_auto` left the online-softmax reduction untiled: the score stayed an n×n buffer and a scalar kernel ran the softmax, at 2.8 TFLOP/s. It now tiles up to 256 lanes, so the score inlines and the Hopper flash shape with 64-key blocks takes over. That shape compiles at 168 registers with no spills.
+
+Same method and checks as above; 16k tokens per config, 2048 hidden (8 heads); rel_err 2–3e-3 against f64. Measured on a Secure-cloud H200 SXM, idle otherwise. SDPA was run on the same pod.
+
+| causal | N | tang (TFLOP/s) | SDPA (TFLOP/s) |
+|---|---|---|---|
+| false | 1024 | 318 | 306 |
+| false | 4096 | 398 | 323 |
+| false | 16384 | 422 | 318 |
+| true | 1024 | 220 | 251 |
+| true | 4096 | 310 | 285 |
+| true | 16384 | 391 | 295 |
+
+Raw log: `docs/bench/hopper-h200-d256-and-wgmma-bwd.log`. FA3 was not run at d=256.
