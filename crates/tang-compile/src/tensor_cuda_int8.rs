@@ -352,7 +352,7 @@ impl TensorGraph {
             let nt = (s.pos_tile.max(1) as usize)
                 .div_ceil(8)
                 .min(npos.div_ceil(8));
-            if nt > 1 && wa.view.gather.is_none() && xkey.is_none() {
+            if nt > 1 && wa.view.gather.is_none() && xkey.is_none() && (k / 128) % ksplit == 0 {
                 // dense: a block takes `nt` position tiles, the A fragments loaded once
                 let groups = npos.div_ceil(8 * nt);
                 let mut src = String::new();
@@ -362,6 +362,10 @@ impl TensorGraph {
                     r#"__device__ __forceinline__ unsigned tang_ld32h(const unsigned char* p) {{
     const unsigned short* h = (const unsigned short*)p;
     return (unsigned)__ldg(h) | ((unsigned)__ldg(h + 1) << 16);
+}}
+__device__ __forceinline__ unsigned tang_s32h(const unsigned char* p) {{
+    const unsigned short* h = (const unsigned short*)p;
+    return (unsigned)h[0] | ((unsigned)h[1] << 16);
 }}
 extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, tig = lane & 3;
@@ -390,24 +394,40 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     float acc[{nt}][4];
     #pragma unroll
     for (int t = 0; t < {nt}; t++) {{ acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f; }}
-    for (int blk = ks * {nb_per}; blk < (ks + 1) * {nb_per}; blk++) {{
-        const unsigned char* pa = wa + blk * 34;
-        const unsigned char* pb = wb + blk * 34;
-        const float da = tang_h2f_bits(__ldg((const unsigned short*)pa)), db = tang_h2f_bits(__ldg((const unsigned short*)pb));
-        unsigned a[4];
-        a[0] = tang_ld32h(pa + 2 + tig * 4); a[2] = tang_ld32h(pa + 18 + tig * 4);
-        a[1] = tang_ld32h(pb + 2 + tig * 4); a[3] = tang_ld32h(pb + 18 + tig * 4);
+    // a warp's 16 rows × one unit (four 34-byte blocks, 136 bytes, 8-aligned)
+    // staged through shared memory by coalesced 8-byte loads
+    __shared__ __align__(8) unsigned char tang_ws[8][16 * 136];
+    unsigned char* ws = tang_ws[warp];
+    const unsigned char* wrow0 = wbase + (size_t)r0 * {row_bytes};
+    for (int u = ks * {nu_per}; u < (ks + 1) * {nu_per}; u++) {{
+        __syncwarp();
         #pragma unroll
-        for (int t = 0; t < {nt}; t++) {{
-            const signed char* xs_ = xbp[t] + blk * 32;
-            const unsigned b0 = __ldg((const unsigned*)(xs_ + tig * 4)), b1 = __ldg((const unsigned*)(xs_ + 16 + tig * 4));
-            int d[4];
-            tang_mma_s8(d, a, b0, b1);
-            const float2 x0 = __ldg(xsc + xa_[t] + blk), x1 = __ldg(xsc + xb_[t] + blk);
-            acc[t][0] = fmaf(da * x0.x, (float)d[0], acc[t][0]);
-            acc[t][1] = fmaf(da * x1.x, (float)d[1], acc[t][1]);
-            acc[t][2] = fmaf(db * x0.x, (float)d[2], acc[t][2]);
-            acc[t][3] = fmaf(db * x1.x, (float)d[3], acc[t][3]);
+        for (int i = lane; i < 272; i += 32) {{
+            const int rr = i / 17, ww = i % 17;
+            ((uint2*)(ws + rr * 136))[ww] = __ldg((const uint2*)(wrow0 + (size_t)rr * {row_bytes} + (size_t)u * 136) + ww);
+        }}
+        __syncwarp();
+        #pragma unroll
+        for (int b = 0; b < 4; b++) {{
+            const int blk = 4 * u + b;
+            const unsigned char* pa = ws + gq * 136 + b * 34;
+            const unsigned char* pb = ws + (gq + 8) * 136 + b * 34;
+            const float da = tang_h2f_bits(*(const unsigned short*)pa), db = tang_h2f_bits(*(const unsigned short*)pb);
+            unsigned a[4];
+            a[0] = tang_s32h(pa + 2 + tig * 4); a[2] = tang_s32h(pa + 18 + tig * 4);
+            a[1] = tang_s32h(pb + 2 + tig * 4); a[3] = tang_s32h(pb + 18 + tig * 4);
+            #pragma unroll
+            for (int t = 0; t < {nt}; t++) {{
+                const signed char* xs_ = xbp[t] + blk * 32;
+                const unsigned b0 = __ldg((const unsigned*)(xs_ + tig * 4)), b1 = __ldg((const unsigned*)(xs_ + 16 + tig * 4));
+                int d[4];
+                tang_mma_s8(d, a, b0, b1);
+                const float2 x0 = __ldg(xsc + xa_[t] + blk), x1 = __ldg(xsc + xb_[t] + blk);
+                acc[t][0] = fmaf(da * x0.x, (float)d[0], acc[t][0]);
+                acc[t][1] = fmaf(da * x1.x, (float)d[1], acc[t][1]);
+                acc[t][2] = fmaf(db * x0.x, (float)d[2], acc[t][2]);
+                acc[t][3] = fmaf(db * x1.x, (float)d[3], acc[t][3]);
+            }}
         }}
     }}
 {reduce_nt}
@@ -424,6 +444,7 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
                     row_bytes = k / 32 * 34,
                     nb_per = nb / ksplit,
                     pg = 8 * nt,
+                    nu_per = k / 128 / ksplit,
                     reduce_nt = if ksplit > 1 {
                         format!("    __shared__ float4 red_s[8][32];\n    #pragma unroll\n    for (int t = 0; t < {nt}; t++) {{\n        __syncthreads();\n        red_s[warp][lane] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);\n        __syncthreads();\n        if (ks == 0) for (int j = 1; j < {ksplit}; j++) {{ const float4 v = red_s[warp + j][lane]; acc[t][0] += v.x; acc[t][1] += v.y; acc[t][2] += v.z; acc[t][3] += v.w; }}\n    }}\n    if (ks != 0) return;")
                     } else {
