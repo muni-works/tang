@@ -4205,7 +4205,19 @@ impl Coder {
                 && self.in_wide.get()
                 && self.run_derived(w, t, q, kt, vt, rows, part, proj, st, attn)
             {
-                // done: the derived kernel, then the merge as one split
+                // the derived kernel, then the merge as one split; the output projection as
+                // after FA2
+                self.gemv(
+                    w,
+                    "attn_out",
+                    &layer.w_out,
+                    attn,
+                    None,
+                    self.a_on(w, &s.mix),
+                    t,
+                    n,
+                );
+                return;
             } else if let Some(ns) = self.fa2_splits(w, t) {
                 let g = hp.n_head / hp.n_head_kv;
                 let tiles = (t * g).div_ceil(ck::FA2_BM);
