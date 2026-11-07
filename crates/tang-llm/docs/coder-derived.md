@@ -110,3 +110,17 @@ numbers. Order of the remaining work, by what unblocks the most:
   decode step 5.04 vs 4.04 ms at 1 stream, 11.27 vs 9.82 at 8, 37.9 vs 30.0 at 48. Next, in order:
   routed experts on IntMma with sorted pairs at T ≥ 16; a faster top-k lowering (13 µs in one
   block); fewer kernels a layer (14 vs ~4); `Format::Q6K` for the last layer; the router GEMV.
+
+## Part 3 (2026-11-07): routed experts on int8 tensor cores from 16 rows
+
+- `moe_block` from `TANG_DMOE_SORT_MIN` rows (default 16): the (token, expert) pairs sorted by expert
+  as IR comps (key = id·P + pair, rank by comparison, expert and token at each rank), gate/up/down
+  on the `IntMma` MMA stage with gathered weights (consecutive positions with the same expert share
+  the A fragments), the combine reading `dn[rank[t, j]]`. The shared expert takes the Q8_0 MMA there too.
+- The k-quant MMA lowering now stages each warp's 16 rows × one super-block through shared memory
+  with coalesced 16-byte loads (`TANG_INT8_NOSTAGE=1`: the old direct loads). Gate/up at T=48 on the
+  3090: 580 → 255 µs.
+- 3090, 512 experts / top-10, µs a layer: T=16 497 (unsorted GEMVs) → 461; T=48 1550 → 945.
+  Reference check ≤ 4.2e-7 except T=48 with 16 experts (2.8e-4 on both the sorted and the unsorted
+  path: an int8 code flip at a rounding boundary in the reference's SwiGLU quantization, not the
+  sort).
