@@ -793,33 +793,55 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         __syncwarp();
     }
     __syncthreads();
-    // X = dT·Tᵀ (X[k][j] = Σ_{l≤j} dT[k][l]·T[j][l]), then dA = −Tᵀ·X, strict lower
-    for (int i = tid; i < C * C; i += 256) {
-        const int k = i / C, j = i % C;
-        float a0 = 0.0f, a1 = 0.0f;
-        int l = 0;
-        for (; l + 1 <= j; l += 2) {
-            a0 = fmaf(f2[k * LDF + l], f1[j * LDF + l], a0);
-            a1 = fmaf(f2[k * LDF + l + 1], f1[j * LDF + l + 1], a1);
-        }
-        if (l <= j) a0 = fmaf(f2[k * LDF + l], f1[j * LDF + l], a0);
-        xr[k * C + j] = a0 + a1;
-    }
-    __syncthreads();
-    for (int i = tid; i < C * C; i += 256) {
-        const int r = i / C, j = i % C;
-        float a0 = 0.0f, a1 = 0.0f;
-        if (j < r) {
-            int k = r;
-            for (; k + 1 < C; k += 2) {
-                a0 = fmaf(f1[k * LDF + r], xr[k * C + j], a0);
-                a1 = fmaf(f1[(k + 1) * LDF + r], xr[(k + 1) * C + j], a1);
+    // X = dT·Tᵀ, then dA = −Tᵀ·X (strict lower), on tensor cores: dT and X
+    // as bf16 operands over xr
+    {
+        bf* dtb = (bf*)xr;
+        bf* xb = dtb + C * LDT;
+        for (int i = tid; i < C * C; i += 256) dtb[(i / C) * LDT + i % C] = __float2bfloat16(f2[(i / C) * LDF + i % C]);
+        __syncthreads();
+        for (int tt = warp; tt < 16; tt += 8) {
+            const int tr = tt >> 2, tc = tt & 3;
+            FC acc;
+            wmma::fill_fragment(acc, 0.0f);
+            // Tᵀ[l][j] = T[j][l], nonzero for l ≤ j: l blocks ≤ tc
+            for (int e = 0; e <= tc * 16; e += 16) {
+                FA a;
+                FBc b;
+                wmma::load_matrix_sync(a, dtb + tr * 16 * LDT + e, LDT);
+                wmma::load_matrix_sync(b, tb + tc * 16 * LDT + e, LDT);
+                wmma::mma_sync(acc, a, b, acc);
             }
-            if (k < C) a0 = fmaf(f1[k * LDF + r], xr[k * C + j], a0);
+            wmma::store_matrix_sync(stg1, acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) xb[(tr * 16 + e / 16) * LDT + tc * 16 + e % 16] = __float2bfloat16(stg1[e]);
+            __syncwarp();
         }
-        f2[r * LDF + j] = -(a0 + a1);
+        __syncthreads();
+        for (int tt = warp; tt < 16; tt += 8) {
+            const int tr = tt >> 2, tc = tt & 3;
+            FC acc;
+            wmma::fill_fragment(acc, 0.0f);
+            if (tc <= tr) {
+                // Tᵀ[r][k] = T[k][r], nonzero for k ≥ r: k blocks ≥ tr
+                for (int e = tr * 16; e < C; e += 16) {
+                    FAc a;
+                    FBr b;
+                    wmma::load_matrix_sync(a, tb + e * LDT + tr * 16, LDT);
+                    wmma::load_matrix_sync(b, xb + e * LDT + tc * 16, LDT);
+                    wmma::mma_sync(acc, a, b, acc);
+                }
+            }
+            wmma::store_matrix_sync(stg1, acc, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int r = tr * 16 + e / 16, j = tc * 16 + e % 16;
+                f2[r * LDF + j] = j < r ? -stg1[e] : 0.0f;
+            }
+            __syncwarp();
+        }
+        __syncthreads();
     }
-    __syncthreads();
 #endif
     // q kᵀ → f1, k kᵀ → xr (f32)
     for (int tt = warp; tt < 32; tt += 8) {
@@ -935,17 +957,21 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         for (int e = 0; e < C; e += 16) {
             FAc a;
             FBr b;
-            wmma::load_matrix_sync(a, g1b + e * LDT + tr * 16, LDT);
-            wmma::load_matrix_sync(b, qs + e * LDK + tcol * 16, LDK);
-            wmma::mma_sync(am, a, b, am);
+            if (e >= tr * 16) {
+                wmma::load_matrix_sync(a, g1b + e * LDT + tr * 16, LDT);
+                wmma::load_matrix_sync(b, qs + e * LDK + tcol * 16, LDK);
+                wmma::mma_sync(am, a, b, am);
+            }
             FA a2;
             wmma::load_matrix_sync(a2, bsb + tr * 16 * LDT + e, LDT);
             wmma::load_matrix_sync(b, ks + e * LDK + tcol * 16, LDK);
             wmma::mma_sync(am, a2, b, am);
 #if DELTA
-            wmma::load_matrix_sync(a, tb + e * LDT + tr * 16, LDT);
-            wmma::load_matrix_sync(b, dwb + e * LDK + tcol * 16, LDK);
-            wmma::mma_sync(akb, a, b, akb);
+            if (e >= tr * 16) {
+                wmma::load_matrix_sync(a, tb + e * LDT + tr * 16, LDT);
+                wmma::load_matrix_sync(b, dwb + e * LDK + tcol * 16, LDK);
+                wmma::mma_sync(akb, a, b, akb);
+            }
 #endif
         }
         #pragma unroll
@@ -1009,8 +1035,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
             wmma::load_matrix_sync(b, s0 + (size_t)(tcol * 16) * DV + e, DV);
             wmma::mma_sync(aq, a, b, aq);
         }
-        #pragma unroll
-        for (int e = 0; e < C; e += 16) {
+        for (int e = 0; e <= tr * 16; e += 16) {
             FA a;
             FBr b;
             wmma::load_matrix_sync(a, g1b + tr * 16 * LDT + e, LDT);
