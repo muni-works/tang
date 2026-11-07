@@ -569,46 +569,107 @@ pub fn moe_block(m: MoeShape) -> Spec {
     let r = g.input(&[t, n]);
     let wn = g.input(&[n]);
 
-    // routing: top-k (id, logit) pairs, renormalized softmax weights
-    let ie = g.iota(&[t, ne], 1);
-    let top = g
-        .comp_tuple(
-            &[t, 2 * k],
-            &[ne],
-            vec![
-                arg(ie, View::identity(2, 2)),
-                arg(lg, View::pick(2, &[Some(0), Some(1)])),
-            ],
-            Some(Monoid::topk(k)),
-            |v| {
-                let mut o = vec![v[0], v[1]];
-                for _ in 1..k {
-                    o.push(ExprId::ZERO);
-                    o.push(ExprId::from_f64(-(f32::MAX as f64)));
-                }
-                o
-            },
-        )
-        .unwrap();
     let envn = |k: &str, d: usize| {
         std::env::var(k)
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
-    g.set_schedule(
-        top,
-        envn("TANG_DMOE_TOPK_SPLIT", 256) as u32,
-        (0, 0, 0),
-        (1, 1),
-    );
+    let sel = |c, a, b| tang_expr::with_graph(|eg| eg.select(c, a, b));
+    let eqf = move |a: ExprId, b: ExprId| {
+        let (up, down) = (a - b, b - a);
+        let inner = sel(down, ExprId::ZERO, ExprId::ONE);
+        sel(up, ExprId::ZERO, inner)
+    };
+    // routing: the top-k ids `topi [t, k]` and logits `topv [t, k]`, best first, ties to the
+    // lower id. Default: every expert's rank counted by comparison (all experts in parallel),
+    // then the id and logit at each rank; `TANG_DMOE_TOPK=tree`: the top-k monoid (one block a row)
+    let (topi, topv) = if std::env::var("TANG_DMOE_TOPK").as_deref() == Ok("tree") {
+        let ie = g.iota(&[t, ne], 1);
+        let top = g
+            .comp_tuple(
+                &[t, 2 * k],
+                &[ne],
+                vec![
+                    arg(ie, View::identity(2, 2)),
+                    arg(lg, View::pick(2, &[Some(0), Some(1)])),
+                ],
+                Some(Monoid::topk(k)),
+                |v| {
+                    let mut o = vec![v[0], v[1]];
+                    for _ in 1..k {
+                        o.push(ExprId::ZERO);
+                        o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                    }
+                    o
+                },
+            )
+            .unwrap();
+        g.set_schedule(
+            top,
+            envn("TANG_DMOE_TOPK_SPLIT", 256) as u32,
+            (0, 0, 0),
+            (1, 1),
+        );
+        let col = |g: &mut TensorGraph, c: i64| {
+            g.comp(
+                &[t, k],
+                &[],
+                vec![arg(top, affine(2, &[(&[(0, 1)], 0), (&[(1, 2)], c)]))],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap()
+        };
+        (col(&mut g, 0), col(&mut g, 1))
+    } else {
+        // space [t, e | e']: e' ranks above e
+        let i3 = g.iota(&[t, ne, ne], 1);
+        let j3 = g.iota(&[t, ne, ne], 2);
+        let rank = g
+            .comp(
+                &[t, ne],
+                &[ne],
+                vec![
+                    arg(lg, View::pick(3, &[Some(0), Some(1)])),
+                    arg(lg, View::pick(3, &[Some(0), Some(2)])),
+                    arg(i3, View::identity(3, 3)),
+                    arg(j3, View::identity(3, 3)),
+                ],
+                Some(Monoid::sum()),
+                move |v| {
+                    let d = v[1] - v[0];
+                    let tie = sel(v[2] - v[3], ExprId::ONE, ExprId::ZERO);
+                    vec![sel(d, ExprId::ONE, sel(-d, ExprId::ZERO, tie))]
+                },
+            )
+            .unwrap();
+        // space [t, j | e]
+        let jk = g.iota(&[t, k, ne], 1);
+        let ek = g.iota(&[t, k, ne], 2);
+        let pick_rank = |g: &mut TensorGraph, val: Option<TensorId>| {
+            let mut args = vec![
+                arg(rank, View::pick(3, &[Some(0), Some(2)])),
+                arg(jk, View::identity(3, 3)),
+                arg(ek, View::identity(3, 3)),
+            ];
+            if let Some(val) = val {
+                args.push(arg(val, View::pick(3, &[Some(0), Some(2)])));
+            }
+            let has = val.is_some();
+            g.comp(&[t, k], &[ne], args, Some(Monoid::sum()), move |v| {
+                vec![eqf(v[0], v[1]) * if has { v[3] } else { v[2] }]
+            })
+            .unwrap()
+        };
+        let topi = pick_rank(&mut g, None);
+        let topv = pick_rank(&mut g, Some(lg));
+        (topi, topv)
+    };
     // wts[t, j] = exp(v_j − v_0) / Σ_i exp(v_i − v_0)
     let mut wargs = vec![arg(g.iota(&[t, k], 1), View::identity(2, 2))];
     for j in 0..k {
-        wargs.push(arg(
-            top,
-            affine(2, &[(&[(0, 1)], 0), (&[], 2 * j as i64 + 1)]),
-        ));
+        wargs.push(arg(topv, affine(2, &[(&[(0, 1)], 0), (&[], j as i64)])));
     }
     let wts = g
         .comp(&[t, k], &[], wargs, None, move |v| {
@@ -634,7 +695,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
     let silu = |v: &[ExprId]| v[0] / (ExprId::ONE + (-v[0]).exp()) * v[1];
     let (eg, eu, h, dn, rank) = if !sorted {
         // space [t, j, row | col], expert id = top[t, 2j]
-        let id_view = affine(4, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]);
+        let id_view = View::pick(4, &[Some(0), Some(1)]);
         let gx = |g: &mut TensorGraph, w: TensorId| {
             g.comp(
                 &[t, k, ff],
@@ -642,7 +703,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 vec![
                     arg(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
                     arg(xq, View::pick(4, &[Some(0), Some(3)])),
-                    arg(top, id_view.clone()),
+                    arg(topi, id_view.clone()),
                 ],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[1]],
@@ -659,7 +720,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 vec![
                     arg(wd, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 2, 1)),
                     arg(h, View::pick(4, &[Some(0), Some(1), Some(3)])),
-                    arg(top, id_view.clone()),
+                    arg(topi, id_view.clone()),
                 ],
                 Some(Monoid::sum()),
                 |v| vec![v[0] * v[1]],
@@ -676,15 +737,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
             })
         };
         // sel[t, j] = expert id; key = sel·P + pair; rank = #keys below
-        let sel = g
-            .comp(
-                &[t, k],
-                &[],
-                vec![arg(top, affine(2, &[(&[(0, 1)], 0), (&[(1, 2)], 0)]))],
-                None,
-                |v| vec![v[0]],
-            )
-            .unwrap();
+        let sel = topi;
         let it = g.iota(&[t, k], 0);
         let ik = g.iota(&[t, k], 1);
         let key = g
