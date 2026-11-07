@@ -21,6 +21,8 @@ use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
 use super::{TensorGraph, TensorId};
 
+#[path = "tensor_cuda_attn_bwd.rs"]
+mod attn_bwd;
 #[path = "tensor_cuda_fp8.rs"]
 mod fp8;
 pub use fp8::SM90_FP8_SHAPES;
@@ -1970,6 +1972,16 @@ impl TensorGraph {
     pub fn to_cuda_variant(&self, outputs: &[TensorId], variant: Option<usize>) -> WgslProgram {
         let mut nested = self.clone();
         nested.schedule_nested_contractions(outputs);
+        // the attention backward as one kernel per key block, in every
+        // variant alike (its dQ half is a zero fill the kernel adds to)
+        if let Some(plan) = nested.attn_bwd_plan(outputs) {
+            let mut fused = nested.clone();
+            fused.attn_bwd_schedule(&plan);
+            let mut program = fused.to_cuda_variant_scheduled(outputs, variant);
+            if fused.attn_bwd_patch(&plan, &mut program) {
+                return program.canonical();
+            }
+        }
         nested.to_cuda_variant_scheduled(outputs, variant)
     }
 
