@@ -561,7 +561,7 @@ impl TensorGraph {
         // of 64 keys), the others mma.sync at 64 or 128 keys
         let wg = cap > 99 * 1024
             && std::env::var("TANG_ATTN_WG").ok().as_deref() != Some("0")
-            && variant.is_some_and(|v| (v - super::MMA_SHAPES.len()) % 3 == 0);
+            && variant.is_some_and(|v| (v - super::MMA_SHAPES.len()).is_multiple_of(3));
         let bj = if wg { 128 } else { bj };
         let Some(src) = self
             .cuda_attn_bwd_kernel(p.root, p.red, p.dq, &reads, bj, cap, wg)
