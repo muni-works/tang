@@ -285,7 +285,7 @@ fn rmsnorm(
     let split = std::env::var("TANG_DMOE_SS_SPLIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256u32);
+        .unwrap_or(1024u32); // wide-check 3k KL: 0 4.06e-5, 64 1.84e-4, 128 5.86e-5, 256 2.81e-4, 512 4.40e-4, 1024 2.30e-5
     g.set_schedule(ss, split, (0, 0, 0), (1, 1));
     let (inv_n, eps) = (1.0 / n as f64, eps);
     g.comp(
