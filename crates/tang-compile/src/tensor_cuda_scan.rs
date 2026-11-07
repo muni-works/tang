@@ -734,7 +734,6 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     }
     float* stg = xr + warp * 256;
 #if DELTA
-#ifndef XNOCC
     // dW = −dV'·S₀ᵀ  [C × DK]; staging over xr (free until X)
     for (int tt = warp; tt < 4 * (DK / 16); tt += 8) {
         const int tr = tt & 3, tcol = tt >> 2;
@@ -934,7 +933,6 @@ extern "C" __global__ void __launch_bounds__(256) main0(
         g1b[r * LDT + j] = __float2bfloat16(j <= r ? (float)SCALE * f2[r * LDF + j] * __expf(gam[r] - gam[j]) : 0.0f);
     }
     __syncthreads();
-#endif
     // outputs: q, k staged over f1/f2 (dead now), one accumulator staged at a time
     bf* qs = (bf*)f1;
     bf* ks = (bf*)f2;
