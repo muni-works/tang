@@ -475,7 +475,7 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
         Some(IntMma {
             stage: Stage::Gemv,
             ksplit: 1,
-            pos_tile: t.min(8) as u32,
+            pos_tile: std::env::var("TANG_GEMV_PT").ok().and_then(|v| v.parse().ok()).unwrap_or(t.min(8) as u32),
         }),
     );
     // one window row: quantize in the GEMV prologue; more rows: once, by a
