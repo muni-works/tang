@@ -3524,3 +3524,39 @@ with coalesced 8-byte loads, ksplit 2. Same 3090, same reference check (err ≤ 
 
 Before this, T=8 on the LM head took 1189 µs (278 GB/s); T=48 took 26.5 ms on the GEMV path. At T=48
 the B fragments (one global load a tile a block step) are now the limit — next: stage x per unit too.
+
+## Coder-Next: `TANG_CODER_DERIVED=moe` on the model (H200 SXM, RunPod secure, 2026-11-07)
+
+Qwen3-Coder-Next UD-Q4_K_XL. 47 of 48 MoE layers run the derived block (`derived_ops::moe_block`):
+routing, gathered Q4_K/Q5_K experts, Q8_0 shared expert, combine, residual and next norm, plus the
+int8 re-layout for the hand attention/GDN kernels. The router GEMV is still hand, and so is one
+layer (its down stack is Q6_K, which the IR has no format for yet; it falls back per shape).
+Prompt: the first 4.2 KB of `coder_kernels.rs` with a refactor instruction, 1,380 chat tokens, cycled
+to 3k/8k by wide-check (the gates' `refactor.ids` was not available on this pod; on a 50k-token
+non-repeating prompt, **hand fails the wide-check bars too** (KL 3.0e-2 at 3k), so the bars assume a
+cycled prompt).
+
+Gates (all PASS):
+
+| gate | hand | derived MoE |
+|---|---|---|
+| wide-check 3000, int8 KV (KL bar 2.0e-4) | 6.74e-5, greedy equal | 4.06e-5, greedy equal |
+| wide-check 8000, int8 KV (bar 3.2e-5) | 9.08e-6 | 2.70e-5 |
+| wide-check 3000 / 8000, bf16 KV | — | 5.59e-5 / 1.63e-5, greedy equal |
+| batch-check N=8 | PASS bitwise | PASS bitwise |
+| continuation (`serve --batch 8`, int8 KV) | — | warm 1,380-token prefix + 4,663-token extension: 48-token greedy reply equal to a second server's (which reused 1,377 tokens from the persisted prefix cache, not 0) |
+
+Decode step (`flash-batch-check`, context ~1,380, 64 steps):
+
+| streams | hand ms | derived ms (first) | derived ms (after fixes) |
+|---|---|---|---|
+| 1 | 4.04 | 6.35 | 5.04 |
+| 2 | 4.74 | 6.79 | 5.84 |
+| 4 | 6.53 | 8.76 | 7.54 |
+| 8 | 9.82 | 12.71 | 11.27 |
+
+The fixes: the RMSNorm sum of squares ran as one thread per row (27 µs a layer), and every GEMV
+block re-quantized x in its prologue (x is now written once). Per layer on the H200 at T=1 (512 experts,
+top-10, `examples/coder_derived_moe.rs`): 90 → 60 µs. What is left at T=1: the top-k reduction is 13 µs
+in one block (the hand `cx_route` is one warp), and 14 kernels against the hand path's ~4.
+Startup: the derived shapes build in 6.3 s at load.
