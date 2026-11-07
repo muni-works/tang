@@ -1763,6 +1763,7 @@ impl Coder {
         };
         let mut c = c;
         c.write_slot_tables();
+        c.prebuild_derived();
         Ok(c)
     }
 
@@ -4783,6 +4784,39 @@ impl Coder {
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
+    }
+
+    /// `TANG_CODER_DERIVED`: build every narrow window's derived shapes now (window graphs are
+    /// captured later, and nothing builds inside a capture).
+    fn prebuild_derived(&self) {
+        if !derived_moe_on() {
+            return;
+        }
+        let t0 = Instant::now();
+        let mut tys: Vec<(i32, i32)> = self
+            .layers
+            .iter()
+            .map(|l| (l.gate.w.ty, l.down.w.ty))
+            .collect();
+        tys.sort();
+        tys.dedup();
+        let mut cache = self.dmoe.borrow_mut();
+        for t in 1..=MAX_T {
+            for &(gu, down) in &tys {
+                let key: DMoeKey = (t, MAX_T, gu, down);
+                let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
+                if let Err(e) = &built {
+                    eprintln!("coder: no derived MoE for {key:?} ({e}); hand kernels");
+                }
+                cache.insert(key, built.ok());
+            }
+        }
+        let ok = cache.values().filter(|d| d.is_some()).count();
+        eprintln!(
+            "coder: derived MoE: {ok} of {} shapes built in {:.1} s",
+            cache.len(),
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     /// The derived MoE layer after the router (`TANG_CODER_DERIVED=moe`): routing, experts,
