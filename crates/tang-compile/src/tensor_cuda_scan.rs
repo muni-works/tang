@@ -696,7 +696,7 @@ extern "C" __global__ void __launch_bounds__(256) main0(
     float* dgam = bet + C;                       // [C]
     float* dbet = dgam + C;                      // [C]
     float* red = dbet + C;                       // [2]: ⟨dS_end, S₀⟩, Σ R
-    float* stg1 = red + 4 + warp * 256;          // [8][256] output staging
+    float* stg1 = red + 4 + (threadIdx.x >> 5) * 256;  // [8][256] output staging
     const int c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const size_t row0 = (size_t)h * T + (size_t)c * C;
     const bf* s0 = Hs + ((size_t)h * NT + c) * DK * DV;
