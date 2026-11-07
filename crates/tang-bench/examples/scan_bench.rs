@@ -147,7 +147,23 @@ fn setup(dev: &CudaDevice, plan: &ChunkedScan, d: &Data, bv: usize) -> Run {
 }
 
 fn launch(dev: &CudaDevice, r: &Run) {
+    launch_k(dev, r, 0);
+    launch_k(dev, r, 1);
+}
+
+fn launch_k(dev: &CudaDevice, r: &Run, k: usize) {
     let s = &dev.stream;
+    if k == 1 {
+        let (f, cfg) = &r.launches[1];
+        let mut b = s.launch_builder(f);
+        for x in &r.scratch16 {
+            b.arg(x);
+        }
+        b.arg(&r.gc);
+        b.arg(&r.out);
+        unsafe { b.launch(*cfg) }.expect("state launch");
+        return;
+    }
     let (f, cfg) = &r.launches[0];
     let mut b = s.launch_builder(f);
     for x in &r.ins {
@@ -161,14 +177,19 @@ fn launch(dev: &CudaDevice, r: &Run) {
     }
     b.arg(&r.gc);
     unsafe { b.launch(*cfg) }.expect("prep launch");
-    let (f, cfg) = &r.launches[1];
-    let mut b = s.launch_builder(f);
-    for x in &r.scratch16 {
-        b.arg(x);
+}
+
+/// Median ms of 20 runs of `f`.
+fn median(dev: &CudaDevice, mut f: impl FnMut()) -> f64 {
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let t0 = std::time::Instant::now();
+        f();
+        dev.sync();
+        times.push(t0.elapsed().as_secs_f64() * 1e3);
     }
-    b.arg(&r.gc);
-    b.arg(&r.out);
-    unsafe { b.launch(*cfg) }.expect("state launch");
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times[10]
 }
 
 fn main() {
@@ -218,21 +239,16 @@ fn main() {
         launch(&dev, &r);
     }
     dev.sync();
-    let mut times = Vec::new();
-    for _ in 0..20 {
-        let t0 = std::time::Instant::now();
-        launch(&dev, &r);
-        dev.sync();
-        times.push(t0.elapsed().as_secs_f64() * 1e3);
-    }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let total = median(&dev, || launch(&dev, &r));
+    let k1 = median(&dev, || launch_k(&dev, &r, 0));
+    let k2 = median(&dev, || launch_k(&dev, &r, 1));
     let name = match mode {
         Mode::Gdn => "gdn",
         Mode::Ssd => "ssd",
         Mode::Lin => "lin",
     };
     println!(
-        "{name} H={h} T={t} n={n} m={m} bv={bv} {:.3} ms rel_err={rel:.2e} ({})",
-        times[10], dev.name
+        "{name} H={h} T={t} n={n} m={m} bv={bv} {total:.3} ms (chunk {k1:.3} + state {k2:.3}) rel_err={rel:.2e} ({})",
+        dev.name
     );
 }
