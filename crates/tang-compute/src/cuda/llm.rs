@@ -476,14 +476,14 @@ impl CudaComputeDevice {
         };
         // Block rows and occupancy (see `F16_GEMM_CUDA`). RTX 3090, Qwen3-8B shapes: 128-row
         // blocks at two an SM win from 512 rows (up to 53 TFLOPS vs 39 at one an SM); 64-row
-        // blocks win at ~128 rows, except on very wide outputs, where each extra row tile
-        // re-reads the whole weight. TANG_F16_VARIANT forces one.
+        // blocks win at ~128 rows (with grouped tile order; without it a wide output's row
+        // tiles each re-read the whole weight). TANG_F16_VARIANT forces one.
         let (name, bm) = match std::env::var("TANG_F16_VARIANT").as_deref() {
             Ok("m128") => ("gemm_f16_q4_m128", 128),
             Ok("m128_o2") => ("gemm_f16_q4_m128_o2", 128),
             Ok("m64") => ("gemm_f16_q4_m64", 64),
             Ok("m64_o2") => ("gemm_f16_q4_m64_o2", 64),
-            _ if m <= 192 && n <= 12288 => ("gemm_f16_q4_m64", 64),
+            _ if m <= 192 => ("gemm_f16_q4_m64", 64),
             _ => ("gemm_f16_q4_m128_o2", 128),
         };
         let f = self.llm_funcs.borrow().get(name).cloned();
@@ -492,6 +492,13 @@ impl CudaComputeDevice {
             self.llm_funcs.borrow_mut().insert(name, f.clone());
             f
         });
+        // row tiles a raster group: 8 keeps resident blocks on shared weight tiles (1.45x at
+        // 2048 x 4096 x 24576, 1.8x for 64-row blocks at 128 rows); TANG_F16_GROUP=0 is plain
+        // column-fastest order
+        let gm: u32 = std::env::var("TANG_F16_GROUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         let (mu, ku, nu, gu) = (m as u32, k as u32, n as u32, q.group as u32);
         unsafe {
             self.stream
@@ -505,7 +512,8 @@ impl CudaComputeDevice {
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&gu)
-                .launch(blocks((n.div_ceil(128), m.div_ceil(bm), 1), 256))
+                .arg(&gm)
+                .launch(blocks((n.div_ceil(128) * m.div_ceil(bm), 1, 1), 256))
                 .unwrap();
         }
     }

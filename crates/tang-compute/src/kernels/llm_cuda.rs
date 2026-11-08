@@ -1481,7 +1481,7 @@ extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m32(
 /// then rounded) into padded shared tiles (row stride 40 halves: conflict-free `ldmatrix`),
 /// double-buffered, the next chunk's global loads in registers while this chunk's mma issue.
 /// No dequantized weight ever reaches global memory. A row's sums go in K order alone (never
-/// by M). Needs K % 32 == 0, group % 32 == 0. Launch: grid (ceil(N / 128), ceil(M / BM)),
+/// by M). Needs K % 32 == 0, group % 32 == 0. Launch: grid ceil(N / 128) * ceil(M / BM), gm row tiles a group,
 /// block 256. Entry points: `gemm_f16_q4_m{128,64}` (block rows), `_o2` with registers capped
 /// for two blocks an SM.
 pub const F16_GEMM_CUDA: &str = with_common!(
@@ -1505,14 +1505,25 @@ template <int MT>
 __device__ __forceinline__ void gemm_f16_q4_body(
     const float* __restrict__ X, const unsigned int* __restrict__ Wq,
     const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
-    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group)
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int gm)
 {
     constexpr int BM = 32 * MT, AH = BM * 8 / 256;   // float4s of A a thread per chunk
     __shared__ __align__(16) unsigned short As[2][BM * FG_LD];
     __shared__ __align__(16) unsigned short Ws[2][128 * FG_LD];
     unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     unsigned int wm = warp >> 2, wn = warp & 3;
-    unsigned int n0 = blockIdx.x * 128, m0 = blockIdx.y * BM;
+    // tile order: a 1-D grid walked in groups of `gm` row tiles, all of a group's row tiles
+    // for one column tile before the next column tile, so blocks resident together share
+    // weight and activation tiles in L2 (gm 0: column tiles fastest)
+    unsigned int nt_n = (N + 127) / 128, nt_m = (M + BM - 1) / BM, pid = blockIdx.x, tm, tn;
+    if (gm == 0) {
+        tn = pid % nt_n; tm = pid / nt_n;
+    } else {
+        unsigned int per = gm * nt_n, first = (pid / per) * gm, rows = min(nt_m - first, gm);
+        tm = first + (pid % per) % rows; tn = (pid % per) / rows;
+    }
+    unsigned int n0 = tn * 128, m0 = tm * BM;
     unsigned int words = K / 8, G = K / group;
     // staging assignments: A 128 rows x 8 float4 (4 a thread), W 128 cols x 4 words (2 a thread)
     float4 xa[AH];
@@ -1624,8 +1635,9 @@ __device__ __forceinline__ void gemm_f16_q4_body(
 extern "C" __global__ void __launch_bounds__(256, MINB) name(                                  \
     const float* __restrict__ X, const unsigned int* __restrict__ Wq,                          \
     const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,                \
-    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group)  \
-{ gemm_f16_q4_body<MT>(X, Wq, S, B, Y, M, K, N, group); }
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,  \
+    unsigned int gm)                                                                           \
+{ gemm_f16_q4_body<MT>(X, Wq, S, B, Y, M, K, N, group, gm); }
 FG_ENTRY(gemm_f16_q4_m128, 4, 1)
 FG_ENTRY(gemm_f16_q4_m128_o2, 4, 2)
 FG_ENTRY(gemm_f16_q4_m64, 2, 1)
