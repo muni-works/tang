@@ -193,7 +193,7 @@ impl IoReport {
 
 impl TensorGraph {
     /// Follow reshapes to the node that owns the bytes.
-    fn io_storage(&self, mut t: usize) -> usize {
+    pub(crate) fn io_storage(&self, mut t: usize) -> usize {
         while let Op::Reshape(s) = &self.nodes[t].op {
             t = s.n();
         }

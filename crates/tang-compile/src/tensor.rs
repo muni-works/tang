@@ -64,6 +64,8 @@ mod grad;
 #[path = "tensor_io.rs"]
 pub mod io;
 pub use io::{IoReport, KernelIo};
+#[path = "tensor_io_lp.rs"]
+pub mod io_lp;
 #[path = "tensor_memplan.rs"]
 pub mod memplan;
 #[path = "tensor_modq.rs"]
