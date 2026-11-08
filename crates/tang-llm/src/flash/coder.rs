@@ -1440,6 +1440,9 @@ pub struct Coder {
     /// `TANG_CODER_DERIVED=moe|all`: the decode MoE layer derived from the IR, by window
     /// shape and weight formats (`None`: that shape failed to build; the hand kernels run it).
     dmoe: std::cell::RefCell<HashMap<DMoeKey, Option<DMoe>>>,
+    /// `TANG_CODER_L2PF`: the last dense matrix's segment table and, per matrix, the next
+    /// one's (segments, count) in call order.
+    l2pf: std::cell::RefCell<(u64, HashMap<u64, (u64, i32)>)>,
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
@@ -1763,6 +1766,7 @@ impl Coder {
             load_report,
             derived: Default::default(),
             dmoe: Default::default(),
+            l2pf: Default::default(),
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
@@ -3564,6 +3568,15 @@ impl Coder {
             return;
         }
         let v = self.stage_view(wi);
+        // TANG_CODER_L2PF: learn the dense call order (prefill teaches it before any capture)
+        if env_is("TANG_CODER_L2PF", "1") {
+            let sp = v.dev.buffer_addr(&w.segs);
+            let mut order = self.l2pf.borrow_mut();
+            let prev = std::mem::replace(&mut order.0, sp);
+            if prev != 0 && prev != sp {
+                order.1.insert(prev, (sp, w.nseg));
+            }
+        }
         // Wide windows: the tensor-core GEMM over every row (TANG_CODER_WGEMM=0: the GEMVs below).
         if t > MAX_T && self.var.wgemm && w.gemm_ok && (!self.in_batch.get() || self.var.bgemm) {
             if let Some(wd) = v.wide {
@@ -3811,6 +3824,13 @@ impl Coder {
         if q8xw > 0 && w.q8x_ok && w.rest.is_none() && w.k.is_multiple_of(512) && w.k <= 4096 {
             let f = v.nk.gemvq8w[q8xw.trailing_zeros() as usize][t - 1];
             let launch = if env_is("TANG_CODER_PDL", "1") { gpu::launch_pdl } else { gpu::launch };
+            // TANG_CODER_L2PF=1: prefetch the next dense matrix (learned from the call order,
+            // the same every step) into L2 while this one runs
+            let (pfs, pfn) = if env_is("TANG_CODER_L2PF", "1") {
+                self.l2pf.borrow().1.get(&sp).copied().unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            };
             unsafe {
                 launch(
                     f,
@@ -3818,7 +3838,7 @@ impl Coder {
                     (256, 1, 1),
                     0,
                     v.stream,
-                    tang_moe::args![sp, ns, x, xq, ki, out, os],
+                    tang_moe::args![sp, ns, x, xq, ki, out, os, pfs, pfn],
                 )
                 .expect("cx_gemvq8w")
             };
