@@ -154,3 +154,54 @@ Together with #160's result (a grid barrier costs what an empty launch costs in 
 ### For Prove (Little's law)
 
 `docs/bench/ncu/3090-occ/` has ncu achieved occupancy, registers per thread, waves per SM and long-scoreboard stall cycles per warp for every derived MoE kernel at T=1/8. For example, `ex_gate_up` at T=1 runs at 60% occupancy, 40 registers and 0.65 waves on the 3090. The microbench table above gives bytes in flight per thread (16·4·R) against achieved GB/s on both GPUs. The H200 container doesn't expose counters, so its occupancy has to come from the launch shapes plus these 3090 measurements.
+
+## Round 3: fill/drain, L2 prefetch, concurrency (H200)
+
+All flags default off. One pod, about 70 minutes, roughly $6. Logs are in `docs/bench/ncu/fill-drain/`.
+
+### Fill/drain per kernel (`gemv_bif`, cold L2, repacked Q8 GEMV)
+
+| rows × 2048 | MB | µs |
+|---|---|---|
+| 128 | 0.28 | 7.39 |
+| 1024 | 2.23 | 7.39 |
+| 4096 | 8.91 | 8.67 |
+| 16384 | 35.7 | 14.4 |
+| 131072 | 285 | 69.0 |
+
+Fitting t = τ + bytes/BW gives **τ = 6.9 µs** and BW = 4.62 TB/s (0.96 of peak); this τ includes the stream launch and event overhead. The same fit on the 3090 gives τ = 5.0 µs and 0.94 of peak.
+
+In the round-1 decode traces, near-zero-byte elementwise kernels last 1.2–2.5 µs (kernel duration only), so roughly 4–5 µs of τ is launch plus the first DRAM round trip. Either way, a dependent kernel moving under ~2 MB costs about τ whatever its size. At N=1 the step runs ~550–830 kernels, so the critical path is dominated by τ, not bytes.
+
+### L2 prefetch (`cp.async.bulk.prefetch.L2`, `TANG_CODER_L2PF=1`)
+
+The pair microbench runs GEMV A, which prefetches B into L2, then GEMV B. B speeds up by 0.4–0.6 µs, but A slows by 0.6–4 µs from issuing the prefetch, so the pair is net slower (4096 rows: 17.2 → 20.7 µs). On the engine, the wide Q8X GEMV prefetches the next dense matrix, with the call order learned at prefill: N=1 / N=8 go 4.08 / 10.13 → 4.10 / 10.19 ms. Adding PDL: 4.16 / 10.22.
+
+**Prefetch issued inside a short kernel costs more than it saves.** It would have to run off the critical path: in a kernel with spare issue slots and bandwidth (attention, GDN conv), or on a side branch.
+
+### Concurrency inside a layer
+
+The only independent work inside a layer is the shared expert, alongside the router and top-k. Attention/GDN → MoE is a data dependency. The existing `TANG_CODER_SHPAR=1` puts the shared expert on a parallel graph branch. With it, the derived MoE switch is ignored and the path is hand, bitwise identical to hand.
+
+| decode ms | N=1 | N=8 | N=16 | N=32 | N=48 |
+|---|---|---|---|---|---|
+| hand (same pod) | 4.11 | 9.92 | 15.96 | 23.62 | 30.20 |
+| hand + `SHPAR=1` | **4.04** | **9.70** | **14.34** | **20.53** | **28.29** |
+| derived hybrid, round 7 (for reference) | 4.05 | 9.81 | 14.06 | 21.40 | 28.45 |
+
+`SHPAR` is about 2% faster at N=1–8 and 6–13% faster at N=16–48. At N=1–8 that is within this pod's run-to-run noise: the same baseline measured 4.03–4.12 ms across rounds. An earlier H200 log recorded −2% at N=1. The large-N gain is new: the shared expert's dense GEMVs overlap the routed experts' sorted GEMMs.
+
+Gates with `SHPAR=1`:
+
+| gate | result |
+|---|---|
+| wide-check 3000 (int8) | PASS, KL 6.74e-5 |
+| wide-check 8000 (int8) | PASS, KL 9.08e-6 |
+| batch-check N=8 | PASS, bitwise; checksum 24a2aee70897bb74, main's |
+| batch-check N=48 | 99.00%, mean \|dlogit\| 0.142, checksum 4c1cc97f3193e028: identical to the hand engine, which sits exactly at the 99% bar (prints FAIL, as it has every round) |
+
+### Where this leaves the 1–8 stream gap
+
+- Per kernel the cost is τ ≈ 7 µs; per step it is the number of dependent kernels. Neither in-kernel tricks (wide loads, PDL, L2 prefetch) nor the one available branch move N=1–8 beyond noise.
+- What remains is fewer dependent steps: fusing the per-layer chains (norm → GEMV → conv/attention prep, route → experts → combine → norm) into fewer kernels without adding grid barriers. #160 showed a barrier costs as much as a launch, so the fused pieces must run their phases inside blocks (block-local dependencies), not across the grid.
+- For Prove's critical-path term: at N=1 the hand step has 548 kernels on one stream (one path) and 4.04 ms of wall time, about 7.4 µs per kernel — close to the measured τ.

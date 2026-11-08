@@ -1,0 +1,30 @@
+coder: 8 of 48 layers in VRAM (19 s)
+coder: 16 of 48 layers in VRAM (38 s)
+coder: 24 of 48 layers in VRAM (57 s)
+coder: 32 of 48 layers in VRAM (77 s)
+coder: 40 of 48 layers in VRAM (96 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (115 s)
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 116 s, kernels 109 s, total 225 s
+coder: 127 sequence slots fit (0.28 GB each, 99.9 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 1 (prompt 1377 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 2 (prompt 1374 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 0 of 9723904 entries
+batch-check: PASS (bitwise) (logits checksum 0ceea8b6b2250ba9)
+batch 1: prefilled to ~1380 tokens in 1.7 s
+batch 1: 4.10 ms a step, 244 tok/s aggregate, 244 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.4 s
+batch 2: 4.88 ms a step, 410 tok/s aggregate, 205 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 6.8 s
+batch 4: 6.76 ms a step, 592 tok/s aggregate, 148 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 13.5 s
+batch 8: 10.19 ms a step, 785 tok/s aggregate, 98 tok/s a stream (context ~1380)
+exit 0
