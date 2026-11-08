@@ -2198,8 +2198,10 @@ mod tests {
             ] {
                 let x = vals(m * k, 41, 2.0);
                 let (p, s, b) = q4(n, k, group);
-                let got = g.download(&g.linear(&g.upload(&x), &g.upload_q4(&p, &s, &b, group), m, k, n));
-                let want = c.download(&c.linear(&c.upload(&x), &c.upload_q4(&p, &s, &b, group), m, k, n));
+                let got =
+                    g.download(&g.linear(&g.upload(&x), &g.upload_q4(&p, &s, &b, group), m, k, n));
+                let want =
+                    c.download(&c.linear(&c.upload(&x), &c.upload_q4(&p, &s, &b, group), m, k, n));
                 close(&got, &want, 4e-3, &format!("f16 q4 gemm {m}x{k}x{n}"));
             }
         });
