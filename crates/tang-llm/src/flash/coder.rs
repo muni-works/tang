@@ -2903,8 +2903,16 @@ impl Coder {
             proj,
             xq,
             part: self.dev.alloc_f32(1),
+            // Optional: if the chunked kernels don't build (NVRTC needs the toolkit's headers,
+            // which a CUDA runtime image lacks), keep the wide windows on the hand GDN kernel.
             gdnc: if GdnChunked::enabled() {
-                Some(GdnChunked::new(&self.gpu, &self.dev, &self.geo, rows)?)
+                match GdnChunked::new(&self.gpu, &self.dev, &self.geo, rows) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("tang-llm: TANG_CODER_GDN=chunked unavailable ({e}); hand GDN");
+                        None
+                    }
+                }
             } else {
                 None
             },
