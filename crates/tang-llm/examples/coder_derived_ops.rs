@@ -42,6 +42,14 @@ fn max_rel(got: &[f32], want: &[f32]) -> f64 {
 
 /// Min µs a launch of `f` over `iters` timed single launches.
 fn time(s: &Stream, mut f: impl FnMut()) -> f64 {
+    // `ONCE=1`: three launches, no timing (for ncu / nsys)
+    if std::env::var_os("ONCE").is_some() {
+        for _ in 0..3 {
+            f();
+        }
+        s.sync().unwrap();
+        return f64::NAN;
+    }
     for _ in 0..10 {
         f();
     }
