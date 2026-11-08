@@ -25,7 +25,7 @@ prof() { # name [ncu opts] -- cmd...
 }
 EX=$TGT/release/examples
 for t in 1 8 48; do ONCE=1 prof moe_t$t -k regex:dop -- "$EX/coder_derived_moe" $t; done
-ONCE=1 prof ops -- "$EX/coder_derived_ops" 1 8
+for t in 1 8; do ONCE=1 prof ops_t$t -- "$EX/coder_derived_ops" $t; done
 prof gdn_scan -- "$EX/scan_bench" gdn 32 4096
 prof attn_bwd --launch-count 400 -- env CASES=8x4096x128x0 "$EX/attn_bwd_check"
 [ "$set_" = all ] || exit 0
