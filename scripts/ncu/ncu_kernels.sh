@@ -23,6 +23,11 @@ M=$M,sm__throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,dram__throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,launch__grid_size,launch__block_size
+# Little's-law inputs: achieved occupancy, registers, waves, and the share of warp time stalled
+# on global loads (long scoreboard), plus L2 <-> DRAM sector traffic
+M=$M,sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread
+M=$M,launch__waves_per_multiprocessor,launch__occupancy_limit_registers
+M=$M,smsp__average_warp_latency_issue_stalled_long_scoreboard.ratio
 # --cache-control none / --clock-control none: measure as the program runs (warm L2, boost
 # clocks), not ncu's flushed-cache, base-clock defaults
 $NCU --csv --print-units base --metrics "$M" --cache-control none --clock-control none \

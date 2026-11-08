@@ -590,6 +590,8 @@ struct Kern {
     gemvk8: [Fun; MAX_T],
     gemvk2: [Fun; MAX_T],
     gemvk1: [Fun; MAX_T],
+    /// `cx_gemvq8w{1,2,4}_t*` (`TANG_CODER_Q8XW`): R rows a warp, every load issued up front.
+    gemvq8w: [[Fun; MAX_T]; 3],
     /// Batch modules only (null elsewhere): `cx_gemvkb{Q}_t{T}`, by Q (1, 2, 4, 8) and T
     /// (8, 16, 32), over rows of a wider window.
     gemvkb: [[Fun; 3]; 4],
@@ -672,6 +674,7 @@ impl Kern {
             gemvk1: self.gemvk1,
             gemvk2: self.gemvk2,
             gemvk8: self.gemvk8,
+            gemvq8w: self.gemvq8w,
             gemvkb: {
                 let mut a = [[std::ptr::null_mut(); 3]; 4];
                 for (qi, q) in [1, 2, 4, 8].into_iter().enumerate() {
@@ -806,6 +809,11 @@ impl Kern {
             gemvk1: sized(std::array::from_fn(|i| format!("cx_gemvk1_t{}", i + 1)))?,
             gemvk2: sized(std::array::from_fn(|i| format!("cx_gemvk2_t{}", i + 1)))?,
             gemvk8: sized(std::array::from_fn(|i| format!("cx_gemvk8_t{}", i + 1)))?,
+            gemvq8w: [
+                sized(std::array::from_fn(|i| format!("cx_gemvq8w1_t{}", i + 1)))?,
+                sized(std::array::from_fn(|i| format!("cx_gemvq8w2_t{}", i + 1)))?,
+                sized(std::array::from_fn(|i| format!("cx_gemvq8w4_t{}", i + 1)))?,
+            ],
             gemvkb: [[std::ptr::null_mut(); 3]; 4],
             norm_q8: f(cm, "cx_norm_q8")?,
             route: f(cm, "cx_route")?,
@@ -1134,6 +1142,21 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// `TANG_CODER_DERIVED`: which engine ops run as kernels derived from the tensor IR (off by
 /// default). `moe` (or `all`): decode windows' MoE layers (`derived_ops::moe_block`), each
 /// shape that fails to build falling back to the hand kernels on its own.
+/// Rows a warp of the Q8X GEMV with every load up front (`TANG_CODER_Q8XW` = 1, 2 or 4;
+/// 0 / unset: the K-split kernels).
+fn q8xw_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("TANG_CODER_Q8XW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(r @ (1 | 2 | 4)) => r,
+            _ => 0,
+        }
+    })
+}
+
 fn derived_moe_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -3788,7 +3811,27 @@ impl Coder {
             }
         };
         let kq = self.var.kq;
-        if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
+        // TANG_CODER_Q8XW=R (1, 2, 4): all-Q8X matrices on the R-rows-a-warp kernel
+        let q8xw = q8xw_rows();
+        if q8xw > 0 && w.q8x_ok && w.rest.is_none() && w.k.is_multiple_of(512) && w.k <= 4096 {
+            let f = v.nk.gemvq8w[q8xw.trailing_zeros() as usize][t - 1];
+            let launch = if env_is("TANG_CODER_PDL", "1") {
+                gpu::launch_pdl
+            } else {
+                gpu::launch
+            };
+            unsafe {
+                launch(
+                    f,
+                    (w.rows.div_ceil(8 * q8xw) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    v.stream,
+                    tang_moe::args![sp, ns, x, xq, ki, out, os],
+                )
+                .expect("cx_gemvq8w")
+            };
+        } else if w.k.is_multiple_of(kq * 256) && !gemv_v1() {
             let f = match kq {
                 8 => v.nk.gemvk8[t - 1],
                 2 => v.nk.gemvk2[t - 1],

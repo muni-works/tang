@@ -1,0 +1,9 @@
+coder: 8 of 48 layers in VRAM (19 s)
+coder: 16 of 48 layers in VRAM (39 s)
+coder: 24 of 48 layers in VRAM (58 s)
+coder: 32 of 48 layers in VRAM (77 s)
+coder: 40 of 48 layers in VRAM (96 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (116 s)

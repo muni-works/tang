@@ -3174,6 +3174,80 @@ __device__ __forceinline__ void gemvk_body(const Seg* segs, int nseg, const floa
     gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
 
+// Q8X GEMV with more bytes in flight (`TANG_CODER_Q8XW=R`): a warp owns R whole rows, a lane
+// issues every one of its k / 512 uint4 code loads for all R rows (16·R·k/512 bytes) before any
+// math, then dots them with each of the T activation rows. All segments Q8X, k % 512 == 0,
+// k <= 4096. Not bitwise the K-split kernels' order.
+template <int T, int R>
+__device__ void gemvq8w_core(const Seg* segs, int nseg, const unsigned char* xq, const float* xd, int k, float* out, int ostride) {
+#if __CUDA_ARCH__ >= 900
+    // programmatic dependent launch (TANG_CODER_PDL=1): let the next kernel start its own
+    // weight stream now; this one waits for its predecessor before reading activations
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int kl = k >> 9;                       // uint4 loads a lane a row
+    int rr[R], ss[R];
+    const unsigned char* wp[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        int row = (blockIdx.x * 8 + warp) * R + r, s = 0;
+        while (s < nseg && row >= segs[s].rows) { row -= segs[s].rows; s++; }
+        rr[r] = row; ss[r] = s;
+        wp[r] = s < nseg ? (const unsigned char*)segs[s].w + (size_t)row * segs[s].row_bytes : nullptr;
+    }
+    uint4 c[R][8];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            c[r][j] = (wp[r] && j < kl) ? __ldg((const uint4*)(wp[r] + (lane + 32 * j) * 16)) : make_uint4(0, 0, 0, 0);
+    }
+    float sw[R][8];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+            sw[r][j] = (wp[r] && j < kl) ? h2f(((const unsigned short*)(wp[r] + k))[(lane + 32 * j) >> 1]) : 0.f;
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    #pragma unroll
+    for (int t = 0; t < T; t++) {
+        float acc[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++) acc[r] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            if (j >= kl) break;
+            const int e = (lane + 32 * j) * 16;
+            const uint4 xv = __ldg((const uint4*)(xq + (size_t)t * k + e));
+            const float dx = __ldg(xd + t * (k / 32) + (e >> 5));
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                const int d = __dp4a((int)c[r][j].x, (int)xv.x, __dp4a((int)c[r][j].y, (int)xv.y,
+                              __dp4a((int)c[r][j].z, (int)xv.z, __dp4a((int)c[r][j].w, (int)xv.w, 0))));
+                acc[r] = fmaf(dx * sw[r][j], i2f(d), acc[r]);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            float a = acc[r];
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (lane == 0 && ss[r] < nseg) out[(size_t)t * ostride + segs[ss[r]].out_off + rr[r]] = a;
+        }
+    }
+}
+#define GEMVQ8W_T(T) \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvq8w1_t##T(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvq8w_core<T, 1>(segs, nseg, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride); } \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvq8w2_t##T(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvq8w_core<T, 2>(segs, nseg, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride); } \
+    extern "C" __global__ void __launch_bounds__(256) cx_gemvq8w4_t##T(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
+    gemvq8w_core<T, 4>(segs, nseg, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride); }
+GEMVQ8W_T(1) GEMVQ8W_T(2) GEMVQ8W_T(3) GEMVQ8W_T(4) GEMVQ8W_T(5) GEMVQ8W_T(6) GEMVQ8W_T(7) GEMVQ8W_T(8)
+
 // Batch modules (CX_MAXT > 8): the same K-split GEMV over T rows of a wider window, the rows
 // starting at row t0 of the module's activations. The host passes x, xq (codes), xd (scales)
 // and out already offset to row t0. A row's sum is the narrow kernel's (same lanes, same

@@ -864,6 +864,32 @@ struct GemvShape<'a> {
 /// and `2h + 1`) at a time; `lanes` lanes share a row, `32 / lanes` rows a
 /// warp, 8 warps a block, one position a block. Same scaling as the MMA
 /// kernel: `acc += dₓ·(d·scⱼ)·dot − (dmin·mⱼ)·(dₓ·Σc)`.
+/// Bytes-in-flight knobs of the GEMV lowerings: warps a block (`TANG_GEMV_WARPS`, default 8;
+/// fewer = more, smaller blocks) and a fully unrolled unit loop with a compile-time trip count
+/// (`TANG_GEMV_UNROLL=1`: every load of a lane issued before its math). A fused activation
+/// prologue quantizes with the whole block, so it keeps 8 warps.
+fn gemv_knobs(g: &GemvShape) -> (usize, bool) {
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let warps = if g.fused.is_some() {
+        8
+    } else {
+        env("TANG_GEMV_WARPS").unwrap_or(8).clamp(1, 32)
+    };
+    (warps, env("TANG_GEMV_UNROLL").unwrap_or(0) == 1)
+}
+
+/// The GEMV's loop over a lane's units: `u = u0, u0 + lanes, …`.
+fn uloop(units: usize, lanes: usize, unroll: bool) -> String {
+    if unroll && units.is_multiple_of(lanes) {
+        format!(
+            "        #pragma unroll\n        for (int ui = 0; ui < {}; ui++) {{\n            const int u = u0 + ui * {lanes};\n",
+            units / lanes
+        )
+    } else {
+        format!("        for (int u = u0; u < {units}; u += {lanes}) {{\n")
+    }
+}
+
 fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     if g.b.per == 32 && g.ptile > 1 {
         return gemv_kernel_q8_0_tiled(g);
@@ -878,8 +904,9 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
+    let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
-    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let row_blocks = g.rows.div_ceil(warps * rpw);
     let (bb, qs) = (g.b.bytes, g.b.qs);
     let row_bytes = g.k / 256 * bb;
     let params: Vec<String> = (0..g.reads)
@@ -922,10 +949,10 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     }
     write!(
         src,
-        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+        r#"extern "C" __global__ void __launch_bounds__({threads}) main0({params}, float* __restrict__ out, unsigned count) {{
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
-    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    const int r = (rb * {warps} + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
     if (pos >= {npos}) return;
     const bool live = r < {rows};
     long long KEY, xr;
@@ -938,8 +965,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     const unsigned char* wr = wbase + (size_t)(live ? r : 0) * {row_bytes};
 {xsrc}    float acc = 0.f;
     if (live) {{
-        for (int u = u0; u < {units}; u += {lanes}) {{
-            const int sb = u >> 1, h = u & 1;
+{uloop}            const int sb = u >> 1, h = u & 1;
             const unsigned char* bp = wr + sb * {bb};
             const unsigned dw = __ldg((const unsigned*)bp);
             const float d = tang_h2f_bits((unsigned short)(dw & 0xFFFFu)), dm = tang_h2f_bits((unsigned short)(dw >> 16));
@@ -979,6 +1005,8 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
 }}
 "#,
         params = params.join(", "),
+        threads = warps * 32,
+        uloop = uloop(units, lanes, unroll),
         npos = g.npos,
         rows = g.rows,
         decode = g.decode,
@@ -988,7 +1016,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
         w_off = g.w_off,
     )
     .unwrap();
-    (src, 256, g.npos * row_blocks)
+    (src, warps * 32, g.npos * row_blocks)
 }
 
 /// [`Stage::Gemv`] on GGUF Q8_0 weights: a lane takes 128 columns (four
@@ -996,9 +1024,15 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
 /// `dp4a`. Blocks are 2-byte aligned, so codes are loaded as halfwords.
 fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     let units = g.k / 128;
-    let lanes = units.next_power_of_two().clamp(1, 32);
+    // units a lane (`TANG_GEMV_Q8_UPL`, default 1): more independent loads in flight a thread
+    let upl: usize = std::env::var("TANG_GEMV_Q8_UPL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
+    let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
-    let row_blocks = g.rows.div_ceil(8 * rpw);
+    let row_blocks = g.rows.div_ceil(warps * rpw);
     let row_bytes = g.k / 32 * 34;
     let params: Vec<String> = (0..g.reads)
         .map(|i| format!("const float* __restrict__ q{i}"))
@@ -1031,10 +1065,10 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     }
     write!(
         src,
-        r#"extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+        r#"extern "C" __global__ void __launch_bounds__({threads}) main0({params}, float* __restrict__ out, unsigned count) {{
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
-    const int r = (rb * 8 + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    const int r = (rb * {warps} + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
     if (pos >= {npos}) return;
     const bool live = r < {rows};
     long long KEY, xr;
@@ -1047,8 +1081,7 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     const unsigned char* wr = wbase + (size_t)(live ? r : 0) * {row_bytes};
 {xsrc}    float acc = 0.f;
     if (live) {{
-        for (int u = u0; u < {units}; u += {lanes}) {{
-            float dd[4]; unsigned qq[4][8];
+{uloop}            float dd[4]; unsigned qq[4][8];
             tang_q8_0_unit(wr + (size_t)u * 136, dd, qq);
             #pragma unroll
             for (int b = 0; b < 4; b++) {{
@@ -1072,6 +1105,8 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
 }}
 "#,
         params = params.join(", "),
+        threads = warps * 32,
+        uloop = uloop(units, lanes, unroll),
         npos = g.npos,
         rows = g.rows,
         decode = g.decode,
@@ -1081,7 +1116,7 @@ fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
         w_off = g.w_off,
     )
     .unwrap();
-    (src, 256, g.npos * row_blocks)
+    (src, warps * 32, g.npos * row_blocks)
 }
 
 /// [`gemv_kernel_q8_0`] with `ptile` positions a block: each lane loads a
