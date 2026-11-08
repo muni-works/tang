@@ -217,7 +217,7 @@ mod flash;
 mod llm;
 mod moe;
 mod rows;
-pub use rows::{RowIn, RowKernel, RowOut};
+pub use rows::{Real, RowKernel, RowLoad, RowStore};
 
 /// Extended pool diagnostics.
 pub struct PoolStats {

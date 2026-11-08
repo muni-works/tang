@@ -43,7 +43,7 @@ pub use tensor::ComputeTensor;
 pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
-pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda, RowIn, RowKernel, RowOut};
+pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda, Real, RowKernel, RowLoad, RowStore};
 /// The expression graph crate kernels are traced in (`elementwise`, row kernels).
 pub use tang_expr;
 
