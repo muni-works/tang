@@ -6303,6 +6303,7 @@ dependencies = [
  "tang",
  "tang-compile",
  "tang-expr",
+ "tang-otel",
  "tang-tensor",
  "tang-train",
  "wgpu",

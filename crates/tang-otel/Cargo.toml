@@ -6,8 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "OpenTelemetry setup shared by tang crates: OTLP/JSON lines to a file by default, OTLP/HTTP only when asked"
 repository.workspace = true
-# internal plumbing behind the `otel` features of tang-gpu, tang-bench and tang-llm
-publish = false
 
 [dependencies]
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"] }
