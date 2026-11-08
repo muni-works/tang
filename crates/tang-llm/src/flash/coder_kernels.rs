@@ -709,37 +709,46 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4f(ExW d, ExW sd,
     moe_down_body<4, true, false>(d, sd, ids, nullptr, gu, out, T, r16, fast, pbase);
 }
 // TANG_CODER_FUSE=addnorm: the fused down kernel, then the combine + residual + next norm of
-// cx_moe_add_norm done by the last block to finish for each token (a per-token arrival counter,
-// no grid barrier). Every pair of the window (routed and shared) must be in this launch.
+// cx_moe_add_norm folded in by arrival counters (no grid barrier). Every pair of the window (routed and shared) must be in this launch.
 template <int R>
 __device__ __forceinline__ void moe_down_addnorm(ExW d, ExW sd, const unsigned* ids, const float* gu, float* parts,
                                                  int T, int r16, int fast, float* r, const float* wts, const float* lg,
                                                  int ls, float* y, const float* wn, float* x, unsigned char* xq, float eps,
                                                  int* cnt) {
     moe_down_body<R, true, false>(d, sd, ids, nullptr, gu, parts, T, r16, fast, 0);
+    // Two arrival levels, integer counters only (deterministic): the last of a token's
+    // CX_TOPK + 1 pairs to finish a hidden slice combines that slice (rows of this block);
+    // the last slice to be combined runs the next norm over the whole row.
     __shared__ int s_last;
     const int p = blockIdx.y;
     const int t = p >= T * CX_TOPK ? p - T * CX_TOPK : p / CX_TOPK;
+    const int n = CX_HID, rows = 8 * R, i0 = blockIdx.x * rows;
+    int* c1 = cnt + CX_MAXT + t * gridDim.x + blockIdx.x;
     __threadfence();
     __syncthreads();
-    if (threadIdx.x == 0) s_last = atomicAdd(&cnt[t], 1) == (int)gridDim.x * (CX_TOPK + 1) - 1;
+    if (threadIdx.x == 0) s_last = atomicAdd(c1, 1) == CX_TOPK;
     __syncthreads();
     if (!s_last) return;
     __threadfence();
-    const int n = CX_HID, nv = CX_HID / (int)blockDim.x;
     float* rt = r + (size_t)t * n;
     const float gs = sigm_f(lg[(size_t)t * ls + CX_NE]);
-    float v[16];
-    for (int j = 0; j < nv; j++) {
-        const int i = threadIdx.x + j * blockDim.x;
+    for (int i = i0 + threadIdx.x; i < i0 + rows; i += blockDim.x) {
         float acc = 0.f;
         for (int k = 0; k < CX_TOPK; k++) acc += wts[t * CX_TOPK + k] * parts[((size_t)t * CX_TOPK + k) * n + i];
         acc += gs * parts[((size_t)T * CX_TOPK + t) * n + i];
         if (y) y[(size_t)t * n + i] = acc;
-        const float a = rt[i] + acc;
-        rt[i] = a;
-        v[j] = a;
+        rt[i] += acc;
     }
+    if (threadIdx.x == 0) *c1 = 0;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) s_last = atomicAdd(&cnt[t], 1) == (int)gridDim.x - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const int nv = n / (int)blockDim.x;
+    float v[16];
+    for (int j = 0; j < nv; j++) v[j] = rt[threadIdx.x + j * blockDim.x];
     norm_q8_body(rt, v, nv, wn, x, xq, n, eps, t);
     if (threadIdx.x == 0) cnt[t] = 0;
 }
@@ -3244,6 +3253,29 @@ __device__ __forceinline__ void gemvk_body(const Seg* segs, int nseg, const floa
     const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride) { \
     gemvk_body<T, 1>(segs, nseg, x, xq, k, out, ostride); }
 GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEMVK_T(8)
+
+// TANG_CODER_FUSE=route: the router GEMV (K-split, Q = 2) whose last block to finish runs the
+// top-k of every row (a warp a row, route_core's arithmetic), so cx_route's launch goes away.
+// cnt[0] is the arrival counter (reset by the last block).
+template <int T>
+__device__ void gemvk_route(const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out,
+                            int ostride, unsigned* ids, float* wts, float scale, int* cnt) {
+    gemvk_core<T, 2>(segs, nseg, x, xq, (const float*)(xq + (size_t)XQ8_T * k), k, out, ostride);
+    __shared__ int s_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) s_last = atomicAdd(cnt, 1) == (int)gridDim.x - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const int warp = threadIdx.x >> 5;
+    if (warp < T) route_core(out, ostride, warp, ids + warp * CX_TOPK, wts + warp * CX_TOPK, scale);
+    if (threadIdx.x == 0) *cnt = 0;
+}
+#define GEMVKR_T(T) extern "C" __global__ void __launch_bounds__(256) cx_gemvk_route_t##T( \
+    const Seg* segs, int nseg, const float* x, const unsigned char* xq, int k, float* out, int ostride, \
+    unsigned* ids, float* wts, float scale, int* cnt) { gemvk_route<T>(segs, nseg, x, xq, k, out, ostride, ids, wts, scale, cnt); }
+GEMVKR_T(1) GEMVKR_T(2) GEMVKR_T(3) GEMVKR_T(4) GEMVKR_T(5) GEMVKR_T(6) GEMVKR_T(7) GEMVKR_T(8)
 
 // Q8X GEMV with more bytes in flight (`TANG_CODER_Q8XW=R`): a warp owns R whole rows, a lane
 // issues every one of its k / 512 uint4 code loads for all R rows (16·R·k/512 bytes) before any

@@ -606,6 +606,7 @@ struct Kern {
     moe_down_df: [Fun; 2],
     /// `TANG_CODER_FUSE`: gate|up with the routing folded in, down with the combine + norm.
     moe_gu_dr: [Fun; 2],
+    gemvk_route: [Fun; MAX_T],
     moe_down_dfa: [Fun; 2],
     moe_gu_db: Fun,
     moe_down_db: Fun,
@@ -697,6 +698,7 @@ impl Kern {
             moe_down_d: [f("cx_moe_down_d2")?, f("cx_moe_down_d4")?],
             moe_down_df: [f("cx_moe_down_d2f")?, f("cx_moe_down_d4f")?],
             moe_gu_dr: [f("cx_moe_gu_d2r")?, f("cx_moe_gu_d4r")?],
+            gemvk_route: self.gemvk_route,
             moe_down_dfa: [f("cx_moe_down_d2fa")?, f("cx_moe_down_d4fa")?],
             moe_gu_db: f("cx_moe_gu_db")?,
             moe_down_db: f("cx_moe_down_db")?,
@@ -830,6 +832,7 @@ impl Kern {
             moe_down_d: [f(cm, "cx_moe_down_d2")?, f(cm, "cx_moe_down_d4")?],
             moe_down_df: [f(cm, "cx_moe_down_d2f")?, f(cm, "cx_moe_down_d4f")?],
             moe_gu_dr: [f(cm, "cx_moe_gu_d2r")?, f(cm, "cx_moe_gu_d4r")?],
+            gemvk_route: sized(std::array::from_fn(|i| format!("cx_gemvk_route_t{}", i + 1)))?,
             moe_down_dfa: [f(cm, "cx_moe_down_d2fa")?, f(cm, "cx_moe_down_d4fa")?],
             moe_gu_db: f(cm, "cx_moe_gu_db")?,
             moe_down_db: f(cm, "cx_moe_down_db")?,
@@ -1021,7 +1024,7 @@ impl Scratch {
             plan: z(2 * (4 + 2 * np)),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
-            fcnt: z(rows),
+            fcnt: z(rows + rows * 256 + 4),
             xk: z((rows * n + rows * n / 256 * 4).div_ceil(4)),
             hk: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 256 * 4).div_ceil(4)),
             moe_y: z(rows * n),
@@ -4871,10 +4874,14 @@ impl Coder {
             self.experts(wi, layer, t, 0, routed, v.stream);
             self.join(wi);
         } else {
-            self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
+            if !(fuse_on("route") && self.router_fusable(layer)) {
+                self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
+            }
             let direct = self.moe_direct(layer, t);
-            if direct && fuse_on("route") {
+            if direct && fuse_on("routegu") {
                 self.fuse_route.set(true);
+            } else if fuse_on("route") && self.router_route(wi, layer, t) {
+                // the top-k ran in the router GEMV's last block
             } else {
                 unsafe {
                     self.launch_on(
@@ -5027,6 +5034,36 @@ impl Coder {
     /// gate|up rows, SiLU+int8, down rows, on `stream`.
     /// Whether experts() takes the direct per-pair kernels (`cx_moe_gu_d*` / `cx_moe_down_d*f`)
     /// for a narrow window of `t` rows: the only path `TANG_CODER_FUSE` folds into.
+    /// The router takes the K-split GEMV with the top-k in its last block (`TANG_CODER_FUSE=route`).
+    fn router_fusable(&self, layer: &Layer) -> bool {
+        let w = &layer.router;
+        !self.in_wide.get() && !self.in_batch.get() && w.k.is_multiple_of(512) && !gemv_v1()
+    }
+
+    /// Router GEMV + top-k in one launch; `false` when not fusable (the caller routes).
+    fn router_route(&self, wi: usize, layer: &Layer, t: usize) -> bool {
+        if !self.router_fusable(layer) {
+            return false;
+        }
+        let v = self.stage_view(wi);
+        let w = &layer.router;
+        let (sp, ns, ki, os) = (v.dev.buffer_addr(&w.segs), w.nseg, w.k as i32, (self.hp.n_expert + 1) as i32);
+        let (x, xq, out) = (v.dev.buffer_addr(&v.s.x), v.dev.buffer_addr(&v.s.mxq), v.dev.buffer_addr(&v.s.lg));
+        let (ids, wts, scale) = (v.dev.buffer_addr(&v.s.ids), v.dev.buffer_addr(&v.s.w), self.hp.expert_weights_scale);
+        let cnt = v.dev.buffer_addr(&v.s.fcnt) + ((self.tw() + self.tw() * 256) * 4) as u64;
+        unsafe {
+            self.launch_on(
+                v.stream,
+                v.nk.gemvk_route[t - 1],
+                (w.rows.div_ceil(4) as u32, 1, 1),
+                256,
+                0,
+                tang_moe::args![sp, ns, x, xq, ki, out, os, ids, wts, scale, cnt],
+            );
+        }
+        true
+    }
+
     fn moe_direct(&self, layer: &Layer, t: usize) -> bool {
         let many = self.in_wide.get() || self.in_batch.get();
         let moe = match self.var.moe {
