@@ -474,7 +474,18 @@ impl CudaComputeDevice {
         let CudaStorage::Q4(q) = w.storage() else {
             unreachable!()
         };
-        let name = "gemm_f16_q4";
+        // Block rows and occupancy (see `F16_GEMM_CUDA`). RTX 3090, Qwen3-8B shapes: 128-row
+        // blocks at two an SM win from 512 rows (up to 53 TFLOPS vs 39 at one an SM); 64-row
+        // blocks win at ~128 rows, except on very wide outputs, where each extra row tile
+        // re-reads the whole weight. TANG_F16_VARIANT forces one.
+        let (name, bm) = match std::env::var("TANG_F16_VARIANT").as_deref() {
+            Ok("m128") => ("gemm_f16_q4_m128", 128),
+            Ok("m128_o2") => ("gemm_f16_q4_m128_o2", 128),
+            Ok("m64") => ("gemm_f16_q4_m64", 64),
+            Ok("m64_o2") => ("gemm_f16_q4_m64_o2", 64),
+            _ if m <= 192 && n <= 12288 => ("gemm_f16_q4_m64", 64),
+            _ => ("gemm_f16_q4_m128_o2", 128),
+        };
         let f = self.llm_funcs.borrow().get(name).cloned();
         let f = f.unwrap_or_else(|| {
             let (_m, f) = self.get_func_with_arch(llm_cuda::F16_GEMM_CUDA, name, "sm_80");
@@ -494,7 +505,7 @@ impl CudaComputeDevice {
                 .arg(&ku)
                 .arg(&nu)
                 .arg(&gu)
-                .launch(blocks((n.div_ceil(128), m.div_ceil(128), 1), 256))
+                .launch(blocks((n.div_ceil(128), m.div_ceil(bm), 1), 256))
                 .unwrap();
         }
     }

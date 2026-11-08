@@ -1481,8 +1481,9 @@ extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m32(
 /// then rounded) into padded shared tiles (row stride 40 halves: conflict-free `ldmatrix`),
 /// double-buffered, the next chunk's global loads in registers while this chunk's mma issue.
 /// No dequantized weight ever reaches global memory. A row's sums go in K order alone (never
-/// by M). Needs K % 32 == 0, group % 32 == 0. Launch: grid (ceil(N / 128), ceil(M / 128)),
-/// block 256.
+/// by M). Needs K % 32 == 0, group % 32 == 0. Launch: grid (ceil(N / 128), ceil(M / BM)),
+/// block 256. Entry points: `gemm_f16_q4_m{128,64}` (block rows), `_o2` with registers capped
+/// for two blocks an SM.
 pub const F16_GEMM_CUDA: &str = with_common!(
     r#"
 #define FG_LD 40
@@ -1499,24 +1500,27 @@ __device__ __forceinline__ void fg_ldsm4(unsigned int* r, const unsigned short* 
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
-extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
+// MT: 16-row mma tiles per warp (block rows BM = 32 * MT, warps 2 x 4, warp tile MT*16 x 32)
+template <int MT>
+__device__ __forceinline__ void gemm_f16_q4_body(
     const float* __restrict__ X, const unsigned int* __restrict__ Wq,
     const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
     float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group)
 {
-    __shared__ __align__(16) unsigned short As[2][128 * FG_LD];
+    constexpr int BM = 32 * MT, AH = BM * 8 / 256;   // float4s of A a thread per chunk
+    __shared__ __align__(16) unsigned short As[2][BM * FG_LD];
     __shared__ __align__(16) unsigned short Ws[2][128 * FG_LD];
     unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     unsigned int wm = warp >> 2, wn = warp & 3;
-    unsigned int n0 = blockIdx.x * 128, m0 = blockIdx.y * 128;
+    unsigned int n0 = blockIdx.x * 128, m0 = blockIdx.y * BM;
     unsigned int words = K / 8, G = K / group;
     // staging assignments: A 128 rows x 8 float4 (4 a thread), W 128 cols x 4 words (2 a thread)
-    float4 xa[4];
+    float4 xa[AH];
     unsigned int wq[2];
     float ws[2], wb[2];
     auto load = [&](unsigned int k0) {
         #pragma unroll
-        for (int h = 0; h < 4; h++) {
+        for (int h = 0; h < AH; h++) {
             unsigned int i = tid + h * 256, r = i >> 3, c4 = i & 7, row = m0 + r;
             xa[h] = row < M ? *(const float4*)&X[(u64)row * K + k0 + c4 * 4]
                             : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1536,7 +1540,7 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
     };
     auto store = [&](int buf) {
         #pragma unroll
-        for (int h = 0; h < 4; h++) {
+        for (int h = 0; h < AH; h++) {
             unsigned int i = tid + h * 256, r = i >> 3, c4 = i & 7;
             uint2 v = make_uint2(fg_h2(xa[h].x, xa[h].y), fg_h2(xa[h].z, xa[h].w));
             *(uint2*)&As[buf][r * FG_LD + c4 * 4] = v;
@@ -1554,9 +1558,9 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
             *(uint4*)&Ws[buf][col * FG_LD + wi * 8] = v;
         }
     };
-    float acc[4][4][4];
+    float acc[MT][4][4];
     #pragma unroll
-    for (int a = 0; a < 4; a++)
+    for (int a = 0; a < MT; a++)
         #pragma unroll
         for (int b = 0; b < 4; b++)
             #pragma unroll
@@ -1567,16 +1571,16 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
     unsigned int chunks = K / 32;
     // ldmatrix lane addresses: A rows lane%16, k half lane/16; B cols (lane&7)+8*(lane>>4),
     // k half (lane>>3)&1
-    unsigned int ar = wm * 64 + (lane & 15), ak = (lane >> 4) * 8;
+    unsigned int ar = wm * MT * 16 + (lane & 15), ak = (lane >> 4) * 8;
     unsigned int bc = wn * 32 + (lane & 7) + ((lane >> 4) << 3), bk = ((lane >> 3) & 1) * 8;
     for (unsigned int c = 0; c < chunks; c++) {
         int buf = c & 1;
         if (c + 1 < chunks) load((c + 1) * 32);
         #pragma unroll
         for (int ks = 0; ks < 32; ks += 16) {
-            unsigned int a[4][4], b[4][2];
+            unsigned int a[MT][4], b[4][2];
             #pragma unroll
-            for (int mt = 0; mt < 4; mt++)
+            for (int mt = 0; mt < MT; mt++)
                 fg_ldsm4(a[mt], &As[buf][(ar + mt * 16) * FG_LD + ks + ak]);
             #pragma unroll
             for (int np = 0; np < 2; np++) {
@@ -1586,7 +1590,7 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
                 b[np * 2 + 1][0] = r[2]; b[np * 2 + 1][1] = r[3];
             }
             #pragma unroll
-            for (int mt = 0; mt < 4; mt++)
+            for (int mt = 0; mt < MT; mt++)
                 #pragma unroll
                 for (int nt = 0; nt < 4; nt++)
                     asm volatile(
@@ -1602,12 +1606,12 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
     }
     unsigned int g = lane >> 2, t = lane & 3;
     #pragma unroll
-    for (int mt = 0; mt < 4; mt++)
+    for (int mt = 0; mt < MT; mt++)
         #pragma unroll
         for (int nt = 0; nt < 4; nt++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
-                unsigned int r = m0 + wm * 64 + mt * 16 + g + h * 8;
+                unsigned int r = m0 + wm * MT * 16 + mt * 16 + g + h * 8;
                 unsigned int n = n0 + wn * 32 + nt * 8 + 2 * t;
                 if (r >= M) continue;
                 if (n + 1 < N)
@@ -1616,6 +1620,16 @@ extern "C" __global__ void __launch_bounds__(256) gemm_f16_q4(
                     Y[(u64)r * N + n] = acc[mt][nt][2 * h];
             }
 }
+#define FG_ENTRY(name, MT, MINB)                                                               \
+extern "C" __global__ void __launch_bounds__(256, MINB) name(                                  \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                          \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,                \
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group)  \
+{ gemm_f16_q4_body<MT>(X, Wq, S, B, Y, M, K, N, group); }
+FG_ENTRY(gemm_f16_q4_m128, 4, 1)
+FG_ENTRY(gemm_f16_q4_m128_o2, 4, 2)
+FG_ENTRY(gemm_f16_q4_m64, 2, 1)
+FG_ENTRY(gemm_f16_q4_m64_o2, 2, 2)
 "#
 );
 /// `top_k_rows`: the K largest of each row of X `[rows, n]`, a block (1024 threads) a row.
