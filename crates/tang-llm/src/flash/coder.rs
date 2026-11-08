@@ -832,7 +832,9 @@ impl Kern {
             moe_down_d: [f(cm, "cx_moe_down_d2")?, f(cm, "cx_moe_down_d4")?],
             moe_down_df: [f(cm, "cx_moe_down_d2f")?, f(cm, "cx_moe_down_d4f")?],
             moe_gu_dr: [f(cm, "cx_moe_gu_d2r")?, f(cm, "cx_moe_gu_d4r")?],
-            gemvk_route: sized(std::array::from_fn(|i| format!("cx_gemvk_route_t{}", i + 1)))?,
+            gemvk_route: sized(std::array::from_fn(|i| {
+                format!("cx_gemvk_route_t{}", i + 1)
+            }))?,
             moe_down_dfa: [f(cm, "cx_moe_down_d2fa")?, f(cm, "cx_moe_down_d4fa")?],
             moe_gu_db: f(cm, "cx_moe_gu_db")?,
             moe_down_db: f(cm, "cx_moe_down_db")?,
@@ -5047,9 +5049,22 @@ impl Coder {
         }
         let v = self.stage_view(wi);
         let w = &layer.router;
-        let (sp, ns, ki, os) = (v.dev.buffer_addr(&w.segs), w.nseg, w.k as i32, (self.hp.n_expert + 1) as i32);
-        let (x, xq, out) = (v.dev.buffer_addr(&v.s.x), v.dev.buffer_addr(&v.s.mxq), v.dev.buffer_addr(&v.s.lg));
-        let (ids, wts, scale) = (v.dev.buffer_addr(&v.s.ids), v.dev.buffer_addr(&v.s.w), self.hp.expert_weights_scale);
+        let (sp, ns, ki, os) = (
+            v.dev.buffer_addr(&w.segs),
+            w.nseg,
+            w.k as i32,
+            (self.hp.n_expert + 1) as i32,
+        );
+        let (x, xq, out) = (
+            v.dev.buffer_addr(&v.s.x),
+            v.dev.buffer_addr(&v.s.mxq),
+            v.dev.buffer_addr(&v.s.lg),
+        );
+        let (ids, wts, scale) = (
+            v.dev.buffer_addr(&v.s.ids),
+            v.dev.buffer_addr(&v.s.w),
+            self.hp.expert_weights_scale,
+        );
         let cnt = v.dev.buffer_addr(&v.s.fcnt) + ((self.tw() + self.tw() * 256) * 4) as u64;
         unsafe {
             self.launch_on(
@@ -5507,20 +5522,26 @@ impl Coder {
                     ((2 * ff / rows) as u32, np, 1),
                     256,
                     0,
-                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb, lg, ls, wts, scale],
+                    tang_moe::args![
+                        gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb, lg, ls, wts, scale
+                    ],
                 );
             } else {
-            self.launch_on(
-                stream,
-                gu_f,
-                ((2 * ff / rows) as u32, np, 1),
-                256,
-                smem_g,
-                tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb],
-            );
+                self.launch_on(
+                    stream,
+                    gu_f,
+                    ((2 * ff / rows) as u32, np, 1),
+                    256,
+                    smem_g,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb],
+                );
             }
             // The direct down kernels can make SiLU(gate) * up's int8 themselves.
-            if let (Some((wn, yo)), true, 0) = (self.fuse_tail.get(), self.var.fuse_silu && (moe == 2 || moe == 4), pbase) {
+            if let (Some((wn, yo)), true, 0) = (
+                self.fuse_tail.get(),
+                self.var.fuse_silu && (moe == 2 || moe == 4),
+                pbase,
+            ) {
                 let (r, wts, lg, ls, x, eps, cnt) = (
                     v.dev.buffer_addr(&s.r),
                     v.dev.buffer_addr(&s.w),
@@ -5536,7 +5557,10 @@ impl Coder {
                     ((nh / rows) as u32, np, 1),
                     256,
                     0,
-                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk, r, wts, lg, ls, yo, wn, x, mxq, eps, cnt],
+                    tang_moe::args![
+                        dw, sd, ids, egu, parts, ti, r16d, fastk, r, wts, lg, ls, yo, wn, x, mxq,
+                        eps, cnt
+                    ],
                 );
                 self.fused_tail.set(true);
                 return;

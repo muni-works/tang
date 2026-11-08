@@ -205,3 +205,45 @@ Gates with `SHPAR=1`:
 - Per kernel the cost is τ ≈ 7 µs; per step it is the number of dependent kernels. Neither in-kernel tricks (wide loads, PDL, L2 prefetch) nor the one available branch move N=1–8 beyond noise.
 - What remains is fewer dependent steps: fusing the per-layer chains (norm → GEMV → conv/attention prep, route → experts → combine → norm) into fewer kernels without adding grid barriers. #160 showed a barrier costs as much as a launch, so the fused pieces must run their phases inside blocks (block-local dependencies), not across the grid.
 - For Prove's critical-path term: at N=1 the hand step has 548 kernels on one stream (one path) and 4.04 ms of wall time, about 7.4 µs per kernel — close to the measured τ.
+
+## Round 4: fusing dependent kernels (H200)
+
+All flags default off, and nothing here is recommended for turning on. Two short pods, roughly $4 in total. Logs: `docs/bench/ncu/fuse-r1/` (first designs) and `fuse-r2/` (redesigns).
+
+**Correction to round 3.** Round 3 concluded that the 1–8 stream gap is "dependent kernels × τ". This round removed up to 96 of the 548 launches at N=1 and the step did not get faster, so that model is wrong as a predictor. The 6.9 µs τ was measured with a stream launch and event records around one cold kernel. Inside a CUDA graph the trace shows 0–1% idle between hand kernels, and near-zero-byte kernels last 1.2–2.5 µs. The 7.4 µs per kernel at N=1 is an average over kernels doing real work, not a fixed cost per launch.
+
+Decode ms per step, `TANG_BATCH_N=8`, same pod for each table:
+
+| first designs (`fuse-r1`) | N=1 | N=8 | output |
+|---|---|---|---|
+| baseline (earlier rounds) | 4.03–4.12 | 9.80–9.92 | |
+| top-k recomputed in every gate\|up block | 4.24 | 11.02 | bitwise equal to main |
+| + combine and norm in the last-arriving down block | 4.53 | 11.74 | deterministic, not bitwise equal to main |
+
+| redesigns (`fuse-r2`) | N=1 | N=2 | N=4 | N=8 | launches removed at N=1 | output |
+|---|---|---|---|---|---|---|
+| baseline | 4.05 | 4.75 | 6.54 | 9.83 | | checksum 24a2aee70897bb74 |
+| `route`: top-k in the router GEMV's last-arriving block | 4.13 | 4.83 | 6.63 | 9.87 | 48 | bitwise equal to main |
+| `addnorm`: combine sliced across down blocks, norm by the last slice | 4.34 | 5.20 | 7.20 | 10.52 | 48 | deterministic, not bitwise equal to main |
+| both | 4.44 | 5.27 | 7.29 | 10.56 | 96 | deterministic, not bitwise equal to main |
+
+All of these pass the N=8 batch consistency check. Launch counts are by construction (one `cx_route` and one `cx_moe_add_norm` per MoE layer); the fused configs were not traced. No config beat baseline by the 1% threshold, so wide-check, N=48 and the SHPAR combinations were not run for them. N=16 and N=48 for hand and SHPAR are in round 3.
+
+Why these lost: the removed kernels' work did not disappear. It moved to the end of a neighbour as arrival counting, fences, two extra `__syncthreads` per block, and a tail that runs on few threads on the critical path. The separate `cx_moe_add_norm` uses 1024-thread blocks over the whole row and is hard to beat.
+
+Not attempted: gate|up→act→down inside one block (spinning on per-tile flags risks deadlock if waiting blocks occupy the SMs), rmsnorm→GEMV, and the rope and KV-write epilogues. Given these results I would want Prove's bound first.
+
+### Instruction counts for Prove (3090, ncu)
+
+`docs/bench/ncu/3090-inst/` has `sm__inst_executed` and issue throughput for the derived MoE kernels at T=1/8 and the small ops at T=1. Note that T=1 and the hand kernels in `ops_t1` are single-launch-shape numbers; the full hand decode step has no ncu run because the model does not fit on the 3090.
+
+| kernel, T=1 | warp inst | inst / DRAM byte | issue % | µs |
+|---|---|---|---|---|
+| `ex_gate_up` | 1,157,120 | 0.078 | 10 | 22.0 |
+| `ex_down` | 962,560 | 0.103 | 13 | 14.6 |
+| top-k | 19,606 | 0.600 | 39 | 11.9 |
+| `sh_gate_up` | 80,896 | 0.031 | 5 | 5.9 |
+| `sh_down` | 77,824 | 0.059 | 11 | 5.5 |
+| `norm_ss` | 4,101 | 0.274 | 27 | 3.7 |
+
+The big expert kernels are far from issue-bound on the 3090; top-k is the most issue-heavy kernel per byte.
