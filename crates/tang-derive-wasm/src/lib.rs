@@ -180,9 +180,11 @@ impl<'a> Parser<'a> {
                     return Ok(Ast::Call(name, args));
                 }
                 match name.as_str() {
-                    "s" | "i" | "j" | "n" | "d" => Ok(Ast::Var(name.chars().next().unwrap())),
+                    "s" | "i" | "j" | "n" | "d" | "u" | "w" => {
+                        Ok(Ast::Var(name.chars().next().unwrap()))
+                    }
                     "pi" => Ok(Ast::Num(std::f64::consts::PI)),
-                    _ => self.err(&format!("unknown name `{name}` (use s, i, j, n, d)")),
+                    _ => self.err(&format!("unknown name `{name}` (use s, i, j, n, d, u, w)")),
                 }
             }
             _ => self.err("expected a number, a name or ("),
@@ -319,6 +321,8 @@ pub struct Variant {
     mask: Option<Ast>,
 }
 
+pub mod design;
+
 pub fn parse_variant(score: &str, mask: &str) -> Result<Variant, String> {
     let score = Parser::new(score)
         .parse()
@@ -329,7 +333,7 @@ pub fn parse_variant(score: &str, mask: &str) -> Result<Variant, String> {
         let m = Parser::new(mask)
             .parse()
             .map_err(|e| format!("mask: {e}"))?;
-        if uses(&m, 's') {
+        if uses(&m, 's') || uses(&m, 'u') || uses(&m, 'w') {
             return Err("mask: the mask may use i, j, n and d, not s".into());
         }
         Some(m)
@@ -346,6 +350,9 @@ pub fn naive_graph(
     backward: bool,
 ) -> Result<(TensorGraph, Vec<TensorId>), String> {
     let e = |r: Result<TensorId, tang_compile::tensor::ShapeError>| r.map_err(|e| format!("{e:?}"));
+    if uses(&v.score, 'u') || uses(&v.score, 'w') {
+        return Err("score: u and w need a gate input (design::design_graph)".into());
+    }
     let mut g = TensorGraph::new();
     let q = g.input(&[n, d]);
     let k = g.input(&[n, d]);
