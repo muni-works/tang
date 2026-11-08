@@ -418,6 +418,80 @@ impl TimeFloor {
     }
 }
 
+/// One kernel of a step: its DRAM bytes, flops and launch shape.
+#[derive(Clone, Copy, Debug)]
+pub struct StepKernel {
+    pub bytes: f64,
+    pub flops: f64,
+    pub grid: usize,
+    pub block: usize,
+    pub regs: usize,
+}
+
+impl StepKernel {
+    /// Waves: workgroups over the SMs' resident slots.
+    pub fn waves(&self, m: &Machine) -> f64 {
+        let occ = Occupancy {
+            grid: usize::MAX,
+            block: self.block,
+            regs: self.regs,
+            inflight_per_thread: 0.0,
+        };
+        self.grid as f64 / (occ.resident_threads(m) / self.block.max(1)) as f64
+    }
+
+    /// Fill/drain floor of one dependent kernel:
+    ///
+    /// `t ≥ launch + max(bytes/BW + latency, flops/peak, ⌈waves⌉·latency)`
+    ///
+    /// The first byte arrives one DRAM latency after the kernel starts, so
+    /// streaming at peak costs `bytes/BW + latency`; each wave of
+    /// workgroups needs at least one dependent round trip; `launch` is the
+    /// cost of an empty kernel (graph node). Nothing is fitted: latency
+    /// and bandwidth are device figures, launch the smallest kernel in a
+    /// trace. Returns the time and the binding term.
+    pub fn floor(&self, m: &Machine) -> (f64, &'static str) {
+        if self.bytes <= 0.0 && self.flops <= 0.0 {
+            return (m.launch, "launch");
+        }
+        let stream = self.bytes / m.dram_bw + m.mem_latency;
+        let compute = self.flops / m.flops;
+        let waves = self.waves(m).ceil().max(1.0) * m.mem_latency;
+        let t = stream.max(compute).max(waves);
+        let why = if t == compute {
+            "compute"
+        } else if t == waves && waves > stream {
+            "waves"
+        } else if m.mem_latency > self.bytes / m.dram_bw {
+            "fill"
+        } else {
+            "stream"
+        };
+        (m.launch + t, why)
+    }
+}
+
+/// Step floor: the longest path through the kernel DAG (`deps[i]` lists
+/// the kernels `i` reads from, all `< i`), each kernel costing
+/// [`StepKernel::floor`]; kernels with no path between them overlap. Also
+/// at least `Σ bytes / BW` (they share DRAM). Returns `(seconds, binding)`
+/// with binding `"chain"` (the summed fill/drain along the critical path)
+/// or `"bandwidth"`.
+pub fn step_floor(m: &Machine, ks: &[StepKernel], deps: &[Vec<usize>]) -> (f64, &'static str) {
+    let mut finish = vec![0.0f64; ks.len()];
+    for (i, k) in ks.iter().enumerate() {
+        let start = deps[i].iter().map(|&j| finish[j]).fold(0.0, f64::max);
+        finish[i] = start + k.floor(m).0;
+    }
+    let chain = finish.iter().cloned().fold(0.0, f64::max);
+    let bw = ks.iter().map(|k| k.bytes).sum::<f64>() / m.dram_bw;
+    if chain >= bw {
+        (chain, "chain")
+    } else {
+        (bw, "bandwidth")
+    }
+}
+
 /// A tile placed on two fast-memory levels.
 #[derive(Clone, Debug)]
 pub struct LevelTile {
@@ -698,6 +772,44 @@ mod tests {
         }
         assert!((Lp::expected_distinct(512.0, 10.0, 1.0) - 10.0).abs() < 1e-9);
         assert!((Lp::expected_distinct(512.0, 10.0, 48.0) - 313.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn step_chain() {
+        let m = Machine::H200;
+        // a 2 MB sub-wave GEMV: fill-dominated on the H200
+        let g = StepKernel {
+            bytes: 2e6,
+            flops: 0.0,
+            grid: 64,
+            block: 256,
+            regs: 32,
+        };
+        let (t, why) = g.floor(&m);
+        assert_eq!(why, "fill");
+        assert!((t - (1e-6 + 2e6 / 4.8e12 + 600e-9)).abs() < 1e-12);
+        // ten in a chain cost ten floors; independent ones overlap
+        let ks = vec![g; 10];
+        let chain: Vec<Vec<usize>> = (0..10)
+            .map(|i| if i == 0 { vec![] } else { vec![i - 1] })
+            .collect();
+        let (tc, b) = step_floor(&m, &ks, &chain);
+        assert_eq!(b, "chain");
+        assert!((tc - 10.0 * t).abs() < 1e-12);
+        let free: Vec<Vec<usize>> = vec![vec![]; 10];
+        let (tf, b) = step_floor(&m, &ks, &free);
+        // all independent: bounded by bandwidth or one kernel's floor
+        assert_eq!(b, "bandwidth");
+        assert!(tf < tc / 4.0, "{tf}");
+        // a big streaming kernel binds on bandwidth
+        let big = StepKernel {
+            bytes: 400e6,
+            flops: 0.0,
+            grid: 7680,
+            block: 256,
+            regs: 64,
+        };
+        assert_eq!(big.floor(&m).1, "stream");
     }
 
     #[test]
