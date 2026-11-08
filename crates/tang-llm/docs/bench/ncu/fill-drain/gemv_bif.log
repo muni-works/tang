@@ -1,0 +1,36 @@
+| kernel | MB | µs | GB/s | fraction of 4800 GB/s |
+|---|---|---|---|---|
+| stream_u1 ×1056 blocks (512 MB) | 536.9 | 122.5 | 4382 | 0.91 |
+| stream_u4 ×1056 blocks (512 MB) | 536.9 | 118.2 | 4541 | 0.95 |
+| stream_u4 ×2112 blocks (512 MB) | 536.9 | 114.1 | 4707 | 0.98 |
+| derived Q8_0 GEMV 4096×2048 (1 kernels) | 8.9 | 8.6 | 1032 | 0.22 |
+| repacked gq8r1 4096×2048 (vs derived max rel 1.6e-4) | 8.9 | 4.1 | 2197 | 0.46 |
+| repacked gq8r2 4096×2048 (vs derived max rel 1.6e-4) | 8.9 | 4.0 | 2226 | 0.46 |
+| repacked gq8r4 4096×2048 (vs derived max rel 1.6e-4) | 8.9 | 4.8 | 1843 | 0.38 |
+| derived Q8_0 GEMV 151936×2048 (1 kernels) | 330.6 | 172.2 | 1920 | 0.40 |
+| repacked gq8r1 151936×2048 (vs derived max rel 1.7e-3) | 330.6 | 78.2 | 4228 | 0.88 |
+| repacked gq8r2 151936×2048 (vs derived max rel 1.7e-3) | 330.6 | 76.0 | 4348 | 0.91 |
+| repacked gq8r4 151936×2048 (vs derived max rel 1.7e-3) | 330.6 | 82.5 | 4005 | 0.83 |
+
+| fill/drain: rows × 2048 (repacked R=2, cold L2) | MB | µs | GB/s |
+|---|---|---|---|
+| 128 | 0.28 | 7.39 | 38 |
+| 256 | 0.56 | 7.23 | 77 |
+| 512 | 1.11 | 7.33 | 152 |
+| 1024 | 2.23 | 7.42 | 300 |
+| 2048 | 4.46 | 7.78 | 573 |
+| 4096 | 8.91 | 8.77 | 1017 |
+| 8192 | 17.83 | 10.34 | 1725 |
+| 16384 | 35.65 | 14.34 | 2487 |
+| 32768 | 71.30 | 22.21 | 3211 |
+| 65536 | 142.61 | 37.38 | 3815 |
+| 131072 | 285.21 | 68.80 | 4146 |
+
+fit: tau (fill + drain, incl. launch in a stream) = 6.88 µs, streaming BW = 4625 GB/s (0.96 of peak)
+
+| L2 prefetch pair: A then B, rows each | B alone µs | B after A (no prefetch) µs | B after A prefetching B µs | A µs (no pf / pf) |
+|---|---|---|---|---|
+| 1024 (2.2 MB) | 7.42 | 7.07 | 6.69 | 7.78 / 8.35 |
+| 2048 (4.5 MB) | 7.81 | 7.49 | 6.98 | 8.16 / 10.21 |
+| 4096 (8.9 MB) | 8.70 | 8.29 | 7.68 | 8.86 / 13.02 |
+| 8192 (17.8 MB) | 10.30 | 10.02 | 9.31 | 11.74 / 12.93 |

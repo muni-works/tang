@@ -13,6 +13,8 @@
 //! `cargo run --release -p tang-llm --features cuda --example gemv_bif [rows...]`
 
 use tang_llm::flash::derived_ops::{self as dop, Op};
+#[allow(unused_imports)]
+use tang_moe::gpu::Module;
 use tang_moe::gpu::{self, DevBuf, Event, Gpu, Stream};
 
 const SRC: &str = r#"
@@ -37,10 +39,23 @@ extern "C" __global__ void stream_u4(const uint4* __restrict__ p, unsigned long 
     if (acc == 0x12345678u) out[0] = acc;
 }
 // repacked Q8 GEMV, k = 2048 (128 uint4 a row: 4 a lane), R rows a warp
+__device__ __forceinline__ void l2_prefetch(const unsigned char* pf, unsigned long long pf_bytes) {
+#if __CUDA_ARCH__ >= 900
+    // this block's share of [pf, pf + pf_bytes), 4 KiB a thread a step, bulk prefetch into L2
+    if (pf == nullptr || pf_bytes == 0) return;
+    const unsigned long long share = ((pf_bytes + gridDim.x - 1) / gridDim.x + 15) & ~15ull;  // 16-byte aligned starts
+    const unsigned long long b0 = blockIdx.x * share, b1 = min(pf_bytes, b0 + share);
+    for (unsigned long long o = b0 + threadIdx.x * 4096ull; o < b1; o += blockDim.x * 4096ull) {
+        const unsigned n = (unsigned)min(4096ull, b1 - o) & ~15u;
+        if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(pf + o), "r"(n) : "memory");
+    }
+#endif
+}
 template <int R>
 __device__ void gq8r(const uint4* __restrict__ codes, const __half* __restrict__ sc,
                      const signed char* __restrict__ xq, const float* __restrict__ xs,
-                     float* __restrict__ out, int rows) {
+                     float* __restrict__ out, int rows, const unsigned char* pf, unsigned long long pf_bytes) {
+    l2_prefetch(pf, pf_bytes);
     __shared__ __align__(16) signed char sx[2048];
     __shared__ float ss[64];
     for (int i = threadIdx.x; i < 2048 / 16; i += blockDim.x) ((uint4*)sx)[i] = ((const uint4*)xq)[i];
@@ -75,9 +90,9 @@ __device__ void gq8r(const uint4* __restrict__ codes, const __half* __restrict__
         if (lane == 0 && r0 + r < rows) out[r0 + r] = acc;
     }
 }
-extern "C" __global__ void __launch_bounds__(256) gq8r1(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows) { gq8r<1>(c, s, x, xs, o, rows); }
-extern "C" __global__ void __launch_bounds__(256) gq8r2(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows) { gq8r<2>(c, s, x, xs, o, rows); }
-extern "C" __global__ void __launch_bounds__(256) gq8r4(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows) { gq8r<4>(c, s, x, xs, o, rows); }
+extern "C" __global__ void __launch_bounds__(256) gq8r1(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows, const unsigned char* pf, unsigned long long pfb) { gq8r<1>(c, s, x, xs, o, rows, pf, pfb); }
+extern "C" __global__ void __launch_bounds__(256) gq8r2(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows, const unsigned char* pf, unsigned long long pfb) { gq8r<2>(c, s, x, xs, o, rows, pf, pfb); }
+extern "C" __global__ void __launch_bounds__(256) gq8r4(const uint4* c, const __half* s, const signed char* x, const float* xs, float* o, int rows, const unsigned char* pf, unsigned long long pfb) { gq8r<4>(c, s, x, xs, o, rows, pf, pfb); }
 "#;
 
 fn best_us(s: &Stream, mut f: impl FnMut()) -> f64 {
@@ -234,6 +249,7 @@ fn main() {
             let blocks = rows.div_ceil(8 * r) as u32;
             let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
                 (rc.ptr, rs.ptr, rx.ptr, rxs.ptr, ro.ptr, rows as i32);
+            let (mut a6, mut a7) = (0u64, 0u64);
             let us = best_us(&s, || unsafe {
                 let mut a = [
                     &mut a0 as *mut u64 as *mut _,
@@ -242,6 +258,8 @@ fn main() {
                     &mut a3 as *mut u64 as *mut _,
                     &mut a4 as *mut u64 as *mut _,
                     &mut a5 as *mut i32 as *mut _,
+                    &mut a6 as *mut u64 as *mut _,
+                    &mut a7 as *mut u64 as *mut _,
                 ];
                 gpu::launch(f, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut a).unwrap();
             });
@@ -257,6 +275,155 @@ fn main() {
                 us,
             );
         }
+    }
+    fill_drain(&gpu, &s, &m, peak);
+}
+
+/// Repacked Q8 GEMV operands for `rows` × 2048 (contents irrelevant to timing).
+struct RepackedMat {
+    c: DevBuf,
+    s: DevBuf,
+    bytes: usize,
+}
+fn repacked(rows: usize) -> RepackedMat {
+    let k = 2048;
+    RepackedMat {
+        c: DevBuf::from_slice(&vec![1i8; rows * k]).unwrap(),
+        s: DevBuf::from_slice(&vec![0x3c00u16; rows * k / 32]).unwrap(),
+        bytes: rows * k + rows * k / 32 * 2,
+    }
+}
+
+/// Launch gq8r2 over `m`, prefetching `pf` (codes then scales, as two ranges? one: codes).
+unsafe fn launch_r2(
+    f: cudarc::driver::sys::CUfunction,
+    s: &Stream,
+    m: &RepackedMat,
+    rows: usize,
+    x: &DevBuf,
+    xs: &DevBuf,
+    out: &DevBuf,
+    pf: Option<&RepackedMat>,
+) {
+    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+        (m.c.ptr, m.s.ptr, x.ptr, xs.ptr, out.ptr, rows as i32);
+    let (mut a6, mut a7) = pf.map_or((0u64, 0u64), |p| (p.c.ptr, (p.bytes - p.bytes / 33) as u64));
+    let mut a = [
+        &mut a0 as *mut u64 as *mut _,
+        &mut a1 as *mut u64 as *mut _,
+        &mut a2 as *mut u64 as *mut _,
+        &mut a3 as *mut u64 as *mut _,
+        &mut a4 as *mut u64 as *mut _,
+        &mut a5 as *mut i32 as *mut _,
+        &mut a6 as *mut u64 as *mut _,
+        &mut a7 as *mut u64 as *mut _,
+    ];
+    gpu::launch(
+        f,
+        (rows.div_ceil(16) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        s,
+        &mut a,
+    )
+    .unwrap();
+}
+
+/// Fill/drain: one GEMV's time against its bytes over a sweep of sizes (fit t = τ + bytes/BW),
+/// then the L2-prefetch pair: GEMV A (prefetching B) followed by GEMV B, B's time with and
+/// without the prefetch, an unrelated 512 MB stream in between each pair so nothing is warm.
+fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
+    let f = m.func("gq8r2").unwrap();
+    let k = 2048;
+    let x = DevBuf::from_slice(&vec![1i8; k]).unwrap();
+    let xs = DevBuf::from_slice(&vec![1f32; k / 32]).unwrap();
+    let out = DevBuf::zeroed(200_000 * 4).unwrap();
+    let flush = DevBuf::zeroed(512 << 20).unwrap();
+    let fl = m.func("stream_u4").unwrap();
+    let do_flush = || unsafe {
+        let (mut p, mut n, mut o) = (flush.ptr, ((512u64 << 20) / 16), out.ptr);
+        let mut a = [
+            &mut p as *mut u64 as *mut _,
+            &mut n as *mut u64 as *mut _,
+            &mut o as *mut u64 as *mut _,
+        ];
+        gpu::launch(fl, (1056, 1, 1), (256, 1, 1), 0, s, &mut a).unwrap();
+    };
+    let _ = gpu;
+    println!("\n| fill/drain: rows × 2048 (repacked R=2, cold L2) | MB | µs | GB/s |");
+    println!("|---|---|---|---|");
+    let mut pts = Vec::new();
+    for rows in [
+        128usize, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+    ] {
+        let mat = repacked(rows);
+        let mut best = f64::MAX;
+        for _ in 0..15 {
+            do_flush();
+            let (a, b) = (Event::new(true).unwrap(), Event::new(true).unwrap());
+            a.record(s).unwrap();
+            unsafe { launch_r2(f, s, &mat, rows, &x, &xs, &out, None) };
+            b.record(s).unwrap();
+            b.sync().unwrap();
+            best = best.min(b.since(&a).unwrap() as f64 * 1000.0);
+        }
+        pts.push((mat.bytes as f64, best));
+        println!(
+            "| {rows} | {:.2} | {best:.2} | {:.0} |",
+            mat.bytes as f64 / 1e6,
+            mat.bytes as f64 / best / 1e3
+        );
+    }
+    // least squares t = tau + bytes / bw over the sizes
+    let n = pts.len() as f64;
+    let (sx, sy) = (
+        pts.iter().map(|p| p.0).sum::<f64>(),
+        pts.iter().map(|p| p.1).sum::<f64>(),
+    );
+    let sxx = pts.iter().map(|p| p.0 * p.0).sum::<f64>();
+    let sxy = pts.iter().map(|p| p.0 * p.1).sum::<f64>();
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    let tau = (sy - slope * sx) / n;
+    println!("\nfit: tau (fill + drain, incl. launch in a stream) = {tau:.2} µs, streaming BW = {:.0} GB/s ({:.2} of peak)", 1e-3 / slope, 1e-3 / slope / peak);
+    // empty-kernel reference: the same launch with rows = 0 work
+    println!("\n| L2 prefetch pair: A then B, rows each | B alone µs | B after A (no prefetch) µs | B after A prefetching B µs | A µs (no pf / pf) |");
+    println!("|---|---|---|---|---|");
+    for rows in [1024usize, 2048, 4096, 8192] {
+        let (ma, mb) = (repacked(rows), repacked(rows));
+        let time = |pf: bool, with_a: bool| -> (f64, f64) {
+            let mut best = (f64::MAX, f64::MAX);
+            for _ in 0..15 {
+                do_flush();
+                let (e0, e1, e2) = (
+                    Event::new(true).unwrap(),
+                    Event::new(true).unwrap(),
+                    Event::new(true).unwrap(),
+                );
+                e0.record(s).unwrap();
+                if with_a {
+                    unsafe { launch_r2(f, s, &ma, rows, &x, &xs, &out, pf.then_some(&mb)) };
+                }
+                e1.record(s).unwrap();
+                unsafe { launch_r2(f, s, &mb, rows, &x, &xs, &out, None) };
+                e2.record(s).unwrap();
+                e2.sync().unwrap();
+                let (ta, tb) = (
+                    e1.since(&e0).unwrap() as f64 * 1000.0,
+                    e2.since(&e1).unwrap() as f64 * 1000.0,
+                );
+                if tb < best.1 {
+                    best = (ta, tb);
+                }
+            }
+            best
+        };
+        let (_, alone) = time(false, false);
+        let (a0, b0) = time(false, true);
+        let (a1, b1) = time(true, true);
+        println!(
+            "| {rows} ({:.1} MB) | {alone:.2} | {b0:.2} | {b1:.2} | {a0:.2} / {a1:.2} |",
+            ma.bytes as f64 / 1e6
+        );
     }
 }
 
