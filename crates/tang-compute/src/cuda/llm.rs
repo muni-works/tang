@@ -483,15 +483,51 @@ impl CudaComputeDevice {
             Ok("m128_o2") => ("gemm_f16_q4_m128_o2", 128),
             Ok("m64") => ("gemm_f16_q4_m64", 64),
             Ok("m64_o2") => ("gemm_f16_q4_m64_o2", 64),
+            Ok("m64_o3") => ("gemm_f16_q4_m64", 64),
             _ if m <= 192 => ("gemm_f16_q4_m64", 64),
             _ => ("gemm_f16_q4_m128_o2", 128),
         };
-        let f = self.llm_funcs.borrow().get(name).cloned();
-        let f = f.unwrap_or_else(|| {
-            let (_m, f) = self.get_func_with_arch(llm_cuda::F16_GEMM_CUDA, name, "sm_80");
-            self.llm_funcs.borrow_mut().insert(name, f.clone());
-            f
-        });
+        let func = |name: &'static str| {
+            let f = self.llm_funcs.borrow().get(name).cloned();
+            f.unwrap_or_else(|| {
+                let (_m, f) = self.get_func_with_arch(llm_cuda::F16_GEMM_CUDA, name, "sm_80");
+                self.llm_funcs.borrow_mut().insert(name, f.clone());
+                f
+            })
+        };
+        // f16 activations (cast once, then cp.async straight into the tiles: ~1.12x at 2048
+        // rows, RTX 3090) unless TANG_F16_ACT=f32 (the f32 loads through registers)
+        let half = std::env::var("TANG_F16_ACT").as_deref() != Ok("f32");
+        let mut xh = None;
+        let f = if half {
+            let hname = match name {
+                // 64-row blocks at three an SM (80 registers): 1.2x at 128 rows on wide outputs
+                "gemm_f16_q4_m64" | "gemm_f16_q4_m64_o2" => {
+                    if std::env::var("TANG_F16_VARIANT").as_deref() == Ok("m64") {
+                        "gemm_f16h_q4_m64"
+                    } else {
+                        "gemm_f16h_q4_m64_o3"
+                    }
+                }
+                _ => "gemm_f16h_q4_m128_o2",
+            };
+            let pairs = (m * k / 2) as u32;
+            let mut h = self.pool_alloc_uninit_f32(m * k / 2);
+            let cast = func("fg_cast");
+            unsafe {
+                self.stream
+                    .launch_builder(&cast)
+                    .arg(x.f32_data())
+                    .arg(h.f32_data_mut())
+                    .arg(&pairs)
+                    .launch(blocks(((m * k / 2).div_ceil(256).min(4096), 1, 1), 256))
+                    .unwrap();
+            }
+            xh = Some(h);
+            func(hname)
+        } else {
+            func(name)
+        };
         // row tiles a raster group: 8 keeps resident blocks on shared weight tiles (1.45x at
         // 2048 x 4096 x 24576, 1.8x for 64-row blocks at 128 rows); TANG_F16_GROUP=0 is plain
         // column-fastest order
@@ -503,7 +539,10 @@ impl CudaComputeDevice {
         unsafe {
             self.stream
                 .launch_builder(&f)
-                .arg(x.f32_data())
+                .arg(match xh.as_ref() {
+                    Some(h) => h.f32_data(),
+                    None => x.f32_data(),
+                })
                 .arg(&q.packed)
                 .arg(&q.scales)
                 .arg(&q.biases)
