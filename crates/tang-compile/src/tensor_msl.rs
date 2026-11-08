@@ -2410,7 +2410,7 @@ fn msl_ty(f: Format) -> &'static str {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 => {
+        Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }

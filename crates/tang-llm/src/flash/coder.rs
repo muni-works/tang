@@ -1145,11 +1145,10 @@ fn derived_moe_on() -> bool {
 /// (window rows, int8 layout rows, gate|up GGUF type, down GGUF type, MoE output kept)
 type DMoeKey = (usize, usize, i32, i32, bool);
 
-/// One derived MoE shape: the layer op, the int8 re-layout ops, and a `y` scratch.
+/// One derived MoE shape: the layer op (which also writes the next layer's int8 input) and a
+/// `y` scratch.
 struct DMoe {
     moe: super::derived_ops::Op,
-    codes: super::derived_ops::Op,
-    scales: super::derived_ops::Op,
     y: gpu::DevBuf,
 }
 
@@ -1180,17 +1179,12 @@ impl DMoe {
                 .ok_or_else(|| anyhow!("down type {down}"))?,
             eps_bits: (eps as f64).to_bits(),
             keep_y,
+            rows,
         };
         let lower = |s: dop::Spec| s.lower().map_err(|e| anyhow!(e));
         let moe = dop::Op::load(gpu, lower(dop::moe_block(m))?, dop::MOE_EXT.len())?;
-        let (c, sc) = dop::engine_q8(t, n);
-        let codes = dop::Op::load(gpu, lower(c)?, 2)?;
-        let scales = dop::Op::load(gpu, lower(sc)?, 2)?;
-        let _ = rows;
         Ok(DMoe {
             moe,
-            codes,
-            scales,
             y: gpu::DevBuf::zeroed(t * n * 4).map_err(|e| anyhow!("{e}"))?,
         })
     }
@@ -4855,7 +4849,7 @@ impl Coder {
             let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
             match &built {
                 Ok(d) => eprintln!(
-                    "coder: derived MoE {key:?}: {} + 2 kernels, built in {:.2} s",
+                    "coder: derived MoE {key:?}: {} kernels, built in {:.2} s",
                     d.moe.kernels(),
                     t0.elapsed().as_secs_f64()
                 ),
@@ -4887,14 +4881,9 @@ impl Coder {
             x,
             layer.gate.w.base,
             layer.sh_gate.w.base,
+            mxq,
         ];
         d.moe.launch(v.stream, &ext).expect("derived MoE launch");
-        d.codes
-            .launch(v.stream, &[x, mxq])
-            .expect("derived int8 codes");
-        d.scales
-            .launch(v.stream, &[x, mxq + (self.tw() * n) as u64])
-            .expect("derived int8 scales");
         if let Some(p) = &self.prof {
             let ev = gpu::Event::new(true).expect("event");
             ev.record(v.stream).expect("record");

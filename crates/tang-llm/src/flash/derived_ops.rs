@@ -564,11 +564,15 @@ pub struct MoeShape {
     /// The MoE output `y` is written (else it is computed inside `r_out`'s kernel only and
     /// the `y` pointer is not touched).
     pub keep_y: bool,
+    /// Rows of the `xq_out` layout (the engine's window width, ≥ `t`): its scales start after
+    /// `rows · n` codes; rows past `t` are written as zeros.
+    pub rows: usize,
 }
 
 /// External tensors of [`moe_block`], in launch order.
-pub const MOE_EXT: [&str; 15] = [
+pub const MOE_EXT: [&str; 16] = [
     "x", "lg", "wg", "wu", "wd", "sg", "su", "sd", "r", "wn", "y", "r_out", "x_out", "wgu", "sgu",
+    "xq_out",
 ];
 
 /// A decode window's whole MoE layer, as the naive math: softmax top-k
@@ -579,7 +583,8 @@ pub const MOE_EXT: [&str; 15] = [
 /// `x_out = rmsnorm(r_out)·wn`. Ext as [`MOE_EXT`] (`r_out` may alias `r`,
 /// `x_out` may alias `x`: every read of them precedes the write). `wgu` / `sgu` are the
 /// gate and up stacks as one buffer (`wg ‖ wu`, `sg ‖ su`: up at gate + gate's bytes): the
-/// unsorted path reads gate and up rows in one launch (`TANG_DMOE_PAIR=0`: two).
+/// unsorted path reads gate and up rows in one launch (`TANG_DMOE_PAIR=0`: two). `xq_out` is
+/// `x_out` as int8 in the hand kernels' layout ([`Format::Q8x32F`]), for the next layer.
 pub fn moe_block(m: MoeShape) -> Spec {
     let MoeShape {
         t,
@@ -1019,6 +1024,16 @@ pub fn moe_block(m: MoeShape) -> Spec {
     let ro = tag(g.map(&[r, y], |v| v[0] + v[1]).unwrap(), "resid");
     g.set_inline(y, !m.keep_y && envn("TANG_DMOE_KEEP_Y", 0) == 0);
     let xo = tag(rmsnorm(&mut g, ro, wn, t, n, eps), "norm");
+    let xq_out = {
+        let mut v = View::identity(2, 2);
+        v.guard = m.rows > t;
+        tag(
+            g.comp(&[m.rows, n], &[], vec![arg(xo, v)], None, |v| vec![v[0]])
+                .unwrap(),
+            "xq_out",
+        )
+    };
+    g.set_precision(xq_out, Precision::storage(Format::Q8x32F));
 
     // schedule: storage formats, int8 contractions, x / SwiGLU quantized
     g.set_precision(wg, Precision::storage(m.gu));
@@ -1060,7 +1075,7 @@ pub fn moe_block(m: MoeShape) -> Spec {
             IntMma {
                 stage: Stage::Mma,
                 ksplit: envn("TANG_DMOE_SH_KSPLIT", 2) as u32,
-                pos_tile: t.min(envn("TANG_DMOE_SH_PTILE", 64)) as u32,
+                pos_tile: t.min(envn("TANG_DMOE_SH_PTILE", 8)) as u32,
             }
         } else {
             IntMma {
@@ -1082,11 +1097,11 @@ pub fn moe_block(m: MoeShape) -> Spec {
     g.set_inline(routed, envn("TANG_DMOE_INLINE_R", 1) == 1);
     Spec {
         g,
-        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo, wgu, sgu],
+        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo, wgu, sgu, xq_out],
         outs: if m.keep_y {
-            vec![y, ro, xo]
+            vec![y, ro, xo, xq_out]
         } else {
-            vec![ro, xo]
+            vec![ro, xo, xq_out]
         },
         auto: false,
     }
@@ -1272,6 +1287,7 @@ mod tests {
             down: Format::Q5K,
             eps_bits: 1e-6f64.to_bits(),
             keep_y: true,
+            rows: t,
         }
     }
 
@@ -1333,6 +1349,7 @@ mod moe_lowering {
                 down: Format::Q5K,
                 eps_bits: 1e-6f64.to_bits(),
                 keep_y: true,
+                rows: t,
             })
             .lower()
             .unwrap();
@@ -1350,7 +1367,9 @@ mod moe_lowering {
                     k.source.contains("tang_q8x32_store")
                 );
             }
-            assert_eq!(int8, 6, "t={t}: six int8 contractions");
+            // gate|up one contraction; the shared gate|up too at one row
+            let want = if t == 1 { 4 } else { 5 };
+            assert_eq!(int8, want, "t={t}: int8 contractions");
         }
     }
 }

@@ -191,11 +191,13 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
         z(t * n),
         z(t * n),
         z(t * n),
+        z(t * n / 4 + t * n / 32),
     ];
     let mut ptrs: Vec<u64> = b.iter().map(|b| b.ptr).collect();
     ptrs[3] = ptrs[2] + wg.len() as u64;
     ptrs[6] = ptrs[5] + sg.len() as u64;
-    ptrs.extend([ptrs[2], ptrs[5]]);
+    let xq = ptrs.pop().unwrap();
+    ptrs.extend([ptrs[2], ptrs[5], xq]);
     let bufs = Bufs {
         ptrs,
         y: 10,
@@ -262,6 +264,24 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
         err = max_rel(&rd(bufs.y), &want_y)
             .max(max_rel(&rd(bufs.ro), &want_ro))
             .max(max_rel(&rd(bufs.xo), &want_xo));
+        // xq_out: the GPU's x_out as codes then one f32 scale a 32
+        let xo = rd(bufs.xo);
+        let raw = bufs._b[13].read::<u8>(0, t * n + t * n / 8).unwrap();
+        let mut bad = 0;
+        for (bi, blk) in xo.chunks(32).enumerate() {
+            let d = f32::from_le_bytes(raw[t * n + 4 * bi..t * n + 4 * bi + 4].try_into().unwrap());
+            let amax = blk.iter().fold(0f32, |a, v| a.max(v.abs()));
+            if (d - amax / 127.0).abs() > 1e-6 * amax.max(1e-30) {
+                bad += 1;
+            }
+            for (i, &v) in blk.iter().enumerate() {
+                let q = raw[bi * 32 + i] as i8 as i32;
+                if (q - (v / d).round() as i32).abs() > 1 {
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "xq_out disagrees with x_out in {bad} places");
     }
     for _ in 0..5 {
         op.launch(s, &bufs.ptrs).unwrap();
@@ -325,6 +345,7 @@ fn main() {
             down: Format::Q5K,
             eps_bits: 1e-6f64.to_bits(),
             keep_y: true,
+            rows: t,
         };
         run(&gpu, &s, base, true);
         run(

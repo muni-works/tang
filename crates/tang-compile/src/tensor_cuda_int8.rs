@@ -132,7 +132,7 @@ __device__ __forceinline__ void tang_q8x32_store(float* out, unsigned g, float v
 
 /// Rewrite a transpiled one-thread-per-point kernel to store its node as
 /// Q8x32. `None` when the kernel is not of that shape.
-pub(super) fn q8x32_writer(src: &str, points: usize) -> Option<String> {
+pub(super) fn q8x32_writer(src: &str, points: usize, f32_scale: bool) -> Option<String> {
     if !points.is_multiple_of(32) {
         return None;
     }
@@ -142,7 +142,16 @@ pub(super) fn q8x32_writer(src: &str, points: usize) -> Option<String> {
     }
     let src = src.replace(store, "tang_q8x32_store(out, g, v[0], params.count);");
     let at = src.find("extern \"C\"")?;
-    Some(format!("{}{Q8X32_STORE}{}", &src[..at], &src[at..]))
+    let helper = if f32_scale {
+        // the scale alone, one f32 a 32
+        Q8X32_STORE.replace(
+            "    int s = q;\n    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);\n    if ((g & 31u) == 0u) ((float2*)((unsigned char*)out + n))[g >> 5] = make_float2(d, d * (float)s);",
+            "    if ((g & 31u) == 0u) ((float*)((unsigned char*)out + n))[g >> 5] = d;",
+        )
+    } else {
+        Q8X32_STORE.to_string()
+    };
+    Some(format!("{}{helper}{}", &src[..at], &src[at..]))
 }
 
 impl TensorGraph {
