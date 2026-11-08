@@ -95,3 +95,7 @@ required-features = ["metal"]
 [[example]]
 name = "kvcomp_niah"
 required-features = ["metal"]
+
+[[example]]
+name = "gemv_bif"
+required-features = ["cuda"]

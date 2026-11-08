@@ -1,0 +1,60 @@
+| T | experts | kernels | µs a layer | build | max rel err vs reference |
+|---|---|---|---|---|---|
+  T=1 ne=16  0 TensorId(13) (1, 256, 0): 6.4 µs
+  T=1 ne=16  1 xq         (8, 256, 0): 4.9 µs
+  T=1 ne=16  2 ex_gate_up (128, 256, 0): 8.5 µs
+  T=1 ne=16  3 ex_down    (64, 256, 0): 7.2 µs
+  T=1 ne=16  4 sh_gate_up (64, 256, 0): 6.8 µs
+  T=1 ne=16  5 sh_down    (32, 256, 0): 6.8 µs
+  T=1 ne=16  6 y          (8, 256, 0): 5.3 µs
+  T=1 ne=16  7 resid      (8, 256, 0): 4.6 µs
+  T=1 ne=16  8 norm_ss    (1, 1024, 0): 5.6 µs
+  T=1 ne=16  9 norm       (8, 256, 0): 4.9 µs
+  T=1 ne=16 10 xq_out     (8, 256, 0): 4.8 µs
+| 1 | 16 | 11 | 34.7 | 0.6 s | 2.51e-7 |
+  T=1 ne=512  0 TensorId(13) (1, 256, 0): 13.2 µs
+  T=1 ne=512  1 xq         (8, 256, 0): 5.1 µs
+  T=1 ne=512  2 ex_gate_up (320, 256, 0): 14.1 µs
+  T=1 ne=512  3 ex_down    (160, 256, 0): 8.7 µs
+  T=1 ne=512  4 sh_gate_up (64, 256, 0): 6.9 µs
+  T=1 ne=512  5 sh_down    (32, 256, 0): 7.1 µs
+  T=1 ne=512  6 y          (8, 256, 0): 5.7 µs
+  T=1 ne=512  7 resid      (8, 256, 0): 4.8 µs
+  T=1 ne=512  8 norm_ss    (1, 1024, 0): 5.7 µs
+  T=1 ne=512  9 norm       (8, 256, 0): 5.1 µs
+  T=1 ne=512 10 xq_out     (8, 256, 0): 5.1 µs
+| 1 | 512 | 11 | 50.2 | 0.4 s | - |
+  T=8 ne=16  0 TensorId(13) (8, 256, 0): 6.6 µs
+  T=8 ne=16  1 xq         (64, 256, 0): 5.2 µs
+  T=8 ne=16  2 ex_gate_up (1024, 256, 0): 33.1 µs
+  T=8 ne=16  3 ex_silu    (64, 256, 0): 5.4 µs
+  T=8 ne=16  4 ex_down    (512, 256, 0): 11.6 µs
+  T=8 ne=16  5 sh_gate    (32, 256, 0): 14.6 µs
+  T=8 ne=16  6 sh_up      (32, 256, 0): 15.0 µs
+  T=8 ne=16  7 sh_silu    (16, 256, 0): 5.3 µs
+  T=8 ne=16  8 sh_down    (32, 256, 0): 11.4 µs
+  T=8 ne=16  9 y          (64, 256, 0): 5.5 µs
+  T=8 ne=16 10 resid      (64, 256, 0): 4.7 µs
+  T=8 ne=16 11 norm_ss    (8, 1024, 0): 5.9 µs
+  T=8 ne=16 12 norm       (64, 256, 0): 5.2 µs
+  T=8 ne=16 13 xq_out     (64, 256, 0): 5.0 µs
+| 8 | 16 | 14 | 96.7 | 0.8 s | 2.43e-7 |
+  T=8 ne=512  0 TensorId(13) (8, 256, 0): 13.2 µs
+  T=8 ne=512  1 xq         (64, 256, 0): 5.0 µs
+  T=8 ne=512  2 ex_gate_up (2560, 256, 0): 62.5 µs
+  T=8 ne=512  3 ex_silu    (160, 256, 0): 5.4 µs
+  T=8 ne=512  4 ex_down    (1280, 256, 0): 25.7 µs
+  T=8 ne=512  5 sh_gate    (32, 256, 0): 14.8 µs
+  T=8 ne=512  6 sh_up      (32, 256, 0): 15.0 µs
+  T=8 ne=512  7 sh_silu    (16, 256, 0): 5.2 µs
+  T=8 ne=512  8 sh_down    (32, 256, 0): 11.1 µs
+  T=8 ne=512  9 y          (64, 256, 0): 5.8 µs
+  T=8 ne=512 10 resid      (64, 256, 0): 4.8 µs
+  T=8 ne=512 11 norm_ss    (8, 1024, 0): 5.8 µs
+  T=8 ne=512 12 norm       (64, 256, 0): 5.0 µs
+  T=8 ne=512 13 xq_out     (64, 256, 0): 5.0 µs
+| 8 | 512 | 14 | 155.0 | 0.5 s | - |
+
+thread 'main' (10514) panicked at crates/tang-compile/src/tensor_cuda.rs:2049:41:
+int8 MMA schedule on node 28: ksplit 4 must divide 8 and k / 256
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
