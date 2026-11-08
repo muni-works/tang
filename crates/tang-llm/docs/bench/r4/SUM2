@@ -1,0 +1,8 @@
+S64   teacher-forced max KL(narrow || wide) over 32 steps: 1.84e-4 (bar 2.0e-4)
+wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861951 of 4861952)
+S128   teacher-forced max KL(narrow || wide) over 32 steps: 5.86e-5 (bar 2.0e-4)
+wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861950 of 4861952)
+S512   teacher-forced max KL(narrow || wide) over 32 steps: 4.40e-4 (bar 2.0e-4)
+S1024   teacher-forced max KL(narrow || wide) over 32 steps: 2.30e-5 (bar 2.0e-4)
+wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861949 of 4861952)
+DONE

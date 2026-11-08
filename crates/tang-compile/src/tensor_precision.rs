@@ -49,12 +49,19 @@ pub enum Format {
     /// GGUF Q5_K: as [`Format::Q4K`] plus 32 bytes of fifth bits, 176 bytes
     /// a super-block.
     Q5K,
+    /// GGUF Q8_0: blocks of 32 along the last dim, 34 bytes each (f16 `d`,
+    /// 32 int8 codes). Input storage only, like [`Format::Q4K`].
+    Q8_0,
     /// int8 codes with one f32 scale a 32 along the last dim (`d = amax /
     /// 127`, codes `round(v / d)`), the scale's companion `d · Σ codes`
     /// beside it: what an integer MMA reads as its activation operand. A
     /// buffer is `[codes: n bytes][(d, d·Σc): n / 32 × 8 bytes]`. The writer
     /// quantizes; [`TensorGraph::eval_emulated`] rounds the same way.
     Q8x32,
+    /// [`Q8x32`](Format::Q8x32)'s codes then one f32 `d` a 32 (`[codes: n bytes][d: n / 32 ×
+    /// 4 bytes]`, no companion): the int8 activation layout hand-written kernels read. Written
+    /// only (no MMA reads it).
+    Q8x32F,
 }
 
 /// Softmax weights rounded to an 8-bit operand format are first scaled by
@@ -89,14 +96,17 @@ impl Format {
             Format::F16 | Format::BF16 => 2,
             Format::E4M3(_) | Format::E5M2(_) => 1,
             Format::Fp8Accum => 4,
-            Format::Q4K | Format::Q5K | Format::Q8x32 => 1,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => 1,
         }
     }
 
     /// Whether this is a block format (its rounding is per block, not per
     /// element, and its buffer is not an array of one element type).
     pub fn is_block(self) -> bool {
-        matches!(self, Format::Q4K | Format::Q5K | Format::Q8x32)
+        matches!(
+            self,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F
+        )
     }
 
     /// 32-bit words a buffer of `len` elements takes.
@@ -106,7 +116,9 @@ impl Format {
             Format::F16 | Format::BF16 => len.div_ceil(2),
             Format::Q4K => len / 256 * 36,
             Format::Q5K => len / 256 * 44,
+            Format::Q8_0 => (len / 32 * 34).div_ceil(4),
             Format::Q8x32 => len / 4 + len / 32 * 2,
+            Format::Q8x32F => len / 4 + len / 32,
             f @ (Format::E4M3(_) | Format::E5M2(_)) => f.buffer_bytes(len).div_ceil(4),
             Format::Fp8Accum => len,
         }
@@ -134,7 +146,7 @@ impl Format {
             Format::BF16 => f32::from_bits(0x7f7f_0000) as f64,
             Format::E4M3(_) => 448.0,
             Format::E5M2(_) => 57344.0,
-            Format::Q4K | Format::Q5K | Format::Q8x32 => f32::MAX as f64,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => f32::MAX as f64,
         }
     }
 
@@ -199,7 +211,7 @@ impl Format {
             Format::E5M2(_) => sat(round_to(x, 2, -14, f64::INFINITY), 57344.0),
             Format::Fp8Accum => truncate_to(x as f32 as f64, FP8_ACCUM_BITS),
             // per block: see `round_blocks`
-            Format::Q4K | Format::Q5K | Format::Q8x32 => x,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => x,
         }
     }
 }
@@ -211,7 +223,7 @@ impl Format {
     /// f32 arithmetic does it on a GPU. Q4K / Q5K inputs are taken as
     /// already representable (they are dequantized GGUF values).
     pub fn round_blocks(self, buf: &mut [f64]) {
-        if self != Format::Q8x32 {
+        if self != Format::Q8x32 && self != Format::Q8x32F {
             return;
         }
         for blk in buf.chunks_mut(32) {

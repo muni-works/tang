@@ -1,0 +1,25 @@
+coder: 8 of 48 layers in VRAM (20 s)
+coder: 16 of 48 layers in VRAM (39 s)
+coder: 24 of 48 layers in VRAM (59 s)
+coder: 32 of 48 layers in VRAM (79 s)
+coder: 40 of 48 layers in VRAM (99 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (120 s)
+coder: no derived MoE for (1, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (2, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (3, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (4, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (5, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (6, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (7, 8, 13, 14, false) (down type 14); hand kernels
+coder: no derived MoE for (8, 8, 13, 14, false) (down type 14); hand kernels
+coder: derived MoE: 8 of 16 shapes built in 8.1 s
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 98.7 GB VRAM (46.9 GB experts), weights 121 s, kernels 108 s, total 229 s
+wide kernels (2048 rows) built in 67.5 s
+coder: 127 sequence slots fit (0.18 GB each, 49.1 GB free, 4 GB headroom)
+  teacher-forced max KL(narrow || wide) over 32 steps: 9.62e-5 (bar 2.0e-4)
+prefill 3000 tokens: narrow 9.28 s (323 tok/s), wide 0.88 s cold / 0.91 s warm (3288 tok/s)
+wide-check 3000: PASS (greedy equal, KL under bar) (next token equal, 32 decoded tokens equal, logits differ in 4861952 of 4861952)
+exit 0

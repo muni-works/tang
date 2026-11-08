@@ -761,6 +761,10 @@ pub struct IntMma {
     /// Warps that split a 16-row tile's reduction (1, 2, 4 or 8), their
     /// partial sums added through shared memory.
     pub ksplit: u32,
+    /// [`Stage::Gemv`] only: consecutive positions that share one read of
+    /// the weights (each block dots its weight rows with up to this many
+    /// activation rows; 0 or 1: one). Needs an ungathered weight.
+    pub pos_tile: u32,
 }
 
 /// Activation staging for [`IntMma`].

@@ -985,7 +985,9 @@ impl Scratch {
             x: z(rows * n),
             // The dense GEMVs' own int8 staging: at most MAX_T rows a call, whatever the window.
             xq8: z((MAX_T * kmax + MAX_T * kmax / 32 * 4).div_ceil(4)),
-            mxq: z(xq_words(n)),
+            // room for the IR's Q8x32 layout too (8-byte scale pairs): `TANG_CODER_DERIVED`
+            // writes the codes that way, then the f32 scales over the pairs
+            mxq: z((rows * n + rows * n / 32 * 8).div_ceil(4)),
             mix: z(rows * n),
             y: z(rows * geo.gdn_v()),
             q: z(rows * hp.n_head * hp.head_dim),
@@ -1128,6 +1130,84 @@ impl GdnChunked {
 /// Attention partials are computed this many rows of a wide window at a time (their scratch
 /// grows with rows × context).
 const WIDE_ATTN_ROWS: usize = 32;
+
+/// `TANG_CODER_DERIVED`: which engine ops run as kernels derived from the tensor IR (off by
+/// default). `moe` (or `all`): decode windows' MoE layers (`derived_ops::moe_block`), each
+/// shape that fails to build falling back to the hand kernels on its own.
+fn derived_moe_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TANG_CODER_DERIVED")
+            .is_ok_and(|v| v.split(',').any(|o| o == "moe" || o == "all"))
+    })
+}
+
+/// Fewest window rows that take the derived MoE (`TANG_DMOE_MIN_ROWS`, default 16): below it
+/// the hand kernels are faster at decode widths. Fixed per process, so a shape's choice is the
+/// same in and out of CUDA graph capture.
+fn derived_moe_min_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TANG_DMOE_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+/// (window rows, int8 layout rows, gate|up GGUF type, down GGUF type, MoE output kept)
+type DMoeKey = (usize, usize, i32, i32, bool);
+
+/// One derived MoE shape: the layer op (which also writes the next layer's int8 input) and a
+/// `y` scratch.
+struct DMoe {
+    moe: super::derived_ops::Op,
+    y: gpu::DevBuf,
+}
+
+fn ggml_format(ty: i32) -> Option<tang_compile::tensor::Format> {
+    use tang_compile::tensor::Format;
+    match ty {
+        12 => Some(Format::Q4K),
+        13 => Some(Format::Q5K),
+        _ => None,
+    }
+}
+
+impl DMoe {
+    fn build(gpu: &Gpu, k: DMoeKey, hp: &Hparams, eps: f32) -> anyhow::Result<Self> {
+        use super::derived_ops as dop;
+        let (t, rows, gu, down, keep_y) = k;
+        let (n, ne) = (hp.n_embd, hp.n_expert);
+        let m = dop::MoeShape {
+            t,
+            n,
+            ff: hp.n_ff_exp,
+            ne,
+            k: hp.n_expert_used,
+            ls: ne + 1,
+            gu: ggml_format(gu).ok_or_else(|| anyhow!("gate|up type {gu}"))?,
+            down: ggml_format(down)
+                .filter(|_| down == 13)
+                .ok_or_else(|| anyhow!("down type {down}"))?,
+            eps_bits: (eps as f64).to_bits(),
+            keep_y,
+            rows,
+        };
+        let lower = |s: dop::Spec| s.lower().map_err(|e| anyhow!(e));
+        let moe = dop::Op::load(gpu, lower(dop::moe_block(m))?, dop::MOE_EXT.len())?;
+        Ok(DMoe {
+            moe,
+            y: gpu::DevBuf::zeroed(t * n * 4).map_err(|e| anyhow!("{e}"))?,
+        })
+    }
+}
+
+fn stream_capturing(s: &Stream) -> bool {
+    let mut st = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    unsafe { cudarc::driver::sys::cuStreamIsCapturing(s.0, &mut st) };
+    st != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+}
 
 /// `TANG_CODER_ATTN=derived` state: compiled window kernels by padded key count, and the fp16
 /// operands / output they read and write (sized for the wide window and `max_ctx` keys).
@@ -1339,6 +1419,9 @@ pub struct Coder {
     prof: Option<std::cell::RefCell<Prof>>,
     /// `TANG_CODER_ATTN=derived`: the window kernels by padded key count and their scratch.
     derived: std::cell::RefCell<DerivedAttn>,
+    /// `TANG_CODER_DERIVED=moe|all`: the decode MoE layer derived from the IR, by window
+    /// shape and weight formats (`None`: that shape failed to build; the hand kernels run it).
+    dmoe: std::cell::RefCell<HashMap<DMoeKey, Option<DMoe>>>,
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
@@ -1661,6 +1744,7 @@ impl Coder {
             last_tree: (0, 0),
             load_report,
             derived: Default::default(),
+            dmoe: Default::default(),
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
@@ -1687,6 +1771,7 @@ impl Coder {
         };
         let mut c = c;
         c.write_slot_tables();
+        c.prebuild_derived();
         Ok(c)
     }
 
@@ -4655,7 +4740,29 @@ impl Coder {
             t as i32,
         );
         let routed = t * kk;
-        if self.var.shared_par {
+        // below the cutoff (and in wide prefill windows) exactly the hand path
+        if derived_moe_on()
+            && t >= derived_moe_min_rows()
+            && !self.in_wide.get()
+            && !self.var.shared_par
+        {
+            self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
+            if self.derived_moe(wi, layer, t, next, keep_y) {
+                return;
+            }
+            // this shape fell back: the hand kernels from the routing on
+            unsafe {
+                self.launch_on(
+                    v.stream,
+                    v.k.route,
+                    (t as u32, 1, 1),
+                    32,
+                    0,
+                    tang_moe::args![lg, lsi, ids, w, scale],
+                );
+            }
+            self.experts(wi, layer, t, 0, routed + t, v.stream);
+        } else if self.var.shared_par {
             // The shared expert doesn't depend on the routing: fork it onto the side stream
             // before the router, join before the combine.
             self.fork(wi);
@@ -4698,6 +4805,120 @@ impl Coder {
                 tang_moe::args![r, parts, w, lg, lsi, ti, yo, wn, xo, mxq, eps],
             );
         }
+    }
+
+    /// `TANG_CODER_DERIVED`: build every narrow window's derived shapes now (window graphs are
+    /// captured later, and nothing builds inside a capture).
+    fn prebuild_derived(&self) {
+        if !derived_moe_on() {
+            return;
+        }
+        let t0 = Instant::now();
+        let mut tys: Vec<(i32, i32)> = self
+            .layers
+            .iter()
+            .map(|l| (l.gate.w.ty, l.down.w.ty))
+            .collect();
+        tys.sort();
+        tys.dedup();
+        let mut cache = self.dmoe.borrow_mut();
+        for t in derived_moe_min_rows().max(1)..=MAX_T {
+            for &(gu, down) in &tys {
+                let key: DMoeKey = (t, MAX_T, gu, down, false);
+                let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
+                if let Err(e) = &built {
+                    eprintln!("coder: no derived MoE for {key:?} ({e}); hand kernels");
+                }
+                cache.insert(key, built.ok());
+            }
+        }
+        let ok = cache.values().filter(|d| d.is_some()).count();
+        eprintln!(
+            "coder: derived MoE: {ok} of {} shapes built in {:.1} s",
+            cache.len(),
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    /// The derived MoE layer after the router (`TANG_CODER_DERIVED=moe`): routing, experts,
+    /// combine, residual and next norm, then the next layer's int8 activations in the hand
+    /// kernels' layout. `false` (nothing enqueued) when this shape has no derived build: the
+    /// caller runs the hand kernels.
+    fn derived_moe(&self, wi: usize, layer: &Layer, t: usize, next: &B, keep_y: bool) -> bool {
+        if t < derived_moe_min_rows() {
+            return false;
+        }
+        let tys = (layer.gate.w.ty, layer.up.w.ty, layer.down.w.ty);
+        let sh_q8 = [layer.sh_gate.w.ty, layer.sh_up.w.ty, layer.sh_down.w.ty]
+            .iter()
+            .all(|&t| t == 8);
+        if tys.0 != tys.1
+            || !sh_q8
+            || self.hp.expert_weights_scale != 1.0 && self.hp.expert_weights_scale != 0.0
+        {
+            return false;
+        }
+        let contiguous = |a: &Experts, b: &Experts, ne: usize| {
+            b.w.base == a.w.base + a.w.estride * ne as u64
+        };
+        if !contiguous(&layer.gate, &layer.up, self.hp.n_expert)
+            || !contiguous(&layer.sh_gate, &layer.sh_up, 1)
+        {
+            return false;
+        }
+        let key: DMoeKey = (t, self.tw(), tys.0, tys.2, keep_y);
+        let v = self.stage_view(wi);
+        let mut cache = self.dmoe.borrow_mut();
+        if !cache.contains_key(&key) {
+            if stream_capturing(v.stream) {
+                // never build inside a graph capture: hand kernels for this capture
+                return false;
+            }
+            let t0 = Instant::now();
+            let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
+            match &built {
+                Ok(d) => eprintln!(
+                    "coder: derived MoE {key:?}: {} kernels, built in {:.2} s",
+                    d.moe.kernels(),
+                    t0.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("coder: no derived MoE for {key:?} ({e}); hand kernels"),
+            }
+            cache.insert(key, built.ok());
+        }
+        let Some(d) = cache.get(&key).and_then(|d| d.as_ref()) else {
+            return false;
+        };
+        let s = &v.s;
+        let a = |b: &B| v.dev.buffer_addr(b);
+        let n = self.hp.n_embd;
+        let (x, r, mxq) = (a(&s.x), a(&s.r), a(&s.mxq));
+        let y = if keep_y { a(&s.moe_y) } else { d.y.ptr };
+        let ext = [
+            x,
+            a(&s.lg),
+            layer.gate.w.base,
+            layer.up.w.base,
+            layer.down.w.base,
+            layer.sh_gate.w.base,
+            layer.sh_up.w.base,
+            layer.sh_down.w.base,
+            r,
+            a(next),
+            y,
+            r,
+            x,
+            layer.gate.w.base,
+            layer.sh_gate.w.base,
+            mxq,
+        ];
+        d.moe.launch(v.stream, &ext).expect("derived MoE launch");
+        if let Some(p) = &self.prof {
+            let ev = gpu::Event::new(true).expect("event");
+            ev.record(v.stream).expect("record");
+            p.borrow_mut().marks.push(("moe_derived", ev));
+        }
+        true
     }
 
     /// Expert pairs `pbase..pbase + n` (routed pairs first, then the shared expert per token):
@@ -6845,16 +7066,24 @@ fn load_layer(
         ],
     )?;
     ensure!(router.rows == hp.n_expert + 1, "{pre} router rows");
-    let sh_gate = upload_experts(&dev, &g, &info(&t("ffn_gate_shexp.weight"))?)?;
-    let sh_up = upload_experts(&dev, &g, &info(&t("ffn_up_shexp.weight"))?)?;
+    let (sh_gate, sh_up) = upload_pair(
+        &dev,
+        &g,
+        &info(&t("ffn_gate_shexp.weight"))?,
+        &info(&t("ffn_up_shexp.weight"))?,
+    )?;
     let sh_down = upload_experts(&dev, &g, &info(&t("ffn_down_shexp.weight"))?)?;
     ensure!(
         sh_gate.w.estride as usize / sh_gate.w.row_bytes as usize == hp.n_ff_exp,
         "{pre}: the shared expert's FF must equal the routed experts' ({})",
         hp.n_ff_exp
     );
-    let gate = upload_experts(&dev, &g, &info(&t("ffn_gate_exps.weight"))?)?;
-    let up = upload_experts(&dev, &g, &info(&t("ffn_up_exps.weight"))?)?;
+    let (gate, up) = upload_pair(
+        &dev,
+        &g,
+        &info(&t("ffn_gate_exps.weight"))?,
+        &info(&t("ffn_up_exps.weight"))?,
+    )?;
     let down = upload_experts(&dev, &g, &info(&t("ffn_down_exps.weight"))?)?;
     Ok(Layer {
         attn_norm: vecf(&t("attn_norm.weight"))?,
@@ -7028,6 +7257,46 @@ fn upload_dense(
 
 /// A `[n_expert][rows][k]` expert tensor into VRAM in its GGUF type (Q8_0 when the expert
 /// kernels don't decode it).
+/// Gate and up stacks in one buffer, up right after gate (the derived MoE reads both in one
+/// launch through the gate pointer); separate buffers when either isn't a plain native stack.
+fn upload_pair(
+    dev: &CudaComputeDevice,
+    g: &Gguf,
+    a: &TensorInfo,
+    b: &TensorInfo,
+) -> Result<(Experts, Experts)> {
+    let native = |t: &TensorInfo| native_id(t.ty).filter(|&id| id != 0 && id != 30).is_some();
+    let tcx = |t: &TensorInfo| {
+        tcx_on() && matches!(t.ty, GgmlType::Q4K | GgmlType::Q5K)
+            && t.dims[1] % 16 == 0
+            && t.dims[0] % 256 == 0
+    };
+    if a.ty != b.ty || a.dims != b.dims || !native(a) || tcx(a) {
+        return Ok((upload_experts(dev, g, a)?, upload_experts(dev, g, b)?));
+    }
+    let (ba, bb) = (g.bytes(a), g.bytes(b));
+    let rb = a.row_bytes()?;
+    let mut bytes = Vec::with_capacity(ba.len() + bb.len() + 16);
+    bytes.extend_from_slice(ba);
+    bytes.extend_from_slice(bb);
+    bytes.extend_from_slice(&[0u8; 16]);
+    let w = dev.upload_bytes(&bytes);
+    let base = dev.buffer_addr(&w);
+    let rows = a.dims[1] as usize;
+    let ty = native_id(a.ty).unwrap();
+    let ex = |base: u64| ExW {
+        base,
+        estride: (rows * rb) as u64,
+        ty: ty as i32,
+        row_bytes: rb as i32,
+    };
+    let (wa, wb) = (ex(base), ex(base + ba.len() as u64));
+    Ok((
+        Experts { w: wa, _w: w, _t: None, t: wa },
+        Experts { w: wb, _w: dev.upload_bytes(&[0u8; 16]), _t: None, t: wb },
+    ))
+}
+
 fn upload_experts(dev: &CudaComputeDevice, g: &Gguf, t: &TensorInfo) -> Result<Experts> {
     ensure!(
         t.dims.len() == 3 || t.dims.len() == 2,

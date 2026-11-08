@@ -461,7 +461,7 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -1133,7 +1133,7 @@ impl TensorGraph {
                                 "tang_b2f(src[0])".to_string(),
                                 format!("tang_b2f(src[{ce}])"),
                             ),
-                            super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                            super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                                 unreachable!("block formats lower only through the int8 MMA kernel")
                             }
                             _ => unreachable!("fp8 has its own tile"),
@@ -1715,7 +1715,7 @@ impl TensorGraph {
                 super::Format::F32 => v.clone(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -2048,12 +2048,13 @@ impl TensorGraph {
                 "node {root} reads a block-format buffer without an int8 MMA schedule"
             );
             if blocky(self, root) {
+                let st = self.nodes[root].precision.storage;
                 assert!(
-                    self.nodes[root].precision.storage == super::Format::Q8x32,
-                    "only Q8x32 can be written"
+                    matches!(st, super::Format::Q8x32 | super::Format::Q8x32F),
+                    "only Q8x32 / Q8x32F can be written"
                 );
                 let src = wgsl_to_cuda(&k.source, k.workgroup_size);
-                k.source = super::cuda_int8::q8x32_writer(&src, k.points as usize)
+                k.source = super::cuda_int8::q8x32_writer(&src, k.points as usize, st == super::Format::Q8x32F)
                     .unwrap_or_else(|| panic!("node {root}: a Q8x32 store needs a one-thread-per-point kernel over a multiple of 32 points"));
                 continue;
             }
@@ -2970,7 +2971,7 @@ impl TensorGraph {
                 super::Format::F32 => format!("b{j}[{idx}]"),
                 super::Format::F16 => format!("tang_h2f(b{j}[{idx}])"),
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 // FP8 operands are staged by the tile; a stray scalar read
@@ -4328,7 +4329,7 @@ impl TensorGraph {
                 super::Format::F32 => v.to_string(),
                 super::Format::F16 => format!("tang_f2h({v})"),
                 super::Format::BF16 => format!("tang_f2b({v})"),
-                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -4379,7 +4380,7 @@ impl TensorGraph {
                     super::Format::F32 => v.clone(),
                     super::Format::F16 => format!("tang_f2h({v})"),
                     super::Format::BF16 => format!("tang_f2b({v})"),
-                    super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 => {
+                    super::Format::Q4K | super::Format::Q5K | super::Format::Q8x32 | super::Format::Q8x32F => {
                         unreachable!("block formats lower only through the int8 MMA kernel")
                     }
                     _ => unreachable!("fp8 has its own tile"),

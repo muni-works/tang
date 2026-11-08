@@ -1,0 +1,110 @@
+coder: 8 of 48 layers in VRAM (20 s)
+coder: 16 of 48 layers in VRAM (41 s)
+coder: 24 of 48 layers in VRAM (60 s)
+coder: 32 of 48 layers in VRAM (80 s)
+coder: 40 of 48 layers in VRAM (100 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (121 s)
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 122 s, kernels 106 s, total 228 s
+coder: 127 sequence slots fit (0.28 GB each, 99.9 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (256/256, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 1 (prompt 1377 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 2 (prompt 1374 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 0 of 4861952 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 0 of 4861952 entries
+batch-check: PASS (bitwise) (logits checksum 781a7e82ce74f92b)
+batch 1: prefilled to ~1380 tokens in 2.3 s
+batch 1: 7.48 ms a step, 134 tok/s aggregate, 134 tok/s a stream (context ~1380)
+profile at batch 1 (32 steps):
+  moe_down           27.53 ms  x1536    14.2%
+  moe_gu             27.48 ms  x1536    14.2%
+  gdn_in             21.05 ms  x1152    10.9%
+  route              14.90 ms  x1536     7.7%
+  moe_add_norm       14.08 ms  x1536     7.3%
+  gdn_out            13.56 ms  x1152     7.0%
+  router             12.66 ms  x1536     6.5%
+  gdn_conv_step      12.18 ms  x1152     6.3%
+  norm_q8            12.05 ms  x1568     6.2%
+  attn_part          10.21 ms  x384      5.3%
+  gdn_commit          6.11 ms  x1152     3.2%
+  attn_in             5.55 ms  x384      2.9%
+  attn_out            4.52 ms  x384      2.3%
+  attn_merge          4.31 ms  x384      2.2%
+  head                3.71 ms  x32       1.9%
+  attn_prep           2.46 ms  x384      1.3%
+  copy                0.85 ms  x128      0.4%
+  argmax              0.41 ms  x64       0.2%
+
+batch 2: prefilled to ~1380 tokens in 4.5 s
+batch 2: 8.18 ms a step, 245 tok/s aggregate, 122 tok/s a stream (context ~1380)
+profile at batch 2 (32 steps):
+  moe_down           40.24 ms  x1536    18.6%
+  moe_gu             33.84 ms  x1536    15.7%
+  gdn_in             21.71 ms  x1152    10.0%
+  route              14.94 ms  x1536     6.9%
+  moe_add_norm       14.31 ms  x1536     6.6%
+  gdn_out            14.06 ms  x1152     6.5%
+  router             13.23 ms  x1536     6.1%
+  gdn_conv_step      12.80 ms  x1152     5.9%
+  norm_q8            12.13 ms  x1568     5.6%
+  attn_part          10.41 ms  x384      4.8%
+  gdn_commit          6.13 ms  x1152     2.8%
+  attn_in             5.65 ms  x384      2.6%
+  attn_out            4.75 ms  x384      2.2%
+  attn_merge          4.39 ms  x384      2.0%
+  head                3.89 ms  x32       1.8%
+  attn_prep           2.48 ms  x384      1.1%
+  copy                0.86 ms  x128      0.4%
+  argmax              0.41 ms  x64       0.2%
+
+batch 4: prefilled to ~1380 tokens in 8.9 s
+batch 4: 9.98 ms a step, 401 tok/s aggregate, 100 tok/s a stream (context ~1380)
+profile at batch 4 (32 steps):
+  moe_down           66.63 ms  x1536    24.3%
+  moe_gu             47.17 ms  x1536    17.2%
+  gdn_in             27.62 ms  x1152    10.1%
+  gdn_out            16.84 ms  x1152     6.1%
+  gdn_conv_step      14.98 ms  x1152     5.5%
+  route              14.96 ms  x1536     5.5%
+  moe_add_norm       14.76 ms  x1536     5.4%
+  router             13.65 ms  x1536     5.0%
+  norm_q8            12.22 ms  x1568     4.5%
+  attn_part          12.01 ms  x384      4.4%
+  attn_in             7.29 ms  x384      2.7%
+  gdn_commit          6.28 ms  x1152     2.3%
+  attn_out            5.63 ms  x384      2.1%
+  head                5.60 ms  x32       2.0%
+  attn_merge          4.44 ms  x384      1.6%
+  attn_prep           2.51 ms  x384      0.9%
+  copy                0.88 ms  x128      0.3%
+  argmax              0.42 ms  x64       0.2%
+
+batch 8: prefilled to ~1380 tokens in 17.8 s
+batch 8: 13.34 ms a step, 599 tok/s aggregate, 75 tok/s a stream (context ~1380)
+profile at batch 8 (32 steps):
+  moe_down           92.33 ms  x1536    24.2%
+  moe_gu             82.58 ms  x1536    21.7%
+  gdn_in             38.85 ms  x1152    10.2%
+  gdn_out            23.71 ms  x1152     6.2%
+  gdn_conv_step      23.00 ms  x1152     6.0%
+  attn_part          21.47 ms  x384      5.6%
+  moe_add_norm       15.26 ms  x1536     4.0%
+  route              15.19 ms  x1536     4.0%
+  router             14.75 ms  x1536     3.9%
+  norm_q8            12.39 ms  x1568     3.3%
+  attn_in             9.80 ms  x384      2.6%
+  head                8.66 ms  x32       2.3%
+  attn_out            7.89 ms  x384      2.1%
+  gdn_commit          6.47 ms  x1152     1.7%
+  attn_merge          4.57 ms  x384      1.2%
+  attn_prep           2.55 ms  x384      0.7%
+  copy                0.92 ms  x128      0.2%
+  argmax              0.52 ms  x64       0.1%
+
+exit 0
