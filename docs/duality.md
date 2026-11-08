@@ -268,6 +268,119 @@ The next measurement that would separate these: ncu
 `l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss` and
 `lts__average_gcomp_input_sector_*` on a host with H100/H200 counters.
 
+## Round 3: fill/drain and the step's critical path
+
+Replace's #189 found that the H200 decode step isn't limited by steady-state
+bandwidth. Its GEMVs are small, and each pays a fill and a drain, summed
+along the dependent kernel chain.
+
+### The terms (`StepKernel::floor`, `step_floor`)
+
+Per kernel:
+
+`t ≥ launch + max(bytes/BW + latency, flops/peak, ⌈waves⌉ · latency)`
+
+* **`bytes/BW + latency`:** the first byte arrives one DRAM latency after
+  the start, then the kernel streams at peak.
+* **`⌈waves⌉ · latency`:** each wave of workgroups needs at least one
+  dependent round trip.
+* **`launch`:** the cost of an empty graph node.
+
+The step floor is the longest path through the kernel DAG, with
+independent kernels overlapping, and at least `Σ bytes / BW`. The binding
+term is named per kernel (`fill`, `stream`, `waves`, `compute`, `launch`)
+and per step (`chain` or `bandwidth`).
+
+**Calibration from first principles, not fitted to the measured times:**
+* DRAM latency: 470 ns on the 3090, 600 ns on the H200 (the H200 value is
+  assumed).
+* Bandwidth: the datasheet.
+* `launch`: the smallest kernel in #186's traces (2 µs on the 3090, 1 µs on
+  the H200 in a graph).
+* Waves: from grid, block, and registers per thread against the SM limits.
+  Waves match #189's ncu numbers on the 3090: 0.65 predicted for
+  `ex_gate_up` T=1, 0.65 measured.
+
+Script: `scripts/ncu/critical_path.py <#186's docs/bench/ncu>`. Test:
+`step_chain`.
+
+### Per kernel, predicted vs measured
+
+| kernel | 3090 meas / **pred** µs | H200 meas / **pred** µs | H200 binding | H200: 3090 µs × SM-rate (0.53) |
+|---|---|---|---|---|
+| MoE `ex_gate_up` T=1 (0.40 waves on H200) | 22.1 / **18.2** | 10.7 / **4.7** | stream | 11.8 |
+| MoE `ex_down` T=1 | 14.7 / **12.4** | 5.4 / **3.5** | stream | 7.8 |
+| shared `sh_gate_up` T=1 (0.06 waves) | 5.8 / **5.3** | 3.1 / **2.1** | fill | |
+| shared `sh_gate` T=8 | 13.3 / **3.9** | 12.3 / **1.9** | fill | |
+| MoE `ex_gate_up` T=8 | 122 / **110** | 59.4 / **22.6** | stream | 64.9 |
+| MoE `ex_down` T=8 | 92.6 / **77.7** | 23.6 / **16.3** | stream | 49.3 |
+| MoE `ex_gate_up` T=48 | 506 / **448** | 182 / **88.6** | stream | 269 |
+| MoE `ex_down` T=48 | 273 / **246** | 125 / **49.1** | stream | 145 |
+| Q8_0 GEMV 256×256 | 144 / **130** | 63.5 / **26.5** | stream | 76.7 |
+
+* **Sound everywhere:** predicted ≤ measured on every kernel, on both GPUs.
+* **3090: tight.** The big kernels come within 0.82–0.90 of measured; the
+  model explains the 3090.
+* **H200: not tight.** The big kernels predict 0.38–0.69 of measured. Fill
+  matters only for the sub-wave shared-expert GEMVs, and even those run
+  1.5–10× over their floor.
+* **The big H200 kernels sit between the floor and the SM-rate column**
+  (3090 time × the SMs × clock ratio). Their H200/3090 speedup is 2.1–3.9×,
+  against 5.1× in bandwidth and 1.9× in SM issue rate. That fits #189's
+  finding that the GGUF Q8_0 layout's instruction cost per byte caps them.
+  The missing per-kernel term is **instruction issue per byte**
+  (dequantization), which this floor does not count: the flops term has no
+  integer or shift ops in it. That term needs a count of the lowered
+  kernel's instructions per byte, which tang could emit (follow-up).
+
+### The decode step (H200, one stream: the chain is the trace order)
+
+| config | wall ms | bytes/BW | **chain floor** | predicted light | measured light | fill share of the floor |
+|---|---|---|---|---|---|---|
+| hand N=1 | 4.04 | 0.72 | **1.48** | 0.49 | 0.18 | 51% |
+| hand N=8 | 9.83 | 2.23 | **2.98** | 0.75 | 0.23 | 25% |
+| hand N=48 | 29.67 | 8.32 | **9.51** | 0.87 | 0.28 | 13% |
+| derived N=1 | 4.39 | 0.72 | **1.76** | 0.41 | 0.16 | 59% |
+| derived N=8 | 10.91 | 2.23 | **3.49** | 0.64 | 0.20 | 36% |
+| derived N=48 | 28.40 | 8.32 | **10.24** | 0.81 | 0.29 | 19% |
+
+* **Fill and launch along the chain are real:** about half of the N=1
+  floor, so the chain floor is 2× the bandwidth floor at N=1.
+* **They don't explain the step.** Measured is 2.5–3.1× above the chain
+  floor at every N. The remaining time is mostly the per-kernel issue
+  limit above, over the ~830 launches.
+
+### Levers: upper bounds on what each could gain (against the chain floor)
+
+| config | (a) shared expert beside the routed chain | (a′) any two adjacent kernels with ≤ 1 wave together run concurrently | (b) each kernel's weights already in L2 | (a′) + (b) |
+|---|---|---|---|---|
+| hand N=1 | −0% (one fused kernel) | −11% | −33% | −44% |
+| hand N=8 | −0% | −3% | −25% (to bytes/BW) | −25% |
+| hand N=48 | −0% | −3% | −13% (to bytes/BW) | −13% |
+| derived N=1 | −5% | −26% | −28% | −52% |
+| derived N=8 | −9% | −11% | −36% (to bytes/BW) | −36% |
+| derived N=48 | −3% | −7% | −19% (to bytes/BW) | −19% |
+
+Each lever, and its assumptions:
+* **(b) L2 prefetch:** each kernel streams from L2 instead of DRAM. L2 is
+  assumed at 10 TB/s and 260 ns, not measured. The step stays at least
+  bytes/BW, because DRAM still has to deliver every byte.
+* **(a′) concurrency:** greedy pairing of neighbours, which ignores data
+  dependence, so it is an upper bound on what reordering independent work
+  can buy.
+* **Scope:** the bounds are on the *floor's* time. Today they buy at most
+  that fraction of the floor's ~1.5–10 ms, not of the 4–30 ms measured;
+  the issue-limited remainder is untouched by either lever.
+
+**For Replace, by N:**
+* **N=1:** prefetch plus concurrency could take the floor from ~1.6 ms to
+  ~0.85 ms. Prefetch is worth about 3× concurrency on the hand engine and
+  about as much as it on derived. Running the shared expert beside the
+  routed experts alone is worth ≤ 9%.
+* **N ≥ 8:** the floor is already near bytes/BW, so neither lever matters
+  until the issue limit is fixed (the aligned Q8 repack in the derived
+  path, #189).
+
 ## Lean
 
 * **`Tang.Duality.weak_duality`.** For any covering HBL exponents `s` and
