@@ -1,0 +1,47 @@
+{
+ "title": "H200 gdn_scan",
+ "kernels": [
+  {
+   "kernel": "main0@64x256",
+   "launches": 406,
+   "us": 184.11053940886728,
+   "total_ms": 74.74887900000012,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "64",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@4x128",
+   "launches": 204,
+   "us": 244.79302941176485,
+   "total_ms": 49.93777800000002,
+   "mb": 0.22208,
+   "floor_us": 0.046266666666666664,
+   "light": 0.00018900320314612306,
+   "grid": "4",
+   "block": "128",
+   "cls": "latency"
+  },
+  {
+   "kernel": "main0@2x256",
+   "launches": 2,
+   "us": 17.1035,
+   "total_ms": 0.034207,
+   "mb": 0.238016,
+   "floor_us": 0.04958666666666667,
+   "light": 0.0028992116623303226,
+   "grid": "2",
+   "block": "256",
+   "cls": "latency"
+  }
+ ],
+ "kernel_ms": 124.72086400000013,
+ "span_ms": 8503.169018,
+ "idle_ms": 8378.448154000002,
+ "launches": 612,
+ "floor_mb": null,
+ "step_ms": null
+}
