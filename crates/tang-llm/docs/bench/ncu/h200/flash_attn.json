@@ -1,0 +1,107 @@
+{
+ "title": "H200 flash_attn",
+ "kernels": [
+  {
+   "kernel": "main0@8192x256",
+   "launches": 55,
+   "us": 598792.5860363634,
+   "total_ms": 32933.59223199999,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "8192",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@131072x256",
+   "launches": 2775,
+   "us": 6233.673930810873,
+   "total_ms": 17298.44515800017,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "131072",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@2048x384",
+   "launches": 1954,
+   "us": 2761.456690378711,
+   "total_ms": 5395.886373000001,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "2048",
+   "block": "384",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@4096x128",
+   "launches": 279,
+   "us": 4425.608229390682,
+   "total_ms": 1234.7446960000004,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "4096",
+   "block": "128",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@4096x256",
+   "launches": 334,
+   "us": 3363.4888203592855,
+   "total_ms": 1123.4052660000013,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "4096",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@2048x256",
+   "launches": 119,
+   "us": 6383.101588235294,
+   "total_ms": 759.589089,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "2048",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@8192x128",
+   "launches": 108,
+   "us": 3628.532527777776,
+   "total_ms": 391.88151299999987,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "8192",
+   "block": "128",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@1024x256",
+   "launches": 1088,
+   "us": 180.95077297794154,
+   "total_ms": 196.8744410000004,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "1024",
+   "block": "256",
+   "cls": "?"
+  }
+ ],
+ "kernel_ms": 59334.41876800016,
+ "span_ms": 156342.24018400002,
+ "idle_ms": 97007.821416,
+ "launches": 6712,
+ "floor_mb": null,
+ "step_ms": null
+}

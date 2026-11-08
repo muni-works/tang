@@ -2058,6 +2058,13 @@ pub fn batch_check(args: &[String]) -> Result<()> {
         if !sizes.contains(&nb) {
             sizes.push(nb);
         }
+        // `TANG_BATCH_ONLY=b`: that size only. `TANG_PROFILE_STEPS=k`: after the timed steps,
+        // k more inside cuProfilerStart / Stop (ncu `--profile-from-start off` takes just those)
+        let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+        if let Some(only) = env_n("TANG_BATCH_ONLY") {
+            sizes.retain(|&b| b == only);
+        }
+        let prof_steps = env_n("TANG_PROFILE_STEPS").unwrap_or(0);
         for b in sizes {
             let slots: Vec<usize> = (0..b).map(|_| e.alloc_slot()).collect::<Result<_>>()?;
             let mut next: Vec<u32> = Vec::new();
@@ -2091,6 +2098,11 @@ pub fn batch_check(args: &[String]) -> Result<()> {
             let t0 = std::time::Instant::now();
             run(&mut e, &mut next, steps)?;
             let dt = t0.elapsed().as_secs_f64();
+            if prof_steps > 0 {
+                unsafe { cudarc::driver::sys::cuProfilerStart() };
+                run(&mut e, &mut next, prof_steps)?;
+                unsafe { cudarc::driver::sys::cuProfilerStop() };
+            }
             let agg = (b * steps) as f64 / dt;
             println!(
                 "batch {b}: {:.2} ms a step, {agg:.0} tok/s aggregate, {:.0} tok/s a stream (context ~{ctx_at})",

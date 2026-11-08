@@ -165,11 +165,20 @@ mod gpu_impl {
         pub fn load(gpu: &Gpu, l: Lowered, n_ext: usize) -> anyhow::Result<Self> {
             use anyhow::anyhow;
             let mut ks = Vec::new();
-            for k in l.kernels {
-                let m = gpu.module(&k.source).map_err(|e| anyhow!("{e}"))?;
-                let f = m
-                    .func(tang_compile::tensor::cuda::CUDA_ENTRY)
-                    .map_err(|e| anyhow!("{e}"))?;
+            for (i, k) in l.kernels.into_iter().enumerate() {
+                // entry named after the kernel's node (`tag`), so profilers (ncu, nsys) show
+                // `dop_ex_gate_up` rather than a row of `main0`s
+                let entry: String = format!("dop{i:02}_{}", k.name)
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let src = k.source.replacen(
+                    &format!("{}(", tang_compile::tensor::cuda::CUDA_ENTRY),
+                    &format!("{entry}("),
+                    1,
+                );
+                let m = gpu.module(&src).map_err(|e| anyhow!("{e}"))?;
+                let f = m.func(&entry).map_err(|e| anyhow!("{e}"))?;
                 if k.smem > 48 * 1024 {
                     unsafe {
                         gpu::check(
@@ -281,6 +290,9 @@ pub fn add_norm(t: usize, n: usize, eps: f64, add: bool) -> Spec {
     }
     ext.push(x);
     outs.push(x);
+    for &o in &outs {
+        tag(o, "add_norm");
+    }
     Spec {
         g,
         ext,
@@ -406,6 +418,9 @@ pub fn moe_combine_norm(t: usize, n: usize, topk: usize, ne: usize, ls: usize, e
         .unwrap();
     let ro = g.map(&[r, y], |x| x[0] + x[1]).unwrap();
     let x = rmsnorm(&mut g, ro, w, t, n, eps);
+    for o in [y, ro, x] {
+        tag(o, "combine_norm");
+    }
     Spec {
         g,
         ext: vec![r, parts, wts, lg, w, y, ro, x],
@@ -430,6 +445,7 @@ pub fn argmax(t: usize, v: usize) -> Spec {
         )
         .unwrap();
     g.set_schedule(am, 256, (0, 0, 0), (1, 1));
+    tag(am, "argmax");
     Spec {
         g,
         ext: vec![l, am],
@@ -491,6 +507,8 @@ pub fn route(t: usize, ne: usize, ls: usize, k: usize) -> Spec {
             vec![acc / norm]
         })
         .unwrap();
+    tag(top, "route_topk");
+    tag(wts, "route_wts");
     Spec {
         g,
         ext: vec![lg, top, wts],
@@ -544,6 +562,7 @@ pub fn gemv_q8_0(t: usize, rows: usize, k: usize) -> Spec {
         }),
     );
     g.set_inline(xq, t == 1);
+    tag(out, "gemv_q8_0");
     Spec {
         g,
         ext: vec![x, w, out],
