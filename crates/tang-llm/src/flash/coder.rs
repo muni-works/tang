@@ -1146,9 +1146,14 @@ const WIDE_ATTN_ROWS: usize = 32;
 /// 0 / unset: the K-split kernels).
 fn q8xw_rows() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| match std::env::var("TANG_CODER_Q8XW").ok().and_then(|v| v.parse().ok()) {
-        Some(r @ (1 | 2 | 4)) => r,
-        _ => 0,
+    *V.get_or_init(|| {
+        match std::env::var("TANG_CODER_Q8XW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(r @ (1 | 2 | 4)) => r,
+            _ => 0,
+        }
     })
 }
 
@@ -3810,7 +3815,11 @@ impl Coder {
         let q8xw = q8xw_rows();
         if q8xw > 0 && w.q8x_ok && w.rest.is_none() && w.k.is_multiple_of(512) && w.k <= 4096 {
             let f = v.nk.gemvq8w[q8xw.trailing_zeros() as usize][t - 1];
-            let launch = if env_is("TANG_CODER_PDL", "1") { gpu::launch_pdl } else { gpu::launch };
+            let launch = if env_is("TANG_CODER_PDL", "1") {
+                gpu::launch_pdl
+            } else {
+                gpu::launch
+            };
             unsafe {
                 launch(
                     f,

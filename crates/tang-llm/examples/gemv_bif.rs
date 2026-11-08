@@ -110,16 +110,30 @@ impl Rng {
 }
 
 fn main() {
-    let peak: f64 = std::env::var("PEAK_GBS").ok().and_then(|v| v.parse().ok()).unwrap_or(4800.0);
-    let rows_list: Vec<usize> = std::env::args().skip(1).map(|a| a.parse().unwrap()).collect();
-    let rows_list = if rows_list.is_empty() { vec![4096, 20480, 151936] } else { rows_list };
+    let peak: f64 = std::env::var("PEAK_GBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4800.0);
+    let rows_list: Vec<usize> = std::env::args()
+        .skip(1)
+        .map(|a| a.parse().unwrap())
+        .collect();
+    let rows_list = if rows_list.is_empty() {
+        vec![4096, 20480, 151936]
+    } else {
+        rows_list
+    };
     let gpu = Gpu::new().expect("cuda");
     let s = Stream::new().unwrap();
     let m = gpu.module(SRC).expect("nvrtc");
     let sms = 132u32.max(1);
     let line = |name: &str, bytes: f64, us: f64| {
         let gbs = bytes / us / 1e3;
-        println!("| {name} | {:.1} | {us:.1} | {gbs:.0} | {:.2} |", bytes / 1e6, gbs / peak);
+        println!(
+            "| {name} | {:.1} | {us:.1} | {gbs:.0} | {:.2} |",
+            bytes / 1e6,
+            gbs / peak
+        );
     };
     println!("| kernel | MB | µs | GB/s | fraction of {peak:.0} GB/s |");
     println!("|---|---|---|---|---|");
@@ -128,29 +142,49 @@ fn main() {
     let n16: usize = (512usize << 20) / 16;
     let buf = DevBuf::zeroed(n16 * 16).unwrap();
     let sink = DevBuf::zeroed(16).unwrap();
-    for (name, blocks) in [("stream_u1", sms * 8), ("stream_u4", sms * 8), ("stream_u4", sms * 16)] {
+    for (name, blocks) in [
+        ("stream_u1", sms * 8),
+        ("stream_u4", sms * 8),
+        ("stream_u4", sms * 16),
+    ] {
         let f = m.func(name).unwrap();
         let (mut p, mut n, mut o) = (buf.ptr, n16 as u64, sink.ptr);
         let us = best_us(&s, || unsafe {
-            let mut a = [&mut p as *mut u64 as *mut _, &mut n as *mut u64 as *mut _, &mut o as *mut u64 as *mut _];
+            let mut a = [
+                &mut p as *mut u64 as *mut _,
+                &mut n as *mut u64 as *mut _,
+                &mut o as *mut u64 as *mut _,
+            ];
             gpu::launch(f, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut a).unwrap();
         });
-        line(&format!("{name} ×{blocks} blocks (512 MB)"), (n16 * 16) as f64, us);
+        line(
+            &format!("{name} ×{blocks} blocks (512 MB)"),
+            (n16 * 16) as f64,
+            us,
+        );
     }
 
     // 2./3. the GEMVs, k = 2048
     let k = 2048usize;
     let mut rng = Rng(0x9e3779b97f4a7c15);
-    let xf: Vec<f32> = (0..k).map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0).collect();
+    let xf: Vec<f32> = (0..k)
+        .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
     // x as Q8x32: codes then per-32 f32 scale (the repacked kernel's operand)
     let mut xq = vec![0i8; k];
     let mut xs = vec![0f32; k / 32];
     for b in 0..k / 32 {
-        let amax = xf[32 * b..32 * b + 32].iter().fold(0f32, |a, v| a.max(v.abs()));
+        let amax = xf[32 * b..32 * b + 32]
+            .iter()
+            .fold(0f32, |a, v| a.max(v.abs()));
         let d = amax / 127.0;
         xs[b] = d;
         for i in 0..32 {
-            xq[32 * b + i] = if d == 0.0 { 0 } else { (xf[32 * b + i] / d).round() as i8 };
+            xq[32 * b + i] = if d == 0.0 {
+                0
+            } else {
+                (xf[32 * b + i] / d).round() as i8
+            };
         }
     }
     for &rows in &rows_list {
@@ -180,7 +214,11 @@ fn main() {
         );
         let ptrs = [dx.ptr, dw.ptr, dout.ptr];
         let us = best_us(&s, || op.launch(&s, &ptrs).unwrap());
-        line(&format!("derived Q8_0 GEMV {rows}×{k} ({} kernels)", op.kernels()), gg.len() as f64, us);
+        line(
+            &format!("derived Q8_0 GEMV {rows}×{k} ({} kernels)", op.kernels()),
+            gg.len() as f64,
+            us,
+        );
         let want = dout.read::<f32>(0, rows).unwrap();
         // repacked
         let (rc, rs, rx, rxs, ro) = (
@@ -194,17 +232,30 @@ fn main() {
         for (name, r) in [("gq8r1", 1usize), ("gq8r2", 2), ("gq8r4", 4)] {
             let f = m.func(name).unwrap();
             let blocks = rows.div_ceil(8 * r) as u32;
-            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (rc.ptr, rs.ptr, rx.ptr, rxs.ptr, ro.ptr, rows as i32);
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+                (rc.ptr, rs.ptr, rx.ptr, rxs.ptr, ro.ptr, rows as i32);
             let us = best_us(&s, || unsafe {
                 let mut a = [
-                    &mut a0 as *mut u64 as *mut _, &mut a1 as *mut u64 as *mut _, &mut a2 as *mut u64 as *mut _,
-                    &mut a3 as *mut u64 as *mut _, &mut a4 as *mut u64 as *mut _, &mut a5 as *mut i32 as *mut _,
+                    &mut a0 as *mut u64 as *mut _,
+                    &mut a1 as *mut u64 as *mut _,
+                    &mut a2 as *mut u64 as *mut _,
+                    &mut a3 as *mut u64 as *mut _,
+                    &mut a4 as *mut u64 as *mut _,
+                    &mut a5 as *mut i32 as *mut _,
                 ];
                 gpu::launch(f, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut a).unwrap();
             });
             let got = ro.read::<f32>(0, rows).unwrap();
-            let err = got.iter().zip(&want).map(|(g, w)| ((g - w) / w.abs().max(1e-3)).abs()).fold(0f32, f32::max);
-            line(&format!("repacked {name} {rows}×{k} (vs derived max rel {err:.1e})"), bytes, us);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| ((g - w) / w.abs().max(1e-3)).abs())
+                .fold(0f32, f32::max);
+            line(
+                &format!("repacked {name} {rows}×{k} (vs derived max rel {err:.1e})"),
+                bytes,
+                us,
+            );
         }
     }
 }
