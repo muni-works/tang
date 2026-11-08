@@ -381,6 +381,125 @@ Each lever, and its assumptions:
   until the issue limit is fixed (the aligned Q8 repack in the derived
   path, #189).
 
+## Round 4: instruction issue, prefetch charged, fusion
+
+### Instruction-issue term (`IssueCost`)
+
+`t ≥ launch + latency + issue`, where `issue = max(wavefronts, int_ops/64) / (SMs · clock)`.
+
+The counts come from the lowered source in `tensor_cuda_int8.rs`, not from a
+fit to the measured times:
+* **L1 wavefronts:** one per distinct 128-byte line a warp request touches,
+  one per SM-cycle. Only the DRAM operand's requests are counted, so the
+  term stays a floor.
+* **int32 thread-ops:** 64 per SM-cycle on both Ampere and Hopper.
+
+The two lowerings:
+* **`gemv_kernel_q8_0`:** each lane loads a 136-byte unit as 17 `uint2`
+  loads. Lanes sit 136 B apart, so every request touches 32 lines: 17·32
+  wavefronts per 32·136 B, about 8 B per SM-cycle. Integer work is ≈ 76
+  ops a unit (32 `dp4a`, 16 funnel shifts, address and select ops).
+* **Q4_K `gemv_kernel` (k = 2048):** 8 lanes × 4 rows per warp. The 8
+  weight requests of each unit touch 16 lines: 8·16 wavefronts per 32·72 B,
+  about 18 B per SM-cycle. Integer work is ≈ 116 ops a unit.
+
+| kernel | 3090 meas / pred µs (binding) | H200 meas / pred µs (binding) | H200 pred/meas, round 3 → **4** |
+|---|---|---|---|
+| Q8_0 GEMV, GGUF blocks, 119 MB | 144 / 130 (stream) | 63.5 / **58.7 (issue)** | 0.42 → **0.92** |
+| MoE `ex_gate_up` T=1, Q4_K lanes | 22.1 / 18.2 | 10.7 / 4.7 (issue ≈ stream) | 0.44 → 0.44 |
+| MoE `ex_down` T=1 | 14.7 / 12.4 | 5.4 / 3.6 | 0.66 → 0.67 |
+| MoE `ex_gate_up` T=8 | 122 / 110 | 59.4 / 23.0 | 0.38 → 0.39 |
+| MoE `ex_down` T=8 | 92.6 / 77.7 | 23.6 / 16.6 | 0.69 → 0.70 |
+| MoE T=48 (int-MMA, shared-staged: issue not counted) | 506 / 448; 273 / 246 | 182 / 88.6; 125 / 49.1 | 0.49, 0.39 |
+
+**Does it close the gap while staying sound?** Partly. It stays sound:
+predicted ≤ measured on every kernel on both GPUs.
+* **Q8_0 GEMV: closed.** On the H200 the L1-wavefront term binds at about
+  8 B per SM-cycle ≈ 2.1 TB/s, 0.92 of measured. On the 3090 the same
+  wavefront rate is 1.11 TB/s, above its 936 GB/s, so the 3090 stays
+  bandwidth-bound, as measured. This is #189's layout finding derived from
+  the lowering, and it also says why the aligned repack (4 lines per
+  request) reaches 0.89.
+* **Q4_K MoE GEMVs: not closed.** Their requests touch half as many lines
+  per byte, so the wavefront term sits at about the bandwidth term and
+  they stay at 0.39–0.70.
+  * Counting the activation requests as well (24 more per unit) would bind
+    them, but for the Q8_0 GEMV that count already exceeds the measured
+    time (77 µs > 63.5). So the one-line-per-cycle rule is too coarse to
+    add them soundly.
+  * Measuring `l1tex__data_pipe_lsu_wavefronts` on an H100/H200 with
+    counters would settle it.
+* **T=48 int-MMA kernels:** not modeled (shared-memory staged; the issue
+  count of its MMA loop isn't done).
+
+### L2 prefetch, charged to the prefetcher
+
+The prefetching kernel now streams the next matrix's bytes as well: its
+stream term grows by `B_next/BW`. The next kernel fills from L2.
+
+| config | chain floor | every dense GEMV prefetches the next | only where it pays |
+|---|---|---|---|
+| hand N=1 / 8 / 48 | 1.48 / 2.98 / 9.51 ms | **+28% / +15% / +4%** | −1% / −0% / −0% |
+| derived N=1 / 8 / 48 | 1.76 / 3.49 / 10.24 ms | **+23% / +13% / +4%** | −1% / −0% / −0% |
+
+* **The bound now matches Replace's net-negative result (#191).** A dense
+  GEMV's matrix (2–15 MB) costs its prefetcher 0.4–3 µs of streaming, more
+  than the next kernel saves (one fill latency plus the DRAM–L2 bandwidth
+  difference).
+* **Prefetch only pays off off the critical path:** issued from a kernel
+  with slack (compute-bound attention) or on a side branch. Even selected
+  pair by pair it is worth ≤ 1% of the floor.
+* The round-3 "−25 to −36%" figure was wrong: it never charged the
+  prefetcher.
+
+### Fusion of block-local chains (upper bound per fusion)
+
+Adjacent kernel pairs in the trace whose dependence can be block-local
+(`FUSE` in `critical_path.py`), from the H200 N=1 traces:
+
+| pair | per step |
+|---|---|
+| `cx_norm_q8 → cx_gemvk2_t1` (norm+quantize → dense GEMV prologue) | 49 |
+| `cx_moe_add_norm → cx_gemvk2_t1` (hand) / `dop09_xq_out → cx_gemvk2_t1` (derived) | 48 / 47 |
+| `cx_moe_gu_d2 → cx_moe_down_d2f` (hand) / `ex_gate_up → ex_down` (derived) | 48 / 47 |
+| `dop01_xq → ex_gate_up` (derived) | 47 |
+| `sh_gate_up → sh_down` (derived) | 47 |
+
+Each fused pair removes one dependent kernel's `τ`. The table gives two
+values of `τ`:
+* **floor τ** = launch + latency = 1.6 µs;
+* **measured τ** = 6.9 µs (#191's cold-GEMV fit, which includes launch).
+
+| config | fusable / kernels | saving at floor τ | saving at measured τ |
+|---|---|---|---|
+| hand N=1 | 145 / 548 | −0.23 ms (16% of floor) | −1.00 ms (**25% of wall**) |
+| hand N=8 | 145 / 548 | −0.23 ms | −1.00 ms (10%) |
+| hand N=48 | 193 / 858 | −0.31 ms | −1.33 ms (4%) |
+| derived N=1 | 239 / 830 | −0.38 ms (22% of floor) | −1.65 ms (**38% of wall**) |
+| derived N=8 | 380 / 971 | −0.61 ms | −2.62 ms (24%) |
+| derived N=48 | 334 / 1469 | −0.53 ms | −2.30 ms (8%) |
+
+**For Replace, per fusion at N=1 (measured τ):**
+* norm → GEMV prologue (≈ 96 pairs): −0.66 ms;
+* gate|up → down per expert (47–48): −0.33 ms;
+* the derived path's quantize → gate|up and shared gate|up → down (47 each):
+  −0.32 ms each.
+
+Fusion is the only lever here that grows as N shrinks, which matches #191.
+
+Caveats:
+* **norm → GEMV is block-local** because every block recomputes the norm
+  of one hidden vector: 2048 values, cheap. The derived path already does
+  this (`GemvShape::fused`).
+* **gate|up → down per expert is block-local only if one block (or a
+  cluster) holds an expert's whole intermediate row** (512 values). Today
+  32 CTAs share an expert. Fusing means those CTAs each recompute the
+  others' slices, or a cluster with distributed shared memory. That cost is
+  not in the bound.
+* **The savings are upper bounds.** The fused kernel keeps all its bytes,
+  so only `τ` goes away. The real saving is smaller by whatever the fusion
+  adds (recomputed norms, lower occupancy).
+
 ## Lean
 
 * **`Tang.Duality.weak_duality`.** For any covering HBL exponents `s` and

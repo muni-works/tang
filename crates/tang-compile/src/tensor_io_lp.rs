@@ -290,6 +290,8 @@ pub struct Machine {
     /// Unloaded DRAM latency, s (Little's law: bytes in flight needed to
     /// sustain `dram_bw` is `dram_bw × mem_latency`).
     pub mem_latency: f64,
+    /// SM clock, Hz (boost).
+    pub clock: f64,
 }
 
 impl Machine {
@@ -307,6 +309,7 @@ impl Machine {
         threads_per_sm: 1536,
         regs_per_sm: 65536,
         mem_latency: 470e-9,
+        clock: 1.695e9,
     };
     /// H200 SXM: 4.8 TB/s HBM3e, 132 SMs × 2048 threads × 64K registers,
     /// ~600 ns DRAM latency (assumed), ~1 µs smallest kernel inside a CUDA
@@ -322,6 +325,7 @@ impl Machine {
         threads_per_sm: 2048,
         regs_per_sm: 65536,
         mem_latency: 600e-9,
+        clock: 1.98e9,
     };
     /// Apple M4 (10-core GPU): 32 KB threadgroup, 120 GB/s, ~4.3 TFLOP/s
     /// f32, ~10 µs per dispatch through wgpu.
@@ -336,6 +340,7 @@ impl Machine {
         threads_per_sm: 1024,
         regs_per_sm: 65536,
         mem_latency: 400e-9,
+        clock: 1.5e9,
     };
 
     /// Bytes that must be in flight to sustain peak bandwidth.
@@ -426,6 +431,54 @@ pub struct StepKernel {
     pub grid: usize,
     pub block: usize,
     pub regs: usize,
+    /// Issue cost of the lowered kernel (zero = not counted).
+    pub issue: IssueCost,
+}
+
+/// Per-kernel instruction-issue cost, counted from the lowered source:
+/// L1 wavefronts (one per distinct 128-byte line a warp request touches,
+/// one wavefront per SM-cycle) and 32-bit integer thread-ops (64 per
+/// SM-cycle on Ampere and Hopper). Only requests for the DRAM operand are
+/// counted, so the term is a floor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IssueCost {
+    pub wavefronts: f64,
+    pub int_ops: f64,
+}
+
+impl IssueCost {
+    /// Seconds: the slower pipe, all SMs busy.
+    pub fn seconds(&self, m: &Machine) -> f64 {
+        let sm_cycles = self.wavefronts.max(self.int_ops / 64.0);
+        sm_cycles / (m.sms as f64 * m.clock)
+    }
+
+    /// `gemv_kernel_q8_0` (GGUF Q8_0, `tensor_cuda_int8.rs`): a lane takes
+    /// a 136-byte unit (four 34-byte blocks) as 17 `uint2` loads; lanes
+    /// (and the warp's rows) sit 136 bytes apart, so every warp load
+    /// touches 32 lines: 17·32 wavefronts per 32·136 weight bytes. Integer
+    /// work per unit per lane: 32 `dp4a`, 16 funnel shifts, ~28 address /
+    /// select ops ≈ 76.
+    pub fn q8_0_gemv(weight_bytes: f64) -> Self {
+        let units = weight_bytes / 136.0;
+        Self {
+            wavefronts: units / 32.0 * 17.0 * 32.0,
+            int_ops: units * 76.0,
+        }
+    }
+
+    /// `gemv_kernel` on Q4_K (k = 2048: 16 half-super-block units of 72
+    /// bytes, 8 lanes × 4 rows a warp): the 4 header and 4 code loads of a
+    /// unit touch one line per (row, super-block) pair, 16 a request: 8·16
+    /// wavefronts per 32·72 bytes. Integer work ≈ 116 a unit a lane
+    /// (2 `dp4a` + 4 mask/shift/select per code word, scale extraction).
+    pub fn q4k_gemv(weight_bytes: f64) -> Self {
+        let units = weight_bytes / 72.0;
+        Self {
+            wavefronts: units / 32.0 * 8.0 * 16.0,
+            int_ops: units * 116.0,
+        }
+    }
 }
 
 impl StepKernel {
@@ -442,7 +495,8 @@ impl StepKernel {
 
     /// Fill/drain floor of one dependent kernel:
     ///
-    /// `t ≥ launch + max(bytes/BW + latency, flops/peak, ⌈waves⌉·latency)`
+    /// `t ≥ launch + max(bytes/BW + latency, flops/peak, ⌈waves⌉·latency,
+    ///                   issue + latency)`
     ///
     /// The first byte arrives one DRAM latency after the kernel starts, so
     /// streaming at peak costs `bytes/BW + latency`; each wave of
@@ -457,8 +511,11 @@ impl StepKernel {
         let stream = self.bytes / m.dram_bw + m.mem_latency;
         let compute = self.flops / m.flops;
         let waves = self.waves(m).ceil().max(1.0) * m.mem_latency;
-        let t = stream.max(compute).max(waves);
-        let why = if t == compute {
+        let issue = self.issue.seconds(m) + m.mem_latency;
+        let t = stream.max(compute).max(waves).max(issue);
+        let why = if t == issue && issue > stream {
+            "issue"
+        } else if t == compute {
             "compute"
         } else if t == waves && waves > stream {
             "waves"
@@ -784,6 +841,7 @@ mod tests {
             grid: 64,
             block: 256,
             regs: 32,
+            issue: IssueCost::default(),
         };
         let (t, why) = g.floor(&m);
         assert_eq!(why, "fill");
@@ -808,8 +866,30 @@ mod tests {
             grid: 7680,
             block: 256,
             regs: 64,
+            issue: IssueCost::default(),
         };
         assert_eq!(big.floor(&m).1, "stream");
+    }
+
+    #[test]
+    fn issue_q8_0_gemv() {
+        // PR #186 ops_t1: the GGUF Q8_0 GEMV, 119.35 MB, 256×256, 36 regs;
+        // measured 144.2 µs (3090) and 63.5 µs (H200)
+        let k = StepKernel {
+            bytes: 119.35e6,
+            flops: 0.0,
+            grid: 256,
+            block: 256,
+            regs: 36,
+            issue: IssueCost::q8_0_gemv(119.35e6),
+        };
+        let (t3, w3) = k.floor(&Machine::RTX3090);
+        let (th, wh) = k.floor(&Machine::H200);
+        assert_eq!(w3, "stream");
+        assert_eq!(wh, "issue");
+        // sound (≤ measured) and within 15% on the H200
+        assert!(t3 <= 144.2e-6 && th <= 63.5e-6, "{t3} {th}");
+        assert!(th >= 0.85 * 63.5e-6, "{th}");
     }
 
     #[test]
