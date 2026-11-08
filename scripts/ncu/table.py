@@ -59,7 +59,7 @@ for d in launches.values():
     k["occ"] = k.get("occ", 0) + m.get("sm__warps_active.avg.pct_of_peak_sustained_active", 0)
     k["regs"] = m.get("launch__registers_per_thread", 0)
     k["waves"] = m.get("launch__waves_per_multiprocessor", 0)
-    k["lsb"] = k.get("lsb", 0) + m.get("smsp__warps_issue_stalled_long_scoreboard_per_issue_active.ratio", 0)
+    k["lsb"] = k.get("lsb", 0) + m.get("smsp__average_warp_latency_issue_stalled_long_scoreboard.ratio", 0)
 
 out = []
 for name, k in K.items():
@@ -87,10 +87,10 @@ tot = sum(r["total_ms"] for r in out)
 tot_floor = sum(r["floor_us"] * r["launches"] for r in out) / 1e3
 if a.title:
     print(f"#### {a.title}\n")
-print("| kernel | launches | µs each | total ms | share | MB each | floor µs | light | SM % | DRAM % | occ % | regs | waves | long-sb | grid×block | bound |")
+print("| kernel | launches | µs each | total ms | share | MB each | floor µs | light | SM % | DRAM % | occ % | regs | waves | long-sb cyc/warp | grid×block | bound |")
 print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 for r in out:
-    print(f"| `{r['kernel']}` | {r['launches']} | {r['us']:.1f} | {r['total_ms']:.3f} | {100*r['total_ms']/tot:.1f}% | {r['mb']:.2f} | {r['floor_us']:.1f} | {r['light']:.2f} | {r['sm_pct']:.0f} | {r['dram_pct']:.0f} | {r['occ_pct']:.0f} | {r['regs']:.0f} | {r['waves']:.2f} | {r['long_sb']:.1f} | {r['grid']}×{r['block']} | {r['cls']} |")
+    print(f"| `{r['kernel']}` | {r['launches']} | {r['us']:.1f} | {r['total_ms']:.3f} | {100*r['total_ms']/tot:.1f}% | {r['mb']:.2f} | {r['floor_us']:.1f} | {r['light']:.2f} | {r['sm_pct']:.0f} | {r['dram_pct']:.0f} | {r['occ_pct']:.0f} | {r['regs']:.0f} | {r['waves']:.2f} | {r['long_sb']:.0f} | {r['grid']}×{r['block']} | {r['cls']} |")
 by_cls = {}
 for r in out:
     by_cls[r["cls"]] = by_cls.get(r["cls"], 0) + r["total_ms"]
