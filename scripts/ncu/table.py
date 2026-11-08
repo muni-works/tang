@@ -46,7 +46,10 @@ def short(n):
 K = OrderedDict()
 for d in launches.values():
     m = d["m"]
-    k = K.setdefault(short(d["name"]), {"n": 0, "t": 0.0, "rd": 0.0, "wr": 0.0, "sm": 0.0, "dr": 0.0, "grid": m.get("launch__grid_size", 0), "block": m.get("launch__block_size", 0)})
+    key = short(d["name"])
+    if key.startswith("main"):  # the IR runtime's kernels share an entry name: split by shape
+        key = f"{key}@{int(m.get('launch__grid_size', 0))}x{int(m.get('launch__block_size', 0))}"
+    k = K.setdefault(key, {"n": 0, "t": 0.0, "rd": 0.0, "wr": 0.0, "sm": 0.0, "dr": 0.0, "grid": m.get("launch__grid_size", 0), "block": m.get("launch__block_size", 0)})
     k["n"] += 1
     k["t"] += m.get("gpu__time_duration.sum", 0) * 1e-9
     k["rd"] += m.get("dram__bytes_read.sum", 0)

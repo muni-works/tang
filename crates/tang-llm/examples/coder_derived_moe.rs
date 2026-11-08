@@ -358,7 +358,9 @@ fn main() {
             keep_y: true,
             rows: t,
         };
-        run(&gpu, &s, base, true);
+        if std::env::var_os("ONCE").is_none() {
+            run(&gpu, &s, base, true);
+        }
         run(
             &gpu,
             &s,
