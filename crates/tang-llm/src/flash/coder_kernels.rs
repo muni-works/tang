@@ -506,12 +506,28 @@ __device__ __forceinline__ void cx_async_wait() {
 // Grid (2 FF / (8 R), T · (K + 1)), block 256, dynamic smem 8 R × r16 × 16 bytes.
 template <int R, bool STAGE = true>
 __device__ __forceinline__ void moe_gu_body(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
-                                            const unsigned char* xq, float* out, int T, int r16, int fast, int pbase) {
+                                            const unsigned char* xq, float* out, int T, int r16, int fast, int pbase,
+                                            const float* lg = nullptr, int ls = 0, float* wts = nullptr, float scale = 0.f) {
     extern __shared__ uint4 dsm[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, p = pbase + blockIdx.y;
     const bool shared = p >= T * CX_TOPK;
     const int t = shared ? p - T * CX_TOPK : p / CX_TOPK;
-    const unsigned e = shared ? 0u : ids[p];
+    unsigned e;
+    if (lg != nullptr && !shared) {
+        // TANG_CODER_FUSE=route: the token's top-k here (cx_route's arithmetic), the first
+        // row block of each pair writing ids / weights for the down and combine kernels
+        __shared__ unsigned s_ids[CX_TOPK];
+        __shared__ float s_w[CX_TOPK];
+        if (warp == 0) route_core(lg, ls, t, s_ids, s_w, scale);
+        __syncthreads();
+        e = s_ids[p % CX_TOPK];
+        if (blockIdx.x == 0 && p % CX_TOPK == 0 && threadIdx.x < CX_TOPK) {
+            ((unsigned*)ids)[t * CX_TOPK + threadIdx.x] = s_ids[threadIdx.x];
+            wts[t * CX_TOPK + threadIdx.x] = s_w[threadIdx.x];
+        }
+    } else {
+        e = shared ? 0u : ids[p];
+    }
     const unsigned char* w[R];
     int ty[R], rr[R];
     #pragma unroll
@@ -653,6 +669,16 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d2(ExW g, ExW u, ExW
                                                                int fast, int pbase) {
     moe_gu_body<2, false>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase);
 }
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d2r(ExW g, ExW u, ExW sg, ExW su, unsigned* ids,
+                                                                const unsigned char* xq, float* out, int T, int r16,
+                                                                int fast, int pbase, const float* lg, int ls, float* wts, float scale) {
+    moe_gu_body<2, false>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase, lg, ls, wts, scale);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d4r(ExW g, ExW u, ExW sg, ExW su, unsigned* ids,
+                                                                const unsigned char* xq, float* out, int T, int r16,
+                                                                int fast, int pbase, const float* lg, int ls, float* wts, float scale) {
+    moe_gu_body<4, false>(g, u, sg, su, ids, xq, out, T, r16, fast, pbase, lg, ls, wts, scale);
+}
 extern "C" __global__ void __launch_bounds__(256) cx_moe_gu_d4(ExW g, ExW u, ExW sg, ExW su, const unsigned* ids,
                                                                const unsigned char* xq, float* out, int T, int r16,
                                                                int fast, int pbase) {
@@ -681,6 +707,51 @@ extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4f(ExW d, ExW sd,
                                                                   const float* gu, float* out, int T, int r16,
                                                                   int fast, int pbase) {
     moe_down_body<4, true, false>(d, sd, ids, nullptr, gu, out, T, r16, fast, pbase);
+}
+// TANG_CODER_FUSE=addnorm: the fused down kernel, then the combine + residual + next norm of
+// cx_moe_add_norm done by the last block to finish for each token (a per-token arrival counter,
+// no grid barrier). Every pair of the window (routed and shared) must be in this launch.
+template <int R>
+__device__ __forceinline__ void moe_down_addnorm(ExW d, ExW sd, const unsigned* ids, const float* gu, float* parts,
+                                                 int T, int r16, int fast, float* r, const float* wts, const float* lg,
+                                                 int ls, float* y, const float* wn, float* x, unsigned char* xq, float eps,
+                                                 int* cnt) {
+    moe_down_body<R, true, false>(d, sd, ids, nullptr, gu, parts, T, r16, fast, 0);
+    __shared__ int s_last;
+    const int p = blockIdx.y;
+    const int t = p >= T * CX_TOPK ? p - T * CX_TOPK : p / CX_TOPK;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) s_last = atomicAdd(&cnt[t], 1) == (int)gridDim.x * (CX_TOPK + 1) - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const int n = CX_HID, nv = CX_HID / (int)blockDim.x;
+    float* rt = r + (size_t)t * n;
+    const float gs = sigm_f(lg[(size_t)t * ls + CX_NE]);
+    float v[16];
+    for (int j = 0; j < nv; j++) {
+        const int i = threadIdx.x + j * blockDim.x;
+        float acc = 0.f;
+        for (int k = 0; k < CX_TOPK; k++) acc += wts[t * CX_TOPK + k] * parts[((size_t)t * CX_TOPK + k) * n + i];
+        acc += gs * parts[((size_t)T * CX_TOPK + t) * n + i];
+        if (y) y[(size_t)t * n + i] = acc;
+        const float a = rt[i] + acc;
+        rt[i] = a;
+        v[j] = a;
+    }
+    norm_q8_body(rt, v, nv, wn, x, xq, n, eps, t);
+    if (threadIdx.x == 0) cnt[t] = 0;
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d2fa(ExW d, ExW sd, const unsigned* ids, const float* gu,
+        float* parts, int T, int r16, int fast, float* r, const float* wts, const float* lg, int ls, float* y,
+        const float* wn, float* x, unsigned char* xq, float eps, int* cnt) {
+    moe_down_addnorm<2>(d, sd, ids, gu, parts, T, r16, fast, r, wts, lg, ls, y, wn, x, xq, eps, cnt);
+}
+extern "C" __global__ void __launch_bounds__(256) cx_moe_down_d4fa(ExW d, ExW sd, const unsigned* ids, const float* gu,
+        float* parts, int T, int r16, int fast, float* r, const float* wts, const float* lg, int ls, float* y,
+        const float* wn, float* x, unsigned char* xq, float eps, int* cnt) {
+    moe_down_addnorm<4>(d, sd, ids, gu, parts, T, r16, fast, r, wts, lg, ls, y, wn, x, xq, eps, cnt);
 }
 
 // Per-pair expert kernels with the rows double-buffered: each warp runs L groups of R rows,

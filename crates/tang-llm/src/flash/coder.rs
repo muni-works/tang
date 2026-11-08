@@ -604,6 +604,9 @@ struct Kern {
     moe_gu_d: [Fun; 2],
     moe_down_d: [Fun; 2],
     moe_down_df: [Fun; 2],
+    /// `TANG_CODER_FUSE`: gate|up with the routing folded in, down with the combine + norm.
+    moe_gu_dr: [Fun; 2],
+    moe_down_dfa: [Fun; 2],
     moe_gu_db: Fun,
     moe_down_db: Fun,
     moe_gu_g: Fun,
@@ -693,6 +696,8 @@ impl Kern {
             moe_gu_d: [f("cx_moe_gu_d2")?, f("cx_moe_gu_d4")?],
             moe_down_d: [f("cx_moe_down_d2")?, f("cx_moe_down_d4")?],
             moe_down_df: [f("cx_moe_down_d2f")?, f("cx_moe_down_d4f")?],
+            moe_gu_dr: [f("cx_moe_gu_d2r")?, f("cx_moe_gu_d4r")?],
+            moe_down_dfa: [f("cx_moe_down_d2fa")?, f("cx_moe_down_d4fa")?],
             moe_gu_db: f("cx_moe_gu_db")?,
             moe_down_db: f("cx_moe_down_db")?,
             moe_gu_g: f("cx_moe_gu_g")?,
@@ -824,6 +829,8 @@ impl Kern {
             moe_gu_d: [f(cm, "cx_moe_gu_d2")?, f(cm, "cx_moe_gu_d4")?],
             moe_down_d: [f(cm, "cx_moe_down_d2")?, f(cm, "cx_moe_down_d4")?],
             moe_down_df: [f(cm, "cx_moe_down_d2f")?, f(cm, "cx_moe_down_d4f")?],
+            moe_gu_dr: [f(cm, "cx_moe_gu_d2r")?, f(cm, "cx_moe_gu_d4r")?],
+            moe_down_dfa: [f(cm, "cx_moe_down_d2fa")?, f(cm, "cx_moe_down_d4fa")?],
             moe_gu_db: f(cm, "cx_moe_gu_db")?,
             moe_down_db: f(cm, "cx_moe_down_db")?,
             moe_gu_g: f(cm, "cx_moe_gu_g")?,
@@ -961,6 +968,8 @@ struct Scratch {
     /// Grouped-expert plans (`cx_moe_plan`): one for the main stream, one for the side stream.
     plan: B,
     parts: B,
+    /// Per-row arrival counters of the down kernel with the combine folded in (`TANG_CODER_FUSE=addnorm`).
+    fcnt: B,
     moe_y: B,
     head: B,
     out_ids: B,
@@ -1012,6 +1021,7 @@ impl Scratch {
             plan: z(2 * (4 + 2 * np)),
             hq: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 32 * 4).div_ceil(4)),
             parts: z(np * n),
+            fcnt: z(rows),
             xk: z((rows * n + rows * n / 256 * 4).div_ceil(4)),
             hk: z((np * hp.n_ff_exp + np * hp.n_ff_exp / 256 * 4).div_ceil(4)),
             moe_y: z(rows * n),
@@ -1155,6 +1165,15 @@ fn q8xw_rows() -> usize {
             _ => 0,
         }
     })
+}
+
+/// `TANG_CODER_FUSE` (comma list): `route` folds the top-k into the routed gate|up kernel,
+/// `addnorm` folds the combine + residual + next norm into the down kernel (last block a token).
+fn fuse_on(what: &str) -> bool {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("TANG_CODER_FUSE").unwrap_or_default())
+        .split(',')
+        .any(|o| o == what || o == "all")
 }
 
 fn derived_moe_on() -> bool {
@@ -1448,6 +1467,11 @@ pub struct Coder {
     /// `TANG_CODER_L2PF`: the last dense matrix's segment table and, per matrix, the next
     /// one's (segments, count) in call order.
     l2pf: std::cell::RefCell<(u64, HashMap<u64, (u64, i32)>)>,
+    /// `TANG_CODER_FUSE`: set by enqueue_moe for the next experts() call — route in gate|up,
+    /// and the combine's (next norm, y) for the down kernel; `fused_tail` reports it was taken.
+    fuse_route: std::cell::Cell<bool>,
+    fuse_tail: std::cell::Cell<Option<(u64, u64)>>,
+    fused_tail: std::cell::Cell<bool>,
     /// Stage sweep: enqueue only this stage's launches (`stage_sweep`).
     only: std::cell::Cell<Option<&'static str>>,
     var: Variants,
@@ -1772,6 +1796,9 @@ impl Coder {
             derived: Default::default(),
             dmoe: Default::default(),
             l2pf: Default::default(),
+            fuse_route: Default::default(),
+            fuse_tail: Default::default(),
+            fused_tail: Default::default(),
             prof: std::env::var("TANG_CODER_PROF")
                 .is_ok_and(|v| v == "1")
                 .then(|| std::cell::RefCell::new(Prof::default())),
@@ -4845,17 +4872,30 @@ impl Coder {
             self.join(wi);
         } else {
             self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
-            unsafe {
-                self.launch_on(
-                    v.stream,
-                    v.k.route,
-                    (t as u32, 1, 1),
-                    32,
-                    0,
-                    tang_moe::args![lg, lsi, ids, w, scale],
-                );
+            let direct = self.moe_direct(layer, t);
+            if direct && fuse_on("route") {
+                self.fuse_route.set(true);
+            } else {
+                unsafe {
+                    self.launch_on(
+                        v.stream,
+                        v.k.route,
+                        (t as u32, 1, 1),
+                        32,
+                        0,
+                        tang_moe::args![lg, lsi, ids, w, scale],
+                    );
+                }
+            }
+            if direct && fuse_on("addnorm") {
+                self.fuse_tail.set(Some((wn, yo)));
             }
             self.experts(wi, layer, t, 0, routed + t, v.stream);
+            self.fuse_route.set(false);
+            self.fuse_tail.set(None);
+            if self.fused_tail.replace(false) {
+                return;
+            }
         }
         let parts = v.dev.buffer_addr(&s.parts);
         unsafe {
@@ -4985,6 +5025,23 @@ impl Coder {
 
     /// Expert pairs `pbase..pbase + n` (routed pairs first, then the shared expert per token):
     /// gate|up rows, SiLU+int8, down rows, on `stream`.
+    /// Whether experts() takes the direct per-pair kernels (`cx_moe_gu_d*` / `cx_moe_down_d*f`)
+    /// for a narrow window of `t` rows: the only path `TANG_CODER_FUSE` folds into.
+    fn moe_direct(&self, layer: &Layer, t: usize) -> bool {
+        let many = self.in_wide.get() || self.in_batch.get();
+        let moe = match self.var.moe {
+            usize::MAX if t <= 4 => 2,
+            usize::MAX => 4,
+            v => v,
+        };
+        !many
+            && !self.var.grouped
+            && !(self.var.nstream && t >= 2)
+            && layer.gate.t.ty < 112
+            && (moe == 2 || moe == 4)
+            && self.var.fuse_silu
+    }
+
     fn experts(&self, wi: usize, layer: &Layer, t: usize, pbase: usize, n: usize, stream: &Stream) {
         if n == 0 {
             return;
@@ -5399,6 +5456,23 @@ impl Coder {
             ),
         };
         unsafe {
+            let di = usize::from(moe == 4);
+            if self.fuse_route.get() && (moe == 2 || moe == 4) {
+                let (lg, ls, wts, scale) = (
+                    v.dev.buffer_addr(&s.lg),
+                    (hp.n_expert + 1) as i32,
+                    v.dev.buffer_addr(&s.w),
+                    hp.expert_weights_scale,
+                );
+                self.launch_on(
+                    stream,
+                    v.k.moe_gu_dr[di],
+                    ((2 * ff / rows) as u32, np, 1),
+                    256,
+                    0,
+                    tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb, lg, ls, wts, scale],
+                );
+            } else {
             self.launch_on(
                 stream,
                 gu_f,
@@ -5407,9 +5481,31 @@ impl Coder {
                 smem_g,
                 tang_moe::args![gw, uw, sg, su, ids, mxq, egu, ti, r16g, fastk, pb],
             );
+            }
             // The direct down kernels can make SiLU(gate) * up's int8 themselves.
+            if let (Some((wn, yo)), true, 0) = (self.fuse_tail.get(), self.var.fuse_silu && (moe == 2 || moe == 4), pbase) {
+                let (r, wts, lg, ls, x, eps, cnt) = (
+                    v.dev.buffer_addr(&s.r),
+                    v.dev.buffer_addr(&s.w),
+                    v.dev.buffer_addr(&s.lg),
+                    (hp.n_expert + 1) as i32,
+                    v.dev.buffer_addr(&s.x),
+                    self.eps,
+                    v.dev.buffer_addr(&s.fcnt),
+                );
+                self.launch_on(
+                    stream,
+                    v.k.moe_down_dfa[di],
+                    ((nh / rows) as u32, np, 1),
+                    256,
+                    0,
+                    tang_moe::args![dw, sd, ids, egu, parts, ti, r16d, fastk, r, wts, lg, ls, yo, wn, x, mxq, eps, cnt],
+                );
+                self.fused_tail.set(true);
+                return;
+            }
             if self.var.fuse_silu && (moe == 2 || moe == 4) {
-                let df = v.k.moe_down_df[usize::from(moe == 4)];
+                let df = v.k.moe_down_df[di];
                 self.launch_on(
                     stream,
                     df,
