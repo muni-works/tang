@@ -216,6 +216,8 @@ use crate::pool::BufferPool;
 mod flash;
 mod llm;
 mod moe;
+mod rows;
+pub use rows::{RowIn, RowKernel, RowOut};
 
 /// Extended pool diagnostics.
 pub struct PoolStats {

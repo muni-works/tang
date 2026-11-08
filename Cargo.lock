@@ -6260,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "tang-compute"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "cram-codec",
@@ -6282,7 +6282,7 @@ dependencies = [
 
 [[package]]
 name = "tang-expr"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "naga",
  "tang",
