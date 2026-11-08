@@ -470,17 +470,17 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
     const int ks = warp % {ksplit}, r0 = (rb * {tiles_per_block} + warp / {ksplit}) * 16;
     if (pos >= {npos}) return;
-    long long key0;
+    long long key0, woff0;
     {{ const long long P = pos;
-{decode}      key0 = {wkey}; }}
+{decode}      key0 = {wkey}; const long long KEY = key0; woff0 = ({w_off}); }}
     if (pos % 8 != 0) {{
         const long long P = pos - 1;
-{decode}        if ({wkey} == key0) return;
+{decode}        {{ const long long KEY = {wkey}; if (({w_off}) == woff0) return; }}
     }}
     int m = 1;
     while (m < 8 - pos % 8 && pos + m < {npos}) {{
         const long long P = pos + m;
-{decode}        if ({wkey} != key0) break;
+{decode}        {{ const long long KEY = {wkey}; if (({w_off}) != woff0) break; }}
         m++;
     }}
     if (r0 >= {rows}) return;
@@ -563,18 +563,19 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
     const int ks = warp % {ksplit}, r0 = (rb * {tiles_per_block} + warp / {ksplit}) * 16;
     if (pos >= {npos}) return;
-    // the run this position starts (or exit)
-    long long key0;
+    // the run this position starts (or exit): consecutive positions reading the same weight
+    // slice (the whole offset, not only the gather key: a position dim may move it too)
+    long long key0, woff0;
     {{ const long long P = pos;
-{decode}      key0 = {wkey}; }}
+{decode}      key0 = {wkey}; const long long KEY = key0; woff0 = ({w_off}); }}
     if (pos % 8 != 0) {{
         const long long P = pos - 1;
-{decode}        if ({wkey} == key0) return;
+{decode}        {{ const long long KEY = {wkey}; if (({w_off}) == woff0) return; }}
     }}
     int m = 1;
     while (m < 8 - pos % 8 && pos + m < {npos}) {{
         const long long P = pos + m;
-{decode}        if ({wkey} != key0) break;
+{decode}        {{ const long long KEY = {wkey}; if (({w_off}) != woff0) break; }}
         m++;
     }}
     if (r0 >= {rows}) return;

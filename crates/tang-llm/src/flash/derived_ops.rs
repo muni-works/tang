@@ -885,9 +885,38 @@ pub fn moe_block(m: MoeShape) -> Spec {
             )
             .unwrap()
         };
-        let eg = tag(gx(&mut g, wg), "ex_gate");
-        let eu = tag(gx(&mut g, wu), "ex_up");
-        let h = tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu");
+        let (eg, eu, h) = if envn("TANG_DMOE_PAIR", 1) == 1 {
+            // space [half, pair, row | col]: half outermost, so a run of positions sharing an
+            // expert stays inside one half (the MMA's runs compare the whole weight offset)
+            let egu = g
+                .comp(
+                    &[2, p, ff],
+                    &[n],
+                    vec![
+                        arg(
+                            wgu,
+                            View::pick(4, &[Some(0), None, Some(2), Some(3)]).gather(1, 2, 1),
+                        ),
+                        arg(xq, View::pick(4, &[None, Some(3)]).gather(0, 3, 1)),
+                        arg(skey, View::pick(4, &[Some(1)])),
+                        arg(stok, View::pick(4, &[Some(1)])),
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let half = |c: i64| affine(2, &[(&[], c), (&[(0, 1)], 0), (&[(1, 1)], 0)]);
+            let h = g
+                .comp(&[p, ff], &[], vec![arg(egu, half(0)), arg(egu, half(1))], None, |v| {
+                    vec![silu(v)]
+                })
+                .unwrap();
+            (tag(egu, "ex_gate_up"), egu, tag(h, "ex_silu"))
+        } else {
+            let eg = tag(gx(&mut g, wg), "ex_gate");
+            let eu = tag(gx(&mut g, wu), "ex_up");
+            (eg, eu, tag(g.map(&[eg, eu], silu).unwrap(), "ex_silu"))
+        };
         let dn = g
             .comp(
                 &[p, n],
