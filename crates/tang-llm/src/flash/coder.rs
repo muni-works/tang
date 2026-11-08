@@ -4858,9 +4858,8 @@ impl Coder {
         {
             return false;
         }
-        let contiguous = |a: &Experts, b: &Experts, ne: usize| {
-            b.w.base == a.w.base + a.w.estride * ne as u64
-        };
+        let contiguous =
+            |a: &Experts, b: &Experts, ne: usize| b.w.base == a.w.base + a.w.estride * ne as u64;
         if !contiguous(&layer.gate, &layer.up, self.hp.n_expert)
             || !contiguous(&layer.sh_gate, &layer.sh_up, 1)
         {
@@ -7267,7 +7266,8 @@ fn upload_pair(
 ) -> Result<(Experts, Experts)> {
     let native = |t: &TensorInfo| native_id(t.ty).filter(|&id| id != 0 && id != 30).is_some();
     let tcx = |t: &TensorInfo| {
-        tcx_on() && matches!(t.ty, GgmlType::Q4K | GgmlType::Q5K)
+        tcx_on()
+            && matches!(t.ty, GgmlType::Q4K | GgmlType::Q5K)
             && t.dims[1] % 16 == 0
             && t.dims[0] % 256 == 0
     };
@@ -7292,8 +7292,18 @@ fn upload_pair(
     };
     let (wa, wb) = (ex(base), ex(base + ba.len() as u64));
     Ok((
-        Experts { w: wa, _w: w, _t: None, t: wa },
-        Experts { w: wb, _w: dev.upload_bytes(&[0u8; 16]), _t: None, t: wb },
+        Experts {
+            w: wa,
+            _w: w,
+            _t: None,
+            t: wa,
+        },
+        Experts {
+            w: wb,
+            _w: dev.upload_bytes(&[0u8; 16]),
+            _t: None,
+            t: wb,
+        },
     ))
 }
 

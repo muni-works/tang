@@ -146,7 +146,9 @@ impl Format {
             Format::BF16 => f32::from_bits(0x7f7f_0000) as f64,
             Format::E4M3(_) => 448.0,
             Format::E5M2(_) => 57344.0,
-            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => f32::MAX as f64,
+            Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+                f32::MAX as f64
+            }
         }
     }
 
