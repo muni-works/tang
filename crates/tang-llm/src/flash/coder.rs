@@ -3810,8 +3810,9 @@ impl Coder {
         let q8xw = q8xw_rows();
         if q8xw > 0 && w.q8x_ok && w.rest.is_none() && w.k.is_multiple_of(512) && w.k <= 4096 {
             let f = v.nk.gemvq8w[q8xw.trailing_zeros() as usize][t - 1];
+            let launch = if env_is("TANG_CODER_PDL", "1") { gpu::launch_pdl } else { gpu::launch };
             unsafe {
-                gpu::launch(
+                launch(
                     f,
                     (w.rows.div_ceil(8 * q8xw) as u32, 1, 1),
                     (256, 1, 1),

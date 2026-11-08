@@ -3180,6 +3180,11 @@ GEMVK_T(1) GEMVK_T(2) GEMVK_T(3) GEMVK_T(4) GEMVK_T(5) GEMVK_T(6) GEMVK_T(7) GEM
 // k <= 4096. Not bitwise the K-split kernels' order.
 template <int T, int R>
 __device__ void gemvq8w_core(const Seg* segs, int nseg, const unsigned char* xq, const float* xd, int k, float* out, int ostride) {
+#if __CUDA_ARCH__ >= 900
+    // programmatic dependent launch (TANG_CODER_PDL=1): let the next kernel start its own
+    // weight stream now; this one waits for its predecessor before reading activations
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int kl = k >> 9;                       // uint4 loads a lane a row
     int rr[R], ss[R];
@@ -3205,6 +3210,9 @@ __device__ void gemvq8w_core(const Seg* segs, int nseg, const unsigned char* xq,
         for (int j = 0; j < 8; j++)
             sw[r][j] = (wp[r] && j < kl) ? h2f(((const unsigned short*)(wp[r] + k))[(lane + 32 * j) >> 1]) : 0.f;
     }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     #pragma unroll
     for (int t = 0; t < T; t++) {
         float acc[R];

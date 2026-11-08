@@ -764,6 +764,43 @@ pub unsafe fn launch(
     launch_raw(f, grid, block, smem, s, args)
 }
 
+/// [`launch`] with programmatic dependent launch (Hopper+): the kernel may start while the
+/// previous kernel on `s` is still running, once that kernel's blocks have executed
+/// `griddepcontrol.launch_dependents` (or exited); it must execute `griddepcontrol.wait`
+/// before touching anything the previous kernel writes. Captured into CUDA graphs as a
+/// programmatic edge.
+///
+/// # Safety
+/// As [`launch`], plus the `griddepcontrol.wait` contract above.
+pub unsafe fn launch_pdl(
+    f: sys::CUfunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    smem: u32,
+    s: &Stream,
+    args: &mut [*mut c_void],
+) -> Result<()> {
+    let mut attr: sys::CUlaunchAttribute = std::mem::zeroed();
+    attr.id = sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    attr.value.programmaticStreamSerializationAllowed = 1;
+    let cfg = sys::CUlaunchConfig {
+        gridDimX: grid.0,
+        gridDimY: grid.1,
+        gridDimZ: grid.2,
+        blockDimX: block.0,
+        blockDimY: block.1,
+        blockDimZ: block.2,
+        sharedMemBytes: smem,
+        hStream: s.0,
+        attrs: &mut attr,
+        numAttrs: 1,
+    };
+    check(
+        sys::cuLaunchKernelEx(&cfg, f, args.as_mut_ptr(), std::ptr::null_mut()),
+        "cuLaunchKernelEx",
+    )
+}
+
 unsafe fn launch_raw(
     f: sys::CUfunction,
     grid: (u32, u32, u32),
