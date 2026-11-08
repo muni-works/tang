@@ -269,41 +269,117 @@ pub fn simplex(a: &[Vec<f64>], b: &[f64], c: &[f64]) -> Option<(Vec<f64>, Vec<f6
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
     pub name: &'static str,
-    /// Fast memory one workgroup can stage, words.
+    /// Fast memory one workgroup can stage (shared / threadgroup), words.
     pub mem_words: f64,
+    /// Register words one workgroup can hold as a register tile
+    /// (accumulators, online state): the schedule space's largest register
+    /// tile, `reg` ≤ 4×4 points per thread × 256 threads = 4096.
+    pub reg_words: f64,
     /// DRAM bandwidth, bytes/s.
     pub dram_bw: f64,
     /// Peak arithmetic, flop/s (f32 FMA = 2).
     pub flops: f64,
     /// Per-kernel launch + drain latency, s.
     pub launch: f64,
+    /// Streaming multiprocessors (cores).
+    pub sms: usize,
+    /// Resident threads per SM.
+    pub threads_per_sm: usize,
+    /// 32-bit registers per SM.
+    pub regs_per_sm: usize,
+    /// Unloaded DRAM latency, s (Little's law: bytes in flight needed to
+    /// sustain `dram_bw` is `dram_bw × mem_latency`).
+    pub mem_latency: f64,
 }
 
 impl Machine {
-    /// RTX 3090: 48 KB shared/block, 936 GB/s, 35.6 TFLOP/s f32, ~5 µs.
+    /// RTX 3090 (GA102): 48 KB shared/block, 936 GB/s, 35.6 TFLOP/s f32,
+    /// 82 SMs × 1536 threads × 64K registers, ~470 ns DRAM latency,
+    /// ~2 µs smallest kernel in a trace (PR #186).
     pub const RTX3090: Machine = Machine {
         name: "3090",
         mem_words: 12288.0,
+        reg_words: 4096.0,
         dram_bw: 936e9,
         flops: 35.6e12,
-        launch: 5e-6,
+        launch: 2e-6,
+        sms: 82,
+        threads_per_sm: 1536,
+        regs_per_sm: 65536,
+        mem_latency: 470e-9,
+    };
+    /// H200 SXM: 4.8 TB/s HBM3e, 132 SMs × 2048 threads × 64K registers,
+    /// ~600 ns DRAM latency (assumed), ~1 µs smallest kernel inside a CUDA
+    /// graph (PR #186).
+    pub const H200: Machine = Machine {
+        name: "h200",
+        mem_words: 57344.0,
+        reg_words: 4096.0,
+        dram_bw: 4.8e12,
+        flops: 67e12,
+        launch: 1e-6,
+        sms: 132,
+        threads_per_sm: 2048,
+        regs_per_sm: 65536,
+        mem_latency: 600e-9,
     };
     /// Apple M4 (10-core GPU): 32 KB threadgroup, 120 GB/s, ~4.3 TFLOP/s
     /// f32, ~10 µs per dispatch through wgpu.
     pub const M4: Machine = Machine {
         name: "m4",
         mem_words: 8192.0,
+        reg_words: 4096.0,
         dram_bw: 120e9,
         flops: 4.3e12,
         launch: 10e-6,
+        sms: 10,
+        threads_per_sm: 1024,
+        regs_per_sm: 65536,
+        mem_latency: 400e-9,
     };
+
+    /// Bytes that must be in flight to sustain peak bandwidth.
+    pub fn bandwidth_delay(&self) -> f64 {
+        self.dram_bw * self.mem_latency
+    }
 }
 
-/// `max(bytes / BW, flops / peak, launches × latency)`, with the binding
-/// term named.
+/// A kernel's launch shape and how many bytes each thread keeps in flight:
+/// the input to the Little's-law term.
+#[derive(Clone, Copy, Debug)]
+pub struct Occupancy {
+    /// Workgroups (CTAs).
+    pub grid: usize,
+    /// Threads per workgroup.
+    pub block: usize,
+    /// Registers per thread.
+    pub regs: usize,
+    /// Bytes one thread has outstanding at once (independent loads issued
+    /// before the first is consumed × their width).
+    pub inflight_per_thread: f64,
+}
+
+impl Occupancy {
+    /// Threads resident at once: workgroups per SM limited by threads and
+    /// registers, times SMs, capped by the grid.
+    pub fn resident_threads(&self, m: &Machine) -> usize {
+        let by_threads = m.threads_per_sm / self.block.max(1);
+        let by_regs = m.regs_per_sm / (self.regs.max(1) * self.block.max(1));
+        let per_sm = by_threads.min(by_regs).clamp(1, 32);
+        self.grid.min(m.sms * per_sm) * self.block
+    }
+    pub fn inflight_bytes(&self, m: &Machine) -> f64 {
+        self.resident_threads(m) as f64 * self.inflight_per_thread
+    }
+}
+
+/// `max(bytes / BW, bytes · latency / in-flight, flops / peak, launches ×
+/// latency)`, with the binding term named.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeFloor {
     pub memory_s: f64,
+    /// Little's law: achievable bandwidth ≤ bytes in flight / latency.
+    pub inflight_s: f64,
     pub compute_s: f64,
     pub launch_s: f64,
 }
@@ -312,21 +388,208 @@ impl TimeFloor {
     pub fn new(m: &Machine, dram_bytes: f64, flops: f64, launches: usize) -> Self {
         Self {
             memory_s: dram_bytes / m.dram_bw,
+            inflight_s: 0.0,
             compute_s: flops / m.flops,
             launch_s: launches as f64 * m.launch,
         }
     }
+    /// With the bytes-in-flight term of one kernel's launch shape.
+    pub fn with_occupancy(mut self, m: &Machine, dram_bytes: f64, occ: &Occupancy) -> Self {
+        self.inflight_s = dram_bytes * m.mem_latency / occ.inflight_bytes(m).max(1.0);
+        self
+    }
     pub fn seconds(&self) -> f64 {
-        self.memory_s.max(self.compute_s).max(self.launch_s)
+        self.memory_s
+            .max(self.inflight_s)
+            .max(self.compute_s)
+            .max(self.launch_s)
     }
     pub fn binding(&self) -> &'static str {
         let s = self.seconds();
         if s == self.memory_s {
             "memory"
+        } else if s == self.inflight_s {
+            "bytes-in-flight"
         } else if s == self.compute_s {
             "compute"
         } else {
             "launch"
+        }
+    }
+}
+
+/// A tile placed on two fast-memory levels.
+#[derive(Clone, Debug)]
+pub struct LevelTile {
+    pub tile: Vec<usize>,
+    /// Arrays (bit j = `projs[j]`) held in registers; the rest are staged
+    /// in shared memory.
+    pub in_regs: u64,
+    /// DRAM traffic, words, with the best innermost coordinate.
+    pub traffic: f64,
+}
+
+impl Lp {
+    /// Array element counts.
+    pub fn sizes(&self) -> Vec<f64> {
+        self.projs
+            .iter()
+            .map(|&p| {
+                (0..self.extents.len())
+                    .filter(|q| p & (1 << q) != 0)
+                    .map(|q| self.extents[q] as f64)
+                    .product()
+            })
+            .collect()
+    }
+
+    /// Traffic of a box tiling with the best innermost coordinate: arrays
+    /// that do not depend on it stay resident across it (loaded once per
+    /// tile of the other coordinates).
+    pub fn best_order_traffic(&self, tile: &[usize]) -> f64 {
+        self.order_traffic(tile, u64::MAX)
+    }
+
+    /// [`Lp::best_order_traffic`] with the innermost coordinate drawn from
+    /// `inner_ok` (a bitmask).
+    pub fn order_traffic(&self, tile: &[usize], inner_ok: u64) -> f64 {
+        let sizes = self.sizes();
+        let r = self.extents.len();
+        (0..r)
+            .filter(|&q| tile[q] < self.extents[q] && inner_ok & (1 << q) != 0)
+            .map(|inner| {
+                self.projs
+                    .iter()
+                    .zip(&sizes)
+                    .map(|(&p, &n)| {
+                        let resident = p & (1 << inner) == 0;
+                        n * (0..r)
+                            .filter(|q| p & (1 << q) == 0 && !(resident && *q == inner))
+                            .map(|q| self.extents[q].div_ceil(tile[q].max(1)) as f64)
+                            .product::<f64>()
+                    })
+                    .sum::<f64>()
+            })
+            .fold(self.tiled_traffic(tile, &sizes), f64::min)
+    }
+
+    /// Bound with gathered arrays. A gathered read (`W[idx[p], …]`, MoE
+    /// experts) has no fixed projection, so it is left out of the LP (as
+    /// [`TensorGraph::kernel_lp`] does); `gathered_words` is the words of
+    /// the distinct slices the index data touches (`U · slice`, with `U` the
+    /// distinct indices). Each must be loaded at least once, so
+    ///
+    /// `traffic ≥ max(bound(rest), Σ|rest| + gathered_words)`.
+    ///
+    /// Sound for that index data: the HBL argument for the remaining
+    /// arrays counts all loads (a stretch of `M` loads still holds at most
+    /// `2M` words of them), and the compulsory term counts distinct words.
+    /// For routing that picks `k` of `E` slices uniformly per point over `N`
+    /// points, `E·(1 − (1 − k/E)^N)` is the expected `U`.
+    pub fn gather_bound(&self, mem: f64, gathered_words: f64) -> Option<f64> {
+        let rest = self.bound(mem)?;
+        Some(rest.max(self.sizes().iter().sum::<f64>() + gathered_words))
+    }
+
+    /// Expected distinct slices when each of `n` points picks `k` of `e`.
+    pub fn expected_distinct(e: f64, k: f64, n: f64) -> f64 {
+        e * (1.0 - (1.0 - k / e).powf(n))
+    }
+
+    /// Multi-level dual: the box tile minimizing DRAM traffic when each
+    /// array's tile lives in registers (`regs` words per workgroup) or in
+    /// shared memory (`smem`), the footprints of each level summing to at
+    /// most its capacity; the output (the last array, by the convention of
+    /// [`matmul_lp`], [`attention_lp`] and [`TensorGraph::kernel_lp`]) is
+    /// the register-held accumulator. Exhaustive over power-of-two (and full) extents
+    /// per coordinate and over the register/shared split; atomic
+    /// coordinates are full. Ties go to the larger tile.
+    ///
+    /// The single-level dual counts every operand against one capacity;
+    /// with a register level the accumulator (matmul's `C`, attention's
+    /// online `O`) no longer competes with the streamed operands. The lower
+    /// bound stays [`Lp::bound`] at `regs + smem` — any schedule's on-chip
+    /// storage is at most that.
+    pub fn tile_levels(&self, regs: f64, smem: f64) -> Option<LevelTile> {
+        let r = self.extents.len();
+        let cands: Vec<Vec<usize>> = (0..r)
+            .map(|q| {
+                let n = self.extents[q];
+                if self.atomic & (1 << q) != 0 {
+                    return vec![n];
+                }
+                let mut v: Vec<usize> = (0..).map(|e| 1usize << e).take_while(|&t| t < n).collect();
+                v.push(n);
+                v
+            })
+            .collect();
+        let nj = self.projs.len();
+        let mut best: Option<(LevelTile, f64)> = None;
+        let mut idx = vec![0usize; r];
+        loop {
+            let tile: Vec<usize> = (0..r).map(|q| cands[q][idx[q]]).collect();
+            let foot: Vec<f64> = self
+                .projs
+                .iter()
+                .map(|&p| {
+                    (0..r)
+                        .filter(|q| p & (1 << q) != 0)
+                        .map(|q| tile[q] as f64)
+                        .product()
+                })
+                .collect();
+            // the output (last array: the accumulator / online state) is
+            // held in registers; inputs go to either level. Smallest
+            // register assignment that fits.
+            let acc = 1u64 << (nj - 1);
+            let fit = (0..1u64 << nj).filter(|m| m & acc != 0).find(|&mask| {
+                let (mut rg, mut sm) = (0.0, 0.0);
+                for (j, f) in foot.iter().enumerate() {
+                    if mask & (1 << j) != 0 {
+                        rg += f;
+                    } else {
+                        sm += f;
+                    }
+                }
+                rg <= regs && sm <= smem
+            });
+            if let Some(mask) = fit {
+                // the accumulator stays in registers across the innermost
+                // loop: that loop runs over a coordinate the output does
+                // not depend on (a reduction)
+                let traffic = self.order_traffic(&tile, !self.projs[nj - 1]);
+                let vol: f64 = tile.iter().map(|&t| t as f64).product();
+                let better = match &best {
+                    None => true,
+                    Some((b, bv)) => {
+                        traffic < b.traffic * (1.0 - 1e-12)
+                            || (traffic <= b.traffic * (1.0 + 1e-12) && vol > *bv)
+                    }
+                };
+                if better {
+                    best = Some((
+                        LevelTile {
+                            tile,
+                            in_regs: mask,
+                            traffic,
+                        },
+                        vol,
+                    ));
+                }
+            }
+            // next index
+            let mut q = 0;
+            loop {
+                if q == r {
+                    return best.map(|b| b.0);
+                }
+                idx[q] += 1;
+                if idx[q] < cands[q].len() {
+                    break;
+                }
+                idx[q] = 0;
+                q += 1;
+            }
         }
     }
 }
@@ -382,6 +645,82 @@ pub fn attention_bound(n: usize, d: usize, mem: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn levels_match_m4_autotuner() {
+        // the M4 autotuner's picks (docs/duality.md): matmul 64×64, attention
+        // 64 query rows × 32 keys; the single-level dual gave 52 and 32×…
+        let m = Machine::M4;
+        let mm = matmul_lp(4096, 4096, 4096);
+        let t = mm.tile_levels(m.reg_words, m.mem_words).unwrap();
+        assert_eq!(&t.tile[..2], &[64, 64]);
+        assert_eq!(t.in_regs, 0b100);
+        let at = attention_lp(4096, 64, true);
+        let ta = at.tile_levels(m.reg_words, m.mem_words).unwrap();
+        assert_eq!(&ta.tile[..2], &[64, 32]);
+        for (lp, lt) in [(&mm, &t), (&at, &ta)] {
+            // never below the bound at the total on-chip capacity, never
+            // above the single-level dual tile's traffic
+            let bound = lp.bound(m.reg_words + m.mem_words).unwrap();
+            assert!(lt.traffic >= bound, "{} < {bound}", lt.traffic);
+            let single = lp.best_order_traffic(&lp.tile(m.mem_words).unwrap());
+            assert!(lt.traffic <= single * 1.0001, "{} > {single}", lt.traffic);
+        }
+        // the 3090: same matmul tile, 64 keys (more shared memory)
+        let m = Machine::RTX3090;
+        assert_eq!(
+            &mm.tile_levels(m.reg_words, m.mem_words).unwrap().tile[..2],
+            &[64, 64]
+        );
+        assert_eq!(
+            &at.tile_levels(m.reg_words, m.mem_words).unwrap().tile[..2],
+            &[64, 64]
+        );
+    }
+
+    #[test]
+    fn gather_bound_moe() {
+        // MoE expert GEMV, Coder-Next-like: E = 512 experts, k = 10, hidden
+        // 2048, expert rows 2·512 (gate|up); coords (t, s, r, c): x[t,c],
+        // out[t,s,r]; the expert weight W[idx[t,s], r, c] is gathered
+        let (e, k, h, rows) = (512.0, 10.0, 2048usize, 1024usize);
+        for t in [1usize, 8, 48] {
+            let lp = Lp {
+                extents: vec![t, 10, rows, h],
+                projs: vec![0b1001, 0b0111],
+                atomic: 0,
+            };
+            let u = Lp::expected_distinct(e, k, t as f64);
+            let slice = (rows * h) as f64;
+            let b = lp.gather_bound(12288.0, u * slice).unwrap();
+            // decode: the distinct experts' weights dominate
+            assert!(b >= u * slice);
+            assert!(b <= u * slice * 1.01 + (t * h + t * 10 * rows) as f64);
+        }
+        assert!((Lp::expected_distinct(512.0, 10.0, 1.0) - 10.0).abs() < 1e-9);
+        assert!((Lp::expected_distinct(512.0, 10.0, 48.0) - 313.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn littles_law() {
+        let m = Machine::H200;
+        assert!((m.bandwidth_delay() - 2.88e6).abs() < 1e3);
+        // MoE ex_gate_up at T=1 (PR #186): 320×256, 40 regs → all resident
+        let occ = Occupancy {
+            grid: 320,
+            block: 256,
+            regs: 40,
+            inflight_per_thread: 16.0,
+        };
+        assert_eq!(occ.resident_threads(&m), 320 * 256);
+        let b = 14.68e6;
+        let f = TimeFloor::new(&m, b, 0.0, 1).with_occupancy(&m, b, &occ);
+        assert_eq!(f.binding(), "bytes-in-flight");
+        // the same kernel on the 3090 is bound by bandwidth
+        let m3 = Machine::RTX3090;
+        let f3 = TimeFloor::new(&m3, b, 0.0, 1).with_occupancy(&m3, b, &occ);
+        assert_eq!(f3.binding(), "memory");
+    }
+
     use super::*;
 
     fn close(a: f64, b: f64) -> bool {

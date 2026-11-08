@@ -130,7 +130,7 @@ flash kernel, with its `c` marked atomic. Traffic is in MB at f32.
 | affine pick view (transpose, broadcast, slice, head split `64h+2i` on separate coords) | yes | a projection |
 | **guarded** pick view (zero padding) | yes | reads ⊆ the projection; the bound stays valid (padding only lowers the footprint) |
 | multi-term form (`x[t + k]`, strided/dilated conv, polyphase) | **no** | HBL holds for general linear maps, but the LP's constraints then range over the lattice of subgroups (Christ et al. §6), which is exponential and not implemented. The array is *dropped* (`LpCoverage::non_projective`). That is sound (fewer arrays only weaken the bound) but loose: for a convolution the bound misses the input-reuse term. |
-| **gather** view (`W[sel[t,k]]`, embeddings, paged KV) | **no** | the address is data, so there is no projection. Dropped (`LpCoverage::gathered`), and the compulsory bound caps touched slices instead. The per-expert grouped-matmul bound needs a routing assumption (balanced) the LP cannot see, and a skewed routing changes its asymptotics. |
+| **gather** view (`W[sel[t,k]]`, embeddings, paged KV) | **partly** | the address is data, so there is no projection. The gathered array is dropped from the LP (`LpCoverage::gathered`), and `Lp::gather_bound` adds it back as compulsory traffic, `max(bound(rest), Σ\|rest\| + U·slice)`, with `U` the distinct slices the index data touches. That is sound for the given data. `Lp::expected_distinct` gives `E(1 − (1 − k/E)^N)` for uniform top-k routing, which is #186's analytic decode floor. The reuse term of a grouped matmul (each expert slice against its tokens) still needs the per-expert token counts, and skewed routing changes it. |
 | nested contraction consumed nonlinearly | yes, as *atomic* | the atomic/spill choice is the min of two LPs. `attention_bound` does both; `kernel_lp` from the IR builds the atomic model only. |
 | causal / sliding masks (`select` on `iota`) | partly | the LP counts the full box. The bound is valid for tang's CDAG, which evaluates masked scores, but a mask-skipping schedule is a different CDAG and could halve it. |
 | scans (`Op::Scan`), operators | no | not comprehensions; compulsory traffic only |
@@ -142,11 +142,131 @@ flash kernel, with its `c` marked atomic. Traffic is in MB at f32.
   achieves. That is the Θ-constant Saha & Ye leave unstated.
 * The time floor uses peak rates and a fixed launch latency. The M4
   figures (120 GB/s, 4.3 TFLOP/s, 10 µs) are nominal, not measured.
-* Registers are not a level in the LP. A tile the dual allows may not fit
-  the register file, and a tile tang keeps in registers (matmul's C) is
-  charged to shared memory.
-* One level only (shared memory ↔ DRAM). L2 and the register file are the
-  same LP at other `M`s, but nothing composes the levels yet.
+* Registers are a level for the *tile* (`Lp::tile_levels`, below), but
+  the *bound* uses one level at `regs + smem` words. That is sound and
+  loses nothing at this scale. L2 is not modeled.
+
+## Round 2: registers, bytes in flight, H200
+
+### Two-level dual tile (`Lp::tile_levels`)
+
+The single-level dual charges every operand to shared memory. tang (and any
+GPU GEMM) keeps the accumulator in registers. The two-level dual puts the
+output array (matmul's `C`, attention's online `O`) in registers
+(`Machine::reg_words` per workgroup) and the inputs in shared memory
+(`mem_words`). The footprints on each level must sum to at most its
+capacity, and the innermost loop must run over a coordinate the output does
+not depend on (the accumulator stays resident). The search is exhaustive
+over power-of-two tiles and register/shared splits. The bound stays
+single-level at `regs + smem` (sound, since on-chip storage is at most that).
+
+`reg_words = 4096` is the schedule space's largest register tile (`reg` up
+to 4×4 points × 256 threads). It is not the hardware register file.
+
+| kernel (from the IR, `io_dual`) | single-level dual | **two-level dual** | M4 autotuner | traffic |
+|---|---|---|---|---|
+| matmul 4096³, M4 | 52×52 | **64×64**, C in registers | 64×64 | 8657 MB, the same as tang's |
+| matmul 4096³, 3090 | 64×64 | **64×64** | (schedule_auto 64×64) | |
+| attention fwd N=4096 d=64, M4 | 32 rows × 32 keys | **64 rows × 32 keys**, O in registers, Q/K/V in shared | **64×32** | 1090 MB vs 2164 MB, half, as the autotuner measured |
+| attention fwd N=4096 d=64, 3090 | 48 rows | 128 rows × 32 keys, value columns split in two | not tuned | 830 MB vs 1460 MB |
+
+So the register level **explains both M4 autotuner picks**. The "half the
+dual's traffic" gap from round 1 is the online state moving out of shared
+memory. Caveats:
+* The match depends on `reg_words`. At 8192 words the matmul tile would
+  be 128×64, which tang's space can't express.
+* On the 3090 the IR LP leaves the value-column coordinate free and
+  prefers splitting it (128×32, recomputing `QKᵀ` per half). The hand LP
+  (`attention_lp`, `e` atomic) gives 64×64. Which one wins on hardware was
+  not measured.
+* Tests: `levels_match_m4_autotuner` (also checks bound ≤ two-level ≤
+  single-level traffic).
+
+### Bytes in flight (`Occupancy`, `TimeFloor::with_occupancy`)
+
+Little's law: sustained bandwidth ≤ bytes in flight / latency, so a kernel
+takes at least `bytes · latency / in_flight`. `in_flight` is resident
+threads (from grid, block, registers per thread and the SM limits) × the
+bytes one thread keeps outstanding. That term joins the composite floor and
+is named `bytes-in-flight` when it binds. Machine constants:
+* 3090: 82 SMs × 1536 threads, latency 470 ns, bandwidth-delay 0.44 MB.
+* H200: 132 × 2048, latency 600 ns (assumed; not measured), 2.9 MB.
+
+Launch floors are the smallest kernel in #186's traces: 2 µs on the 3090,
+1 µs on the H200 inside a CUDA graph.
+
+### Predicted vs measured: #186's kernels
+
+From `scripts/ncu/predict_floor.py <#186's docs/bench/ncu> 96 64 16`. Bytes
+are the 3090's ncu counts, and registers per thread come from the H200
+trace. Per-thread in flight `b`:
+* 96 B: the int-MMA Q4_K inner loop issues 8 + 24 + 64 B of independent
+  loads per super-block before using them.
+* 64 B: the lane GEMV's `uint4` pair plus scales.
+* 16 B: one vector load, a calibration rather than a schedule value.
+
+A ✗ marks a "floor" above the measured time (not a floor).
+
+| kernel | GPU | measured µs / light | b = 96 (schedule) | b = 64 | b = 16 (calibrated) |
+|---|---|---|---|---|---|
+| MoE `ex_gate_up` T=1 (320×256) | 3090 | 22.1 / 0.71 | 15.7 / 1.00 memory | same | same |
+| | H200 | 10.7 / **0.29** | 3.1 / 1.00 memory | 3.1 / 1.00 | 6.7 / 0.46 in-flight |
+| MoE `ex_down` T=1 (160×256) | 3090 | 14.7 / 0.68 | 10.0 / 1.00 | same | same |
+| | H200 | 5.4 / **0.36** | 1.9 / 1.00 | 2.1 / 0.91 in-flight | 8.5 / 0.23 ✗ |
+| MoE `ex_gate_up` T=8 | H200 | 59.4 / **0.35** | 21.0 / 1.00 | 21.0 / 1.00 | 22.4 / 0.94 |
+| MoE `ex_down` T=8 | H200 | 23.6 / **0.62** | 14.7 / 1.00 | 14.7 / 1.00 | 15.6 / 0.94 |
+| MoE `ex_gate_up` T=48 | 3090 | 506 / 0.88 | 446 / 1.00 | same | same |
+| | H200 | 182 / **0.48** | 87 / 1.00 | 87 / 1.00 | 116 / 0.75 in-flight |
+| MoE `ex_down` T=48 | 3090 | 273 / 0.89 | 244 / 1.00 | same | same |
+| | H200 | 125 / **0.38** | 47.5 / 1.00 | 47.5 / 1.00 | 63 / 0.75 in-flight |
+| Q8_0 GEMV 256×256 | 3090 | 144 / 0.88 | 128 / 1.00 | same | same |
+| | H200 | 63.5 / **0.39** | 24.9 / 1.00 | 24.9 / 1.00 | 68 / 0.36 ✗ |
+
+### Predicted vs measured: H200 decode step
+
+Group floors are #186's analytic bytes. A group's bytes are spread over its
+launches by thread count, and each launch's floor is summed.
+
+| config | wall ms | measured light | predicted light, b = 96 | b = 64 | b = 16 |
+|---|---|---|---|---|---|
+| hand N=1 | 4.04 | **0.18** | 0.68 | 0.65 | 0.44 |
+| hand N=8 | 9.83 | **0.23** | 0.89 | 0.88 | 0.58 |
+| hand N=48 | 29.67 | **0.28** | 0.95 | 0.94 | 0.37 |
+| derived N=1 | 4.39 | **0.16** | 0.54 | 0.51 | 0.29 |
+| derived N=8 | 10.91 | **0.20** | 0.77 | 0.75 | 0.46 |
+| derived N=48 | 28.40 | **0.29** | 0.89 | 0.88 | 0.49 |
+
+**Verdict: the new floor does not predict the H200.**
+* **The 3090 is predicted.** Every big kernel is bandwidth-bound there at
+  any `b ≥ 16`, as measured (0.7–0.9).
+* **The H200 is not, with schedule-derived `b`.** With `b = 64–96 B` and
+  unloaded latency, every big kernel has more than the 2.9 MB
+  bandwidth-delay product in flight (82k resident threads × 64 B = 5 MB).
+  Little's law then predicts light ≈ 1, against a measured 0.3–0.5.
+  #186's diagnosis ("too few bytes in flight") is not reproduced by
+  counting threads × issued loads.
+* **The class flip comes out only with `b ≈ 16 B`.** Then the 3090 stays
+  bandwidth-bound while the H200 turns in-flight-bound. That is
+  qualitatively #186's finding, but the per-kernel error is up to 2.3×,
+  and four kernels predict a time above the measured one. So `b ≈ 16 B` is
+  a fit, not a floor.
+* **The step: launches explain part of N=1, nothing explains the rest.**
+  The launch term (~550–830 launches × 1 µs) accounts for a share of the
+  N=1 gap: predicted 0.51–0.68 vs measured 0.16–0.18. At N=48 the floor
+  is within 10% of pure bandwidth, while the step runs 3.4× slower.
+
+What the model is missing:
+* **Loaded latency.** At 50% of peak, HBM latency is well above 600 ns.
+* **Effective outstanding requests.** Dependent dequant chains, the
+  per-SM miss queue and L1 MSHR limits all cut it below what the threads
+  issue. tang can't see this, and it needs per-SM counters (ncu on the
+  H200, unavailable in RunPod containers).
+* **Tails.** Gate_up T=1 is ~2.8 load rounds per thread.
+* **Bytes.** The H200 light uses the 3090's bytes; the 50 MB L2 changes them.
+
+The next measurement that would separate these: ncu
+`l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss` and
+`lts__average_gcomp_input_sector_*` on a host with H100/H200 counters.
 
 ## Lean
 
