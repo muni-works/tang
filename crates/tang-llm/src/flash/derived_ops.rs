@@ -1059,8 +1059,8 @@ pub fn moe_block(m: MoeShape) -> Spec {
         if t > 1 && (sorted || std::env::var("TANG_CODER_DMOE_MMA").is_ok_and(|v| v == "1")) {
             IntMma {
                 stage: Stage::Mma,
-                ksplit: 2,
-                pos_tile: t.min(64) as u32,
+                ksplit: envn("TANG_DMOE_SH_KSPLIT", 2) as u32,
+                pos_tile: t.min(envn("TANG_DMOE_SH_PTILE", 64)) as u32,
             }
         } else {
             IntMma {
