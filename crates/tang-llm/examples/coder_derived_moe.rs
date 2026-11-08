@@ -217,7 +217,10 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
                 op.launch(s, &bufs.ptrs).unwrap();
             }
             s.sync().unwrap();
-            println!("| {t} | {ne} | {} | once | {build:.1} s | - |", op.kernels());
+            println!(
+                "| {t} | {ne} | {} | once | {build:.1} s | - |",
+                op.kernels()
+            );
         }
         return;
     }
@@ -320,7 +323,11 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
                 e.sync().unwrap();
                 b = b.min(e.since(&a).unwrap() as f64 * 1000.0);
             }
-            eprintln!("  T={t} ne={ne} {i:2} {:<10} {:?}: {b:.1} µs", op.name(i), op.shape(i));
+            eprintln!(
+                "  T={t} ne={ne} {i:2} {:<10} {:?}: {b:.1} µs",
+                op.name(i),
+                op.shape(i)
+            );
         }
     }
     println!(

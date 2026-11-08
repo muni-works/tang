@@ -113,7 +113,12 @@ impl Spec {
             };
             let node = resolve(k.node);
             let name = TAGS
-                .with(|v| v.borrow().iter().find(|(t, _)| resolve(*t) == node).map(|x| x.1))
+                .with(|v| {
+                    v.borrow()
+                        .iter()
+                        .find(|(t, _)| resolve(*t) == node)
+                        .map(|x| x.1)
+                })
                 .map_or_else(|| format!("{node:?}"), str::to_string);
             kernels.push(LKernel {
                 source: k.source.clone(),
@@ -818,9 +823,20 @@ pub fn moe_block(m: MoeShape) -> Spec {
                     |v| vec![v[0] * v[1]],
                 )
                 .unwrap();
-            let half = |c: i64| affine(3, &[(&[(0, 1)], 0), (&[(1, 1)], 0), (&[], c), (&[(2, 1)], 0)]);
+            let half = |c: i64| {
+                affine(
+                    3,
+                    &[(&[(0, 1)], 0), (&[(1, 1)], 0), (&[], c), (&[(2, 1)], 0)],
+                )
+            };
             let h = g
-                .comp(&[t, k, ff], &[], vec![arg(egu, half(0)), arg(egu, half(1))], None, |v| vec![silu(v)])
+                .comp(
+                    &[t, k, ff],
+                    &[],
+                    vec![arg(egu, half(0)), arg(egu, half(1))],
+                    None,
+                    |v| vec![silu(v)],
+                )
                 .unwrap();
             (tag(egu, "ex_gate_up"), egu, tag(h, "ex_silu"))
         } else {
@@ -931,9 +947,13 @@ pub fn moe_block(m: MoeShape) -> Spec {
                 .unwrap();
             let half = |c: i64| affine(2, &[(&[], c), (&[(0, 1)], 0), (&[(1, 1)], 0)]);
             let h = g
-                .comp(&[p, ff], &[], vec![arg(egu, half(0)), arg(egu, half(1))], None, |v| {
-                    vec![silu(v)]
-                })
+                .comp(
+                    &[p, ff],
+                    &[],
+                    vec![arg(egu, half(0)), arg(egu, half(1))],
+                    None,
+                    |v| vec![silu(v)],
+                )
                 .unwrap();
             (tag(egu, "ex_gate_up"), egu, tag(h, "ex_silu"))
         } else {
@@ -989,7 +1009,13 @@ pub fn moe_block(m: MoeShape) -> Spec {
             .unwrap();
         let half = |c: i64| affine(2, &[(&[(0, 1)], 0), (&[], c), (&[(1, 1)], 0)]);
         let sh = g
-            .comp(&[t, ff], &[], vec![arg(sgu_out, half(0)), arg(sgu_out, half(1))], None, |v| vec![silu(v)])
+            .comp(
+                &[t, ff],
+                &[],
+                vec![arg(sgu_out, half(0)), arg(sgu_out, half(1))],
+                None,
+                |v| vec![silu(v)],
+            )
             .unwrap();
         (tag(sgu_out, "sh_gate_up"), sgu_out, tag(sh, "sh_silu"))
     } else {
@@ -1116,7 +1142,9 @@ pub fn moe_block(m: MoeShape) -> Spec {
     g.set_inline(routed, envn("TANG_DMOE_INLINE_R", 1) == 1);
     Spec {
         g,
-        ext: vec![x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo, wgu, sgu, xq_out],
+        ext: vec![
+            x, lg, wg, wu, wd, sg, su, sd, r, wn, y, ro, xo, wgu, sgu, xq_out,
+        ],
         outs: if m.keep_y {
             vec![y, ro, xo, xq_out]
         } else {
