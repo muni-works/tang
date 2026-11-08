@@ -160,11 +160,20 @@ mod gpu_impl {
         pub fn load(gpu: &Gpu, l: Lowered, n_ext: usize) -> anyhow::Result<Self> {
             use anyhow::anyhow;
             let mut ks = Vec::new();
-            for k in l.kernels {
-                let m = gpu.module(&k.source).map_err(|e| anyhow!("{e}"))?;
-                let f = m
-                    .func(tang_compile::tensor::cuda::CUDA_ENTRY)
-                    .map_err(|e| anyhow!("{e}"))?;
+            for (i, k) in l.kernels.into_iter().enumerate() {
+                // entry named after the kernel's node (`tag`), so profilers (ncu, nsys) show
+                // `dop_ex_gate_up` rather than a row of `main0`s
+                let entry: String = format!("dop{i:02}_{}", k.name)
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let src = k.source.replacen(
+                    &format!("{}(", tang_compile::tensor::cuda::CUDA_ENTRY),
+                    &format!("{entry}("),
+                    1,
+                );
+                let m = gpu.module(&src).map_err(|e| anyhow!("{e}"))?;
+                let f = m.func(&entry).map_err(|e| anyhow!("{e}"))?;
                 if k.smem > 48 * 1024 {
                     unsafe {
                         gpu::check(

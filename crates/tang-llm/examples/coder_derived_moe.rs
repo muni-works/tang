@@ -210,6 +210,17 @@ fn run(gpu: &Gpu, s: &Stream, m: MoeShape, check: bool) {
     let build = t0.elapsed().as_secs_f64();
     op.launch(s, &bufs.ptrs).unwrap();
     s.sync().unwrap();
+    // `ONCE=1`: the engine shape launched twice more and nothing else (for ncu / nsys)
+    if std::env::var_os("ONCE").is_some() {
+        if !check {
+            for _ in 0..2 {
+                op.launch(s, &bufs.ptrs).unwrap();
+            }
+            s.sync().unwrap();
+            println!("| {t} | {ne} | {} | once | {build:.1} s | - |", op.kernels());
+        }
+        return;
+    }
     let mut err = f64::NAN;
     if check {
         let gu = dequant_k(&wg, false);
