@@ -1318,9 +1318,7 @@ mod tests {
             let l = online_lift(s).unwrap_or_else(|e| panic!("{e:?}"));
             let (rows, n) = (2, 9);
             let (mut g2, two, mut g1, one) = online_graphs(s, &l, rows, n);
-            let xs1: Vec<_> = (0..s.n_x)
-                .map(|i| super::super::TensorId::from_index(i))
-                .collect();
+            let xs1: Vec<_> = (0..s.n_x).map(super::super::TensorId::from_index).collect();
             let gr1 = g1
                 .backward(one, &xs1)
                 .unwrap_or_else(|e| panic!("{}: {e:?}", s.name));

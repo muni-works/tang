@@ -422,7 +422,7 @@ impl TensorGraph {
             let b = inline(&body, &bouts, &v[..na]);
             let mut acc = b[0] * v[na];
             for j in 1..w {
-                acc = acc + b[j] * v[na + j];
+                acc += b[j] * v[na + j];
             }
             vec![acc]
         });
@@ -492,7 +492,7 @@ impl TensorGraph {
             let v: Vec<ExprId> = (0..2 * na).map(|i| ExprId::var(i as u16)).collect();
             let mut acc = v[0] * v[na];
             for a in 1..na {
-                acc = acc + v[a] * v[na + a];
+                acc += v[a] * v[na + a];
             }
             vec![acc]
         });
@@ -539,7 +539,7 @@ impl TensorGraph {
             let b = inline(&body, &bouts, &v[..na]);
             let mut acc = b[0] * v[na];
             for j in 1..w {
-                acc = acc + b[j] * v[na + j];
+                acc += b[j] * v[na + j];
             }
             vec![acc]
         });
