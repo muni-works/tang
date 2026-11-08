@@ -1142,6 +1142,19 @@ fn derived_moe_on() -> bool {
     })
 }
 
+/// Fewest window rows that take the derived MoE (`TANG_DMOE_MIN_ROWS`, default 16): below it
+/// the hand kernels are faster at decode widths. Fixed per process, so a shape's choice is the
+/// same in and out of CUDA graph capture.
+fn derived_moe_min_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TANG_DMOE_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+    })
+}
+
 /// (window rows, int8 layout rows, gate|up GGUF type, down GGUF type, MoE output kept)
 type DMoeKey = (usize, usize, i32, i32, bool);
 
@@ -4719,7 +4732,12 @@ impl Coder {
             t as i32,
         );
         let routed = t * kk;
-        if derived_moe_on() && !self.in_wide.get() && !self.var.shared_par {
+        // below the cutoff (and in wide prefill windows) exactly the hand path
+        if derived_moe_on()
+            && t >= derived_moe_min_rows()
+            && !self.in_wide.get()
+            && !self.var.shared_par
+        {
             self.gemv(wi, "router", &layer.router, x, Some(mxq), lg, t, ls);
             if self.derived_moe(wi, layer, t, next, keep_y) {
                 return;
@@ -4796,7 +4814,7 @@ impl Coder {
         tys.sort();
         tys.dedup();
         let mut cache = self.dmoe.borrow_mut();
-        for t in 1..=MAX_T {
+        for t in derived_moe_min_rows().max(1)..=MAX_T {
             for &(gu, down) in &tys {
                 let key: DMoeKey = (t, MAX_T, gu, down, false);
                 let built = DMoe::build(&self.gpu, key, &self.hp, self.eps);
@@ -4819,6 +4837,9 @@ impl Coder {
     /// kernels' layout. `false` (nothing enqueued) when this shape has no derived build: the
     /// caller runs the hand kernels.
     fn derived_moe(&self, wi: usize, layer: &Layer, t: usize, next: &B, keep_y: bool) -> bool {
+        if t < derived_moe_min_rows() {
+            return false;
+        }
         let tys = (layer.gate.w.ty, layer.up.w.ty, layer.down.w.ty);
         let sh_q8 = [layer.sh_gate.w.ty, layer.sh_up.w.ty, layer.sh_down.w.ty]
             .iter()
