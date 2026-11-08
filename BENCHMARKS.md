@@ -3733,3 +3733,26 @@ Decode ms per step (context ~1380). The derived column is from the N=48 run; the
 | 48 | 30.26 | **28.78** |
 
 Derived beats hand from N=16 up; at N=48 it is 1.5 ms per step faster (round 5: 1.9 ms slower). The pod run was stopped before its N=48 profiles, since the target was met.
+
+### Round 7: hybrid cutoff, `TANG_DMOE_MIN_ROWS=16` (seventh H200, `crates/tang-llm/docs/bench/r7/`)
+
+With `TANG_CODER_DERIVED=moe`, windows of 16 rows or more take the derived MoE. Narrower windows run exactly the hand path, router included, and so do wide prefill windows. The cutoff is read once per process, so a shape takes the same path inside and outside CUDA graph capture. `TANG_DMOE_MIN_ROWS` overrides it (`1` is the round-6 behaviour).
+
+| gate | result |
+|---|---|
+| wide-check 3000 (int8) | PASS, KL 6.74e-5 |
+| wide-check 8000 (int8) | PASS, KL 9.08e-6 |
+| batch-check N=8, derived switch on | PASS, bitwise; checksum 24a2aee70897bb74, equal to hand in this run and to main in round 6 |
+| batch-check N=48 | derived 98.93%, mean \|dlogit\| 0.141 (FAIL by 0.07 points); hand in the same run 99.00%, 0.142 (FAIL) |
+
+Decode ms per step (context ~1380):
+
+| N | hand | hybrid |
+|---|---|---|
+| 1 | 4.05 | 4.05 (b8 run; 4.29 in the N=48 run) |
+| 8 | 9.81 | 9.81 (b8 run; 9.99 in the N=48 run) |
+| 16 | 15.87 | **14.06** |
+| 32 | 23.48 | **21.40** |
+| 48 | 30.01 | **28.45** |
+
+The N=48 token-agreement figure moves with the mix of narrow and wide windows: 98.58% in rounds 4–5, 99.28% in round 6 (derived at every width) and 98.93% here. The hand engine itself scores exactly at the bar, and derived's mean \|dlogit\| is at or below hand's in every round.
