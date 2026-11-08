@@ -59,6 +59,8 @@ for d in launches.values():
     k["occ"] = k.get("occ", 0) + m.get("sm__warps_active.avg.pct_of_peak_sustained_active", 0)
     k["regs"] = m.get("launch__registers_per_thread", 0)
     k["waves"] = m.get("launch__waves_per_multiprocessor", 0)
+    k["inst"] = k.get("inst", 0) + m.get("sm__inst_executed.sum", 0)
+    k["issue"] = k.get("issue", 0) + m.get("sm__instruction_throughput.avg.pct_of_peak_sustained_active", 0)
     k["lsb"] = k.get("lsb", 0) + m.get("smsp__average_warp_latency_issue_stalled_long_scoreboard.ratio", 0)
 
 out = []
@@ -81,16 +83,16 @@ for name, k in K.items():
                     floor_us=floor * 1e6, light=light, sm_pct=sm, dram_pct=dr,
                     grid=int(k["grid"]), block=int(k["block"]), cls=cls,
                     occ_pct=k.get("occ", 0) / n, regs=k.get("regs", 0), waves=k.get("waves", 0),
-                    long_sb=k.get("lsb", 0) / n))
+                    long_sb=k.get("lsb", 0) / n, inst=k.get("inst", 0) / n, issue_pct=k.get("issue", 0) / n))
 out.sort(key=lambda r: -r["total_ms"])
 tot = sum(r["total_ms"] for r in out)
 tot_floor = sum(r["floor_us"] * r["launches"] for r in out) / 1e3
 if a.title:
     print(f"#### {a.title}\n")
-print("| kernel | launches | µs each | total ms | share | MB each | floor µs | light | SM % | DRAM % | occ % | regs | waves | long-sb cyc/warp | grid×block | bound |")
-print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+print("| kernel | launches | µs each | total ms | share | MB each | floor µs | light | SM % | DRAM % | occ % | regs | waves | long-sb cyc/warp | warp inst | inst/byte | issue % | grid×block | bound |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 for r in out:
-    print(f"| `{r['kernel']}` | {r['launches']} | {r['us']:.1f} | {r['total_ms']:.3f} | {100*r['total_ms']/tot:.1f}% | {r['mb']:.2f} | {r['floor_us']:.1f} | {r['light']:.2f} | {r['sm_pct']:.0f} | {r['dram_pct']:.0f} | {r['occ_pct']:.0f} | {r['regs']:.0f} | {r['waves']:.2f} | {r['long_sb']:.0f} | {r['grid']}×{r['block']} | {r['cls']} |")
+    print(f"| `{r['kernel']}` | {r['launches']} | {r['us']:.1f} | {r['total_ms']:.3f} | {100*r['total_ms']/tot:.1f}% | {r['mb']:.2f} | {r['floor_us']:.1f} | {r['light']:.2f} | {r['sm_pct']:.0f} | {r['dram_pct']:.0f} | {r['occ_pct']:.0f} | {r['regs']:.0f} | {r['waves']:.2f} | {r['long_sb']:.0f} | {r['inst']:.0f} | {r['inst'] / max(r['mb'] * 1e6, 1):.3f} | {r['issue_pct']:.0f} | {r['grid']}×{r['block']} | {r['cls']} |")
 by_cls = {}
 for r in out:
     by_cls[r["cls"]] = by_cls.get(r["cls"], 0) + r["total_ms"]
