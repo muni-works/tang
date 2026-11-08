@@ -5,7 +5,9 @@
 //! solve primal and dual (`tensor::io_lp`), and compare the dual's tile
 //! with (a) `schedule_auto`'s pick and (b) with `TUNE=1`, the GPU
 //! autotuner's pick on this machine (`tang_gpu::autotune`, M4 via wgpu
-//! here). Traffic in MB at f32; `floor` is the composite time floor
+//! here). `2-level dual` is the tile with the output held in registers
+//! (`Machine::reg_words`) and the inputs staged in shared memory
+//! (`Lp::tile_levels`). Traffic in MB at f32; `floor` is the composite time floor
 //! `max(bytes/BW, flops/peak, launches×latency)` with its binding term.
 //!
 //!   cargo run --release -p tang-bench --example io_dual
@@ -144,6 +146,7 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
     let bound = lp.bound(mem).unwrap();
     let dual = lp.tile(mem).unwrap();
     let dual_traffic = tiled_traffic(&lp, &dual);
+    let levels = lp.tile_levels(m.reg_words, mem);
     let (auto_t, auto_staged, launches) = tang_tile(g, outs, k, &lp, nest);
     let fmt = |t: &[usize]| {
         names
@@ -186,6 +189,20 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
         mb(dual_traffic),
         dual_traffic / bound.max(1.0)
     );
+    if let Some(lt) = &levels {
+        println!(
+            "  2-level dual [{}]  traffic {:.2} MB ({:.2}× bound at regs+smem {:.2} MB); in registers: {}",
+            fmt(&lt.tile),
+            mb(lt.traffic),
+            lt.traffic / lp.bound(m.reg_words + mem).unwrap().max(1.0),
+            mb(lp.bound(m.reg_words + mem).unwrap()),
+            (0..lp.projs.len())
+                .filter(|j| lt.in_regs & (1 << j) != 0)
+                .map(|j| format!("{:#b}", lp.projs[j]))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
     println!(
         "  schedule_auto[{}]  LP traffic {:.2} MB, staged {:.2} MB ({:.2}× bound), {launches} kernel(s)",
         fmt(&auto_t),
