@@ -3695,3 +3695,41 @@ Decode ms a step, from the N=48 runs in the same pod session (context ~1380):
 | 48 | 30.01 | 31.88 | 31.71 | 1.53 → 1.87 (sorted path unchanged; run noise) |
 
 The b8 run measured derived N=8 at 10.69 ms, a gap of 0.88 ms. Windows of 16 rows and up (the sorted path) still run separate gate and up passes.
+
+### Round 6: sorted path fused, engine int8 folded in, shared expert retiled (sixth H200, `crates/tang-llm/docs/bench/r6/`)
+
+Changes:
+- **Sorted path (T ≥ 16): gate|up in one launch.** The space is `[half, pair, row | col]`, with half outermost. The int8 MMA's same-weight runs now compare the whole weight offset rather than only the gather key, because a position dim can move the offset too.
+- **The next layer's int8 input is written by the MoE op itself.** A new storage format, `Format::Q8x32F` (codes, then one f32 scale per 32, the layout the hand kernels read), takes one kernel. That replaces the two separate `engine_q8` launches per layer.
+- **Shared-expert MMA tile is 8 positions** (it was T). At T=48 the old tile ran 8 blocks; the new one runs 48 (3090: 941 → 887 µs per layer).
+- SiLU stays a separate kernel. Gate and up land in different MMA tiles, so a register epilogue would need a row-interleaved weight view, which affine forms can't express.
+
+Hand engine, this branch vs main (contiguous gate‖up upload), same pod:
+
+| | main | this branch |
+|---|---|---|
+| N=1 checksum | 58a49b7dcb916b00 | 58a49b7dcb916b00 |
+| N=8 checksum | 24a2aee70897bb74 | 24a2aee70897bb74 |
+
+Bitwise unchanged.
+
+Gates:
+
+| gate | result |
+|---|---|
+| wide-check 3000 (int8) | PASS, KL 3.44e-5 |
+| wide-check 8000 (int8) | PASS, KL 2.03e-5 |
+| batch-check N=8 | PASS, bitwise (checksum 796c8f3f0fe0a52b) |
+| batch-check N=48 | derived **PASS**, 99.28%, mean \|dlogit\| 0.145; hand in the same run 99.00%, 0.142 (FAIL) |
+
+Decode ms per step (context ~1380). The derived column is from the N=48 run; the N=1 and N=8 numbers from the b8 run are in brackets.
+
+| N | hand | derived |
+|---|---|---|
+| 1 | 4.15 | 4.48 (b8 run: 4.13) |
+| 8 | 9.92 | 10.98 (b8 run: 10.74) |
+| 16 | 15.95 | **14.39** |
+| 32 | 23.66 | **21.67** |
+| 48 | 30.26 | **28.78** |
+
+Derived beats hand from N=16 up; at N=48 it is 1.5 ms per step faster (round 5: 1.9 ms slower). The pod run was stopped before its N=48 profiles, since the target was met.

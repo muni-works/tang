@@ -1,0 +1,30 @@
+coder: 8 of 48 layers in VRAM (21 s)
+coder: 16 of 48 layers in VRAM (40 s)
+coder: 24 of 48 layers in VRAM (61 s)
+coder: 32 of 48 layers in VRAM (84 s)
+coder: 40 of 48 layers in VRAM (106 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (129 s)
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 130 s, kernels 110 s, total 241 s
+coder: 127 sequence slots fit (0.28 GB each, 99.9 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 1 (prompt 1377 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 2 (prompt 1374 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 0 of 9723904 entries
+batch-check: PASS (bitwise) (logits checksum 24a2aee70897bb74)
+batch 1: prefilled to ~1380 tokens in 1.7 s
+batch 1: 4.09 ms a step, 244 tok/s aggregate, 244 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.3 s
+batch 2: 4.82 ms a step, 415 tok/s aggregate, 208 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 6.6 s
+batch 4: 6.59 ms a step, 607 tok/s aggregate, 152 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 13.1 s
+batch 8: 9.92 ms a step, 807 tok/s aggregate, 101 tok/s a stream (context ~1380)
+exit 0
