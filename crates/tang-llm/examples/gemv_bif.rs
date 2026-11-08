@@ -13,9 +13,9 @@
 //! `cargo run --release -p tang-llm --features cuda --example gemv_bif [rows...]`
 
 use tang_llm::flash::derived_ops::{self as dop, Op};
-use tang_moe::gpu::{self, DevBuf, Event, Gpu, Stream};
 #[allow(unused_imports)]
 use tang_moe::gpu::Module;
+use tang_moe::gpu::{self, DevBuf, Event, Gpu, Stream};
 
 const SRC: &str = r#"
 #include <cuda_fp16.h>
@@ -125,16 +125,30 @@ impl Rng {
 }
 
 fn main() {
-    let peak: f64 = std::env::var("PEAK_GBS").ok().and_then(|v| v.parse().ok()).unwrap_or(4800.0);
-    let rows_list: Vec<usize> = std::env::args().skip(1).map(|a| a.parse().unwrap()).collect();
-    let rows_list = if rows_list.is_empty() { vec![4096, 20480, 151936] } else { rows_list };
+    let peak: f64 = std::env::var("PEAK_GBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4800.0);
+    let rows_list: Vec<usize> = std::env::args()
+        .skip(1)
+        .map(|a| a.parse().unwrap())
+        .collect();
+    let rows_list = if rows_list.is_empty() {
+        vec![4096, 20480, 151936]
+    } else {
+        rows_list
+    };
     let gpu = Gpu::new().expect("cuda");
     let s = Stream::new().unwrap();
     let m = gpu.module(SRC).expect("nvrtc");
     let sms = 132u32.max(1);
     let line = |name: &str, bytes: f64, us: f64| {
         let gbs = bytes / us / 1e3;
-        println!("| {name} | {:.1} | {us:.1} | {gbs:.0} | {:.2} |", bytes / 1e6, gbs / peak);
+        println!(
+            "| {name} | {:.1} | {us:.1} | {gbs:.0} | {:.2} |",
+            bytes / 1e6,
+            gbs / peak
+        );
     };
     println!("| kernel | MB | µs | GB/s | fraction of {peak:.0} GB/s |");
     println!("|---|---|---|---|---|");
@@ -143,29 +157,49 @@ fn main() {
     let n16: usize = (512usize << 20) / 16;
     let buf = DevBuf::zeroed(n16 * 16).unwrap();
     let sink = DevBuf::zeroed(16).unwrap();
-    for (name, blocks) in [("stream_u1", sms * 8), ("stream_u4", sms * 8), ("stream_u4", sms * 16)] {
+    for (name, blocks) in [
+        ("stream_u1", sms * 8),
+        ("stream_u4", sms * 8),
+        ("stream_u4", sms * 16),
+    ] {
         let f = m.func(name).unwrap();
         let (mut p, mut n, mut o) = (buf.ptr, n16 as u64, sink.ptr);
         let us = best_us(&s, || unsafe {
-            let mut a = [&mut p as *mut u64 as *mut _, &mut n as *mut u64 as *mut _, &mut o as *mut u64 as *mut _];
+            let mut a = [
+                &mut p as *mut u64 as *mut _,
+                &mut n as *mut u64 as *mut _,
+                &mut o as *mut u64 as *mut _,
+            ];
             gpu::launch(f, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut a).unwrap();
         });
-        line(&format!("{name} ×{blocks} blocks (512 MB)"), (n16 * 16) as f64, us);
+        line(
+            &format!("{name} ×{blocks} blocks (512 MB)"),
+            (n16 * 16) as f64,
+            us,
+        );
     }
 
     // 2./3. the GEMVs, k = 2048
     let k = 2048usize;
     let mut rng = Rng(0x9e3779b97f4a7c15);
-    let xf: Vec<f32> = (0..k).map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0).collect();
+    let xf: Vec<f32> = (0..k)
+        .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
     // x as Q8x32: codes then per-32 f32 scale (the repacked kernel's operand)
     let mut xq = vec![0i8; k];
     let mut xs = vec![0f32; k / 32];
     for b in 0..k / 32 {
-        let amax = xf[32 * b..32 * b + 32].iter().fold(0f32, |a, v| a.max(v.abs()));
+        let amax = xf[32 * b..32 * b + 32]
+            .iter()
+            .fold(0f32, |a, v| a.max(v.abs()));
         let d = amax / 127.0;
         xs[b] = d;
         for i in 0..32 {
-            xq[32 * b + i] = if d == 0.0 { 0 } else { (xf[32 * b + i] / d).round() as i8 };
+            xq[32 * b + i] = if d == 0.0 {
+                0
+            } else {
+                (xf[32 * b + i] / d).round() as i8
+            };
         }
     }
     for &rows in &rows_list {
@@ -195,7 +229,11 @@ fn main() {
         );
         let ptrs = [dx.ptr, dw.ptr, dout.ptr];
         let us = best_us(&s, || op.launch(&s, &ptrs).unwrap());
-        line(&format!("derived Q8_0 GEMV {rows}×{k} ({} kernels)", op.kernels()), gg.len() as f64, us);
+        line(
+            &format!("derived Q8_0 GEMV {rows}×{k} ({} kernels)", op.kernels()),
+            gg.len() as f64,
+            us,
+        );
         let want = dout.read::<f32>(0, rows).unwrap();
         // repacked
         let (rc, rs, rx, rxs, ro) = (
@@ -209,19 +247,33 @@ fn main() {
         for (name, r) in [("gq8r1", 1usize), ("gq8r2", 2), ("gq8r4", 4)] {
             let f = m.func(name).unwrap();
             let blocks = rows.div_ceil(8 * r) as u32;
-            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (rc.ptr, rs.ptr, rx.ptr, rxs.ptr, ro.ptr, rows as i32);
+            let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+                (rc.ptr, rs.ptr, rx.ptr, rxs.ptr, ro.ptr, rows as i32);
             let (mut a6, mut a7) = (0u64, 0u64);
             let us = best_us(&s, || unsafe {
                 let mut a = [
-                    &mut a0 as *mut u64 as *mut _, &mut a1 as *mut u64 as *mut _, &mut a2 as *mut u64 as *mut _,
-                    &mut a3 as *mut u64 as *mut _, &mut a4 as *mut u64 as *mut _, &mut a5 as *mut i32 as *mut _,
-                    &mut a6 as *mut u64 as *mut _, &mut a7 as *mut u64 as *mut _,
+                    &mut a0 as *mut u64 as *mut _,
+                    &mut a1 as *mut u64 as *mut _,
+                    &mut a2 as *mut u64 as *mut _,
+                    &mut a3 as *mut u64 as *mut _,
+                    &mut a4 as *mut u64 as *mut _,
+                    &mut a5 as *mut i32 as *mut _,
+                    &mut a6 as *mut u64 as *mut _,
+                    &mut a7 as *mut u64 as *mut _,
                 ];
                 gpu::launch(f, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut a).unwrap();
             });
             let got = ro.read::<f32>(0, rows).unwrap();
-            let err = got.iter().zip(&want).map(|(g, w)| ((g - w) / w.abs().max(1e-3)).abs()).fold(0f32, f32::max);
-            line(&format!("repacked {name} {rows}×{k} (vs derived max rel {err:.1e})"), bytes, us);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| ((g - w) / w.abs().max(1e-3)).abs())
+                .fold(0f32, f32::max);
+            line(
+                &format!("repacked {name} {rows}×{k} (vs derived max rel {err:.1e})"),
+                bytes,
+                us,
+            );
         }
     }
     fill_drain(&gpu, &s, &m, peak);
@@ -243,15 +295,38 @@ fn repacked(rows: usize) -> RepackedMat {
 }
 
 /// Launch gq8r2 over `m`, prefetching `pf` (codes then scales, as two ranges? one: codes).
-unsafe fn launch_r2(f: cudarc::driver::sys::CUfunction, s: &Stream, m: &RepackedMat, rows: usize, x: &DevBuf, xs: &DevBuf, out: &DevBuf, pf: Option<&RepackedMat>) {
-    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) = (m.c.ptr, m.s.ptr, x.ptr, xs.ptr, out.ptr, rows as i32);
+unsafe fn launch_r2(
+    f: cudarc::driver::sys::CUfunction,
+    s: &Stream,
+    m: &RepackedMat,
+    rows: usize,
+    x: &DevBuf,
+    xs: &DevBuf,
+    out: &DevBuf,
+    pf: Option<&RepackedMat>,
+) {
+    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5) =
+        (m.c.ptr, m.s.ptr, x.ptr, xs.ptr, out.ptr, rows as i32);
     let (mut a6, mut a7) = pf.map_or((0u64, 0u64), |p| (p.c.ptr, (p.bytes - p.bytes / 33) as u64));
     let mut a = [
-        &mut a0 as *mut u64 as *mut _, &mut a1 as *mut u64 as *mut _, &mut a2 as *mut u64 as *mut _,
-        &mut a3 as *mut u64 as *mut _, &mut a4 as *mut u64 as *mut _, &mut a5 as *mut i32 as *mut _,
-        &mut a6 as *mut u64 as *mut _, &mut a7 as *mut u64 as *mut _,
+        &mut a0 as *mut u64 as *mut _,
+        &mut a1 as *mut u64 as *mut _,
+        &mut a2 as *mut u64 as *mut _,
+        &mut a3 as *mut u64 as *mut _,
+        &mut a4 as *mut u64 as *mut _,
+        &mut a5 as *mut i32 as *mut _,
+        &mut a6 as *mut u64 as *mut _,
+        &mut a7 as *mut u64 as *mut _,
     ];
-    gpu::launch(f, (rows.div_ceil(16) as u32, 1, 1), (256, 1, 1), 0, s, &mut a).unwrap();
+    gpu::launch(
+        f,
+        (rows.div_ceil(16) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        s,
+        &mut a,
+    )
+    .unwrap();
 }
 
 /// Fill/drain: one GEMV's time against its bytes over a sweep of sizes (fit t = τ + bytes/BW),
@@ -267,14 +342,20 @@ fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
     let fl = m.func("stream_u4").unwrap();
     let do_flush = || unsafe {
         let (mut p, mut n, mut o) = (flush.ptr, ((512u64 << 20) / 16), out.ptr);
-        let mut a = [&mut p as *mut u64 as *mut _, &mut n as *mut u64 as *mut _, &mut o as *mut u64 as *mut _];
+        let mut a = [
+            &mut p as *mut u64 as *mut _,
+            &mut n as *mut u64 as *mut _,
+            &mut o as *mut u64 as *mut _,
+        ];
         gpu::launch(fl, (1056, 1, 1), (256, 1, 1), 0, s, &mut a).unwrap();
     };
     let _ = gpu;
     println!("\n| fill/drain: rows × 2048 (repacked R=2, cold L2) | MB | µs | GB/s |");
     println!("|---|---|---|---|");
     let mut pts = Vec::new();
-    for rows in [128usize, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072] {
+    for rows in [
+        128usize, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+    ] {
         let mat = repacked(rows);
         let mut best = f64::MAX;
         for _ in 0..15 {
@@ -287,11 +368,18 @@ fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
             best = best.min(b.since(&a).unwrap() as f64 * 1000.0);
         }
         pts.push((mat.bytes as f64, best));
-        println!("| {rows} | {:.2} | {best:.2} | {:.0} |", mat.bytes as f64 / 1e6, mat.bytes as f64 / best / 1e3);
+        println!(
+            "| {rows} | {:.2} | {best:.2} | {:.0} |",
+            mat.bytes as f64 / 1e6,
+            mat.bytes as f64 / best / 1e3
+        );
     }
     // least squares t = tau + bytes / bw over the sizes
     let n = pts.len() as f64;
-    let (sx, sy) = (pts.iter().map(|p| p.0).sum::<f64>(), pts.iter().map(|p| p.1).sum::<f64>());
+    let (sx, sy) = (
+        pts.iter().map(|p| p.0).sum::<f64>(),
+        pts.iter().map(|p| p.1).sum::<f64>(),
+    );
     let sxx = pts.iter().map(|p| p.0 * p.0).sum::<f64>();
     let sxy = pts.iter().map(|p| p.0 * p.1).sum::<f64>();
     let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
@@ -306,7 +394,11 @@ fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
             let mut best = (f64::MAX, f64::MAX);
             for _ in 0..15 {
                 do_flush();
-                let (e0, e1, e2) = (Event::new(true).unwrap(), Event::new(true).unwrap(), Event::new(true).unwrap());
+                let (e0, e1, e2) = (
+                    Event::new(true).unwrap(),
+                    Event::new(true).unwrap(),
+                    Event::new(true).unwrap(),
+                );
                 e0.record(s).unwrap();
                 if with_a {
                     unsafe { launch_r2(f, s, &ma, rows, &x, &xs, &out, pf.then_some(&mb)) };
@@ -315,7 +407,10 @@ fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
                 unsafe { launch_r2(f, s, &mb, rows, &x, &xs, &out, None) };
                 e2.record(s).unwrap();
                 e2.sync().unwrap();
-                let (ta, tb) = (e1.since(&e0).unwrap() as f64 * 1000.0, e2.since(&e1).unwrap() as f64 * 1000.0);
+                let (ta, tb) = (
+                    e1.since(&e0).unwrap() as f64 * 1000.0,
+                    e2.since(&e1).unwrap() as f64 * 1000.0,
+                );
                 if tb < best.1 {
                     best = (ta, tb);
                 }
@@ -325,7 +420,10 @@ fn fill_drain(gpu: &Gpu, s: &Stream, m: &gpu::Module, peak: f64) {
         let (_, alone) = time(false, false);
         let (a0, b0) = time(false, true);
         let (a1, b1) = time(true, true);
-        println!("| {rows} ({:.1} MB) | {alone:.2} | {b0:.2} | {b1:.2} | {a0:.2} / {a1:.2} |", ma.bytes as f64 / 1e6);
+        println!(
+            "| {rows} ({:.1} MB) | {alone:.2} | {b0:.2} | {b1:.2} | {a0:.2} / {a1:.2} |",
+            ma.bytes as f64 / 1e6
+        );
     }
 }
 

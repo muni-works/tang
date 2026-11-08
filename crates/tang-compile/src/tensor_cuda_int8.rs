@@ -880,7 +880,7 @@ fn gemv_knobs(g: &GemvShape) -> (usize, bool) {
 
 /// The GEMV's loop over a lane's units: `u = u0, u0 + lanes, …`.
 fn uloop(units: usize, lanes: usize, unroll: bool) -> String {
-    if unroll && units % lanes == 0 {
+    if unroll && units.is_multiple_of(lanes) {
         format!(
             "        #pragma unroll\n        for (int ui = 0; ui < {}; ui++) {{\n            const int u = u0 + ui * {lanes};\n",
             units / lanes
