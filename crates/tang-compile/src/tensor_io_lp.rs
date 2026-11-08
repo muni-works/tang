@@ -479,7 +479,7 @@ mod tests {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            (seed >> 33) as u64
+            seed >> 33
         };
         for _ in 0..200 {
             let r = 2 + (rnd() % 3) as usize;
