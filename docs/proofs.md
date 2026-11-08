@@ -306,3 +306,5 @@ Christ, Demmel, Knight, Scanlon, Yelick, *Communication lower bounds and optimal
 Kwasniewski et al., *Red-blue pebbling revisited: near optimal parallel matrix-matrix multiplication*, SC 2019.
 Dao et al., *FlashAttention*, NeurIPS 2022.
 Saha & Ye, *The I/O complexity of attention, or how optimal is FlashAttention?*, ICML 2024.
+
+See also [duality.md](duality.md): the bound and the tile as primal/dual of one LP.
