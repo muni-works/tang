@@ -95,3 +95,62 @@ Flash attention fwd/bwd on the H200: `hopper_attention` autotunes inside the run
 3. **Persistent fused MoE kernel.** One resident kernel per layer that streams gate|up, then down, for every (token, expert) pair keeps loads in flight across expert and kernel boundaries. It removes the per-call ramp and tail (the main cost at N=1–8) and absorbs the ~15–25% of step time spent in sub-5 µs kernels (route, norms, quantize, combine). That is where derived is behind hand at N=1–8 (more small kernels, 8% idle against 1%).
 4. **Dense projections at N≥8** are the other large lever: light 0.18 at N=8 and 0.08 at N=48. `cx_mma_q8x` takes 4 ms per step at N=48 against a 0.46 ms weight floor, with only 192 CTAs. Same disease, same cure.
 5. **GDN state traffic is real at N=48:** 7.2 GB per step, about 1.5 ms of floor, at light 0.46–0.49. State in bf16 (`TANG_CODER_GDN_STATE=bf16`) would halve that floor.
+
+## Round 2: raising bytes in flight (H200)
+
+Pod time this round was about 1.7 H200-hours, roughly $8, across four short pods. Every change is behind a flag that defaults off. The default engine is unchanged: on the same pod, the hand engine at N=8 produced main's checksum (24a2aee70897bb74).
+
+### Flash attention, clean (bf16, bh=64, N=4096, D=128, non-causal)
+
+| | measured | FLOP roof (989 TFLOP/s) | compute light | traffic floor | traffic light |
+|---|---|---|---|---|---|
+| fwd, tuned (1 kernel) | 1.413 ms (389 TFLOP/s) | 0.556 ms | **0.39** | 0.056 ms | 0.04 |
+| fwd + bwd, tuned (9 kernels) | 8.325 ms (165 TFLOP/s bwd-equiv.) | 1.95 ms | **0.23** | 0.17 ms | 0.02 |
+| fixed variant 0 / 1 / 2 | fwd 3.65 / 2.74 / 3.57 ms; fwd+bwd 15.3 / 14.3 / 15.2 ms | | 0.15–0.20 | | |
+
+Attention is compute-bound: its gap to light is FLOP throughput, not traffic. The tuner's per-kernel choice beats every single fixed variant by 1.9–2.6×. Logs: `docs/bench/ncu/bif-s1/attn_*.log`.
+
+### GEMV / MMA knob sweep on the derived MoE layer
+
+New knobs in the lowering: `TANG_GEMV_WARPS`, `TANG_GEMV_UNROLL` (all of a lane's loads issued before its math), `TANG_GEMV_Q8_UPL`, plus the existing `TANG_GEMV_UPL`, `TANG_DMOE_KSPLIT`, `TANG_DMOE_FRAG` and `TANG_INT8_NOSTAGE`.
+
+| µs per layer | T=1 | T=8 | T=16 | T=48 |
+|---|---|---|---|---|
+| base | 50.1 | 155.1 | 236.2 | 430.6 |
+| best knob | 48.2 (`WARPS=2/4`) | 143.2 (`UPL=4`) | 230.1 (`KSPLIT=1`) | 413.0 (`KSPLIT=1`) |
+
+The best knob gains 2–8%. Unrolling alone does nothing. The derived Q8_0 GEMV on GGUF blocks reaches 812–2181 GB/s (0.17–0.45 of peak) at any knob setting. Logs: `docs/bench/ncu/bif-s1/`.
+
+### What a GEMV can reach on the H200: `examples/gemv_bif.rs`
+
+| kernel | 3090: GB/s (fraction of 936) | H200: GB/s (fraction of 4800) |
+|---|---|---|
+| streaming read, 512 MB, uint4 ×4 unrolled | 919 (0.98) | 4610 (0.96) |
+| derived Q8_0 GEMV, GGUF 34-byte blocks, 4096×2048 | 495 (0.53) | 1023 (0.21) |
+| repacked (aligned codes, separate scales), R=2 rows per warp, 4096×2048 | 680 (0.73) | 2185 (0.46) |
+| derived, 20480×2048 | 762 (0.81) | 1586 (0.33) |
+| repacked R=4, 20480×2048 (fits in the 50 MB L2) | 823 (0.88) | 4905 (1.02) |
+| derived, 151936×2048 (vocab head) | 864 (0.92) | 1921 (0.40) |
+| repacked R=2, 151936×2048 | 874 (0.93) | 4282 (**0.89**) |
+
+On the H200 the GGUF Q8_0 layout itself is the cap. Its 34-byte blocks force halfword loads and funnel shifts: the instruction cost per byte stays the same while the bytes needed per SM-cycle are 2.7× the 3090's. A 16-byte-aligned repack, where each lane issues 4·R uint4 loads before any math, reaches 0.89 of peak on the large GEMV. The engine already stores dense Q8_0 in this aligned form (Q8X, type 108). The derived lowering still reads GGUF blocks; porting the repack to the derived Q8_0 path is a straightforward follow-up.
+
+### On the model: no change
+
+| hand engine, decode ms (N=1 / 2 / 4 / 8) | |
+|---|---|
+| baseline K-split Q8X GEMV | 4.03–4.05 / 4.74 / 6.51 / 9.80 |
+| `TANG_CODER_Q8XW=1` (gemv_bif's structure on the engine's Q8X: a warp owns R rows, every load up front) | 4.04 / 4.81 / 6.64 / 10.03 |
+| `Q8XW=2` / `Q8XW=4` | 4.18 / 4.91 / 6.81 / 10.21 (R=4 run did not finish) |
+| `Q8XW=1` + `TANG_CODER_PDL=1` (programmatic dependent launch: next GEMV streams its weights before `griddepcontrol.wait`) | 4.09 / 4.82 / 6.66 / 10.04 (bitwise equal to `Q8XW=1`) |
+
+The microbench's 2.2× doesn't reach the decode step. The model's dense GEMVs are small (4–10 µs each, 145 a step at N=1): their cost is the fixed fill-and-drain of a dependent kernel, not the inner loop. PDL only overlaps a GEMV with its predecessor when that predecessor also triggers early, and most predecessors are norms, routing or attention.
+
+Together with #160's result (a grid barrier costs what an empty launch costs in a graph), this argues against the persistent fused MoE kernel as specified. Fusing route, top-k, gate|up, down and combine into one persistent kernel replaces launches with barriers at the same price, unless the phases overlap. The levers left for N=1–8:
+- **Concurrency of independent work inside a layer:** the shared expert alongside routed experts, and the router GEMV alongside the next norm. This fills the SMs during the many sub-wave kernels (waves 0.13–0.65 on the 3090 runs; fewer SMs filled still on the 132-SM H200).
+- **Cross-kernel L2 prefetch:** a layer's dense and expert weights (46 + ~19 MB) fit the H200's 50 MB L2. Prefetching the next kernel's weights during the current one (`prefetch.global.L2`, or an access-policy window on a side stream) removes the first DRAM round trip that dominates a 5 µs kernel.
+- **Fewer dependent steps:** cross-layer fusion of norm → GEMV prologues (the derived path already inlines quantization).
+
+### For Prove (Little's law)
+
+`docs/bench/ncu/3090-occ/` has ncu achieved occupancy, registers per thread, waves per SM and long-scoreboard stall cycles per warp for every derived MoE kernel at T=1/8. For example, `ex_gate_up` at T=1 runs at 60% occupancy, 40 registers and 0.65 waves on the 3090. The microbench table above gives bytes in flight per thread (16·4·R) against achieved GB/s on both GPUs. The H200 container doesn't expose counters, so its occupancy has to come from the launch shapes plus these 3090 measurements.
