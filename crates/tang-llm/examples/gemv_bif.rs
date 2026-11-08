@@ -43,7 +43,7 @@ __device__ __forceinline__ void l2_prefetch(const unsigned char* pf, unsigned lo
 #if __CUDA_ARCH__ >= 900
     // this block's share of [pf, pf + pf_bytes), 4 KiB a thread a step, bulk prefetch into L2
     if (pf == nullptr || pf_bytes == 0) return;
-    const unsigned long long share = (pf_bytes + gridDim.x - 1) / gridDim.x;
+    const unsigned long long share = ((pf_bytes + gridDim.x - 1) / gridDim.x + 15) & ~15ull;  // 16-byte aligned starts
     const unsigned long long b0 = blockIdx.x * share, b1 = min(pf_bytes, b0 + share);
     for (unsigned long long o = b0 + threadIdx.x * 4096ull; o < b1; o += blockDim.x * 4096ull) {
         const unsigned n = (unsigned)min(4096ull, b1 - o) & ~15u;

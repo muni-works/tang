@@ -3185,7 +3185,7 @@ __device__ __forceinline__ void l2pf_segs(const Seg* pfs, int pfn) {
     for (int s = 0; s < pfn; s++) {
         const unsigned char* base = (const unsigned char*)pfs[s].w;
         const unsigned long long bytes = (unsigned long long)pfs[s].rows * pfs[s].row_bytes;
-        const unsigned long long share = (bytes + gridDim.x - 1) / gridDim.x;
+        const unsigned long long share = ((bytes + gridDim.x - 1) / gridDim.x + 15) & ~15ull;  // 16-byte aligned starts
         const unsigned long long b0 = blockIdx.x * share, b1 = min(bytes, b0 + share);
         for (unsigned long long o = b0 + threadIdx.x * 4096ull; o < b1; o += blockDim.x * 4096ull) {
             const unsigned n = (unsigned)min(4096ull, b1 - o) & ~15u;
