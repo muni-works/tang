@@ -3818,7 +3818,7 @@ Bytes come from ncu on mew (`scripts/ncu/ncu_kernels.sh … --profile-from-start
 | matmul tile 1024³ TF32 | 0.098 ms | 12.5 MB | 13.4 µs (0.14) | 2.15 G | 60 µs (**0.62**) |
 | matmul tile 512×576×1536 TF32 | 0.054 ms | 8.9 MB | 9.6 µs (0.18) | 0.91 G | 25 µs (**0.47**) |
 
-These kernels are compute-shaped: their traffic floors are 2–15% of their time, so the GEMV-style "light" says nothing about them. Against the TF32 roof, the matmul tile reaches 0.47–0.62 and flash 0.25–0.28. Flash's fused backward kernel alone takes 0.476 ms of its 0.743 ms. Full ncu tables, including occupancy, L1 requests and stalls, are in `mew-ncu/*.md`.
+These kernels are compute-shaped: their traffic floors are 2–18% of their time, so the GEMV-style "light" says nothing about them. Against the TF32 roof, the matmul tile reaches 0.47–0.62 and flash 0.25–0.28. Flash's fused backward kernel alone takes 0.476 ms of its 0.743 ms. Full ncu tables, including occupancy, L1 requests and stalls, are in `mew-ncu/*.md`.
 
 ### 7. Greedy equivalence, Qwen3-8B, 256 tokens (idle 3090)
 
