@@ -756,6 +756,13 @@ pub struct TNode {
     /// [`TensorGraph::set_sorted`]; the backward uses it to give gathered
     /// contractions a [`Segment`].
     pub sorted: bool,
+    /// A fact about differentiation, not a schedule: this node is
+    /// [`detach`](TensorGraph::detach)ed — an identity map whose
+    /// cotangent is zero. Rewrite passes keep it a node of its own (they
+    /// never splice it into its readers, nor merge it with an
+    /// undetached twin); schedules may still inline it, so it costs
+    /// nothing at run time.
+    pub detach: bool,
     /// The reduction's contributing range along one reduce dim is the run
     /// of a sorted key equal to a point coordinate (a segmented sum). Set by
     /// the backward of a gather through a [`sorted`](Self::sorted) index;
@@ -1065,6 +1072,7 @@ impl TensorGraph {
             int_mma: None,
             segment: None,
             sorted: false,
+            detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1086,6 +1094,7 @@ impl TensorGraph {
             int_mma: None,
             segment: None,
             sorted: false,
+            detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1122,6 +1131,7 @@ impl TensorGraph {
             int_mma: None,
             segment: None,
             sorted: false,
+            detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1150,6 +1160,7 @@ impl TensorGraph {
             int_mma: None,
             segment: None,
             sorted: false,
+            detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1300,6 +1311,7 @@ impl TensorGraph {
             int_mma: None,
             segment: None,
             sorted: false,
+            detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
             precision: Precision::default(),
@@ -1335,6 +1347,44 @@ impl TensorGraph {
             })
             .collect();
         self.comp(&shape, &[], args, None, |v| vec![f(v)])
+    }
+
+    /// `x`, as a constant of [`backward`](Self::backward): the same
+    /// values, no cotangent flows through.
+    ///
+    /// **Implicit differentiation.** Let `λ*` solve `F(λ, θ) = 0`, found
+    /// by any iteration, and `H = ∂F/∂λ`. Take one more Newton step from
+    /// the detached solution with a detached matrix,
+    ///
+    /// `λ' = detach(λ*) − detach(H)⁻¹·F(detach(λ*), θ)`.
+    ///
+    /// Its value is `λ*` (the residual is zero) and its derivative is
+    /// `−H⁻¹·∂F/∂θ`: the implicit function theorem. So the adjoint of a
+    /// converged solve is one linear solve with the same matrix, whatever
+    /// the iteration count, and nothing of the iteration is kept for the
+    /// backward. Exact only at convergence: the gradient's error is of the
+    /// order of the residual.
+    ///
+    /// **Representation.** An identity map with [`TNode::detach`] set.
+    /// The mark is on the node, so it survives every rewrite pass
+    /// (`substitute_maps`, `eliminate_common`, `merge_siblings`,
+    /// `relayout`, `eliminate_dead`, the schedules): passes never splice a
+    /// detached map into its readers or merge it with an undetached twin.
+    /// Schedules may inline it, so it costs no buffer or kernel.
+    ///
+    /// **Higher order.** `detach` is a constant for every `backward`, so
+    /// derivatives of any order through it are zero: a gradient graph that
+    /// reads a detached node (the cotangent of a body that read it) treats
+    /// it as a constant again, and the vjp-of-vjp through it is zero —
+    /// `stop_gradient` semantics, not the implicit function theorem
+    /// applied twice. For second-order implicit derivatives, detach
+    /// inside the step you differentiate twice. tang-compile has no
+    /// forward-mode (jvp) pass; there the same rule (zero tangent) would
+    /// apply.
+    pub fn detach(&mut self, x: TensorId) -> Result<TensorId, ShapeError> {
+        let y = self.map(&[x], |v| v[0])?;
+        self.nodes[y.n()].detach = true;
+        Ok(y)
     }
 
     /// Reduce `axis` of `x` with `m`; the axis is kept as size 1 so the
@@ -1788,7 +1838,13 @@ impl TensorGraph {
             })
             .collect();
         let pinned = self.gather_pins(&live, &candidate);
-        let inline: Vec<bool> = (0..n).map(|i| candidate[i] && !pinned[i]).collect();
+        // a detached map is never spliced (its reader would differentiate
+        // through it); where it would have been, it is scheduled inline
+        // instead, so it still costs no buffer
+        let spliceable: Vec<bool> = (0..n).map(|i| candidate[i] && !pinned[i]).collect();
+        let inline: Vec<bool> = (0..n)
+            .map(|i| spliceable[i] && !self.nodes[i].detach)
+            .collect();
 
         let mut ng = TensorGraph {
             nodes: Vec::new(),
@@ -1842,7 +1898,7 @@ impl TensorGraph {
             ng.nodes.push(TNode {
                 op,
                 shape: node.shape.clone(),
-                inline: node.inline,
+                inline: node.inline || spliceable[i],
                 split: node.split,
                 tile: node.tile,
                 reg: node.reg,
@@ -1850,6 +1906,7 @@ impl TensorGraph {
                 int_mma: node.int_mma,
                 segment: node.segment,
                 sorted: node.sorted,
+                detach: node.detach,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
                 precision: node.precision,
@@ -1872,6 +1929,7 @@ impl TensorGraph {
         let candidate: Vec<bool> = (0..n)
             .map(|j| {
                 j != i
+                    && !self.nodes[j].detach
                     && self
                         .comp_at(j)
                         .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
@@ -2864,7 +2922,8 @@ impl TensorGraph {
                 continue;
             };
             let key = format!(
-                "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                "{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                g.nodes[i].detach,
                 c.out,
                 c.red,
                 c.tuple,
@@ -3114,6 +3173,7 @@ impl TensorGraph {
                 int_mma: None,
                 segment: None,
                 sorted: false,
+                detach: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
                 precision: Precision::default(),
@@ -3714,6 +3774,7 @@ impl TensorGraph {
                     int_mma: None,
                     segment: None,
                     sorted: false,
+                    detach: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
                     inline: false,
