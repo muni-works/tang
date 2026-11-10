@@ -133,6 +133,31 @@ impl TensorGraph {
             }
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
+            let generic = c.monoid.as_ref().is_some_and(|m| match m.kind() {
+                MonoidKind::OnlineSoftmax => false,
+                MonoidKind::Sum | MonoidKind::Max => c.tuple == 1,
+                MonoidKind::Other => true,
+            });
+            let tuple_map = c.monoid.is_none() && c.tuple == 1;
+            if generic || tuple_map {
+                let gs = if generic {
+                    self.monoid_backward(TensorId(j as u32), &c, dy)?
+                } else {
+                    self.tuple_map_backward(&c, dy)?
+                };
+                for (a, g) in gs.into_iter().enumerate() {
+                    if stable.contains(&c.args[a].src.n()) {
+                        continue;
+                    }
+                    let src = c.args[a].src.n();
+                    let acc = match grads.get(&src) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src, acc);
+                }
+                continue;
+            }
             for a in 0..c.args.len() {
                 if stable.contains(&c.args[a].src.n()) {
                     continue;
@@ -271,6 +296,266 @@ impl TensorGraph {
             );
         }
         used
+    }
+
+    /// Backward of a reduction with an arbitrary (associative) tuple
+    /// monoid — the monoids [`discover`](super::discover) emits, top-k,
+    /// argmax. For `y = e₀ ⊕ … ⊕ e_{K−1}` along the one reduce dim,
+    /// `∂y/∂e_k` is the Jacobian of `P_k ⊕ e ⊕ S_k` in `e`, with `P_k`,
+    /// `S_k` the exclusive prefix and suffix folds: two scans of the
+    /// same monoid, then an elementwise vjp of the combine (derived by
+    /// `tang-expr`), chained through the body by the ordinary
+    /// [`arg_grad`](Self::arg_grad) of the map `Σⱼ ēⱼ·bodyⱼ`. Exact for
+    /// any associative combine; no structure assumed.
+    fn monoid_backward(
+        &mut self,
+        self_id: TensorId,
+        c: &Comp,
+        dy: TensorId,
+    ) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let m = c.monoid.clone().expect("a reduction");
+        if let Some(sv) = m.saved.clone() {
+            if c.tuple == 1 && c.red.len() == 1 && !c.has_gather() && body_is(c, &sv.element) {
+                return self.saved_backward(self_id, c, dy, &sv);
+            }
+        }
+        let w = m.width;
+        if c.red.len() != 1 || c.has_gather() {
+            return err("backward: generic monoids need one reduce dim and affine views");
+        }
+        let pts = c.points().to_vec();
+        let np = pts.len();
+        let mut space = pts.clone();
+        space.push(c.red[0]);
+        let r = np + 1;
+        let na = c.args.len();
+        // elements, one tensor per slot, over the comp's own space
+        let mut elems = vec![];
+        for j in 0..w {
+            let (body, out) = (c.body.clone(), c.body_outs[j]);
+            elems.push(self.comp(&space, &[], c.args.clone(), None, move |v| {
+                inline(&body, &[out], v)
+            })?);
+        }
+        let pre = self.scan(&elems, np, m.clone(), true, false)?;
+        let suf = self.scan(&elems, np, m.clone(), true, true)?;
+        let slot = |j: usize, wide: bool| {
+            let mut forms: Vec<Form> = (0..r).map(|d| Form::unit(r, d)).collect();
+            if wide {
+                forms.push(Form::constant(r, j as i64));
+            }
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+        };
+        let dyv = |j: usize| {
+            let mut forms: Vec<Form> = (0..np).map(|d| Form::unit(r, d)).collect();
+            if c.tuple == 1 {
+                forms.push(Form::constant(r, j as i64));
+            }
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+        };
+        // ē = dyᵀ ∂((pre ⊕ e) ⊕ suf)/∂e: vars pre 0..w, e w..2w, suf 2w..3w, seed 3w..4w
+        let (vg, vouts) = {
+            let (mut g, outs) = tang_expr::trace(|| {
+                let v: Vec<ExprId> = (0..3 * w).map(|i| ExprId::var(i as u16)).collect();
+                let mut a = v[..2 * w].to_vec();
+                let pe = inline(&m.combine, &m.outs, &a);
+                a = pe;
+                a.extend_from_slice(&v[2 * w..]);
+                inline(&m.combine, &m.outs, &a)
+            });
+            let seeds: Vec<ExprId> = (0..w).map(|i| g.var((3 * w + i) as u16)).collect();
+            let gr = g.vjp(&outs, &seeds, 3 * w);
+            (g, gr[w..2 * w].to_vec())
+        };
+        let mut ebar = vec![];
+        for jj in 0..w {
+            let mut args = c.args.clone();
+            for j in 0..w {
+                args.push(Arg {
+                    src: pre,
+                    view: slot(j, w > 1),
+                });
+            }
+            for j in 0..w {
+                args.push(Arg {
+                    src: suf,
+                    view: slot(j, w > 1),
+                });
+            }
+            for j in 0..w {
+                args.push(Arg {
+                    src: dy,
+                    view: dyv(j),
+                });
+            }
+            let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+            let (vg, out) = (vg.clone(), vouts[jj]);
+            ebar.push(self.comp(&space, &[], args, None, move |v| {
+                let e = inline(&body, &bouts, &v[..na]);
+                let mut u = v[na..na + w].to_vec();
+                u.extend(e);
+                u.extend_from_slice(&v[na + w..na + 2 * w]);
+                u.extend_from_slice(&v[na + 2 * w..na + 3 * w]);
+                inline(&vg, &[out], &u)
+            })?);
+        }
+        // the map Σⱼ ēⱼ·bodyⱼ(args), differentiated in each original arg
+        let mut args = c.args.clone();
+        for &e in &ebar {
+            args.push(Arg {
+                src: e,
+                view: slot(0, false),
+            });
+        }
+        let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..na + w).map(|i| ExprId::var(i as u16)).collect();
+            let b = inline(&body, &bouts, &v[..na]);
+            let mut acc = b[0] * v[na];
+            for j in 1..w {
+                acc += b[j] * v[na + j];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: space.clone(),
+            tuple: 0,
+            red: vec![],
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&space, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
+    }
+
+    /// Elementwise backward of a discovered online lift from its saved
+    /// final state (see [`SavedBwd::element_grad`](super::discover::SavedBwd::element_grad)):
+    /// one pass reading the elements, the state and its cotangent — the
+    /// FlashAttention-backward shape, derived for every lift.
+    fn saved_backward(
+        &mut self,
+        self_id: TensorId,
+        c: &Comp,
+        dy: TensorId,
+        sv: &super::discover::SavedBwd,
+    ) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let w = sv.w1 + sv.r;
+        let na = c.args.len();
+        let pts = c.points().to_vec();
+        let np = pts.len();
+        let mut space = pts.clone();
+        space.push(c.red[0]);
+        let r = np + 1;
+        let row = |src: TensorId, j: usize| {
+            let mut forms: Vec<Form> = (0..np).map(|d| Form::unit(r, d)).collect();
+            forms.push(Form::constant(r, j as i64));
+            Arg {
+                src,
+                view: View {
+                    forms,
+                    guard: false,
+                    gather: None,
+                },
+            }
+        };
+        let (eg, eo) = sv.element_grad();
+        let mut xbar = vec![];
+        for a in 0..na {
+            let mut args = c.args.clone();
+            args.extend((0..w).map(|j| row(self_id, j)));
+            args.extend((0..w).map(|j| row(dy, j)));
+            let (eg, out) = (eg.clone(), eo[a]);
+            xbar.push(self.comp(&space, &[], args, None, move |v| inline(&eg, &[out], v))?);
+        }
+        let mut args = c.args.clone();
+        for &x in &xbar {
+            args.push(Arg {
+                src: x,
+                view: View::identity(r, r),
+            });
+        }
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..2 * na).map(|i| ExprId::var(i as u16)).collect();
+            let mut acc = v[0] * v[na];
+            for a in 1..na {
+                acc += v[a] * v[na + a];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: space.clone(),
+            tuple: 0,
+            red: vec![],
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&space, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
+    }
+
+    /// Backward of a tuple-valued map (`comp_tuple` without a monoid):
+    /// the scalar map `Σⱼ dyⱼ·bodyⱼ(args)` with `dy`'s slots as extra
+    /// args, differentiated by [`arg_grad`](Self::arg_grad).
+    fn tuple_map_backward(&mut self, c: &Comp, dy: TensorId) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let w = c.width();
+        let pts = c.points().to_vec();
+        let r = pts.len();
+        let na = c.args.len();
+        let mut args = c.args.clone();
+        for j in 0..w {
+            let mut forms: Vec<Form> = (0..r).map(|d| Form::unit(r, d)).collect();
+            forms.push(Form::constant(r, j as i64));
+            args.push(Arg {
+                src: dy,
+                view: View {
+                    forms,
+                    guard: false,
+                    gather: None,
+                },
+            });
+        }
+        let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..na + w).map(|i| ExprId::var(i as u16)).collect();
+            let b = inline(&body, &bouts, &v[..na]);
+            let mut acc = b[0] * v[na];
+            for j in 1..w {
+                acc += b[j] * v[na + j];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: pts.clone(),
+            tuple: 0,
+            red: c.red.clone(),
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&pts, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
     }
 
     /// `∂L/∂(arg a of c)` given `dy = ∂L/∂c`.
@@ -618,6 +903,24 @@ impl Deg {
             _ => None,
         }
     }
+}
+
+/// Whether `c`'s body is `element(args)` (probed at a few points).
+fn body_is(c: &Comp, element: &super::discover::Fun) -> bool {
+    let na = c.args.len();
+    if element.outs.len() != c.body_outs.len() {
+        return false;
+    }
+    (0..3).all(|t| {
+        let v: Vec<f64> = (0..na)
+            .map(|i| 0.31 + ((i * 5 + t * 3) % 7) as f64 * 0.23)
+            .collect();
+        let a = c.body.eval_many::<f64>(&c.body_outs, &v);
+        let b = element.call(&v);
+        a.iter()
+            .zip(&b)
+            .all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + y.abs()) || (x.is_nan() && y.is_nan()))
+    })
 }
 
 fn same(a: f64, b: f64) -> bool {
