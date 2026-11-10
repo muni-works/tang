@@ -200,6 +200,20 @@ driver, so it used CUDA lowerings, not wgpu.
   candidate and prints the best time per LP tile:
   `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`.
 
+### M4 per-tile race (every autotuner candidate timed, `RACE=1 TUNE=1 cargo run --release -p tang-bench --example io_dual`)
+
+| kernel | best on hardware | two-level / dual tile | schedule_auto | autotuner | spread of top 5 |
+|---|---|---|---|---|---|
+| matmul 1024³ | 64×64×16, 0.551 ms | 64×64 (two-level) 0.551–0.559 ms | 64×64×32, 0.559 ms | 32×64×16, 0.554 ms | 1.4%, traffic 138–206 MB |
+| matmul 4096³ | 64×64×32, 29.59 ms | 64×64 (two-level) | same | same | 3.5% |
+| attention N=1024 | key chunk 16, 16×64, 3.86 ms | dual 32×64: 4.77 ms (+23%) | same as best | same as best | — |
+| attention N=4096 | 64×64, 51.5 ms | dual 32×64: 57.2 ms (+11%) | 16×64: 54.8 ms (+6%) | 64×64 (= best) | — |
+
+- Matmul time is flat across traffic: the top 5 tiles span 1.5× in LP traffic but ≤3.5% in time. The traffic objective does not rank these tiles.
+- Attention: the one-level dual tile loses on both sizes. At N=1024 the lowest-traffic tile (64×64, 71 MB) is 29% slower than the 273 MB winner. Traffic is not what decides attention on the M4 either.
+- matmul 4096³ lists a split-K=256 subgroup candidate at 0.098 ms; that is faster than peak FLOPs allow, so the kernel is wrong (not checked for correctness in RACE mode) and is excluded.
+- 3090 per-tile race not run yet (needs an idle 3090: `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`).
+
 ### What else does not hold up
 
 * Rounds 3–4's step floors and lever bounds use the mean bytes-per-thread
