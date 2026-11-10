@@ -60,6 +60,12 @@ fn rows_chunk() -> usize {
         .unwrap_or(8)
 }
 
+/// `DS_ROWS_FUSED=0`: a rows step's attention runs each row's whole attention (its own
+/// weight reads) instead of [`GpuModel::attention_rows_fused`]'s batched projections (A/B).
+fn rows_fused() -> bool {
+    std::env::var("DS_ROWS_FUSED").map_or(true, |v| v != "0")
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -974,9 +980,401 @@ impl GpuModel {
         }
     }
 
+    /// Swap row `sg`'s per-sequence step state in (slot, position params, selection).
+    fn seg_in(&mut self, sg: &mut Seg) {
+        self.cur = sg.slot;
+        self.p = sg.p;
+        self.topk = sg.topk.take();
+        self.cand = sg.cand.take();
+        self.sh_ckv = sg.sh_ckv;
+        self.sh_idxk = sg.sh_idxk;
+    }
+
+    /// Swap the row's selection state back out into `sg`.
+    fn seg_out(&mut self, sg: &mut Seg) {
+        sg.topk = self.topk.take();
+        sg.cand = self.cand.take();
+        sg.sh_ckv = self.sh_ckv;
+        sg.sh_idxk = self.sh_idxk;
+    }
+
+    /// [`Self::attention`] over a [`Self::forward_rows`] step with every weight read ONCE
+    /// for the rows: wq_a|wkv, wq_b, the compressor and indexer projections and wo run over
+    /// all `t` rows; only the position- and cache-dependent kernels (the q/kv epilogue with
+    /// rope and the ring write, the compressor pool and cache rows, the indexer scores and
+    /// top-k, the attention itself) run per row, each on its row's slot and position. The
+    /// same kernels a lone t = 1 decode runs, so bit for bit (t <= 8). `None` when this
+    /// layer's shapes miss the fused q/kv path (the caller runs [`Self::attention_rows`]).
+    fn attention_rows_fused(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+    ) -> Result<Option<Buf>> {
+        let (h, hd) = (self.cpu.cfg.n_heads, self.cpu.cfg.head_dim);
+        let wqa = self.dw(&format!("{p}.attn.wq_a.weight"))?.v;
+        let wkv = self.dw(&format!("{p}.attn.wkv.weight"))?.v;
+        let wqb = self.dw(&format!("{p}.attn.wq_b.weight"))?.v;
+        let qn = self.dw(&format!("{p}.attn.q_norm.weight"))?.v;
+        let kn = self.dw(&format!("{p}.attn.kv_norm.weight"))?.v;
+        let ok = rows_fused()
+            && self.fast
+            && (1..=8).contains(&t)
+            && comp_batched()
+            && [wqa, wkv, wqb].iter().all(|w| self.k.ks_ok(w))
+            && wqa.cols == wkv.cols
+            && wkv.rows as usize == hd
+            && wqb.cols == wqa.rows
+            && wqb.rows as usize == h * hd
+            && qn.cols == wqa.rows
+            && kn.cols as usize == hd
+            && wqa.rows % 32 == 0
+            && hd % 32 == 0;
+        if !ok {
+            return Ok(None);
+        }
+        let mut segs = self
+            .segs
+            .take()
+            .context("attention_rows_fused without rows")?;
+        let r = self.attention_rows_fused_impl(p, lid, x, t, &mut segs, (wqa, wkv, wqb, qn, kn));
+        self.segs = Some(segs);
+        r.map(Some)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn attention_rows_fused_impl(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+        segs: &mut [Seg],
+        (wqa, wkv, wqb, qn, kn): (DsW, DsW, DsW, DsW, DsW),
+    ) -> Result<Buf> {
+        let c = self.cpu.cfg.clone();
+        let (h, hd, win, rd, eps) = (
+            c.n_heads,
+            c.head_dim,
+            c.window_size,
+            c.rope_head_dim,
+            c.norm_eps,
+        );
+        anyhow::ensure!(segs.len() == t, "rows step: {} rows for t {t}", segs.len());
+        let r = c.compress_ratios[lid];
+        let (is_kv, is_idx) = (
+            r > 0 && c.is_kv_source(lid),
+            r > 0 && c.is_index_source(lid),
+        );
+        let at0 = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        // ---- batched: wq_a | wkv over the rows (each bit for bit its own ks_gemv)
+        let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
+        let sp = self.span("q");
+        let (xc, xs) = self.k.ks_x_ptrs();
+        self.k.ks_quant_to(&self.s, x.ptr, xc, xs, t * d)?;
+        let (qr, kv) = (self.fbuf(t * ql)?, self.fbuf(t * hd)?);
+        self.k
+            .ks_gemv2(&self.s, &wqa, &wkv, xc, xs, qr.ptr, kv.ptr, t, true)?;
+        // the compressor's projections over the rows (position-free)
+        let norm = format!("{p}.attn.compressor.norm.weight");
+        let comp = if is_kv {
+            Some(if r == 1 {
+                let kvc = self.lin(x, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+                self.rms(kvc, t, &norm)?;
+                (kvc, None)
+            } else {
+                let kvc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+                let sc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
+                (kvc, Some(sc))
+            })
+        } else {
+            None
+        };
+        self.end(sp);
+        // ---- per row: the q/kv epilogue (rms, q codes, kv rope at the row's position, its
+        // slot's ring), the compressor pool into its slot's partial group
+        let (qc, qs) = self.k.wo_x_ptrs();
+        let tab = self.tabs[lid].ptr;
+        let (rdi, wi) = (rd as i32, win as i32);
+        let lat = if is_kv && r > 1 {
+            Some(self.fbuf(t * hd)?)
+        } else {
+            None
+        };
+        for (i, sg) in segs.iter_mut().enumerate() {
+            self.seg_in(sg);
+            let ring = self.seqs[self.cur].win[lid].ptr;
+            let (pp, zero) = (self.p.ptr, 0u64);
+            let (qri, kvi) = (qr.at(i * ql * 4), kv.at(i * hd * 4));
+            let (qci, qsi) = (qc + (i * ql) as u64, qs + (i * (ql / 32) * 4) as u64);
+            unsafe {
+                self.k.go(
+                    "ds_qkv_post",
+                    (1, 2, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![qri.ptr, qn, qci, qsi, kvi.ptr, kn, tab, rdi, pp, ring, wi, zero, eps],
+                )?
+            };
+            if let (Some((kvc, Some(sc))), Some(lat)) = (comp, lat) {
+                self.sh_ckv = lid;
+                let (kst, sst) = {
+                    let (a, bb) = &self.seqs[self.cur].cst[&lid];
+                    (a.ptr, bb.ptr)
+                };
+                let nw = self.dw(&norm)?.v;
+                let (ri, hdi, one) = (r as i32, hd as i32, 1i32);
+                let (kvr, scr, lr) = (kvc.at(i * hd * 4), sc.at(i * hd * 4), lat.at(i * hd * 4));
+                unsafe {
+                    self.k.go(
+                        "ds_comp_pool",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![kst, sst, kvr.ptr, scr.ptr, lr.ptr, nw, pp, ri, hdi, eps],
+                    )?;
+                    self.k.go(
+                        "ds_ring_last2",
+                        blocks(hd, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![kst, kvr.ptr, sst, scr.ptr, one, hdi, ri, pp],
+                    )?;
+                }
+                self.jrows.push((lid, 0, kvr, scr));
+            } else if is_kv {
+                self.sh_ckv = lid;
+            }
+            self.seg_out(sg);
+        }
+        // ---- batched: wq_b over the rows' codes; the indexer's projections
+        let sp = self.span("q");
+        let q = self.fbuf(t * h * hd)?;
+        self.k
+            .ks_gemv(&self.s, &wqb, None, qc, qs, q.ptr, t, true, 0, 0.0)?;
+        self.end(sp);
+        let lat = match (comp, lat) {
+            (Some((kvc, None)), _) => Some(kvc),
+            (_, l) => l,
+        };
+        let key = match lat.filter(|_| is_idx) {
+            Some(l) => Some(self.lin(l, t, &format!("{p}.attn.indexer.wk.weight"))?),
+            None => None,
+        };
+        let iq = if is_idx {
+            let qi = self.lin(qr, t, &format!("{p}.attn.indexer.wq_b.weight"))?;
+            Some((qi, self.index_weights(p, x, t)?))
+        } else {
+            None
+        };
+        // ---- per row: compressed cache rows, indexer selection, the attention
+        let o = self.fbuf(t * h * hd)?;
+        let (nh, ihd) = (c.index_n_heads, c.index_head_dim);
+        let (wmax, kmax) = (if r > 0 { c.max_seq_len / r } else { 0 }, c.index_topk);
+        let src_l = c.candidate_source_layer;
+        let makes_cand = r > 0 && lid as i64 == src_l;
+        let eats_cand = is_idx && src_l >= 0 && (src_l as usize) < lid;
+        for (i, sg) in segs.iter_mut().enumerate() {
+            self.seg_in(sg);
+            let pp = self.p.ptr;
+            if let Some(l) = lat {
+                let li = l.at(i * hd * 4);
+                let (kn2, ikp, idxk) = match key {
+                    Some(k) => (
+                        self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
+                        k.at(i * ihd * 4).ptr,
+                        self.seqs[self.cur].idxk[&lid].ptr,
+                    ),
+                    None => (self.dw(&norm)?.v, 0, 0),
+                };
+                if key.is_some() {
+                    self.sh_idxk = lid;
+                }
+                let (hdi, ihdi, ri, one) = (hd as i32, ihd as i32, r as i32, 1i32);
+                let (ckv, tb) = (self.seqs[self.cur].ckv[&lid].ptr, self.tabs[lid].ptr);
+                unsafe {
+                    self.k.go(
+                        "ds_comp_post",
+                        (1, 1 + key.is_some() as u32, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![li.ptr, hdi, ckv, ikp, ihdi, kn2, idxk, tb, rdi, pp, ri, one, eps],
+                    )?
+                };
+            }
+            if let Some((qi, wts)) = iq {
+                let tk = self.fbuf(kmax)?;
+                let cand_out = if makes_cand {
+                    Some(self.bytes(wmax)?)
+                } else {
+                    None
+                };
+                let cand_in = if eats_cand {
+                    Some(self.cand.context("no candidate mask")?)
+                } else {
+                    None
+                };
+                let s = self.span("indexer");
+                let q1 = qi.at(i * nh * ihd * 4);
+                let w1 = wts.at(i * nh * 4);
+                self.indexer_row(lid, q1, w1, win, tk, cand_out, cand_in)?;
+                self.end(s);
+                self.topk = Some((tk, kmax));
+                if let Some(cb) = cand_out {
+                    self.cand = Some((cb, wmax));
+                }
+            } else if makes_cand {
+                anyhow::bail!("rows step: a candidate source that is not an index source");
+            }
+            let (mut kc, mut kv1) = (0, 0);
+            if r > 0 {
+                kc = self.topk.as_ref().context("no top-k")?.1;
+                kv1 = self.seqs[self.cur].ckv[&self.sh_ckv].ptr;
+            }
+            let (src, ki) = match kc {
+                0 => (0, 0),
+                _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
+            };
+            let ring = b(&self.seqs[self.cur].win[lid]);
+            let qi = q.at(i * h * hd * 4);
+            let ix = if rd % 2 == 0 && rd <= hd && self.k.attn_fd_win_ok(h, hd, win + kc) {
+                Ix::Win(WinIdx {
+                    mode: 1,
+                    win: win as i32,
+                    src,
+                    kc: ki,
+                })
+            } else {
+                let idx = self.fbuf(win + kc)?;
+                let (st, ni, mi, wi2) = ((win + kc) as i32, win as i32, 1i32, win as i32);
+                unsafe {
+                    self.gk.go(
+                        "dg_win_idx",
+                        blocks(win + kc, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki],
+                    )?
+                };
+                Ix::Rows(idx)
+            };
+            let (oi, _) = self.attn_core(
+                p,
+                qi,
+                false,
+                (ring, win, kv1),
+                ix,
+                1,
+                win + kc,
+                lid,
+                at0,
+                false,
+            )?;
+            self.copy(o.ptr + (i * h * hd * 4) as u64, oi.ptr, h * hd)?;
+            self.seg_out(sg);
+        }
+        // ---- batched: wo over the rows
+        self.attn_wo(p, o, t, false)
+    }
+
+    /// One row's indexer selection (as [`Self::indexer_dyn`] at t = 1, from its projected
+    /// query `q` [nh][ihd] and weights `wts` [nh]) into `out` [index_topk].
+    #[allow(clippy::too_many_arguments)]
+    fn indexer_row(
+        &mut self,
+        lid: usize,
+        q: Buf,
+        wts: Buf,
+        offset: usize,
+        out: Buf,
+        cand_out: Option<Buf>,
+        cand_in: Option<(Buf, usize)>,
+    ) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let (r, nh, ihd) = (c.compress_ratios[lid], c.index_n_heads, c.index_head_dim);
+        let (wmax, kmax) = (c.max_seq_len / r, c.index_topk);
+        // q is a slice of the rows' batch: rope / quantize a private copy
+        let qq = self.fbuf(nh * ihd)?;
+        self.copy(qq.ptr, q.ptr, nh * ihd)?;
+        let at = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        self.rope(qq, 1, nh, ihd, lid, at, false)?;
+        self.k.fp4_qdq(&self.s, qq.ptr, nh * ihd, 32, false)?;
+        let score = self.fbuf(wmax)?;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
+        let (pp, ri, nhi, ihdi, wi) = (self.p.ptr, r as i32, nh as i32, ihd as i32, wmax as i32);
+        let (sg, ty) = (blocks(wmax * 32, 256), 1u32);
+        unsafe {
+            self.gk.go(
+                "dg_index_score",
+                (sg.0, ty, 1),
+                B256,
+                0,
+                &self.s,
+                args![qq.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi],
+            )?
+        };
+        if let Some(cb) = cand_out {
+            let (bs, kb) = (c.candidate_block_size, c.candidate_topk_blocks);
+            let nb = wmax.div_ceil(bs);
+            let (sc, sel) = (self.fbuf(nb)?, self.fbuf(nb)?);
+            let (bsi, kbi, nbi) = (bs as i32, kb as i32, nb as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_candidates",
+                    (ty, 1, 1),
+                    SEL,
+                    0,
+                    &self.s,
+                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi],
+                )?
+            };
+        } else if let Some((cb, st)) = cand_in {
+            let (mg, sti) = (blocks(wmax, 256), st as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_mask_scores",
+                    (mg.0, ty, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti],
+                )?
+            };
+        }
+        let sel = self.fbuf(kmax)?;
+        let (ki, oi) = (kmax as i32, offset as i32);
+        unsafe {
+            self.gk.go(
+                "dg_topk",
+                (ty, 1, 1),
+                SEL,
+                0,
+                &self.s,
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi],
+            )
+        }
+    }
+
     /// [`Self::attention`] over a [`Self::forward_rows`] step: row `i` attends on its own
     /// slot (caches, position, the step's selection so far), one row at a time.
     fn attention_rows(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
+        if let Some(y) = self.attention_rows_fused(p, lid, x, t)? {
+            return Ok(y);
+        }
         let d = self.cpu.cfg.dim;
         let mut segs = self.segs.take().context("attention_rows without rows")?;
         anyhow::ensure!(segs.len() == t, "rows step: {} rows for t {t}", segs.len());
@@ -1467,6 +1865,26 @@ impl GpuModel {
         lid: usize,
         at: At,
     ) -> Result<Buf> {
+        let (o, wo_pre) = self.attn_core(p, q, q_roped, kv, di, t, k, lid, at, true)?;
+        self.attn_wo(p, o, t, wo_pre)
+    }
+
+    /// [`Self::attn_out`]'s attention: o `[t][h][hd]` (inverse rope applied) and whether the
+    /// fused merge already quantized it for wo_ks (only when `pre_ok`).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_core(
+        &self,
+        p: &str,
+        q: Buf,
+        q_roped: bool,
+        kv: (Buf, usize, u64),
+        di: Ix,
+        t: usize,
+        k: usize,
+        lid: usize,
+        at: At,
+        pre_ok: bool,
+    ) -> Result<(Buf, bool)> {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
         let s = self.span("sparse_attn");
@@ -1504,7 +1922,7 @@ impl GpuModel {
             (Ix::Win(w), Some(mut r)) => {
                 // the merge also quantizes o for wo_ks (one launch fewer)
                 let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
-                r.wo_quant = self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
+                r.wo_quant = pre_ok && self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
                 wo_pre = r.wo_quant;
                 self.k.attn_fd_win(
                     &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
@@ -1514,10 +1932,17 @@ impl GpuModel {
         }
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
         self.end(s);
-        let s = self.span("wo");
         if rope.is_none() {
             self.rope(o, t, h, hd, lid, at, true)?;
         }
+        Ok((o, wo_pre))
+    }
+
+    /// [`Self::attn_out`]'s output projection over `t` rows of o.
+    fn attn_wo(&self, p: &str, o: Buf, t: usize, wo_pre: bool) -> Result<Buf> {
+        let c = &self.cpu.cfg;
+        let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
+        let s = self.span("wo");
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
         let mid = self.fbuf(t * g * ol)?;
         if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
