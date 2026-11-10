@@ -187,6 +187,10 @@ pub struct DsServe {
     /// Continuous batching (`DS_SERVE_SLOTS`, default 1 = one request at a time): which
     /// sequence slots a running request holds.
     busy: Vec<bool>,
+    /// Per slot, the tokens a finished request left in it and when (an LRU stamp): a new
+    /// request whose prompt extends them continues that slot instead of prefilling again.
+    parked: Vec<Option<(Vec<usize>, u64)>>,
+    clock: u64,
 }
 
 /// The served sequence slots (`DS_SERVE_SLOTS`; 1 = no batching).
@@ -222,18 +226,29 @@ pub(crate) struct SlotSeq {
     max_new: usize,
     /// Set once the sequence ends; the caller may set it too (a stop string, a cancel).
     pub done: Option<Finish>,
+    /// Every token the slot holds, in order (the prompt as fed, then the fed outputs): what
+    /// a later request can continue from.
+    pub fed: Vec<usize>,
 }
 
 impl SlotSeq {
     pub fn new(slot: usize, prompt: Vec<usize>, max_new: usize) -> Self {
+        Self::resume(slot, prompt, 0, max_new)
+    }
+
+    /// A sequence whose slot already holds `prompt[..held]` (a parked conversation it
+    /// extends): only the rest is prefilled, from position `held`.
+    pub fn resume(slot: usize, prompt: Vec<usize>, held: usize, max_new: usize) -> Self {
+        let fed = prompt[..held].to_vec();
         Self {
             slot,
             prompt,
-            pos: 0,
+            pos: held,
             feed: None,
             n: 0,
             max_new,
             done: None,
+            fed,
         }
     }
 
@@ -292,6 +307,7 @@ pub(crate) fn slots_step(
             }
             let end = (q.pos + chunk).min(q.prompt.len());
             let (lg, _) = m.forward(&q.prompt[q.pos..end], q.pos, None)?;
+            q.fed.extend_from_slice(&q.prompt[q.pos..end]);
             q.pos = end;
             left = left.saturating_sub(1);
             if !q.prefilling() {
@@ -313,7 +329,7 @@ pub(crate) fn slots_step(
     let next = m.forward_rows(&rows)?;
     for (j, &i) in live.iter().enumerate() {
         let q = &mut *seqs[i];
-        q.feed = None;
+        q.fed.push(q.feed.take().unwrap());
         q.pos += 1;
         let cap = m.slot_cap(q.slot);
         q.take(next[j], eos, cap, &mut out[i]);
@@ -337,6 +353,32 @@ struct DsStream {
 }
 
 impl DsServe {
+    /// The slot for a prompt `ids`: the free parked slot holding the longest strict prefix
+    /// of it (continued from there: `held` > 0), else a free empty slot, else the least
+    /// recently parked one (its tokens dropped).
+    fn pick_slot(&self, ids: &[usize]) -> Result<(usize, usize)> {
+        let free = |i: &usize| !self.busy[*i];
+        let n = self.busy.len();
+        let best = (0..n)
+            .filter(free)
+            .filter_map(|i| {
+                let (t, _) = self.parked[i].as_ref()?;
+                (t.len() < ids.len() && ids.starts_with(t)).then_some((i, t.len()))
+            })
+            .max_by_key(|&(_, l)| l);
+        if let Some(b) = best {
+            return Ok(b);
+        }
+        if let Some(i) = (0..n).filter(free).find(|&i| self.parked[i].is_none()) {
+            return Ok((i, 0));
+        }
+        let i = (0..n)
+            .filter(free)
+            .min_by_key(|&i| self.parked[i].as_ref().map_or(0, |p| p.1))
+            .context("no free sequence slot")?;
+        Ok((i, 0))
+    }
+
     /// `dir`: the checkpoint with `tokenizer.json`, `tokenizer_config.json`,
     /// `chat_template.jinja`, `inference/config.json` and `engram.json`.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -403,6 +445,8 @@ impl DsServe {
             eos,
             ctx,
             busy: vec![false; slots],
+            parked: vec![None; slots],
+            clock: 0,
         })
     }
 }
@@ -713,11 +757,6 @@ impl Backend for DsServe {
         if req.sampling.temperature > 0.0 {
             bail!("deepseek batching is greedy only for now (temperature 0)");
         }
-        let slot = self
-            .busy
-            .iter()
-            .position(|b| !b)
-            .context("no free sequence slot")?;
         let think = req.think.unwrap_or(true);
         let prompt = self
             .tpl
@@ -727,6 +766,7 @@ impl Backend for DsServe {
             .encode(prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         let ids: Vec<usize> = enc.get_ids().iter().map(|&i| i as usize).collect();
+        let (slot, held) = self.pick_slot(&ids)?;
         let cap = g.slot_cap(slot);
         let max_new = req
             .max_tokens
@@ -739,8 +779,11 @@ impl Backend for DsServe {
             );
         }
         self.busy[slot] = true;
+        self.parked[slot] = None;
+        let mut usage = Usage::default();
+        usage.cached_tokens = held;
         Ok(Box::new(DsStream {
-            seq: SlotSeq::new(slot, ids, max_new),
+            seq: SlotSeq::resume(slot, ids, held, max_new),
             think,
             out: Vec::new(),
             detok: Detok::default(),
@@ -748,7 +791,7 @@ impl Backend for DsServe {
             dsml: Dsml::default(),
             called: false,
             stop: req.stop.clone(),
-            usage: Usage::default(),
+            usage,
             t0: Instant::now(),
             t1: None,
         }))
@@ -856,6 +899,13 @@ impl Backend for DsServe {
             .map_err(|_| anyhow::anyhow!("a stream this backend admitted"))?;
         if let Some(b) = self.busy.get_mut(s.seq.slot) {
             *b = false;
+            // park what the slot holds for the conversation's next turn (a cancelled or
+            // failed run's slot may be mid-step: not reused)
+            self.clock += 1;
+            self.parked[s.seq.slot] = match s.seq.done {
+                Some(Finish::Cancelled) | None => None,
+                Some(_) => Some((s.seq.fed.clone(), self.clock)),
+            };
         }
         let _ = s.think;
         Ok(Outcome::Done(
@@ -1123,6 +1173,81 @@ fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation's next turn continues its parked slot ([`SlotSeq::resume`]): only the
+    /// new tokens are prefilled, and the reply equals `forward::generate` over the whole
+    /// prompt from scratch (greedy). A different slot runs alongside the whole time.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slot_resume_matches_generate() {
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let v = m.cpu.cfg.vocab_size;
+        m.add_slots(2, m.cpu.cfg.max_seq_len.min(512)).unwrap();
+        let run = |m: &mut GpuModel, seqs: &mut Vec<SlotSeq>| -> Vec<Vec<usize>> {
+            let mut got = vec![Vec::new(); seqs.len()];
+            while seqs[0].done.is_none() {
+                let idx: Vec<usize> = (0..seqs.len())
+                    .filter(|&i| seqs[i].done.is_none())
+                    .collect();
+                let mut r: Vec<&mut SlotSeq> =
+                    seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+                let out = slots_step(m, &mut r, &[]).unwrap();
+                for (j, o) in out.into_iter().enumerate() {
+                    got[idx[j]].extend(o);
+                }
+            }
+            got
+        };
+        // turn 1 on slot 0, a neighbour on slot 1
+        let other: Vec<usize> = (0..ids.len()).map(|i| (31 * i + 5) % v).collect();
+        let mut seqs = vec![SlotSeq::new(0, ids.clone(), 5), SlotSeq::new(1, other, 40)];
+        let first = run(&mut m, &mut seqs);
+        let held = seqs[0].fed.clone();
+        assert!(
+            held.len() >= ids.len() + 4,
+            "turn 1 fed {} tokens",
+            held.len()
+        );
+        // turn 2: the held tokens, the unfed last reply token, then a few new ones
+        let mut p2 = held.clone();
+        p2.push(*first[0].last().unwrap());
+        p2.extend((0..6).map(|i| (17 * i + 3) % v));
+        let n1 = std::mem::replace(&mut seqs[0], SlotSeq::resume(0, p2.clone(), held.len(), 6));
+        drop(n1);
+        let second = run(&mut m, &mut seqs);
+        // the reference: the whole turn-2 prompt from scratch
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let mut want = Vec::new();
+        let mut pick = SpecSampler::new(0.0, 1.0, 1);
+        let mut u = Usage::default();
+        forward::generate(&mut a, &p2, 6, &mut pick, false, &[], &mut u, &mut |t| {
+            want.push(t);
+            None
+        })
+        .unwrap();
+        eprintln!("resume: got {:?} want {:?}", second[0], want);
+        assert_eq!(second[0], want, "resumed turn 2");
+    }
 
     /// The slot batcher against the single-request path: sequences that arrive at different
     /// steps, with different prompts and limits, batched by [`slots_step`] (prefill on the
