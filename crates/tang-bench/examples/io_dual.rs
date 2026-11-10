@@ -218,6 +218,59 @@ fn cache_bw(m: &Machine, ws_bytes: f64) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Fast memory of the whole device, bytes, as an upper bound: the smallest
+/// probed working set whose bandwidth is within 5% of the DRAM plateau.
+/// Everything at or above it is served at the DRAM rate, so no cache level
+/// holds that much.
+fn fast_bytes(m: &Machine) -> f64 {
+    let t = cache_table(m);
+    let plateau = t.last().unwrap().1;
+    t.iter()
+        .find(|e| e.1 <= 1.05 * plateau)
+        .map(|e| e.0)
+        .unwrap_or(f64::INFINITY)
+}
+
+/// A floor that does not depend on how the kernel stages data, so it holds
+/// for every lowering of the candidate (WGSL or CUDA):
+///
+/// `L + max(λ + B_comp/β(B_comp), λ + B_HBL(C)/β_DRAM, F/π, ⌈G/S⌉λ)`
+///
+/// `B_comp` (every array once) moves at no more than the best probed rate
+/// for a working set that large. `B_HBL(C)` is the Brascamp–Lieb minimum
+/// traffic at the device's whole fast memory `C` ([`fast_bytes`]): any
+/// execution moves at least that much between DRAM and everything faster,
+/// at the DRAM plateau rate. The tile enters only through `G` and `S`.
+fn sound_floor(
+    lp: &Lp,
+    sk: &tang_compile::tensor::io_lp::StepKernel,
+    m: &Machine,
+) -> (f64, &'static str) {
+    let comp = compulsory(lp) * 4.0;
+    let c = fast_bytes(m);
+    let hbl = if c.is_finite() {
+        lp.bound(c / 4.0).unwrap_or(0.0) * 4.0
+    } else {
+        0.0
+    };
+    let plateau = cache_table(m).last().unwrap().1.max(m.dram_bw);
+    let stream = m.mem_latency + comp / cache_bw(m, comp).max(m.dram_bw);
+    let hier = m.mem_latency + hbl / plateau;
+    let compute = sk.flops / m.flops;
+    let waves = sk.waves(m).ceil().max(1.0) * m.mem_latency;
+    let t = stream.max(hier).max(compute).max(waves);
+    let why = if t == compute {
+        "compute"
+    } else if t == waves {
+        "waves"
+    } else if t == hier {
+        "hbl"
+    } else {
+        "stream"
+    };
+    (m.launch + t, why)
+}
+
 fn race(
     g: &TensorGraph,
     outs: &[TensorId],
@@ -253,8 +306,20 @@ fn race(
     let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let k = main_kernel(g, outs);
     let space = Space::standard();
-    // (tile, measured ms, encoding, floor s, binding term)
-    let mut best: Vec<(Vec<usize>, f64, String, f64, &'static str, String)> = Vec::new();
+    // (tile, measured ms, encoding, per-tile estimate s, its binding term,
+    //  occupancy, sound floor s, its binding term)
+    #[allow(clippy::type_complexity)]
+    let mut best: Vec<(
+        Vec<usize>,
+        f64,
+        String,
+        f64,
+        &'static str,
+        String,
+        f64,
+        &'static str,
+    )> = Vec::new();
+    let mut invalid = 0usize;
     for c in space.candidates(g, k) {
         let mut gc = g.clone();
         space.apply(&mut gc, k, &c);
@@ -267,6 +332,11 @@ fn race(
             eprintln!("--- {}\n{}", c.encode(&space), lk.source);
         }
         let (grid, block, regs, smem) = launch_shape(&lk.source, lk.count, lk.workgroup_size);
+        // an empty grid computes nothing: not a kernel of this problem
+        if grid == 0 {
+            invalid += 1;
+            continue;
+        }
         let Ok(prog) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Program::compile(&rt, &gc, outs, &ins)
         })) else {
@@ -305,6 +375,7 @@ fn race(
         let (fl, why) = sk.floor(&mc);
         let dram = m.launch + m.mem_latency + comp / m.dram_bw;
         let (fl, why) = if dram > fl { (dram, "dram") } else { (fl, why) };
+        let (sfl, swhy) = sound_floor(lp, &sk, m);
         // keep every candidate: the model ranks schedules, not LP tiles
         best.push((
             t,
@@ -316,22 +387,38 @@ fn race(
                 "grid {grid} block {block} regs {regs} smem {smem} waves {:.1}",
                 sk.waves(m)
             ),
+            sfl,
+            swhy,
         ));
     }
     best.retain(|b| b.1.is_finite());
-    // faster than its floor: either a wrong kernel (RACE does not check
-    // outputs) or the floor is not a floor; kept and counted, not dropped
+    println!("  invalid (empty grid, not timed): {invalid}");
+    // faster than the sound floor: a wrong kernel (RACE does not check
+    // outputs) or a wrong constant; kept and counted, not dropped
     let viol: Vec<String> = best
         .iter()
-        .filter(|b| b.1 * 1e-3 < b.3)
-        .map(|b| format!("{:.3}<{:.3} ms ({})", b.1, b.3 * 1e3, b.2))
+        .filter(|b| b.1 * 1e-3 < b.6)
+        .map(|b| format!("{:.3}<{:.3} ms {} ({})", b.1, b.6 * 1e3, b.7, b.2))
         .collect();
     println!("  floor violations: {}/{}", viol.len(), best.len());
     for v in viol.iter().take(4) {
         println!("    {v}");
     }
+    let tight = best
+        .iter()
+        .map(|b| b.1 * 1e-3 / b.6)
+        .fold(f64::INFINITY, f64::min);
+    println!("  tightest: measured = {tight:.2}× floor");
+    // the per-tile estimate charges the WGSL tile's LP traffic; it is a
+    // model of the kernel, not a bound, and a kernel can beat it
+    let under = best.iter().filter(|b| b.1 * 1e-3 < b.3).count();
+    println!(
+        "  faster than the per-tile estimate: {under}/{}",
+        best.len()
+    );
     best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    // the model's pick: argmin floor, ties (within 0.1%) to lower traffic
+    // the model's pick: argmin per-tile estimate, ties (within 0.1%) to
+    // lower traffic
     let pick = (0..best.len()).min_by(|&i, &j| {
         let (a, b) = (&best[i], &best[j]);
         if (a.3 - b.3).abs() <= 1e-3 * a.3.min(b.3) {
@@ -345,7 +432,7 @@ fn race(
     if let Some(p) = pick {
         let b = &best[p];
         println!(
-            "  time-floor pick: rank {}/{}  {:.3} ms = {:.3}× winner  floor {:.3} ms ({})  ({})",
+            "  estimate pick: rank {}/{}  {:.3} ms = {:.3}× winner  estimate {:.3} ms ({})  ({})",
             p + 1,
             best.len(),
             b.1,
@@ -356,9 +443,9 @@ fn race(
         );
         println!("    pick: {}", b.5);
     }
-    for (t, ms, enc, fl, why, occ) in best.iter().take(12) {
+    for (t, ms, enc, fl, why, occ, sfl, swhy) in best.iter().take(12) {
         println!(
-            "  race [{}]  {:.3} ms  floor {:.3} ms ({why})  LP traffic {:.2} MB  [{occ}]  ({enc})",
+            "  race [{}]  {:.3} ms  floor {:.3} ms ({swhy})  estimate {:.3} ms ({why})  LP traffic {:.2} MB  [{occ}]  ({enc})",
             names
                 .iter()
                 .zip(t)
@@ -366,6 +453,7 @@ fn race(
                 .collect::<Vec<_>>()
                 .join(" "),
             ms,
+            sfl * 1e3,
             fl * 1e3,
             mb(tiled_traffic(lp, t))
         );

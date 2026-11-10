@@ -9,7 +9,7 @@ Experiment: `cargo run --release -p tang-bench --example io_dual`
 (`TUNE=1` adds the GPU autotuner's pick on the local device). Lean:
 `proofs/TangProofs/Duality.lean`, `Trace*.lean`.
 
-## Corrections after the paper review (read this first)
+## Corrections (read this first)
 
 This section overrides the rounds below where they disagree. Rounds 2–4 are
 kept as history. Their machine constants (600 ns H200 latency, 1–2 µs launch
@@ -27,15 +27,15 @@ python3 scripts/ncu/floor_table.py
 cargo run --release -p tang-bench --example io_dual
 ```
 
-| claim in the paper | verdict | right number |
+| earlier claim | verdict | right number |
 |---|---|---|
 | Q8 GEMV "63.5 µs measured" | **not one kernel** | `dop00_gemv_q8_0` in `ops_t1` is the mean of three shapes launched under one name, grouped by name in #186's table. See the shapes below. |
 | Q8 GEMV "58.7 µs / 0.92" (round 4) | **withdraw** | Computed from that mean, with a hypothesized L1 term. |
 | Q8 GEMV "26.5 µs / 0.42" (round 3) | **superseded** | Same mean, older constants. |
 | "0.92" in `fraction-of-light.md` | different quantity | The vocab head's 3090 throughput as a fraction of peak (864 / 936 GB/s), not predicted/measured. |
 | attention traffic "2–2.8×" | **should be 2.0–3.0×** | `schedule_auto` / single-level dual tile: 3090 2.83× (N=1024), 2.95× (N=4096); M4 1.97×, 1.99×. |
-| reviewer's 1.76× | a different ratio | Single-level dual / two-level dual on the 3090 at N=4096 (1460 / 830 MB). |
-| reviewer's 2.0× | correct for the M4 | |
+| "1.76×" for the same ratio | a different ratio | Single-level dual / two-level dual on the 3090 at N=4096 (1460 / 830 MB). |
+| "2.0×" for the same ratio | correct for the M4 Max | |
 
 Q8_0 GEMV by shape, H200 (#186 raw trace, `ops_t1`). The floor is defined below:
 
@@ -78,7 +78,7 @@ S = SMs · min(threads_per_SM / block, regs_per_SM / (regs · block), hw limit)
 over peak, `G` workgroups. The Little's-law term
 `B·λ / (resident threads · bytes per thread)` lives only in `TimeFloor`; it is
 not in this formula, and it never bound with bytes per thread counted from the
-schedule (round 2). The paper's formula should be this one.
+schedule (round 2). This is the formula the paper uses.
 
 Justifying `⌈G/S⌉·λ`: if every workgroup makes at least one DRAM round trip,
 each occupies a slot for at least `λ`. A slot then hosts at most `⌊T/λ⌋`
