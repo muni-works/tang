@@ -150,7 +150,16 @@ fn launch_shape(src: &str, count: u32, block: u32) -> (usize, usize, usize, f64)
     let mut smem = 0.0;
     let mut regs = REG_BASE as f64;
     for l in src.lines().map(str::trim) {
-        if let Some(r) = l.strip_prefix("var<workgroup>") {
+        // CUDA lowering: dynamic smem in bytes, register arrays `float a[..][..];`
+        if let Some(r) = l.strip_prefix("#define TANG_SMEM ") {
+            smem += r.trim().parse::<f64>().unwrap_or(0.0) / 4.0;
+        } else if l.starts_with("float ") && l.contains('[') && l.ends_with("];") {
+            regs += l
+                .split('[')
+                .skip(1)
+                .filter_map(|d| d.split(']').next()?.trim().parse::<f64>().ok())
+                .product::<f64>();
+        } else if let Some(r) = l.strip_prefix("var<workgroup>") {
             let ty = r.split_once(':').map(|x| x.1).unwrap_or("");
             // drop the f32/f16 width digits before multiplying
             smem += words(&ty.replace("f32", "").replace("f16", "").replace("u32", ""));
