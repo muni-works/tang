@@ -1458,10 +1458,6 @@ impl GpuModel {
             );
         }
         anyhow::ensure!(!self.journal_on, "rows step under an open snapshot");
-        anyhow::ensure!(
-            self.moe_reduce.is_none(),
-            "rows step: expert parallel not wired"
-        );
         let c = self.cpu.cfg.clone();
         let home = self.cur;
         self.last = None;

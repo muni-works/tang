@@ -78,6 +78,10 @@ enum Cmd {
     DecodeSpec(usize, Vec<f32>, usize, SpecSampler),
     Reset,
     Misses,
+    /// Sequence slots ([`GpuModel::add_slots`]), the active one, a batched rows step.
+    AddSlots(usize, usize),
+    Select(usize),
+    Rows(Vec<(usize, usize, usize)>),
 }
 
 enum Reply {
@@ -86,6 +90,7 @@ enum Reply {
     DecodeSpec(SpecStep, u64),
     Done,
     Misses(usize),
+    Rows(Vec<usize>),
 }
 
 struct Rank {
@@ -100,6 +105,8 @@ pub struct EpGroup {
     ranks: Vec<Rank>,
     seq: std::cell::Cell<u64>,
     cfg: super::Config,
+    /// Each sequence slot's positions (slot 0 the model's context).
+    caps: Vec<usize>,
 }
 
 impl EpGroup {
@@ -192,6 +199,9 @@ impl EpGroup {
                                 .map(|st| Reply::DecodeSpec(st, pick.rng)),
                             Cmd::Reset => m.reset().map(|_| Reply::Done),
                             Cmd::Misses => Ok(Reply::Misses(m.expert_misses())),
+                            Cmd::AddSlots(n, cap) => m.add_slots(n, cap).map(|_| Reply::Done),
+                            Cmd::Select(s) => m.select_slot(s).map(|_| Reply::Done),
+                            Cmd::Rows(rows) => m.forward_rows(&rows).map(Reply::Rows),
                         };
                         if let Err(e) = &r {
                             // the peers are in (or heading into) this step's collectives and
@@ -218,10 +228,12 @@ impl EpGroup {
                 dir.join("config.json")
             }
         })?;
+        let caps = vec![cfg.max_seq_len];
         let g = EpGroup {
             ranks,
             seq: std::cell::Cell::new(0),
             cfg,
+            caps,
         };
         g.collect_load(&stage, devices, t_load)?;
         Ok(g)
@@ -356,6 +368,34 @@ impl EpGroup {
 
     pub fn reset(&self) -> Result<()> {
         self.send(|| Cmd::Reset).map(|_| ())
+    }
+
+    /// [`GpuModel::add_slots`] on every rank.
+    pub fn add_slots(&mut self, n: usize, cap: usize) -> Result<()> {
+        self.send(|| Cmd::AddSlots(n, cap))?;
+        while self.caps.len() < n {
+            self.caps.push(cap);
+        }
+        Ok(())
+    }
+
+    /// [`GpuModel::select_slot`] on every rank.
+    pub fn select_slot(&self, s: usize) -> Result<()> {
+        self.send(|| Cmd::Select(s)).map(|_| ())
+    }
+
+    /// The positions slot `s` holds.
+    pub fn slot_cap(&self, s: usize) -> usize {
+        self.caps[s]
+    }
+
+    /// [`GpuModel::forward_rows`] on every rank (the experts' partial sums reduced across
+    /// them per layer); rank 0's next tokens.
+    pub fn forward_rows(&self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        match self.send(|| Cmd::Rows(rows.to_vec()))?.swap_remove(0) {
+            Reply::Rows(v) => Ok(v),
+            _ => Err(anyhow!("ep: unexpected reply to a rows step")),
+        }
     }
 
     /// Routed-expert tensors each rank has uploaded.
