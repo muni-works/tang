@@ -1074,6 +1074,100 @@ pub fn profile(dir: &Path, devices: &[usize], o: &ProfileOpts) -> Result<String>
     Ok(profile_table(&recs, o, load_s, &usage))
 }
 
+/// `deepseek-profile --slots N`: the batched decode's throughput. Opens the model with `N`
+/// sequence slots (`DS_SLOT_CTX` positions each), prefills `prompt_tokens` synthetic tokens
+/// into every slot (slot 0's prompt is the single-request profile's; slots 1.. change one
+/// token, so routing and caches differ), then decodes `steps` tokens in every slot through
+/// the batcher. Reports aggregate decode tok/s, per-step wall times and each slot's first
+/// ids (slot 0's must equal a single-request greedy run of the same prompt).
+pub fn profile_slots(
+    dir: &Path,
+    devices: &[usize],
+    slots: usize,
+    prompt_tokens: usize,
+    steps: usize,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let t0 = Instant::now();
+    let mut m = Engine::open(dir, devices)?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let cfg = m.config().clone();
+    let cap = slot_ctx(cfg.max_seq_len);
+    match &mut m {
+        Engine::Single(g) => g.add_slots(slots, cap)?,
+        #[cfg(feature = "ep")]
+        Engine::Ep(g) => g.add_slots(slots, cap)?,
+    }
+    let v = cfg.vocab_size;
+    let base: Vec<usize> = (0..prompt_tokens.max(1))
+        .map(|i| (i * 7919 + 13) % v)
+        .collect();
+    let mut seqs: Vec<SlotSeq> = (0..slots)
+        .map(|k| {
+            let mut p = base.clone();
+            if k > 0 {
+                let j = p.len() - 1;
+                p[j] = (p[j] + 104729 * k) % v;
+            }
+            SlotSeq::new(k, p, steps + 1)
+        })
+        .collect();
+    let mut gen: Vec<Vec<usize>> = vec![Vec::new(); slots];
+    let t1 = Instant::now();
+    let mut step_ms: Vec<f64> = Vec::new();
+    let mut prefill_s = 0.0;
+    while seqs.iter().any(|q| q.done.is_none()) {
+        let prefilling = seqs.iter().any(|q| q.prefilling());
+        let idx: Vec<usize> = (0..slots).filter(|&i| seqs[i].done.is_none()).collect();
+        let ts = Instant::now();
+        let out = {
+            let mut r: Vec<&mut SlotSeq> = seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+            slots_step(&mut m, &mut r, &[])?
+        };
+        let ms = ts.elapsed().as_secs_f64() * 1e3;
+        if prefilling {
+            prefill_s += ms / 1e3;
+        } else {
+            step_ms.push(ms);
+        }
+        for (j, o) in out.into_iter().enumerate() {
+            gen[idx[j]].extend(o);
+        }
+    }
+    let total_s = t1.elapsed().as_secs_f64();
+    let decode_s: f64 = step_ms.iter().sum::<f64>() / 1e3;
+    let decoded: usize = gen.iter().map(|g| g.len().saturating_sub(1)).sum();
+    let mut sorted = step_ms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| {
+        sorted
+            .get(((sorted.len() as f64 - 1.0) * p) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let mut s = String::new();
+    writeln!(
+        s,
+        "deepseek-profile --slots {slots}: load {load_s:.1} s, prompt {prompt_tokens} tokens x {slots}, prefill {prefill_s:.2} s, {} decode steps in {decode_s:.2} s ({total_s:.2} s total)",
+        step_ms.len()
+    )?;
+    writeln!(
+        s,
+        "decode: {decoded} tokens, aggregate {:.1} tok/s, per step p50 {:.2} ms p90 {:.2} ms max {:.2} ms (rows per step <= {}, DS_ROWS_CHUNK {})",
+        decoded as f64 / decode_s.max(1e-9),
+        pct(0.5),
+        pct(0.9),
+        pct(1.0),
+        slots,
+        std::env::var("DS_ROWS_CHUNK").unwrap_or_else(|_| "8".into())
+    )?;
+    for (k, g) in gen.iter().enumerate().take(4) {
+        let ids: Vec<String> = g.iter().take(16).map(|t| t.to_string()).collect();
+        writeln!(s, "ids slot {k}: {}", ids.join(" "))?;
+    }
+    Ok(s)
+}
+
 fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: &Usage) -> String {
     use super::obs;
     use std::fmt::Write as _;
