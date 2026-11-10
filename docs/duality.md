@@ -214,6 +214,32 @@ driver, so it used CUDA lowerings, not wgpu.
 - matmul 4096³ lists a split-K=256 subgroup candidate at 0.098 ms; that is faster than peak FLOPs allow, so the kernel is wrong (not checked for correctness in RACE mode) and is excluded.
 - 3090 per-tile race not run yet (needs an idle 3090: `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`).
 
+### Time-floor tile pick vs the race (`RACE=1`, M4 Max local, 3090 on mew)
+
+Pick = argmin over every autotuner candidate of `L + max(λ + B_LP/β_cache(ws), λ + B_comp/β_DRAM, F/π, ⌈G/S⌉λ)`. S (resident workgroups) comes from each candidate's lowered source: threads per block, registers counted from its arrays (+24 base, assumed), and smem, all against the device limits. Ties within 0.1% go to lower traffic. Run with `RACE=1 TUNE=1` (M4 Max) or `RACE=1 TUNE=3090 … --features cuda` (mew, under `flock ~/tang-gpu.lock`).
+
+| machine | kernel | floor pick | measured winner | pick's rank | pick / winner |
+|---|---|---|---|---|---|
+| M4 Max | matmul 1024³ | 64×64×16 | same | 1/104 | 1.00 |
+| M4 Max | matmul 4096³ | 64×64×32 | same (among valid kernels) | 1 | 1.00 |
+| M4 Max | attention N=1024 | 64×64×16 | 16×64×16 | 8/120 | **1.29 (loses)** |
+| M4 Max | attention N=4096 | 64×64×32 | same | 1/120 | 1.00 |
+| 3090 | matmul 1024³ | 64×64×32 | same | 1/104 | 1.00 |
+| 3090 | matmul 4096³ | 64×64×32 | 32×64×32 | 29/102 | 1.005 |
+| 3090 | attention N=1024 | 64×64×32 | 4×256×16 | 37/120 | 1.004 |
+| 3090 | attention N=4096 | 64×64×32 | 16×64×16 | 78/120 | 1.03 |
+
+What this does and doesn't show:
+- **M4 Max**: the pick wins 3 of 4. It loses attention N=1024 by 29%. Every attention floor there is ~30–60× below measured, so no term in the floor is what limits those kernels, and the pick is just the lowest-traffic tile.
+- **3090**: the pick is within 0.5–3% of the winner on all four, but that's because the top ~80 candidates sit within 3% of each other. The rank says nothing. Worse, **the floor is not a floor on the 3090**: 64/104, 99/102, 15/120 and 113/120 candidates run faster than their own "floor". The CUDA lowering stages differently from the WGSL tile that `io_report` maps onto the LP (double-buffered cp.async, 56 KB smem), and the 128 KB L1 absorbs re-reads the LP charges to L2. B_LP is therefore not the traffic these kernels move, and the time model is unsound there until B is measured or derived from the CUDA kernel itself.
+- **Kernels left out**: matmul 4096³ on the M4 Max has split-K=256 candidates at 0.15 ms with grid 0 (they launch no work, so they're wrong kernels) and an untiled kernel at 610 ms under a 1104 ms floor (the per-point tile ignores L1 reuse).
+
+Provenance of the constants. Nothing was fitted to race times, but several changes were made **after seeing the first race**, and are disclosed as such:
+- β_cache(ws) comes from standalone probes, `scripts/review/cachebw.swift` and `cachebw.cu`. The tables are in `cache_table` in io_dual.rs. I wrote the probes because the first race showed LP traffic at DRAM β was not a floor.
+- The local host is an **M4 Max** (40 cores, 546 GB/s), not the 10-core M4 that `Machine::M4` (and every earlier "M4" floor in this doc) assumed. `Machine::M4_MAX` is spec values.
+- The rule "a kernel with no smem staging reuses per point" was added after the untiled kernel was picked on the first run.
+- Register count base (24) is assumed.
+
 ### What else does not hold up
 
 * Rounds 3–4's step floors and lever bounds use the mean bytes-per-thread
