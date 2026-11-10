@@ -231,6 +231,10 @@ const MORE: &[&str] = &[
     "ds_kst_f3_g0",
     "ds_kst_f2_g1",
     "ds_kst_f3_g1",
+    "ds_ksr_f2_g0",
+    "ds_ksr_f3_g0",
+    "ds_ksr_f2_g1",
+    "ds_ksr_f3_g1",
     "ds_moe_tgu_f2",
     "ds_moe_tgu_f3",
     "ds_moe_tdown_f2",
@@ -274,8 +278,10 @@ pub struct AttnRope {
 }
 
 /// Floats of cross-block K-split partials, and row-group counters.
-const KS_PART: usize = 1 << 21;
-const KS_CNT: usize = 1 << 13;
+// sized so the n-row guard in ks_gemv (sb -> 1) never trips at real shapes: the split is then
+// a function of the weight alone, the same at t = 1, 8 or (ds_ksr) more
+const KS_PART: usize = 1 << 24;
+const KS_CNT: usize = 1 << 16;
 /// [`Kernels::gemv_bf16`]'s partials (floats) and row groups.
 const GEMV_PART: usize = 1 << 20;
 const GEMV_CNT: usize = 1 << 12;
@@ -331,6 +337,13 @@ fn moe_table(m: &Module) -> Result<[[[Func; 2]; 4]; 2]> {
 /// warps per SM while keeping ≥ 4 groups a warp. Returns (S, row-group blocks, SB).
 /// Work items target `DS_KS_TGT` (default 6) × SMs. 2 is faster on H100 (wq_b 24.5 -> 23.8,
 /// wo_b 36.4 -> 32.6 us at t = 6) but changes the partial-sum order, and greedy acceptance fell.
+/// `DS_KSR=0`: linears over t > 8 rows run `ds_kst` (S = 1, SB = 1: each row its own
+/// rounding) instead of `ds_ksr` (each row its decode result).
+fn ksr_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_KSR").map_or(true, |v| v != "0"))
+}
+
 fn ks_split(tiles: usize, groups: usize, sms: usize) -> (usize, usize, usize) {
     static TGT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let tgt = *TGT.get_or_init(|| env_usize("DS_KS_TGT").unwrap_or(6).max(1));
@@ -464,6 +477,10 @@ impl Kernels {
                     "ds_kst_f3_g0",
                     "ds_kst_f2_g1",
                     "ds_kst_f3_g1",
+                    "ds_ksr_f2_g0",
+                    "ds_ksr_f3_g0",
+                    "ds_ksr_f2_g1",
+                    "ds_ksr_f3_g1",
                     "ds_moe_ks_gu_f2",
                     "ds_moe_ks_gu_f3",
                     "ds_moe_ks_down_f2",
@@ -1000,6 +1017,11 @@ impl Kernels {
         }
         let _ = qdq; // quantized either way (idempotent on a quantized activation)
         if t > 8 {
+            if ksr_on() {
+                if let Some(()) = self.linear_ksr(s, w, w3, x, y, t, round as i32, rw, lim)? {
+                    return Ok(());
+                }
+            }
             return self.linear_kst(s, w, w3, x, y, t, round as i32, rw, lim);
         }
         let (codes, scales) = (self.ks_x.ptr, self.ks_x.ptr + (8 * 16384) as u64);
@@ -1288,6 +1310,77 @@ impl Kernels {
     /// quantized once, a block per (row group, 8-row chunk), chunks adjacent so each row
     /// group's weights come from L2 after the first chunk.
     #[allow(clippy::too_many_arguments)]
+    /// [`Self::linear_ks`] at t > 8 with each row's decode result (`ds_ksr`): the activation
+    /// quantized once, the weight's own (S, SB) split, one launch. `None` when the chunks'
+    /// partials or counters don't fit (the caller runs `ds_kst`).
+    #[allow(clippy::too_many_arguments)]
+    fn linear_ksr(
+        &self,
+        s: &Stream,
+        w: &DsW,
+        w3: Option<&DsW>,
+        x: u64,
+        y: u64,
+        t: usize,
+        r: i32,
+        rw: u64,
+        lim: f32,
+    ) -> Result<Option<()>> {
+        let (rows, cols) = (w.rows as usize, w.cols as usize);
+        let gu = w3.is_some() as usize;
+        let out = if gu == 1 { 8 } else { 16 };
+        let nch = cols / 32;
+        let (sp, br, sb) = ks_split(rows.div_ceil(out), nch, self.sms);
+        let nc = t.div_ceil(8);
+        // ks_gemv's own guard at 8 rows (its sb at any n <= 8)
+        let sb = if sb * 8 * rows * (1 + gu) > KS_PART || br > KS_CNT {
+            1
+        } else {
+            sb
+        };
+        if nc * sb * 8 * rows * (1 + gu) > KS_PART || nc * br > KS_CNT {
+            return Ok(None);
+        }
+        let need = t * cols + t * nch * 4;
+        let mut big = self.ks_big.lock().unwrap();
+        if big.as_ref().is_none_or(|(n, _)| *n < need) {
+            s.sync()?; // the old buffer may be in flight
+            *big = Some((need, DevBuf::alloc(need)?));
+        }
+        let buf = big.as_ref().unwrap().1.ptr;
+        let (codes, scales) = (buf, buf + (t * cols) as u64);
+        let ng = (t * nch) as i32;
+        unsafe {
+            super::obs::launch(
+                self.ks_quant,
+                blocks(t * nch * 32, 256),
+                (256, 1, 1),
+                0,
+                s,
+                tang_moe::args![x, codes, scales, ng],
+            )?
+        }
+        let smem = 8 * (cols.div_ceil(128) * 128 + 32) + 8 * nch * 4;
+        let (wv, w3v) = (*w, *w3.unwrap_or(w));
+        let (ti, si, sbi, bri) = (t as i32, sp as i32, sb as i32, br as i32);
+        let (part, cnt) = (self.ks_part.ptr, self.ks_cnt.ptr);
+        let name = [
+            ["ds_ksr_f2_g0", "ds_ksr_f2_g1"],
+            ["ds_ksr_f3_g0", "ds_ksr_f3_g1"],
+        ][w.fmt as usize - 2][gu];
+        unsafe {
+            self.go(
+                name,
+                ((nc * br * sb) as u32, 1, 1),
+                (256, 1, 1),
+                smem as u32,
+                s,
+                tang_moe::args![wv, w3v, codes, scales, y, ti, r, rw, lim, si, sbi, bri, part, cnt],
+            )?
+        }
+        Ok(Some(()))
+    }
+
     fn linear_kst(
         &self,
         s: &Stream,

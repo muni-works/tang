@@ -1850,6 +1850,24 @@ DS_KST(2, 0)
 DS_KST(3, 0)
 DS_KST(2, 1)
 DS_KST(3, 1)
+// The K-split GEMV over t > 8 rows that gives every row exactly its decode (t <= 8) result:
+// the decode's own (S, SB) split (Kernels::ks_split of the weight's shape, not of t), item
+// (chunk c fastest, row group br, K slice sb). Each 8-row chunk has its own partials
+// (part + c * SB * 8 * R2) and counters (cnt + c * nbr), summed in the decode's order.
+#define DS_KSR(F, G)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(256) ds_ksr_f##F##_g##G(                                       \
+        DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
+        float lim, int S, int SB, int nbr, float* part, int* cnt) { DS_PDL_ENTRY                                \
+        int nc = (t + 7) / 8, c = blockIdx.x % nc, item = blockIdx.x / nc, r0 = c * 8;                        \
+        long long r2 = G ? 2LL * w.rows : (long long)w.rows;                                                    \
+        lin_mma<F, G>(w, w3, xc + (long long)r0 * w.cols, xsc + (long long)r0 * (w.cols / 32),                 \
+                      y + (long long)r0 * w.rows, min(8, t - r0), round, rw ? rw + r0 : 0, lim, S, SB, nbr,     \
+                      part + (long long)c * SB * 8 * r2, cnt + (long long)c * nbr, 0, 0, 0, item);               \
+    }
+DS_KSR(2, 0)
+DS_KSR(3, 0)
+DS_KSR(2, 1)
+DS_KSR(3, 1)
 // Two K-split GEMVs on the same quantized x in one launch (wq_a and wkv): items 0 .. na - 1 are
 // w's (S, SB, nbr, part, cnt), the rest wb's; x staged once per block. Each output as its own
 // ds_ks_f*_g0 launch, bit for bit.

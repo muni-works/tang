@@ -5556,6 +5556,66 @@ mod tests {
         assert!(worst < 1e-3, "rows logits off: rel {worst}");
     }
 
+    /// A K-split linear over t > 8 rows (`ds_ksr`) gives every row exactly its t = 1 and
+    /// t = 8 result, for each K-split weight of layer 0's attention and a shared expert's
+    /// gate/up pair; `DS_KSR=0` (ds_kst) is reported for contrast.
+    #[test]
+    fn gpu_tiny_linear_rows_invariant() {
+        let Some((m, _)) = open() else { return };
+        let names = [
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wo_b.weight",
+        ];
+        let mut checked = 0;
+        for name in names {
+            let w = m.dw(name).unwrap().v;
+            if !m.k.ks_ok(&w) {
+                eprintln!("{name}: not on the K-split path, skipped");
+                continue;
+            }
+            let k = w.cols as usize;
+            let n = w.rows as usize;
+            for t in [9usize, 17, 24] {
+                m.arena.borrow_mut().reset().unwrap();
+                let xs: Vec<f32> = (0..t * k)
+                    .map(|i| (((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0) * 0.7)
+                    .collect();
+                let x = m.up(&xs).unwrap();
+                let y = m.lin(x, t, name).unwrap();
+                let got = m.read(y, t * n).unwrap();
+                for r in 0..t {
+                    let xr = Buf {
+                        ptr: x.ptr + (r * k * 4) as u64,
+                        len: k * 4,
+                    };
+                    let y1 = m.lin(xr, 1, name).unwrap();
+                    let one = m.read(y1, n).unwrap();
+                    assert_eq!(
+                        &got[r * n..(r + 1) * n],
+                        &one[..],
+                        "{name} t {t} row {r} vs t=1"
+                    );
+                }
+                let c0 = (t - 1) / 8 * 8;
+                let xc = Buf {
+                    ptr: x.ptr + (c0 * k * 4) as u64,
+                    len: (t - c0) * k * 4,
+                };
+                let y8 = m.lin(xc, t - c0, name).unwrap();
+                let eight = m.read(y8, (t - c0) * n).unwrap();
+                assert_eq!(
+                    &got[c0 * n..],
+                    &eight[..],
+                    "{name} t {t} last chunk vs its t<=8 run"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no K-split weight in the fixture");
+    }
+
     /// As forward.rs `tiny_chunk_and_rewind_exact`, on the device.
     #[test]
     fn gpu_tiny_chunk_and_rewind_exact() {
