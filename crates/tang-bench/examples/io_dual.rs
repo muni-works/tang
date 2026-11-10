@@ -242,20 +242,35 @@ fn race(
         };
         let (fl, why) = sk.floor(m);
         // keep every candidate: the model ranks schedules, not LP tiles
-        best.push((t, ms, c.encode(&space), fl, why, format!("grid {grid} block {block} regs {regs} smem {smem} waves {:.1}", sk.waves(m))));
+        best.push((
+            t,
+            ms,
+            c.encode(&space),
+            fl,
+            why,
+            format!(
+                "grid {grid} block {block} regs {regs} smem {smem} waves {:.1}",
+                sk.waves(m)
+            ),
+        ));
     }
     let n0 = best.len();
     // below the floor = a wrong kernel (RACE does not check outputs)
     best.retain(|b| b.1.is_finite() && b.1 * 1e-3 >= b.3);
     if best.len() < n0 {
-        println!("  race: dropped {} candidate(s) faster than their floor", n0 - best.len());
+        println!(
+            "  race: dropped {} candidate(s) faster than their floor",
+            n0 - best.len()
+        );
     }
     best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     // the model's pick: argmin floor, ties (within 0.1%) to lower traffic
     let pick = (0..best.len()).min_by(|&i, &j| {
         let (a, b) = (&best[i], &best[j]);
         if (a.3 - b.3).abs() <= 1e-3 * a.3.min(b.3) {
-            tiled_traffic(lp, &a.0).partial_cmp(&tiled_traffic(lp, &b.0)).unwrap()
+            tiled_traffic(lp, &a.0)
+                .partial_cmp(&tiled_traffic(lp, &b.0))
+                .unwrap()
         } else {
             a.3.partial_cmp(&b.3).unwrap()
         }
