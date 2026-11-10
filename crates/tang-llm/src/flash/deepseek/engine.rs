@@ -66,6 +66,11 @@ fn rows_fused() -> bool {
     std::env::var("DS_ROWS_FUSED").map_or(true, |v| v != "0")
 }
 
+/// `DS_ROWS_GRAPH=0`: rows steps run directly instead of as captured graphs.
+fn rows_graph() -> bool {
+    std::env::var("DS_ROWS_GRAPH").map_or(true, |v| v != "0")
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -334,8 +339,8 @@ pub struct GpuModel {
     jrows: Vec<(usize, usize, Buf, Buf)>,
     arena: RefCell<Arena>,
     stage: RefCell<Staging>,
-    graphs: HashMap<(usize, bool, usize), Captured>,
-    warm: HashMap<(usize, bool, usize), (u64, u64)>,
+    graphs: HashMap<(usize, bool, Vec<usize>), Captured>,
+    warm: HashMap<(usize, bool, Vec<usize>), (u64, u64)>,
     /// Captured drafts by (main rows, sampler (temperature, top-p) bits), and their warm-ups.
     spark_graphs: HashMap<(usize, Option<(u32, u32)>, usize), SparkGraph>,
     spark_warm: HashMap<(usize, Option<(u32, u32)>, usize), (u64, u64)>,
@@ -1489,7 +1494,13 @@ impl GpuModel {
             });
         }
         self.segs = Some(segs);
-        let out = self.direct(&inp, t, DYN, true, None);
+        // graphs keyed by the rows' slots (each row's cache addresses are baked in)
+        let graphable = self.graphable(1, false) && rows_graph();
+        // (a leading usize::MAX: never a plain step's [slot] key)
+        let key: Vec<usize> = std::iter::once(usize::MAX)
+            .chain(rows.iter().map(|r| r.0))
+            .collect();
+        let out = self.run_step(&inp, t, DYN, true, graphable, key, None);
         self.segs = None;
         self.cur = home;
         self.sh_ckv = 0;
@@ -3824,6 +3835,82 @@ impl GpuModel {
             && !self.obs.direct()
     }
 
+    /// A step from staged inputs: replay its captured graph (keyed by its row count, `all`
+    /// and the slots it runs on, whose cache addresses the graph bakes in), capture it once
+    /// it ran warm at this arena generation, or run it directly.
+    #[allow(clippy::too_many_arguments)]
+    fn run_step(
+        &mut self,
+        inp: &Inputs,
+        t: usize,
+        bsp: usize,
+        all: bool,
+        graphable: bool,
+        slots: Vec<usize>,
+        hook: Option<&mut dyn FnMut(&str, &[f32])>,
+    ) -> Result<StepOut> {
+        let key = (t, all, slots);
+        let gen = self.gen();
+        let out = if graphable {
+            if let Some(cg) = self.graphs.get(&key) {
+                self.obs.path(true, false);
+                super::obs::replay();
+                super::obs::h2d(inp.copies.iter().map(|u| u.n).sum());
+                cg.g.launch(&self.s)?;
+                self.graph_stats.replays += 1;
+                cg.out.clone()
+            } else if self.warm.get(&key) == Some(&gen) {
+                // warmed up at this generation: every weight is resident and the arena fits
+                // the step, so the capture allocates nothing
+                let s = ManuallyDrop::new(Stream(self.s.0));
+                // no timeline events inside the capture
+                self.obs.path(true, true);
+                super::obs::capture();
+                self.arena.borrow_mut().frozen = true;
+                let mut out = None;
+                let g = Graph::capture(&s, |s| {
+                    let r = (|| -> Result<StepOut> {
+                        for u in &inp.copies {
+                            u.enqueue(s)?;
+                        }
+                        self.body(inp, t, bsp, all, None)
+                    })();
+                    let ok = r.is_ok();
+                    out = Some(r);
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(tang_moe::gpu::Error("capture body failed".into()))
+                    }
+                });
+                self.arena.borrow_mut().frozen = false;
+                let out = out.context("capture")?.context("captured step")?;
+                let g = g?;
+                g.launch(&self.s)?;
+                self.graph_stats.captures += 1;
+                self.graphs.insert(
+                    key,
+                    Captured {
+                        g,
+                        out: out.clone(),
+                        gen,
+                    },
+                );
+                out
+            } else {
+                self.obs.path(false, false);
+                let out = self.direct(inp, t, bsp, all, None)?;
+                // a step that grew the arena moves it at the next start: warm up again
+                self.warm.insert(key, self.gen_after());
+                out
+            }
+        } else {
+            self.obs.path(false, false);
+            self.direct(inp, t, bsp, all, hook)?
+        };
+        Ok(out)
+    }
+
     fn forward_impl(
         &mut self,
         ids: &[usize],
@@ -3867,68 +3954,15 @@ impl GpuModel {
         let inp = self.inputs(ids, sp, hashes.as_deref())?;
         // host code of a decode step never sees the position (see `DYN`)
         let bsp = if sp == 0 { 0 } else { DYN };
-        let key = (t, all, self.cur);
-        let gen = self.gen();
         if std::env::var_os("DS_GRAPH_DEBUG").is_some() {
-            eprintln!("step t={t} sp={sp} gen={gen:?} {:?}", self.graph_stats);
+            eprintln!(
+                "step t={t} sp={sp} gen={:?} {:?}",
+                self.gen(),
+                self.graph_stats
+            );
         }
-        let out = if self.graphable(sp, hook.is_some()) {
-            if let Some(cg) = self.graphs.get(&key) {
-                self.obs.path(true, false);
-                super::obs::replay();
-                super::obs::h2d(inp.copies.iter().map(|u| u.n).sum());
-                cg.g.launch(&self.s)?;
-                self.graph_stats.replays += 1;
-                cg.out.clone()
-            } else if self.warm.get(&key) == Some(&gen) {
-                // warmed up at this generation: every weight is resident and the arena fits
-                // the step, so the capture allocates nothing
-                let s = ManuallyDrop::new(Stream(self.s.0));
-                // no timeline events inside the capture
-                self.obs.path(true, true);
-                super::obs::capture();
-                self.arena.borrow_mut().frozen = true;
-                let mut out = None;
-                let g = Graph::capture(&s, |s| {
-                    let r = (|| -> Result<StepOut> {
-                        for u in &inp.copies {
-                            u.enqueue(s)?;
-                        }
-                        self.body(&inp, t, bsp, all, None)
-                    })();
-                    let ok = r.is_ok();
-                    out = Some(r);
-                    if ok {
-                        Ok(())
-                    } else {
-                        Err(tang_moe::gpu::Error("capture body failed".into()))
-                    }
-                });
-                self.arena.borrow_mut().frozen = false;
-                let out = out.context("capture")?.context("captured step")?;
-                let g = g?;
-                g.launch(&self.s)?;
-                self.graph_stats.captures += 1;
-                self.graphs.insert(
-                    key,
-                    Captured {
-                        g,
-                        out: out.clone(),
-                        gen,
-                    },
-                );
-                out
-            } else {
-                self.obs.path(false, false);
-                let out = self.direct(&inp, t, bsp, all, None)?;
-                // a step that grew the arena moves it at the next start: warm up again
-                self.warm.insert(key, self.gen_after());
-                out
-            }
-        } else {
-            self.obs.path(false, false);
-            self.direct(&inp, t, bsp, all, hook)?
-        };
+        let graphable = self.graphable(sp, hook.is_some());
+        let out = self.run_step(&inp, t, bsp, all, graphable, vec![self.cur], hook)?;
         self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         if self.journal_on && sp > 0 {
             self.journal_steps += 1;
