@@ -59,7 +59,88 @@ pub enum ScanKind {
     Monoid(Monoid),
     /// The matrix affine monoid; inputs `[A, U, …]` (anything after `U`
     /// is only referenced by `form`).
-    Affine { form: Option<DeltaForm> },
+    ///
+    /// With `bands`, `A` is banded and stored `[P…, n, k]`: entry
+    /// `A[…, i, b]` is the dense `A[…, i, i + bands[b]]` (offsets strictly
+    /// increasing; entries whose column falls outside `0..n` are ignored),
+    /// so a step costs `O(n·k)` instead of `O(n²)`. A CTC lattice is
+    /// `bands = [-2, -1, 0]`, a monotonic alignment `[-1, 0]`.
+    Affine {
+        form: Option<DeltaForm>,
+        ring: Semiring,
+        bands: Option<Vec<i64>>,
+    },
+}
+
+/// The scalar semiring an affine scan's `A_t ⊗ S_{t−1} ⊕ U_t` is taken in.
+///
+/// - [`Real`](Semiring::Real): `(+, ×)`, the ordinary matrix recurrence.
+/// - [`Log`](Semiring::Log): `(logsumexp, +)`. With `A` a log transition
+///   matrix the state is the forward variable of an HMM / CTC lattice, and
+///   the last state is `log Z`: the sum over all paths.
+/// - [`MaxPlus`](Semiring::MaxPlus): `(max, +)`, the tropical semiring.
+///   Same lattice, best path instead of all paths (Viterbi, MAS, DTW).
+///
+/// **Backward.** `∂S_t[i]/∂S_{t−1}[j]` is `J_t[i,j] = exp(A_t[i,j] +
+/// S_{t−1}[j] − S_t[i])` in the log semiring (each row a distribution over
+/// predecessors) and the argmax indicator in max-plus. The cotangent
+/// recurrence `λ_t = G_t + J_{t+1}ᵀ·λ_{t+1}` is therefore an ordinary
+/// *real* affine scan the other way: the backward pass of the forward
+/// algorithm is the backward algorithm, and `∂ log Z/∂A` are the edge
+/// posteriors (max-plus: the best path's edges). Derived for vector
+/// states (`m = 1`), inclusive scans; other shapes are rejected when the
+/// scan is built. Reverse scans are supported.
+///
+/// **Max-plus subgradient.** On a tie the whole gradient goes to one
+/// predecessor: the one with the smallest index `j`, then `U` (as if it
+/// were index `n`), matching [`Monoid::argmax`] and top-k. The result is
+/// the gradient of the max-plus scan along the first-maximum path, an
+/// element of the subdifferential, and does not depend on evaluation
+/// order.
+///
+/// **Log combine.** A row `⊕_j (A[i,j] + S[j]) ⊕ U[i]` is computed in the
+/// online-softmax form (`m' = max(m, x)`, `l' = l·exp(m − m') +
+/// exp(x − m')`, result `m + log l`): the same stabilized logsumexp
+/// [`Monoid::online_softmax`] that [`TensorGraph::stabilize_softmax`]
+/// rewrites softmax denominators to, with one `log` per row.
+///
+/// The semiring zero is [`Semiring::NEG`] (a large finite negative, not
+/// `−∞`, so `f32` kernels and `0·∞` never meet); use it for forbidden
+/// transitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Semiring {
+    #[default]
+    Real,
+    Log,
+    MaxPlus,
+}
+
+impl Semiring {
+    /// The additive identity of the log and max-plus semirings.
+    pub const NEG: f64 = -1e30;
+
+    pub fn zero(self) -> f64 {
+        match self {
+            Semiring::Real => 0.0,
+            _ => Self::NEG,
+        }
+    }
+
+    /// `u ⊕ ⊕ᵢ (aᵢ ⊗ sᵢ)`, the log semiring in the online-softmax form.
+    fn row(self, u: f64, terms: impl Iterator<Item = (f64, f64)>) -> f64 {
+        match self {
+            Semiring::Real => terms.fold(u, |acc, (a, s)| acc + a * s),
+            Semiring::MaxPlus => terms.fold(u, |acc, (a, s)| acc.max(a + s)),
+            Semiring::Log => {
+                let (m, l) = terms.fold((u, 1.0), |(m, l), (a, s)| {
+                    let x = a + s;
+                    let m2 = m.max(x);
+                    (m2, l * (m - m2).exp() + (x - m2).exp())
+                });
+                m + l.ln()
+            }
+        }
+    }
 }
 
 /// A prefix scan along point dim `dim` (see the module docs).
@@ -122,29 +203,35 @@ impl Scan {
                 }
                 out
             }
-            ScanKind::Affine { .. } => {
-                let n = shapes[0][shapes[0].len() - 1];
+            ScanKind::Affine { ring, bands, .. } => {
+                let n = shapes[1][shapes[1].len() - 2];
+                let k = shapes[0][shapes[0].len() - 1];
                 let m = shapes[1][shapes[1].len() - 1];
                 let mut out = vec![0.0; npts * n * m];
                 let mut s = vec![0.0; n * m];
                 let mut nx = vec![0.0; n * m];
                 for o in 0..outer {
                     for i in 0..inner {
-                        s.iter_mut().for_each(|x| *x = 0.0);
+                        s.iter_mut().for_each(|x| *x = ring.zero());
                         for step in 0..tn {
                             let p = (o * tn + order(step)) * inner + i;
                             if self.exclusive {
                                 out[p * n * m..(p + 1) * n * m].copy_from_slice(&s);
                             }
-                            let a = &ins[0][p * n * n..(p + 1) * n * n];
+                            let a = &ins[0][p * n * k..(p + 1) * n * k];
                             let u = &ins[1][p * n * m..(p + 1) * n * m];
                             for r in 0..n {
                                 for c in 0..m {
-                                    let mut acc = u[r * m + c];
-                                    for j in 0..n {
-                                        acc += a[r * n + j] * s[j * m + c];
-                                    }
-                                    nx[r * m + c] = acc;
+                                    // (A[r, j], S[j]) for every stored entry in range
+                                    let terms = (0..k).filter_map(|b| {
+                                        let j = match bands {
+                                            Some(o) => r as i64 + o[b],
+                                            None => b as i64,
+                                        };
+                                        let j = usize::try_from(j).ok().filter(|&j| j < n)?;
+                                        Some((a[r * k + b], s[j * m + c]))
+                                    });
+                                    nx[r * m + c] = ring.row(u[r * m + c], terms);
                                 }
                             }
                             std::mem::swap(&mut s, &mut nx);
@@ -264,9 +351,60 @@ impl TensorGraph {
         exclusive: bool,
         reverse: bool,
     ) -> Result<TensorId, ShapeError> {
-        self.affine_scan(vec![a, u], dim, exclusive, reverse, None)
+        self.affine_scan(
+            vec![a, u],
+            dim,
+            exclusive,
+            reverse,
+            None,
+            Semiring::Real,
+            None,
+        )
     }
 
+    /// [`linear_scan`](Self::linear_scan) in another [`Semiring`]:
+    /// `S_t = A_t ⊗ S_{t−1} ⊕ U_t`, `S_{−1}` the semiring zero. In the log
+    /// semiring this is the forward algorithm; in max-plus, Viterbi.
+    ///
+    /// Log and max-plus scans need a vector state (`U [P…, n, 1]`) and
+    /// `exclusive = false`, the shapes their backward is derived for.
+    pub fn semiring_scan(
+        &mut self,
+        a: TensorId,
+        u: TensorId,
+        dim: usize,
+        exclusive: bool,
+        reverse: bool,
+        ring: Semiring,
+    ) -> Result<TensorId, ShapeError> {
+        self.affine_scan(vec![a, u], dim, exclusive, reverse, None, ring, None)
+    }
+
+    /// [`semiring_scan`](Self::semiring_scan) with a banded transition:
+    /// `A [P…, n, k]` holds `A[…, i, b] = A_dense[…, i, i + bands[b]]`
+    /// (see [`ScanKind::Affine`]), `U [P…, n, 1]`, inclusive. Any
+    /// semiring, `Real` included; one step is `O(n·k)`.
+    pub fn semiring_scan_banded(
+        &mut self,
+        a: TensorId,
+        u: TensorId,
+        bands: &[i64],
+        dim: usize,
+        reverse: bool,
+        ring: Semiring,
+    ) -> Result<TensorId, ShapeError> {
+        self.affine_scan(
+            vec![a, u],
+            dim,
+            false,
+            reverse,
+            None,
+            ring,
+            Some(bands.to_vec()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn affine_scan(
         &mut self,
         inputs: Vec<TensorId>,
@@ -274,20 +412,43 @@ impl TensorGraph {
         exclusive: bool,
         reverse: bool,
         form: Option<DeltaForm>,
+        ring: Semiring,
+        bands: Option<Vec<i64>>,
     ) -> Result<TensorId, ShapeError> {
         let (sa, su) = (
             self.shape(inputs[0]).to_vec(),
             self.shape(inputs[1]).to_vec(),
         );
         let r = su.len();
+        // A's last dim: n dense, k = bands.len() banded
+        let cols = match &bands {
+            Some(o) => Dim::Fixed(o.len()),
+            None => su.get(r.wrapping_sub(2)).copied().unwrap_or(Dim::Fixed(0)),
+        };
         let ok = r >= 3
             && sa.len() == r
             && sa[..r - 2] == su[..r - 2]
-            && sa[r - 2] == sa[r - 1]
-            && sa[r - 1] == su[r - 2]
+            && sa[r - 2] == su[r - 2]
+            && sa[r - 1] == cols
             && dim < r - 2;
         if !ok {
             return err(format!("linear_scan: A {sa:?}, U {su:?}, dim {dim}"));
+        }
+        if let Some(o) = &bands {
+            if o.is_empty() || o.windows(2).any(|w| w[0] >= w[1]) {
+                return err(format!(
+                    "banded scan: offsets {o:?} must be strictly increasing"
+                ));
+            }
+        }
+        // the shapes the non-dense-real backward is derived for
+        if (ring != Semiring::Real || bands.is_some()) && (su[r - 1] != Dim::Fixed(1) || exclusive)
+        {
+            return err(format!(
+                "{ring:?} scan{}: needs a vector state (U [.., n, 1]) and an inclusive scan, \
+                 got U {su:?}, exclusive {exclusive}",
+                if bands.is_some() { " (banded)" } else { "" }
+            ));
         }
         Ok(self.push_scan(
             Scan {
@@ -295,7 +456,7 @@ impl TensorGraph {
                 dim,
                 exclusive,
                 reverse,
-                kind: ScanKind::Affine { form },
+                kind: ScanKind::Affine { form, ring, bands },
             },
             su,
         ))
@@ -433,7 +594,7 @@ impl TensorGraph {
             v: 3,
             delta,
         };
-        self.affine_scan(inputs, dim, false, false, Some(form))
+        self.affine_scan(inputs, dim, false, false, Some(form), Semiring::Real, None)
     }
 
     /// `o[P…, c] = scale · Σᵢ S[P…, i, c]·q[P…, i]`: the output of a
@@ -489,6 +650,9 @@ impl TensorGraph {
         let d: i64 = if sc.reverse { -1 } else { 1 };
         let out = TensorId(j as u32);
         match &sc.kind {
+            ScanKind::Affine { ring, bands, .. } if *ring != Semiring::Real || bands.is_some() => {
+                self.semiring_backward(&sc, *ring, bands.clone(), out, dy)
+            }
             ScanKind::Affine { .. } => {
                 let (a, sa) = (sc.inputs[0], self.shape(sc.inputs[0]).to_vec());
                 let su = self.shape(sc.inputs[1]).to_vec();
@@ -725,6 +889,268 @@ impl TensorGraph {
         }
     }
 
+    /// The backward of a log / max-plus affine scan, or of a banded one in
+    /// any semiring (see [`Semiring`]): build the predecessor weights
+    /// `J[i, b]` (`∂S_t[i]/∂S_{t−1}[j]`, `j` the column of entry `b`), run
+    /// the real scan `λ_t = G_t + J_{t+1}ᵀ·λ_{t+1}` (banded with the
+    /// mirrored offsets when `A` is), then `∂A`, `∂U` from `λ` and `J`.
+    fn semiring_backward(
+        &mut self,
+        sc: &Scan,
+        ring: Semiring,
+        bands: Option<Vec<i64>>,
+        out: TensorId,
+        dy: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError> {
+        let ps = sc.points(self);
+        let q = ps.len();
+        let dim = sc.dim;
+        let d: i64 = if sc.reverse { -1 } else { 1 };
+        let (a, u) = (sc.inputs[0], sc.inputs[1]);
+        let (sa, su) = (self.shape(a).to_vec(), self.shape(u).to_vec());
+        if su[q + 1] != Dim::Fixed(1) || sc.exclusive {
+            return err("semiring scan backward: needs a vector state (m = 1), inclusive");
+        }
+        let tn = ps[dim]
+            .fixed()
+            .ok_or_else(|| ShapeError("scan backward needs a bound scan dim".into()))?;
+        let n = su[q]
+            .fixed()
+            .ok_or_else(|| ShapeError("scan backward needs a bound state dim".into()))?;
+        let k = sa[q + 1].fixed().unwrap_or(n);
+        let r = q + 2;
+        let pts = |shift: i64| -> Vec<Form> {
+            let mut f: Vec<Form> = (0..q).map(|x| Form::unit(r, x)).collect();
+            f[dim] = shifted(r, dim, shift);
+            f
+        };
+        let at = |mut f: Vec<Form>, i: Form, b: Form| {
+            f.extend([i, b]);
+            f
+        };
+        let c = |v: f64| ExprId::from_f64(v);
+        // `x == v` for small integers, as a select condition (> 0 when equal)
+        let is = move |x: ExprId, v: f64| c(0.5) - (x - c(v)) * (x - c(v));
+        let iota_t = self.iota(&ps, dim);
+        let ii = self.iota(&sa, q);
+        let bb = self.iota(&sa, q + 1);
+        let rev = sc.reverse;
+        // Candidate args over space (P…, i, b): A, S_t[i], t, i, b, then the
+        // predecessor S_{t−d}[j]: one read (dense, j = b) or one per band.
+        let mut args = vec![
+            Arg {
+                src: a,
+                view: View::identity(r, r),
+            },
+            Arg {
+                src: out,
+                view: view(at(pts(0), Form::unit(r, q), Form::constant(r, 0)), false),
+            },
+            Arg {
+                src: iota_t,
+                view: view(pts(0), false),
+            },
+            Arg {
+                src: ii,
+                view: View::identity(r, r),
+            },
+            Arg {
+                src: bb,
+                view: View::identity(r, r),
+            },
+        ];
+        let offs: Vec<i64> = bands.clone().unwrap_or_default();
+        match &bands {
+            None => args.push(Arg {
+                src: out,
+                view: view(
+                    at(pts(-d), Form::unit(r, q + 1), Form::constant(r, 0)),
+                    true,
+                ),
+            }),
+            Some(o) => args.extend(o.iter().map(|&off| Arg {
+                src: out,
+                view: view(at(pts(-d), shifted(r, q, off), Form::constant(r, 0)), true),
+            })),
+        }
+        let base = args.len();
+        // (ok ∈ {0, 1}, S_{t−d}[j], A + S_{t−d}[j]) from the candidate args
+        let cand = {
+            let offs = offs.clone();
+            move |x: &[ExprId]| -> (ExprId, ExprId, ExprId) {
+                // the first step's predecessor is the semiring zero: no weight
+                let first = if rev {
+                    x[2] - c(tn as f64 - 1.5)
+                } else {
+                    c(0.5) - x[2]
+                };
+                let (sp, inr) = if offs.is_empty() {
+                    (x[5], c(1.0))
+                } else {
+                    let (mut sp, mut j) = (x[5], x[3] + c(offs[0] as f64));
+                    for (b, &off) in offs.iter().enumerate().skip(1) {
+                        sp = ExprId::select(is(x[4], b as f64), x[5 + b], sp);
+                        j = ExprId::select(is(x[4], b as f64), x[3] + c(off as f64), j);
+                    }
+                    // 0 ≤ j < n
+                    let inr = (j + c(0.5)) * (c(n as f64 - 0.5) - j);
+                    (sp, inr)
+                };
+                let ok = ExprId::select(
+                    first,
+                    ExprId::ZERO,
+                    ExprId::select(inr, ExprId::ONE, ExprId::ZERO),
+                );
+                (ok, sp, x[0] + sp)
+            }
+        };
+        // max-plus: the winning entry per (P…, i), ties to the smaller
+        // column, then U (index k) only if strictly larger
+        let winner = if ring == Semiring::MaxPlus {
+            let mut out_shape = sa.clone();
+            out_shape[q + 1] = Dim::Fixed(2);
+            let cand = cand.clone();
+            let best = self.comp_tuple(
+                &out_shape[..q + 2],
+                &[sa[q + 1]],
+                // reduce over b: the same views (the tuple dim is no space dim)
+                args.clone(),
+                Some(Monoid::argmax()),
+                move |x| {
+                    let (ok, _, v) = cand(x);
+                    vec![x[4], ExprId::select(ok - c(0.5), v, c(-(f32::MAX as f64)))]
+                },
+            )?;
+            let slot = |s: i64| {
+                let mut f: Vec<Form> = (0..q + 1).map(|x| Form::unit(q + 1, x)).collect();
+                f.push(Form::constant(q + 1, s));
+                view(f, false)
+            };
+            let mut uf: Vec<Form> = (0..q + 1).map(|x| Form::unit(q + 1, x)).collect();
+            uf.push(Form::constant(q + 1, 0));
+            Some(self.comp(
+                &su[..q + 1],
+                &[] as &[Dim],
+                vec![
+                    Arg {
+                        src: best,
+                        view: slot(0),
+                    },
+                    Arg {
+                        src: best,
+                        view: slot(1),
+                    },
+                    Arg {
+                        src: u,
+                        view: view(uf, false),
+                    },
+                ],
+                None,
+                move |x| vec![ExprId::select(x[2] - x[1], c(k as f64), x[0])],
+            )?)
+        } else {
+            None
+        };
+        // J[P…, i, b]
+        let mut jargs = args.clone();
+        if let Some(w) = winner {
+            let f: Vec<Form> = (0..q + 1).map(|x| Form::unit(r, x)).collect();
+            jargs.push(Arg {
+                src: w,
+                view: view(f, false),
+            });
+        }
+        let jac = {
+            let cand = cand.clone();
+            self.comp(&sa, &[] as &[Dim], jargs, None, move |x| {
+                let (ok, _, v) = cand(x);
+                let w = match ring {
+                    Semiring::Real => x[0],
+                    Semiring::Log => (v - x[1]).exp(),
+                    Semiring::MaxPlus => {
+                        ExprId::select(is(x[base] - x[4], 0.0), ExprId::ONE, ExprId::ZERO)
+                    }
+                };
+                vec![ExprId::select(ok - c(0.5), w, ExprId::ZERO)]
+            })?
+        };
+        // A'_t = J_{t+d}ᵀ (0 past the end), then the real scan the other way
+        let lam = match &bands {
+            None => {
+                let at_t = self.comp(
+                    &sa,
+                    &[] as &[Dim],
+                    vec![Arg {
+                        src: jac,
+                        view: view(at(pts(d), Form::unit(r, q + 1), Form::unit(r, q)), true),
+                    }],
+                    None,
+                    |x| vec![x[0]],
+                )?;
+                self.linear_scan(at_t, dy, dim, false, !rev)?
+            }
+            Some(o) => {
+                // band b' of the transpose is band k−1−b mirrored:
+                // A'[j, b'] = J_{t+d}[j − o[b], b]
+                let mirror: Vec<i64> = o.iter().rev().map(|x| -x).collect();
+                let mut targs = vec![Arg {
+                    src: bb,
+                    view: View::identity(r, r),
+                }];
+                targs.extend(o.iter().enumerate().map(|(b, &off)| Arg {
+                    src: jac,
+                    view: view(
+                        at(pts(d), shifted(r, q, -off), Form::constant(r, b as i64)),
+                        true,
+                    ),
+                }));
+                let at_t = self.comp(&sa, &[] as &[Dim], targs, None, move |x| {
+                    // x[1 + b] is band b, which sits at b' = k−1−b
+                    let mut v = x[1];
+                    for b in 1..k {
+                        v = ExprId::select(is(x[0], (k - 1 - b) as f64), x[1 + b], v);
+                    }
+                    vec![v]
+                })?;
+                self.semiring_scan_banded(at_t, dy, &mirror, dim, !rev, Semiring::Real)?
+            }
+        };
+        // ∂U = λ ⊙ w_U, w_U the weight of the U branch
+        let gu = match (ring, winner) {
+            (Semiring::Real, _) => lam,
+            (Semiring::Log, _) => self.map(&[lam, u, out], |x| x[0] * (x[1] - x[2]).exp())?,
+            (_, w) => {
+                let w = w.expect("max-plus winner");
+                let ws = self.reshape(w, &su)?;
+                self.map(&[lam, ws], move |x| {
+                    x[0] * ExprId::select(is(x[1], k as f64), ExprId::ONE, ExprId::ZERO)
+                })?
+            }
+        };
+        // ∂A[P…, i, b] = λ[i]·(real: ok·S_{t−d}[j]; else J[i, b])
+        let mut gargs = args.clone();
+        gargs.push(Arg {
+            src: lam,
+            view: view(at(pts(0), Form::unit(r, q), Form::constant(r, 0)), false),
+        });
+        gargs.push(Arg {
+            src: jac,
+            view: View::identity(r, r),
+        });
+        let nl = gargs.len();
+        let ga = self.comp(&sa, &[] as &[Dim], gargs, None, move |x| {
+            let w = match ring {
+                Semiring::Real => {
+                    let (ok, sp, _) = cand(x);
+                    ExprId::select(ok - c(0.5), sp, ExprId::ZERO)
+                }
+                _ => x[nl - 1],
+            };
+            vec![x[nl - 2] * w]
+        })?;
+        Ok(vec![Some(ga), Some(gu)])
+    }
+
     /// The WGSL kernel of scan node `j`: one thread per scanned line
     /// (and per state column, for the affine monoid) walking the scan
     /// dim sequentially. Correct for any monoid on every backend; the
@@ -837,9 +1263,13 @@ impl TensorGraph {
                 writeln!(s, "    }}").unwrap();
                 writeln!(s, "}}").unwrap();
             }
-            ScanKind::Affine { .. } => {
+            ScanKind::Affine { ring, bands, .. } => {
                 let su = fixed(self.shape(sc.inputs[1]));
                 let (n, m) = (su[su.len() - 2], su[su.len() - 1]);
+                let zero = match ring {
+                    Semiring::Real => "0.0",
+                    _ => "-1e30",
+                };
                 lines = outer * inner * m;
                 let (ta, tu) = (sc.inputs[0], sc.inputs[1]);
                 writeln!(s, "@compute @workgroup_size(64)").unwrap();
@@ -858,7 +1288,7 @@ impl TensorGraph {
                 writeln!(s, "    var nv: array<f32, {n}>;").unwrap();
                 writeln!(
                     s,
-                    "    for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{ sv[i] = 0.0; }}"
+                    "    for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{ sv[i] = {zero}; }}"
                 )
                 .unwrap();
                 writeln!(s, "    for (var st: u32 = 0u; st < {tn}u; st = st + 1u) {{").unwrap();
@@ -875,14 +1305,54 @@ impl TensorGraph {
                 writeln!(s, "        for (var i: u32 = 0u; i < {n}u; i = i + 1u) {{").unwrap();
                 let u = load(fmt(tu), &bind(tu), &format!("(p * {n}u + i) * {m}u + col"));
                 writeln!(s, "            var acc: f32 = {u};").unwrap();
-                writeln!(
-                    s,
-                    "            for (var k: u32 = 0u; k < {n}u; k = k + 1u) {{"
-                )
-                .unwrap();
-                let a = load(fmt(ta), &bind(ta), &format!("(p * {n}u + i) * {n}u + k"));
-                writeln!(s, "                acc = acc + {a} * sv[k];").unwrap();
-                writeln!(s, "            }}").unwrap();
+                if *ring == Semiring::Log {
+                    // online logsumexp: acc is the running max, l the scaled sum
+                    writeln!(s, "            var l: f32 = 1.0;").unwrap();
+                }
+                // acc ⊕= a ⊗ sv[j]
+                let combine = |s: &mut String, a: &str, j: &str, pad: &str| match ring {
+                    Semiring::Real => writeln!(s, "{pad}acc = acc + {a} * sv[{j}];").unwrap(),
+                    Semiring::Log => {
+                        writeln!(s, "{pad}let x = {a} + sv[{j}];").unwrap();
+                        writeln!(s, "{pad}let mx = max(acc, x);").unwrap();
+                        writeln!(s, "{pad}l = l * exp(acc - mx) + exp(x - mx);").unwrap();
+                        writeln!(s, "{pad}acc = mx;").unwrap();
+                    }
+                    Semiring::MaxPlus => {
+                        writeln!(s, "{pad}acc = max(acc, {a} + sv[{j}]);").unwrap()
+                    }
+                };
+                match bands {
+                    None => {
+                        writeln!(
+                            s,
+                            "            for (var k: u32 = 0u; k < {n}u; k = k + 1u) {{"
+                        )
+                        .unwrap();
+                        let a = load(fmt(ta), &bind(ta), &format!("(p * {n}u + i) * {n}u + k"));
+                        combine(&mut s, &a, "k", "                ");
+                        writeln!(s, "            }}").unwrap();
+                    }
+                    Some(o) => {
+                        let kb = o.len();
+                        for (b, off) in o.iter().enumerate() {
+                            writeln!(s, "            {{").unwrap();
+                            writeln!(s, "                let j = i32(i) + ({off});").unwrap();
+                            writeln!(s, "                if (j >= 0 && j < {n}) {{").unwrap();
+                            let a = load(
+                                fmt(ta),
+                                &bind(ta),
+                                &format!("(p * {n}u + i) * {kb}u + {b}u"),
+                            );
+                            combine(&mut s, &a, "u32(j)", "                    ");
+                            writeln!(s, "                }}").unwrap();
+                            writeln!(s, "            }}").unwrap();
+                        }
+                    }
+                }
+                if *ring == Semiring::Log {
+                    writeln!(s, "            acc = acc + log(l);").unwrap();
+                }
                 writeln!(s, "            nv[i] = acc;").unwrap();
                 writeln!(s, "        }}").unwrap();
                 writeln!(
@@ -1192,6 +1662,508 @@ mod tests {
             let bi = g.input(&[7, 2]);
             let y = g.scan(&[ai, bi], 0, affine1(), excl, rev).unwrap();
             for k in &g.to_wgsl(&[y]).kernels {
+                naga_ok(&k.source);
+            }
+        }
+    }
+
+    #[test]
+    fn semiring_scan_backward() {
+        let (h, tn, n) = (2, 5, 3);
+        let a = rand_like(h * tn * n * n, 3, 1.0);
+        let u = rand_like(h * tn * n, 4, 1.0);
+        for ring in [Semiring::Log, Semiring::MaxPlus] {
+            for rev in [false, true] {
+                let mut g = TensorGraph::new();
+                let ai = g.input(&[h, tn, n, n]);
+                let ui = g.input(&[h, tn, n, 1]);
+                let s = g.semiring_scan(ai, ui, 1, false, rev, ring).unwrap();
+                check_grads(&g, s, &[a.clone(), u.clone()], 1e-5);
+            }
+        }
+    }
+
+    /// The monotonic-alignment lattice of `lp [B, T, N]` (frame t emits
+    /// token i with log-prob `lp[b,t,i]`; a path starts at token 0 and
+    /// stays or advances by one per frame) as a semiring scan, read out at
+    /// the last token of the last frame: `[B]`.
+    fn alignment(
+        g: &mut TensorGraph,
+        lp: TensorId,
+        b: usize,
+        tn: usize,
+        n: usize,
+        ring: Semiring,
+    ) -> TensorId {
+        let neg = Semiring::NEG;
+        let ii = g.iota(&[n, n], 0);
+        let jj = g.iota(&[n, n], 1);
+        let a = g
+            .comp(
+                &[b, tn, n, n],
+                &[],
+                vec![
+                    Arg {
+                        src: lp,
+                        view: View::pick(4, &[Some(0), Some(1), Some(2)]),
+                    },
+                    Arg {
+                        src: ii,
+                        view: View::pick(4, &[Some(2), Some(3)]),
+                    },
+                    Arg {
+                        src: jj,
+                        view: View::pick(4, &[Some(2), Some(3)]),
+                    },
+                ],
+                None,
+                move |x| {
+                    // on the band when i − j ∈ {0, 1}
+                    let d = x[1] - x[2];
+                    let on = (d + ExprId::from_f64(0.5)) * (ExprId::from_f64(1.5) - d);
+                    vec![ExprId::select(on, x[0], ExprId::from_f64(neg))]
+                },
+            )
+            .unwrap();
+        let tt = g.iota(&[tn, n], 0);
+        let ti = g.iota(&[tn, n], 1);
+        let u = g
+            .comp(
+                &[b, tn, n, 1],
+                &[],
+                vec![
+                    Arg {
+                        src: lp,
+                        view: View::pick(4, &[Some(0), Some(1), Some(2)]),
+                    },
+                    Arg {
+                        src: tt,
+                        view: View::pick(4, &[Some(1), Some(2)]),
+                    },
+                    Arg {
+                        src: ti,
+                        view: View::pick(4, &[Some(1), Some(2)]),
+                    },
+                ],
+                None,
+                move |x| {
+                    let h = ExprId::from_f64(0.5);
+                    let ng = ExprId::from_f64(neg);
+                    vec![ExprId::select(
+                        h - x[1],
+                        ExprId::select(h - x[2], x[0], ng),
+                        ng,
+                    )]
+                },
+            )
+            .unwrap();
+        let s = g.semiring_scan(a, u, 1, false, false, ring).unwrap();
+        g.comp(
+            &[b],
+            &[],
+            vec![Arg {
+                src: s,
+                view: view(
+                    vec![
+                        Form::unit(1, 0),
+                        Form::constant(1, tn as i64 - 1),
+                        Form::constant(1, n as i64 - 1),
+                        Form::constant(1, 0),
+                    ],
+                    false,
+                ),
+            }],
+            None,
+            |x| vec![x[0]],
+        )
+        .unwrap()
+    }
+
+    fn lse(a: f64, b: f64) -> f64 {
+        if a == f64::NEG_INFINITY {
+            return b;
+        }
+        if b == f64::NEG_INFINITY {
+            return a;
+        }
+        a.max(b) + (-(a - b).abs()).exp().ln_1p()
+    }
+
+    /// Host forward–backward over the same paths: `(log Z, γ[t·n + i])`.
+    fn forward_backward(lp: &[f64], n: usize, t: usize) -> (f64, Vec<f64>) {
+        let ninf = f64::NEG_INFINITY;
+        let mut al = vec![ninf; t * n];
+        al[0] = lp[0];
+        for f in 1..t {
+            for i in 0..n {
+                let stay = al[(f - 1) * n + i];
+                let adv = if i > 0 { al[(f - 1) * n + i - 1] } else { ninf };
+                al[f * n + i] = lse(stay, adv) + lp[f * n + i];
+            }
+        }
+        let mut be = vec![ninf; t * n];
+        be[(t - 1) * n + n - 1] = 0.0;
+        for f in (0..t - 1).rev() {
+            for i in 0..n {
+                let stay = be[(f + 1) * n + i] + lp[(f + 1) * n + i];
+                let adv = if i + 1 < n {
+                    be[(f + 1) * n + i + 1] + lp[(f + 1) * n + i + 1]
+                } else {
+                    ninf
+                };
+                be[f * n + i] = lse(stay, adv);
+            }
+        }
+        let z = al[(t - 1) * n + n - 1];
+        let ga = (0..t * n).map(|k| (al[k] + be[k] - z).exp()).collect();
+        (z, ga)
+    }
+
+    /// Host Viterbi over the same paths: `(best score, token per frame)`.
+    fn viterbi(lp: &[f64], n: usize, t: usize) -> (f64, Vec<usize>) {
+        let ninf = f64::NEG_INFINITY;
+        let mut v = vec![ninf; t * n];
+        v[0] = lp[0];
+        for f in 1..t {
+            for i in 0..n {
+                let stay = v[(f - 1) * n + i];
+                let adv = if i > 0 { v[(f - 1) * n + i - 1] } else { ninf };
+                v[f * n + i] = stay.max(adv) + lp[f * n + i];
+            }
+        }
+        let mut path = vec![0; t];
+        let mut i = n - 1;
+        for f in (0..t).rev() {
+            path[f] = i;
+            if f > 0 && i > 0 && v[(f - 1) * n + i - 1] > v[(f - 1) * n + i] {
+                i -= 1;
+            }
+        }
+        (v[(t - 1) * n + n - 1], path)
+    }
+
+    /// The forward-sum loss and MAS are one scan in two semirings, and
+    /// their gradients are the posteriors and the best path.
+    #[test]
+    fn forward_sum_and_mas_are_semiring_scans() {
+        let (b, tn, n) = (3, 12, 5);
+        let lp = rand_like(b * tn * n, 7, 3.0);
+        for ring in [Semiring::Log, Semiring::MaxPlus] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[b, tn, n]);
+            let z = alignment(&mut g, x, b, tn, n, ring);
+            let dx = g.backward(z, &[x]).unwrap()[0];
+            let o = g.eval(std::slice::from_ref(&lp), &[z, dx]);
+            for bb in 0..b {
+                let row = &lp[bb * tn * n..(bb + 1) * tn * n];
+                let got = &o[1][bb * tn * n..(bb + 1) * tn * n];
+                if ring == Semiring::Log {
+                    let (zr, ga) = forward_backward(row, n, tn);
+                    close(&[o[0][bb]], &[zr], 1e-12);
+                    close(got, &ga, 1e-10);
+                } else {
+                    let (zr, path) = viterbi(row, n, tn);
+                    close(&[o[0][bb]], &[zr], 1e-12);
+                    let hot: Vec<f64> = (0..tn * n)
+                        .map(|k| (path[k / n] == k % n) as u8 as f64)
+                        .collect();
+                    close(got, &hot, 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn semiring_scans_lower_to_valid_wgsl() {
+        for ring in [Semiring::Log, Semiring::MaxPlus] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[2, 9, 4]);
+            let z = alignment(&mut g, x, 2, 9, 4, ring);
+            let dx = g.backward(z, &[x]).unwrap()[0];
+            let p = g.to_wgsl(&[z, dx]);
+            assert!(p.kernels.iter().any(|k| k.source.contains("(scan)")));
+            for k in &p.kernels {
+                naga_ok(&k.source);
+            }
+        }
+    }
+
+    /// The dense `[.., n, n]` of a banded `[.., n, k]` (the semiring zero
+    /// off the band).
+    fn densify(ab: &[f64], pts: usize, n: usize, bands: &[i64], zero: f64) -> Vec<f64> {
+        let k = bands.len();
+        let mut a = vec![zero; pts * n * n];
+        for p in 0..pts {
+            for i in 0..n {
+                for (b, &o) in bands.iter().enumerate() {
+                    let j = i as i64 + o;
+                    if (0..n as i64).contains(&j) {
+                        a[(p * n + i) * n + j as usize] = ab[(p * n + i) * k + b];
+                    }
+                }
+            }
+        }
+        a
+    }
+
+    /// A banded scan is the dense scan of its densified `A`, forward and
+    /// backward, in every semiring and direction; and its own backward
+    /// matches finite differences.
+    #[test]
+    fn banded_scan_is_the_dense_scan() {
+        let (h, tn, n) = (2, 6, 5);
+        for bands in [vec![-1i64, 0], vec![-2, -1, 0], vec![-2, 0, 1]] {
+            let k = bands.len();
+            let ab = rand_like(h * tn * n * k, 11, 1.0);
+            let u = rand_like(h * tn * n, 12, 1.0);
+            for ring in [Semiring::Real, Semiring::Log, Semiring::MaxPlus] {
+                let ad = densify(&ab, h * tn, n, &bands, ring.zero());
+                for rev in [false, true] {
+                    let mut g = TensorGraph::new();
+                    let ai = g.input(&[h, tn, n, k]);
+                    let ui = g.input(&[h, tn, n, 1]);
+                    let s = g
+                        .semiring_scan_banded(ai, ui, &bands, 1, rev, ring)
+                        .unwrap();
+                    let gr = g.backward(s, &[ai, ui]).unwrap();
+                    let ob = g.eval(&[ab.clone(), u.clone()], &[s, gr[0], gr[1]]);
+
+                    let mut g = TensorGraph::new();
+                    let ai = g.input(&[h, tn, n, n]);
+                    let ui = g.input(&[h, tn, n, 1]);
+                    let s = g.semiring_scan(ai, ui, 1, false, rev, ring).unwrap();
+                    let gr = g.backward(s, &[ai, ui]).unwrap();
+                    let od = g.eval(&[ad.clone(), u.clone()], &[s, gr[0], gr[1]]);
+
+                    close(&ob[0], &od[0], 1e-12);
+                    close(&ob[2], &od[2], 1e-10);
+                    // ∂A on the band (off it the real ring has a gradient too)
+                    let on = densify(&vec![1.0; ab.len()], h * tn, n, &bands, 0.0);
+                    let ga = densify(&ob[1], h * tn, n, &bands, 0.0);
+                    let gd: Vec<f64> = od[1].iter().zip(&on).map(|(g, m)| g * m).collect();
+                    close(&ga, &gd, 1e-10);
+
+                    let mut g = TensorGraph::new();
+                    let ai = g.input(&[h, tn, n, k]);
+                    let ui = g.input(&[h, tn, n, 1]);
+                    let s = g
+                        .semiring_scan_banded(ai, ui, &bands, 1, rev, ring)
+                        .unwrap();
+                    check_grads(&g, s, &[ab.clone(), u.clone()], 1e-5);
+                }
+            }
+        }
+    }
+
+    /// Max-plus ties: the gradient goes to the smallest predecessor index,
+    /// and to a predecessor before `U`.
+    #[test]
+    fn max_plus_ties_go_to_the_smaller_index() {
+        let neg = Semiring::NEG;
+        // two steps, n = 2. Step 0: S = U = [0, 0]. Step 1: A = 0, so both
+        // predecessors tie for both rows; row 1's U ties them too.
+        let a = vec![0.0; 2 * 2 * 2];
+        let u = vec![0.0, 0.0, neg, 0.0];
+        for banded in [false, true] {
+            let mut g = TensorGraph::new();
+            let (ai, s) = if banded {
+                // bands [-1, 0, 1] cover the dense 2×2 (column j = i + o)
+                let ab: Vec<f64> = vec![0.0; 2 * 2 * 3];
+                let ai = g.input(&[2, 2, 3]);
+                let ui = g.input(&[2, 2, 1]);
+                let s = g
+                    .semiring_scan_banded(ai, ui, &[-1, 0, 1], 0, false, Semiring::MaxPlus)
+                    .unwrap();
+                (ai, (s, ui, ab))
+            } else {
+                let ai = g.input(&[2, 2, 2]);
+                let ui = g.input(&[2, 2, 1]);
+                let s = g
+                    .semiring_scan(ai, ui, 0, false, false, Semiring::MaxPlus)
+                    .unwrap();
+                (ai, (s, ui, a.clone()))
+            };
+            let (s, ui, av) = s;
+            let gr = g.backward(s, &[ai, ui]).unwrap();
+            let o = g.eval(&[av, u.clone()], &[s, gr[0], gr[1]]);
+            close(&o[0], &[0.0, 0.0, 0.0, 0.0], 0.0);
+            // ∂A at step 1, as dense [i][j]: every row picks j = 0
+            let ga = if banded {
+                densify(&o[1], 2, 2, &[-1, 0, 1], 0.0)
+            } else {
+                o[1].clone()
+            };
+            close(&ga[4..], &[1.0, 0.0, 1.0, 0.0], 0.0);
+            // ∂U: step 0 gets both rows' cotangent on j = 0 (plus its own),
+            // step 1's U lost every tie
+            close(&o[2], &[3.0, 1.0, 0.0, 0.0], 0.0);
+        }
+    }
+
+    #[test]
+    fn semiring_scans_reject_unsupported_shapes() {
+        let mut g = TensorGraph::new();
+        let a = g.input(&[4, 3, 3]);
+        let u2 = g.input(&[4, 3, 2]);
+        let u1 = g.input(&[4, 3, 1]);
+        for ring in [Semiring::Log, Semiring::MaxPlus] {
+            let e = g.semiring_scan(a, u2, 0, false, false, ring).unwrap_err();
+            assert!(e.0.contains("vector state"), "{}", e.0);
+            let e = g.semiring_scan(a, u1, 0, true, false, ring).unwrap_err();
+            assert!(e.0.contains("inclusive"), "{}", e.0);
+        }
+        // real dense keeps m > 1 and exclusive
+        assert!(g
+            .semiring_scan(a, u2, 0, true, true, Semiring::Real)
+            .is_ok());
+        let ab = g.input(&[4, 3, 2]);
+        assert!(g
+            .semiring_scan_banded(ab, u2, &[-1, 0], 0, false, Semiring::Real)
+            .is_err());
+        assert!(g
+            .semiring_scan_banded(ab, u1, &[0, -1], 0, false, Semiring::Log)
+            .is_err());
+        assert!(g
+            .semiring_scan_banded(ab, u1, &[-1, 0, 1], 0, false, Semiring::Log)
+            .is_err());
+        assert!(g
+            .semiring_scan_banded(ab, u1, &[-1, 0], 0, false, Semiring::Log)
+            .is_ok());
+    }
+
+    fn fnv(s: &str) -> u64 {
+        s.bytes().fold(0xcbf29ce484222325, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    /// The real ring emits exactly what it did before semirings existed:
+    /// the gated-delta graph, forward and backward, in WGSL and CUDA.
+    /// Hashes taken on `origin/main` at e889ba87.
+    #[test]
+    fn real_scan_codegen_is_unchanged() {
+        let (h, tn, n, m) = (2, 9, 4, 3);
+        let (mut g, o) = gdn_graph(h, tn, n, m);
+        let ins: Vec<TensorId> = (0..5).map(TensorId).collect();
+        let mut outs = vec![o];
+        outs.extend(g.backward(o, &ins).unwrap());
+        let cat = |k: &[WgslKernel]| {
+            k.iter()
+                .map(|k| k.source.clone())
+                .collect::<Vec<_>>()
+                .join("\n//----\n")
+        };
+        assert_eq!(fnv(&cat(&g.to_wgsl(&outs).kernels)), 0xa708c4381058eff8);
+        assert_eq!(fnv(&cat(&g.to_cuda(&outs).kernels)), 0x13f2b5c9a82d1b89);
+        assert!(g.chunked_scan_plan(o).is_some());
+    }
+
+    /// Banded alignment: the same lattice as [`alignment`] with `A` stored
+    /// `[B, T, N, 2]`, bands `[-1, 0]` (advance, stay).
+    fn alignment_banded(
+        g: &mut TensorGraph,
+        lp: TensorId,
+        b: usize,
+        tn: usize,
+        n: usize,
+        ring: Semiring,
+    ) -> TensorId {
+        let neg = Semiring::NEG;
+        let a = g
+            .comp(
+                &[b, tn, n, 2],
+                &[],
+                vec![Arg {
+                    src: lp,
+                    view: View::pick(4, &[Some(0), Some(1), Some(2)]),
+                }],
+                None,
+                |x| vec![x[0]],
+            )
+            .unwrap();
+        let tt = g.iota(&[tn, n], 0);
+        let ti = g.iota(&[tn, n], 1);
+        let u = g
+            .comp(
+                &[b, tn, n, 1],
+                &[],
+                vec![
+                    Arg {
+                        src: lp,
+                        view: View::pick(4, &[Some(0), Some(1), Some(2)]),
+                    },
+                    Arg {
+                        src: tt,
+                        view: View::pick(4, &[Some(1), Some(2)]),
+                    },
+                    Arg {
+                        src: ti,
+                        view: View::pick(4, &[Some(1), Some(2)]),
+                    },
+                ],
+                None,
+                move |x| {
+                    let h = ExprId::from_f64(0.5);
+                    let ng = ExprId::from_f64(neg);
+                    vec![ExprId::select(
+                        h - x[1],
+                        ExprId::select(h - x[2], x[0], ng),
+                        ng,
+                    )]
+                },
+            )
+            .unwrap();
+        let s = g
+            .semiring_scan_banded(a, u, &[-1, 0], 1, false, ring)
+            .unwrap();
+        g.comp(
+            &[b],
+            &[],
+            vec![Arg {
+                src: s,
+                view: view(
+                    vec![
+                        Form::unit(1, 0),
+                        Form::constant(1, tn as i64 - 1),
+                        Form::constant(1, n as i64 - 1),
+                        Form::constant(1, 0),
+                    ],
+                    false,
+                ),
+            }],
+            None,
+            |x| vec![x[0]],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn banded_forward_sum_and_mas() {
+        let (b, tn, n) = (3, 12, 5);
+        let lp = rand_like(b * tn * n, 7, 3.0);
+        for ring in [Semiring::Log, Semiring::MaxPlus] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[b, tn, n]);
+            let z = alignment_banded(&mut g, x, b, tn, n, ring);
+            let dx = g.backward(z, &[x]).unwrap()[0];
+            let o = g.eval(std::slice::from_ref(&lp), &[z, dx]);
+            for bb in 0..b {
+                let row = &lp[bb * tn * n..(bb + 1) * tn * n];
+                let got = &o[1][bb * tn * n..(bb + 1) * tn * n];
+                if ring == Semiring::Log {
+                    let (zr, ga) = forward_backward(row, n, tn);
+                    close(&[o[0][bb]], &[zr], 1e-12);
+                    close(got, &ga, 1e-10);
+                } else {
+                    let (zr, path) = viterbi(row, n, tn);
+                    close(&[o[0][bb]], &[zr], 1e-12);
+                    let hot: Vec<f64> = (0..tn * n)
+                        .map(|k| (path[k / n] == k % n) as u8 as f64)
+                        .collect();
+                    close(got, &hot, 0.0);
+                }
+            }
+            for k in &g.to_wgsl(&[z, dx]).kernels {
                 naga_ok(&k.source);
             }
         }
