@@ -23,6 +23,8 @@ M=$M,sm__throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,dram__throughput.avg.pct_of_peak_sustained_elapsed
 M=$M,launch__grid_size,launch__block_size
+# L1 load requests: separates loads coalesced across lanes from loads each lane issues alone
+M=$M,l1tex__t_requests.sum,l1tex__t_bytes.sum
 # Little's-law inputs: achieved occupancy, registers, waves, and the share of warp time stalled
 # on global loads (long scoreboard), plus L2 <-> DRAM sector traffic
 M=$M,sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread

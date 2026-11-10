@@ -28,6 +28,14 @@ fn main() {
             let ins = (0..if bwd { 4 } else { 3 }).map(|k| rand(n * d, 7 + k)).collect();
             (pl.graph, pl.outputs, ins, pl.nest)
         }
+        "naive_fwd" | "ckpt_fwd" => {
+            let v = parse_variant("s", "j <= i").unwrap();
+            let (g, outs) = naive_graph(&v, n, d, false).unwrap();
+            let sched = if what == "naive_fwd" { MemorySchedule::naive() } else { MemorySchedule::checkpoint() };
+            let pl = g.place(&outs, &sched);
+            let ins = (0..3).map(|k| rand(n * d, 7 + k)).collect();
+            (pl.graph, pl.outputs, ins, pl.nest)
+        }
         "matmul1024" | "matmul512" => {
             let (m, k, r) = if what == "matmul1024" { (1024, 1024, 1024) } else { (512, 576, 1536) };
             let mut g = TensorGraph::new();
