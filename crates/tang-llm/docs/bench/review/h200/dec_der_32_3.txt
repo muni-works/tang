@@ -1,0 +1,50 @@
+coder: 8 of 48 layers in VRAM (21 s)
+coder: 16 of 48 layers in VRAM (41 s)
+coder: 24 of 48 layers in VRAM (62 s)
+coder: 32 of 48 layers in VRAM (82 s)
+coder: 40 of 48 layers in VRAM (103 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (124 s)
+coder: derived MoE: 0 of 0 shapes built in 0.0 s
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 125 s, kernels 111 s, total 236 s
+batch module: 32 rows (71.6 s)
+coder: 127 sequence slots fit (0.28 GB each, 99.7 GB free, 4 GB headroom)
+coder: derived MoE (32, 32, 12, 13, false): 19 kernels, built in 1.25 s
+batch-check tolerance: tokens agree 99.06% (1479/1493, same history), max |dlogit| 8.6382, mean 1.26e-1 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens DIFFER , logits differ in 9723900 of 9723904 entries
+seq 1 (prompt 1377 tokens): tokens DIFFER , logits differ in 9723900 of 9723904 entries
+seq 2 (prompt 1374 tokens): tokens DIFFER , logits differ in 9723902 of 9723904 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 9723891 of 9723904 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 9723891 of 9723904 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 9723890 of 9723904 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 9723897 of 9723904 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 9723895 of 9723904 entries
+seq 8 (prompt 1356 tokens): tokens identical , logits differ in 9723896 of 9723904 entries
+seq 9 (prompt 1353 tokens): tokens DIFFER , logits differ in 9723904 of 9723904 entries
+seq 10 (prompt 1350 tokens): tokens identical , logits differ in 9723898 of 9723904 entries
+seq 11 (prompt 1347 tokens): tokens DIFFER , logits differ in 9723899 of 9723904 entries
+seq 12 (prompt 1344 tokens): tokens DIFFER , logits differ in 9723900 of 9723904 entries
+seq 13 (prompt 1341 tokens): tokens DIFFER , logits differ in 9723894 of 9723904 entries
+seq 14 (prompt 1338 tokens): tokens identical , logits differ in 9723897 of 9723904 entries
+seq 15 (prompt 1335 tokens): tokens identical , logits differ in 9723896 of 9723904 entries
+seq 16 (prompt 1332 tokens): tokens DIFFER , logits differ in 9723904 of 9723904 entries
+seq 17 (prompt 1329 tokens): tokens identical , logits differ in 9723900 of 9723904 entries
+seq 18 (prompt 1326 tokens): tokens identical , logits differ in 9723895 of 9723904 entries
+seq 19 (prompt 1323 tokens): tokens identical , logits differ in 9723895 of 9723904 entries
+seq 20 (prompt 1320 tokens): tokens identical , logits differ in 9723898 of 9723904 entries
+seq 21 (prompt 1317 tokens): tokens identical , logits differ in 9723900 of 9723904 entries
+seq 22 (prompt 1314 tokens): tokens identical , logits differ in 9723894 of 9723904 entries
+seq 23 (prompt 1311 tokens): tokens identical , logits differ in 9723895 of 9723904 entries
+seq 24 (prompt 1308 tokens): tokens DIFFER , logits differ in 9723900 of 9723904 entries
+seq 25 (prompt 1305 tokens): tokens DIFFER , logits differ in 9723901 of 9723904 entries
+seq 26 (prompt 1302 tokens): tokens DIFFER , logits differ in 9723903 of 9723904 entries
+seq 27 (prompt 1299 tokens): tokens DIFFER , logits differ in 9723900 of 9723904 entries
+seq 28 (prompt 1296 tokens): tokens DIFFER , logits differ in 9723899 of 9723904 entries
+seq 29 (prompt 1293 tokens): tokens identical , logits differ in 9723896 of 9723904 entries
+seq 30 (prompt 1290 tokens): tokens identical , logits differ in 9723899 of 9723904 entries
+seq 31 (prompt 1287 tokens): tokens DIFFER , logits differ in 9723904 of 9723904 entries
+batch-check: PASS (tolerance) (logits checksum 36a7b37d406557f0)
+batch 32: prefilled to ~1380 tokens in 51.5 s
+batch 32: 21.36 ms a step, 1498 tok/s aggregate, 47 tok/s a stream (context ~1380)

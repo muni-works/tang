@@ -1,0 +1,6 @@
+Tue Nov 10 00:36:23 UTC 2026
+name, driver_version, memory.total [MiB]
+NVIDIA GeForce RTX 3090, 595.91.07, 24576 MiB
+pid, used_gpu_memory [MiB]
+2.8.0+cu128
+6ebfccd84bf48a70603513d550a432ca32bcd86e

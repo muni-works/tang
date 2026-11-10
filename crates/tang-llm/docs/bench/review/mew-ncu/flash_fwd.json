@@ -1,0 +1,28 @@
+{
+ "title": "flash_fwd",
+ "bw": 936000000000.0,
+ "kernels": [
+  {
+   "kernel": "main0@128x256",
+   "launches": 1,
+   "us": 234.81600000000003,
+   "total_ms": 0.23481600000000002,
+   "mb": 5.51296,
+   "floor_us": 5.88991452991453,
+   "light": 0.025083105622762204,
+   "sm_pct": 23.08,
+   "dram_pct": 2.58,
+   "grid": 128,
+   "block": 256,
+   "cls": "latency",
+   "occ_pct": 16.57,
+   "regs": 99.0,
+   "waves": 1.56,
+   "long_sb": 7862.98
+  }
+ ],
+ "kernel_ms": 0.23481600000000002,
+ "floor_ms": 0.00588991452991453,
+ "step_ms": null,
+ "steps": 1.0
+}

@@ -1,0 +1,5 @@
+{"point":"naive","op":"fwdbwd","n":4096,"d":64,"ms":23.8689,"ms_min":23.8557,"ms_max":23.8865,"hbm_bytes":2192752648,"kernels":30,"max_rel_err":9.837e-6,"correct":true,"tol":2e-3}
+{"point":"checkpoint","op":"fwdbwd","n":4096,"d":64,"ms":33.6574,"ms_min":33.6265,"ms_max":33.6908,"hbm_bytes":1038417920,"kernels":14,"max_rel_err":9.514e-6,"correct":true,"tol":2e-3}
+{"point":"flash","op":"fwdbwd","n":4096,"d":64,"ms":1.6515,"ms_min":1.6504,"ms_max":1.6522,"hbm_bytes":43073536,"kernels":8,"max_rel_err":1.207e-3,"correct":true,"tol":2e-3}
+{"point":"flash_fp32","op":"fwdbwd","n":4096,"d":64,"ms":34.2314,"ms_min":34.2237,"ms_max":34.2371,"hbm_bytes":43073536,"kernels":8,"max_rel_err":1.012e-5,"correct":true,"tol":2e-3}
+{"point":"searched","op":"fwdbwd","n":4096,"d":64,"ms":1.6749,"ms_min":1.6730,"ms_max":1.6756,"hbm_bytes":43073536,"kernels":8,"max_rel_err":1.207e-3,"correct":true,"tol":2e-3}

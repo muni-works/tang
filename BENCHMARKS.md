@@ -3756,3 +3756,207 @@ Decode ms per step (context ~1380):
 | 48 | 30.01 | **28.45** |
 
 The N=48 token-agreement figure moves with the mix of narrow and wide windows: 98.58% in rounds 4–5, 99.28% in round 6 (derived at every width) and 98.93% here. The hand engine itself scores exactly at the bar, and derived's mean \|dlogit\| is at or below hand's in every round.
+
+## Blind-review measurements (2026-11-09/10)
+
+All runs are from branch `claude/review-measurements`; the commit is recorded in each raw `machine.txt`. Every number below has its raw output under `crates/tang-llm/docs/bench/review/`:
+- `3090/`: idle rented RTX 3090 (RunPod secure EU-CZ-1, driver 595.91.07, torch 2.8.0+cu128, commit 6ebfccd8, 2026-11-10 00:36 UTC). `idle.txt` holds `nvidia-smi` samples taken before each step: 1 MiB used, no other process.
+- `mew-ncu/`: ncu bytes on mew. mew is a shared 3090, so it is used only for counters, never for times; runs under `flock ~/tang-gpu.lock` at 1% background load.
+- `h200/`: idle rented H200 SXM (RunPod secure US-GA-2, driver 595.91.07, torch 2.8.0+cu128).
+
+### 1. Figure 1 on the CUDA path (causal attention, n = 4096, d = 64, f32, idle 3090)
+
+`N=4096 D=64 OPS=fwd,fwdbwd REF_DIR=… cargo run --release -p tang-bench --features cuda --example figure1_cuda`
+
+**Method.** Each schedule is `TensorGraph::place` of one graph, lowered by the new `to_cuda_placed`. That lowering keeps the placement's `nest` decision: before this change, `to_cuda` nested every short contraction into a tile, so on CUDA "naive" was not naive. Each program is tuned per kernel (`Program::tuned_placed`). "searched" keeps the fastest correct role-level placement, then each kernel's thread mappings.
+
+**Checking.** *Every* point, flash included, is compared at n = 4096 against the f64 interpreter (`TensorGraph::eval`, computed once per op and cached). The metric is max |error| / max |reference| per output, with one tolerance for the experiment: 2e-3. Times are the median of 7 samples of 5 runs, with the range in brackets.
+
+| schedule | fwd ms | fwd model traffic | kernels | fwd max rel err | fwd+bwd ms | fwd+bwd err |
+|---|---|---|---|---|---|---|
+| naive | 4.206 [4.176–4.650] | 816 MB | 11 | 2.2e-6 | 23.86 | 9.8e-6 |
+| checkpoint | 9.334 [9.334–9.408] | 275 MB | 5 | 2.2e-6 | 33.56 | 9.5e-6 |
+| flash (tuned: TF32 mma) | 0.242 [0.241–0.245] | 4.2 MB | 1 | 5.2e-4 | 0.744 | **1.5e-2 FAIL** |
+| flash, no tensor cores (f32) | 3.664 [3.362–3.665] | 4.2 MB | 1 | 2.0e-6 | 7.64 | **1.5e-2 FAIL** |
+| flash, fused backward off (`TANG_NO_ATTN_BWD=1`) | — | — | 8 | — | 1.652 | 1.2e-3 |
+| searched | **0.233** [0.232–0.238] | 4.2 MB | 1 | 5.2e-4 | 1.907 (fused bwd on) / 1.675 (off) | 1.2e-3 |
+
+- **The forward figure stands, on CUDA and checked.** The searched forward is the flash placement (Smem / Recompute / Reg / Fuse). It is 18× faster than naive and 40× faster than checkpoint, and every point passes.
+- **New finding: flash's forward+backward fails the f32 check.** The fused attention-backward kernel (`tensor_cuda_attn_bwd`) computes in bf16 tensor cores even for an f32 graph. Its error is 1.5e-2 (dQ), 9.7e-3 (dK) and 9.0e-3 (dV), and it is the same with every other kernel on f32 (`flash_fp32` row). With the fused backward disabled, the same flash placement passes at 1.2e-3 and runs 1.65 ms instead of 0.74 ms. The search correctly rejected the fused one, so the "searched" fwd+bwd point is a slower, correct schedule. The earlier figure never checked flash; this run shows the fused backward is not f32-accurate.
+- **The search caught a wrong placement.** Smem / Recompute / Hbm / Fuse produced output with error 7.0 (simply wrong) at 14.5 ms (`fig1.err`). The check rejected it. Its cause is not yet investigated.
+- **Why the lowest-traffic schedule doesn't always win.** Checkpoint moves a third of naive's model traffic (275 vs 816 MB) yet is 2.2× slower. Almost all of the difference is one kernel, the score contraction S = QKᵀ: 7.12 ms in checkpoint against 1.51 ms in naive, with the same arithmetic and the same output.
+  - Naive materializes Kᵀ in its own transpose kernel (8 µs), so in S the 32 lanes of a warp read 32 adjacent floats.
+  - Checkpoint's `substitute_maps` folds the transpose into the view, so each lane reads its own K row.
+  - ncu on mew (`mew-ncu/naive_fwd.csv`, `ckpt_fwd.csv`) confirms it: the same 67.6 M L1 requests carry 5.4 GB in naive and 35.5 GB in checkpoint (6.5×).
+  - **So it is not a wrong lowering:** the output is exact to 2e-6. It is a lowering that loses coalescing when a transpose is recomputed into its reader. The traffic model counts DRAM bytes once per buffer and cannot see this; the L1 bytes can.
+  - Flash, the lowest-traffic schedule (4.2 MB), does win.
+
+### 2. PyTorch baselines for the d = 576 block (idle 3090)
+
+`python3 scripts/review/torch_block_compile.py` (eager, `torch.compile`, CUDA graph via `torch.cuda.graph`; fp32 and TF32) and `cargo run --release -p tang-bench --features cuda --example cuda_block`, interleaved for 6 rounds. Values are best [median] of 6, in ms.
+
+| block | tang (CUDA) | torch eager fp32 / TF32 | torch.compile fp32 / TF32 | torch CUDA graph fp32 / TF32 |
+|---|---|---|---|---|
+| fwd 128 | 0.196 [0.197] | 0.788 / 0.820 | 0.396 / 0.388 | 0.269 / **0.162** [0.162] |
+| fwd 512 | **0.331** [0.332] | 0.793 / 0.841 | 0.434 / 0.407 | 0.560 / 0.396 |
+| fwd+bwd 128 | 0.482 [0.503] | 3.774 / 3.127 | 2.148 / 1.553 | 0.663 / 0.484 [0.484] |
+| fwd+bwd 512 | 1.127 [1.132] | 4.209 / 2.947 | 1.524 / 1.724 | 1.621 / 1.142 [1.144] |
+
+- **This gets worse for the paper.** With a CUDA graph and TF32, PyTorch's forward at seq 128 (0.162 ms) beats tang's (0.196 ms) by 1.2×. fwd+bwd at seq 128 is a tie (0.484 vs 0.482 best, 0.503 median), and so is seq 512 (1.142 vs 1.127).
+- tang still wins the seq-512 forward against every PyTorch mode: 0.331 ms vs 0.396 (graph TF32) and 0.407 (compile TF32).
+- Eager PyTorch on this pod is slower than the paper's numbers (0.79 vs 0.306 ms at fwd 128) because the eager path is CPU-launch bound and this pod's CPU differs. The CUDA-graph rows remove that.
+- The paper's table should compare against the CUDA-graph TF32 column.
+
+### 6. Floors beyond GEMVs: flash attention and matmul tiles (3090)
+
+Bytes come from ncu on mew (`scripts/ncu/ncu_kernels.sh … --profile-from-start off -- floors_cuda <w>`). Times come from the idle rented 3090 (`floors_cuda <w>`, same tuned program). The traffic floor is bytes / 936 GB/s. The compute floor is FLOPs / 35.6 TFLOP/s, the 3090's dense TF32 tensor peak.
+
+| kernel | idle time | DRAM bytes | traffic floor (light) | FLOPs | compute floor (light) |
+|---|---|---|---|---|---|
+| flash fwd, causal 4096×64 (1 kernel) | 0.243 ms | 5.5 MB | 5.9 µs (0.02) | 2.15 G | 60 µs (**0.25**) |
+| flash fwd+bwd, causal 4096×64 (8 kernels) | 0.743 ms | 29 MB | 31 µs (0.04) | 7.5 G | 211 µs (0.28) |
+| matmul tile 1024³ TF32 | 0.098 ms | 12.5 MB | 13.4 µs (0.14) | 2.15 G | 60 µs (**0.62**) |
+| matmul tile 512×576×1536 TF32 | 0.054 ms | 8.9 MB | 9.6 µs (0.18) | 0.91 G | 25 µs (**0.47**) |
+
+These kernels are compute-shaped: their traffic floors are 2–15% of their time, so the GEMV-style "light" says nothing about them. Against the TF32 roof, the matmul tile reaches 0.47–0.62 and flash 0.25–0.28. Flash's fused backward kernel alone takes 0.476 ms of its 0.743 ms. Full ncu tables, including occupancy, L1 requests and stalls, are in `mew-ncu/*.md`.
+
+### 7. Greedy equivalence, Qwen3-8B, 256 tokens (idle 3090)
+
+`qwen_decode model <mlx-community/Qwen3-8B-4bit> ids.txt --gen 256`, then the 277 ids (21-token prompt + 256 generated) are teacher-forced through `--force`. They are compared against `qwen_decode reference` (CPU f32 with f64 accumulation, the checkpoint dequantized exactly) and `qwen_decode compare`.
+
+**Tolerance for the experiment: argmax equal at every position.**
+
+| check | result |
+|---|---|
+| argmax agreement, positions 20…276 | **257/257** |
+| on-device argmax vs the logits' argmax | 257/257 |
+| logit error | max \|err\| 0.98 at max \|logit\| 55.7 (1.8% of scale), mean 6.5e-3 |
+
+The greedy text is the reference's for all 256 tokens. The worst logit error, 0.98, is larger than the 3.3e-2 recorded for 64 tokens. The device caches are f16, and per-position error grows with context; it never flipped an argmax here.
+
+### 4. MoE layer with equal work (idle H200)
+
+`CODER_MOE_B=1,4,8,64 CODER_MOE_DUMP=d coder_moe_ir`, then `coder_moe_hand d 1 4 8 64` on the same bytes. The fragment and GEMV rows add `CODER_MOE_STAGE=frag|gemv`. There were 3 rounds; values are medians of the cold (L2-flushed) medians, in ms, with the round spread in brackets. All outputs agree to ≤ 3e-7.
+
+The hand `cx_moe_add_norm` also does the residual add, the next RMSNorm and the int8 activations. The derived half stops at the combine. For equal work, the same three steps are timed as derived ops on the window's own output (`add_norm` + `engine_q8`, 5 kernels), in the new block at the end of `coder_moe_hand`, and added to the derived half.
+
+| B | derived expert half (stage) | + residual, norm, int8 | **derived, equal work** | **hand** | derived / hand |
+|---|---|---|---|---|---|
+| 1 | 0.0356 [0.0356–0.0356] (Gemv) | 0.0162 | **0.0518** | 0.0439 | 1.18 (slower) |
+| 4 | 0.0763 (Gemv) | 0.0164 | **0.0927** | 0.0868 | 1.07 (slower) |
+| 8 | 0.1062 (Fragment) | 0.0168 | **0.1230** | 0.1248 | 0.99 |
+| 64 | 0.2957 (Fragment) | 0.0222 | **0.3179** | 0.3357 | 0.95 |
+
+- **Which B=1 number is right:** both, for different stages.
+  - 0.036 is the `Stage::Gemv` schedule (fused producers): 0.0356 here, 0.0354 when forced.
+  - BENCHMARKS.md:2810's 0.0484 is the Fragment (int8 MMA) stage at B=1, before `Stage::Gemv` existed: 0.0504 here with `CODER_MOE_STAGE=frag`.
+  - The paper's table uses the Gemv number for B=1/4 and states it.
+- **But with equal work the derived layer loses at B = 1 and 4,** by 18% and 7%. The paper's "beats the hand kernels at batch 1" holds only for the unequal comparison its caption warns about. At B = 8 it is a tie and at B = 64 a 5% win.
+- Gemv at B=8: 0.1167, slower than Fragment's 0.1062, as the default chooses.
+
+### 3. Attention at d = 256 on the H200: tang against FlashAttention-3 and SDPA
+
+`python3 scripts/hopper_attention.py gen DIR N 256 CAUSAL`, then `… bench DIR` (FA3 and SDPA) and `hopper_attention DIR` (tang). 3 rounds each, medians in ms; the round spread is under 2% everywhere (raw: `h200/attn_*`).
+
+- FA3 was built from `flash-attention/hopper` at HEAD with only head dim 256 in bf16 enabled (`flash_attn_3` 3.0.1, `flash_attn_interface`).
+- 16k tokens per configuration and 2048 hidden (8 heads), bf16.
+- Every library is checked on two heads against the f64 reference, and all land at relative error 2–5e-3.
+- tang's backward time is its forward+backward program minus its forward.
+
+| N | causal | tang fwd | FA3 fwd | SDPA fwd | tang / FA3 (fwd) | tang bwd | FA3 bwd | SDPA bwd | tang / FA3 (bwd) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | no | 0.433 | 0.199 | 0.450 | 2.18× slower | 3.624 | 0.914 | 1.742 | 3.96× slower |
+| 1024 | yes | 0.315 | 0.137 | 0.274 | 2.30× | 2.666 | 0.574 | 1.141 | 4.64× |
+| 4096 | no | 1.379 | 0.703 | 1.712 | 1.96× | 8.748 | 3.079 | 5.671 | 2.84× |
+| 4096 | yes | 0.885 | 0.377 | 0.963 | 2.35× | 5.075 | 1.620 | 3.154 | 3.13× |
+| 16384 | no | 5.177 | 2.783 | 6.785 | 1.86× | 29.30 | 11.79 | 21.60 | 2.49× |
+
+- At d = 256, tang's forward runs at 0.43–0.54 of FA3's speed, inside the paper's 0.42–0.60.
+- Its backward runs at 0.22–0.40 of FA3's, the low end of the paper's "about 0.4×". The backward is below 0.3 at N ≤ 4096.
+- Against SDPA, tang's forward wins from N = 4096 up (1.24×, 1.09×, 1.31×) and loses at N = 1024 causal. Its backward loses to SDPA everywhere.
+- The FA3 fp8 path was not built.
+
+### 5. In-model decode, five interleaved rounds (H200)
+
+`TANG_BATCH_N=N TANG_BATCH_ONLY=N [TANG_CODER_DERIVED=moe TANG_DMOE_MIN_ROWS=16] tang-llm flash-batch-check <UD-Q4_K_XL> --prompt-file refactor_short.txt -n 64`
+
+- One idle H200 for all 30 runs, each a fresh process.
+- Hand and derived alternate, and their order flips each round.
+- Context ~1380, 64 timed steps after 4 warm-up steps.
+
+| N | hand ms: 5 rounds (median, range) | derived ms: 5 rounds (median, range) | derived gain per round |
+|---|---|---|---|
+| 16 | 15.83 15.84 15.84 15.84 15.83 (15.84, 0.01) | 13.99 13.52 13.99 13.99 13.53 (13.99, 0.47) | 11.6–14.6% |
+| 32 | 23.45 23.43 23.44 23.43 23.44 (23.44, 0.02) | 21.35 21.35 21.36 21.36 21.36 (21.36, 0.01) | 8.8–9.0% |
+| 48 | 30.00 30.00 30.08 30.00 30.02 (30.00, 0.08) | 28.43 28.43 28.43 28.43 28.46 (28.43, 0.03) | 5.2–5.5% |
+
+- **On one machine the round-to-round swing (at most 0.47 ms, 3%) is far below the gain (5–15%), in every round.**
+- The swing the review saw came from comparing different pods: hand N=48 has read 29.67, 30.01, 30.20 and 30.26 ms on four different H200 pods in earlier rounds.
+- Paired comparisons need one machine. The paper's in-model numbers should be these medians.
+- Batch-check tolerance at each N is the same every round. Hand: 99.16 / 99.23 / 99.00%. Derived: 99.02 / 99.06 / 98.93%; at N=48 derived sits 0.07 points under the 99% bar and hand exactly at it.
+
+### 8. TTFT against vLLM (H200)
+
+vLLM 0.33.0 ran on `Qwen/Qwen3-Coder-Next-FP8`, the official FP8 checkpoint (80 GB). The bf16 checkpoint is 159 GB and does not fit one H200. The command was `VLLM_USE_DEEP_GEMM=0 python scripts/review/vllm_ttft.py`:
+- an offline `LLM` with no prefix reuse
+- three prompts per length, each a different rotation of the same text
+- one output token, after one warm-up.
+
+The first attempt failed: vLLM's DeepGEMM needs nvcc ≥ 12.9 and the image ships 12.8, so DeepGEMM is off.
+
+tang ran `flash-batch-check` with `TANG_BATCH_N=1 TANG_BATCH_CTX=N TANG_CODER_KV=int8 TANG_CODER_WIDE=2048` on the UD-Q4_K_XL GGUF: the time to prefill one stream, three runs.
+
+| prompt | vLLM FP8 (3 runs) | tang hand kernels (3 runs) | tang + `TANG_CODER_ATTN=derived` (2 runs) |
+|---|---|---|---|
+| 8,000 tokens | **0.167–0.173 s** | 2.1 s | — |
+| 44,000 tokens | **1.082–1.088 s** | 13.8 s | 12.9 s |
+
+- **vLLM is 12.4× faster to first token at 8k and 12.7× at 44k.** These are different weight formats (FP8 vs a 4.5-bit GGUF), so the comparison is not precision-matched. But the gap is an order of magnitude and does not come from the format.
+- tang's 13.8 s here is also slower than the paper's 8.33 s (hand) / 5.54 s (derived attention + scan) TTFT. That table came from a warm server, and batch-check's prefill path may include work the server path skips. This was not reconciled within the budget.
+- The paper's prefill claims are relative to tang's own engine. Against vLLM they do not hold, and the paper should say so.
+- SGLang was not tried.
+
+### What this costs and what was not done
+
+- GPU spend: RTX 3090 secure about 0.4 h ($0.2), H200 secure about 7.0 h ($37). All pods were terminated.
+- FA3 fp8 was not built, and SGLang was not run.
+- The flash backward's bf16 kernel is reported, not fixed.
+- The wrong Smem/Recompute/Hbm/Fuse placement is caught by the check but not root-caused.
+- The 13.8 s vs 8.33 s TTFT gap between batch-check and the paper's warm-server measurement is not reconciled.
+
+### For the theory review (Prove): launch, latency and the 3090 attention tile
+
+**Empty kernel and DRAM latency, H200 SXM** (`scripts/review/latency.cu`, `nvcc -O2 -arch=sm_90a`, idle RunPod secure H200, 2026-11-10; raw: `review/prove/latency_h200.txt`). Three runs agree to within 0.5 ns.
+
+| quantity | value |
+|---|---|
+| empty kernel inside a CUDA graph (2000 nodes, best of 10 replays): 1 / 132 / 528 blocks × 256 | **0.48 / 0.54 / 0.78 µs** each |
+| same, launched on a stream | 2.34 / 1.79 / 1.80 µs |
+| pointer chase, one thread, random single cycle with 64 B slots, 1 MB (L2-resident) | 145 ns (286 cycles at 1.98 GHz) |
+| same over 32 MB | 191 ns |
+| same over 4 GB (DRAM, including TLB misses) | **340 ns** (672 cycles) |
+
+A first version re-walked the warm-up run's path, so the timed chase hit L2 (151 ns at 4 GB). It is kept in the raw file and superseded.
+
+**3090 attention autotuner pick** (`TUNE=3090 io_dual` on branch `claude/paper-theory-fixes` fb1cb207). It ran on an idle rented RTX 3090; raw: `review/prove/io_dual_3090_cuda.txt`. The pod has no Vulkan driver, so `Runtime::select` ran with `--features cuda`: the tuner timed CUDA lowerings, not wgpu.
+- matmul 1024³: autotuned [p0=64 p1=64 r0=32], 1.95× bound.
+- attention fwd, 8 heads, N = 1024 and N = 4096, d = 64 causal: autotuned [p2=16 p3=64 r0=16], 24× bound. That is the same as `schedule_auto`; the dual tile is [p2=48 r0=48] and the 2-level dual [p2=128 p3=32 r0=32].
+- Per-tile kernel times were not measured: `io_dual` prints none.
+
+**3090 attention race** (`TUNE=3090 RACE=1 io_dual --features cuda`, PR #195 head 24eb7f7c, 2026-11-10 08:27 UTC; raw: `review/prove/io_dual_race_3090.txt`).
+- **Machine:** RunPod had no RTX 3090 in stock in any region or CUDA version, so this ran on mew under `flock ~/tang-gpu.lock`. mew's other GPU processes (listed at the top of the raw file) were idle: utilization was 1% before the run, and the 2 s samples in `io_dual_race_3090_util.txt` show 100% for our process throughout.
+- **Candidates:** the race times every candidate of the main kernel's schedule space, 12 per workload.
+
+| workload | candidates | fastest | slowest | spread | traffic range of candidates |
+|---|---|---|---|---|---|
+| matmul 1024³ | 12 | 0.100 ms [p0=64 p1=64 r0=32] | 0.101 ms | 1% | 138–541 MB |
+| matmul 4096³ | 12 (2 failed to launch: invalid argument) | 5.511 ms [p0=32 p1=16 r0=32] | 5.566 ms | 1% | 8.7–25.8 GB |
+| attention fwd 8×1024×64 causal | 12 | 0.072 ms (all) | 0.072 ms | <1% | 107–409 MB |
+| attention fwd 8×4096×64 causal | 12 | 0.663 ms [p2=16 p3=64 r0=16] | 0.678 ms | 2% | 1.6–10.8 GB |
+
+Per tile (queries p2 × keys r0, value columns p3):
+- N = 1024: 16×16 (p3=64) 0.072 ms, 64×16 (p3=32) 0.072 ms, 16×32 0.072 ms.
+- N = 4096: 16×16 (p3=64) **0.663 ms**, 64×16 (p3=16) 0.677, 64×32 (p3=32) 0.677, 16×32 (p3=32) 0.678.
+- 64×64 is not in the candidate space io_dual races.
+
+**Reading.** Candidate times differ by at most 2% while their LP traffic differs by 2.5–4×. On this CUDA path, matmul and attention lower to the native mma kernels (TF32 tile, flash on mma), and those take their block shape from the lowering, not from the thread-schedule tile being raced. So on CUDA the race measures the same kernel 12 times. It cannot test whether the dual's tile beats the autotuner's. The wgpu path (Vulkan), where the thread tile is the kernel's tile, would; it needs a 3090 with a Vulkan driver (mew has one).

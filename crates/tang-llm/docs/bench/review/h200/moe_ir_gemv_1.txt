@@ -1,0 +1,44 @@
+interpreter (emulated int8) vs reference, Dims { t: 3, d: 256, e: 6, k: 2, f: 256 }: top-k match true, gu max rel 5.44e-7, y max rel 2.71e-7
+backend: Cuda — NVIDIA H200 (CUDA sm_90a)
+
+B=1 Gemv ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 1.15e-7, dn 1.03e-7, y 1.15e-7
+  k 0   0.0093 ms warm    0.0132 ms cold  router
+  k 1   0.0444 ms warm    0.0132 ms cold  
+  k 2   0.0069 ms warm    0.0051 ms cold  
+  k 3   0.0077 ms warm    0.0056 ms cold  
+  k 4   0.0058 ms warm    0.0050 ms cold  
+  k 5   0.0057 ms warm    0.0049 ms cold  
+  k 6   0.0059 ms warm    0.0051 ms cold  
+  k 7   0.0058 ms warm    0.0045 ms cold  
+  k 8   0.0177 ms warm    0.0176 ms cold  gate|up
+  k 9   0.0101 ms warm    0.0116 ms cold  down
+  k10   0.0063 ms warm    0.0061 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0341 warm / 0.0354 cold ms; all 11 kernels 0.1256 / 0.0919
+
+B=4 Gemv ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 8.09e-8, dn 1.21e-7, y 1.19e-7
+  k 0   0.0087 ms warm    0.0095 ms cold  router
+  k 1   0.0443 ms warm    0.0134 ms cold  
+  k 2   0.0068 ms warm    0.0049 ms cold  
+  k 3   0.0074 ms warm    0.0055 ms cold  
+  k 4   0.0057 ms warm    0.0048 ms cold  
+  k 5   0.0061 ms warm    0.0049 ms cold  
+  k 6   0.0066 ms warm    0.0061 ms cold  
+  k 7   0.0054 ms warm    0.0052 ms cold  
+  k 8   0.0433 ms warm    0.0461 ms cold  gate|up
+  k 9   0.0160 ms warm    0.0235 ms cold  down
+  k10   0.0063 ms warm    0.0063 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0655 warm / 0.0759 cold ms; all 11 kernels 0.1564 / 0.1301
+
+B=8 Gemv ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 9.46e-8, dn 1.21e-7, y 1.19e-7
+  k 0   0.0103 ms warm    0.0115 ms cold  router
+  k 1   0.0441 ms warm    0.0134 ms cold  
+  k 2   0.0069 ms warm    0.0051 ms cold  
+  k 3   0.0076 ms warm    0.0057 ms cold  
+  k 4   0.0051 ms warm    0.0051 ms cold  
+  k 5   0.0054 ms warm    0.0053 ms cold  
+  k 6   0.0075 ms warm    0.0082 ms cold  
+  k 7   0.0071 ms warm    0.0078 ms cold  
+  k 8   0.0781 ms warm    0.0790 ms cold  gate|up
+  k 9   0.0260 ms warm    0.0313 ms cold  down
+  k10   0.0063 ms warm    0.0065 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.1105 warm / 0.1169 cold ms; all 11 kernels 0.2046 / 0.1789

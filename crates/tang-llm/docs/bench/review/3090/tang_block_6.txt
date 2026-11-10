@@ -1,0 +1,78 @@
+backend: Cuda — NVIDIA GeForce RTX 3090 (CUDA sm_86)
+matmul 1024x1024x1024: 0.116 ms (native mma: true)
+matmul 512x576x1536: 0.060 ms (native mma: true)
+block seq=128: tuned (cached), 6 of 6 native kernels kept
+block seq=128: output digest 20c8ff361ae25b5f
+block seq=128: max err 4.33e1 (max |ref| 552448.65)
+block seq=128: fwd 0.197 ms (17 kernels, 6 native)
+    0.006 ms  node TensorId(21) shape [Fixed(128), Fixed(1)] split 256 tile (0, 0, 0) 
+    0.005 ms  node TensorId(22) shape [Fixed(128), Fixed(576)] split 0 tile (0, 0, 0) 
+    0.028 ms  node TensorId(23) shape [Fixed(128), Fixed(192), Fixed(2)] split 0 tile (16, 16, 32) mma
+    0.005 ms  node TensorId(26) shape [Fixed(128), Fixed(192)] split 0 tile (0, 0, 0) 
+    0.005 ms  node TensorId(28) shape [Fixed(3), Fixed(128), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.023 ms  node TensorId(30) shape [Fixed(128), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.005 ms  node TensorId(32) shape [Fixed(128), Fixed(9), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.005 ms  node TensorId(34) shape [Fixed(3), Fixed(128), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.005 ms  node TensorId(35) shape [Fixed(128), Fixed(9), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.014 ms  node TensorId(39) shape [Fixed(128), Fixed(3), Fixed(3), Fixed(64)] split 0 tile (64, 4, 32) mma
+    0.023 ms  node TensorId(42) shape [Fixed(128), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.007 ms  node TensorId(44) shape [Fixed(128), Fixed(1)] split 256 tile (0, 0, 0) 
+    0.006 ms  node TensorId(45) shape [Fixed(128), Fixed(576)] split 0 tile (0, 0, 0) 
+    0.049 ms  node TensorId(46) shape [Fixed(128), Fixed(1536), Fixed(2)] split 0 tile (16, 16, 32) mma
+    0.007 ms  node TensorId(47) shape [Fixed(128), Fixed(1536)] split 0 tile (0, 0, 0) 
+    0.030 ms  node TensorId(48) shape [Fixed(128), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.006 ms  node TensorId(49) shape [Fixed(128), Fixed(576)] split 0 tile (0, 0, 0) 
+block seq=128: train loss 259660398592.000000, outputs digest 47b96240771d1dfe
+block seq=128: fwd+bwd 0.501 ms (49 kernels, 19 of 19 native kept)
+  (sum of kernels 0.579 ms)
+    0.047 ms  node TensorId(60) shape [128, 576, 2] red Some([1536]) monoid Some(Other) split 0 tile (16, 16, 32) args [57[1536, 128] 9[1536, 576] 54[1536, 128] 11[1536, 576]] mma
+    0.043 ms  node TensorId(47) shape [128, 1536, 2] red Some([576]) monoid Some(Other) split 0 tile (16, 16, 32) args [46[128, 576] 11[1536, 576] 9[1536, 576]] mma
+    0.027 ms  node TensorId(49) shape [128, 576] red Some([1536]) monoid Some(Sum) split 0 tile (16, 16, 32) args [48[128, 1536] 13[576, 1536]] mma
+    0.025 ms  node TensorId(24) shape [128, 192, 2] red Some([576]) monoid Some(Other) split 0 tile (16, 16, 32) args [23[128, 576] 5[192, 576] 3[192, 576]] mma
+    0.022 ms  node TensorId(53) shape [128, 1536] red Some([576]) monoid Some(Sum) split 0 tile (16, 16, 32) args [50[576, 128] 13[576, 1536]] mma
+    0.022 ms  node TensorId(82) shape [3, 128, 3, 32, 2] red Some([128]) monoid Some(Other) split 0 tile (32, 8, 32) args [81[128, 3, 3, 128] 37[128, 3, 3, 32] 34[128, 3, 3, 32]] mma
+    0.022 ms  node TensorId(92) shape [128, 3, 3, 32, 2] red Some([128]) monoid Some(Other) split 0 tile (32, 8, 32) args [81[128, 3, 3, 128] 35[3, 128, 32] 29[3, 128, 32]] mma
+    0.021 ms  node TensorId(59) shape [1536, 576] red Some([]) monoid None split 0 tile (16, 16, 32) args [58[1536, 576]] mma
+    0.020 ms  node TensorId(52) shape [576, 1536] red Some([]) monoid None split 0 tile (16, 16, 32) args [51[576, 1536]] mma
+    0.020 ms  node TensorId(56) shape [1536, 576] red Some([]) monoid None split 0 tile (16, 16, 32) args [55[1536, 576]] mma
+    0.020 ms  node TensorId(31) shape [128, 576] red Some([]) monoid None split 0 tile (16, 16, 32) args [30[128, 576] 2[576]] mma
+    0.019 ms  node TensorId(39) shape [3, 3, 128, 1, 64, 3] red Some([128]) monoid Some(OnlineSoftmax) split 0 tile (16, 16, 32) args [38[3, 3, 128, 128] 26[128, 128] 25[128, 128] 24[128, 192, 2] 6[192]] mma
+    0.019 ms  node TensorId(43) shape [128, 576] red Some([576]) monoid Some(Sum) split 0 tile (16, 16, 32) args [42[128, 576] 20[576, 576]] mma
+    0.019 ms  node TensorId(67) shape [3, 3, 128, 64] red Some([576]) monoid Some(Sum) split 0 tile (16, 16, 32) args [63[576, 128] 18[576, 3, 3, 64]] mma
+block seq=512: tuned (cached), 6 of 6 native kernels kept
+block seq=512: output digest 5cff2ba37ff3c2aa
+block seq=512: fwd 0.332 ms (17 kernels, 6 native)
+    0.007 ms  node TensorId(21) shape [Fixed(512), Fixed(1)] split 256 tile (0, 0, 0) 
+    0.006 ms  node TensorId(22) shape [Fixed(512), Fixed(576)] split 0 tile (0, 0, 0) 
+    0.039 ms  node TensorId(23) shape [Fixed(512), Fixed(192), Fixed(2)] split 0 tile (16, 16, 32) mma
+    0.005 ms  node TensorId(26) shape [Fixed(512), Fixed(192)] split 0 tile (0, 0, 0) 
+    0.005 ms  node TensorId(28) shape [Fixed(3), Fixed(512), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.023 ms  node TensorId(30) shape [Fixed(512), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.005 ms  node TensorId(32) shape [Fixed(512), Fixed(9), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.006 ms  node TensorId(34) shape [Fixed(3), Fixed(512), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.004 ms  node TensorId(35) shape [Fixed(512), Fixed(9), Fixed(32)] split 0 tile (0, 0, 0) 
+    0.035 ms  node TensorId(39) shape [Fixed(512), Fixed(3), Fixed(3), Fixed(64)] split 0 tile (64, 4, 32) mma
+    0.022 ms  node TensorId(42) shape [Fixed(512), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.009 ms  node TensorId(44) shape [Fixed(512), Fixed(1)] split 256 tile (0, 0, 0) 
+    0.006 ms  node TensorId(45) shape [Fixed(512), Fixed(576)] split 0 tile (0, 0, 0) 
+    0.120 ms  node TensorId(46) shape [Fixed(512), Fixed(1536), Fixed(2)] split 0 tile (16, 16, 32) mma
+    0.015 ms  node TensorId(47) shape [Fixed(512), Fixed(1536)] split 0 tile (0, 0, 0) 
+    0.049 ms  node TensorId(48) shape [Fixed(512), Fixed(576)] split 0 tile (16, 16, 32) mma
+    0.007 ms  node TensorId(49) shape [Fixed(512), Fixed(576)] split 0 tile (0, 0, 0) 
+block seq=512: train loss 260555997184.000000, outputs digest 57e0a808e6e6777a
+block seq=512: fwd+bwd 1.130 ms (50 kernels, 18 of 18 native kept)
+  (sum of kernels 1.223 ms)
+    0.121 ms  node TensorId(47) shape [512, 1536, 2] red Some([576]) monoid Some(Other) split 0 tile (16, 16, 32) args [46[512, 576] 11[1536, 576] 9[1536, 576]] mma
+    0.106 ms  node TensorId(60) shape [512, 576, 2] red Some([1536]) monoid Some(Other) split 0 tile (16, 16, 32) args [57[1536, 512] 9[1536, 576] 54[1536, 512] 11[1536, 576]] mma
+    0.081 ms  node TensorId(91) shape [512, 3, 3, 32, 2] red Some([512]) monoid Some(Other) split 0 tile (32, 8, 32) args [75[512, 3, 3, 512] 35[3, 512, 32] 29[3, 512, 32]] mma
+    0.073 ms  node TensorId(76) shape [3, 512, 3, 32, 2] red Some([512]) monoid Some(Other) split 0 tile (32, 8, 32) args [75[512, 3, 3, 512] 37[512, 3, 3, 32] 34[512, 3, 3, 32]] mma
+    0.058 ms  node TensorId(53) shape [512, 1536] red Some([576]) monoid Some(Sum) split 0 tile (16, 16, 32) args [50[576, 512] 13[576, 1536]] mma
+    0.053 ms  node TensorId(83) shape [3, 512, 3, 64] red Some([512]) monoid Some(Sum) split 0 tile (64, 4, 32) args [73[3, 64, 3, 512] 82[512, 3, 3, 512]] mma
+    0.049 ms  node TensorId(49) shape [512, 576] red Some([1536]) monoid Some(Sum) split 0 tile (16, 16, 32) args [48[512, 1536] 13[576, 1536]] mma
+    0.045 ms  node TensorId(39) shape [3, 3, 512, 1, 64, 3] red Some([512]) monoid Some(OnlineSoftmax) split 0 tile (16, 16, 32) args [38[3, 3, 512, 512] 26[512, 512] 25[512, 512] 24[512, 192, 2] 6[192]] mma
+    0.044 ms  node TensorId(52) shape [576, 1536] red Some([]) monoid None split 0 tile (16, 16, 32) args [51[576, 1536]] mma
+    0.044 ms  node TensorId(56) shape [1536, 576] red Some([]) monoid None split 0 tile (16, 16, 32) args [55[1536, 576]] mma
+    0.044 ms  node TensorId(59) shape [1536, 576] red Some([]) monoid None split 0 tile (16, 16, 32) args [58[1536, 576]] mma
+    0.039 ms  node TensorId(24) shape [512, 192, 2] red Some([576]) monoid Some(Other) split 0 tile (16, 16, 32) args [23[512, 576] 5[192, 576] 3[192, 576]] mma
+    0.033 ms  node TensorId(86) shape [192, 576, 2] red Some([512]) monoid Some(Other) split 0 tile (16, 16, 32) args [85[512, 192] 23[512, 576] 81[512, 192]] mma
+    0.029 ms  node TensorId(57) shape [1536, 512] red Some([]) monoid None split 0 tile (0, 0, 0) args [53[512, 1536] 47[512, 1536, 2] 10[1536] 47[512, 1536, 2] 12[1536]] 

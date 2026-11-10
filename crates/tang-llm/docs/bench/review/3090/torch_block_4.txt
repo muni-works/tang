@@ -1,0 +1,25 @@
+torch 2.8.0+cu128 NVIDIA GeForce RTX 3090
+block fwd seq=128 fp32 eager: 0.788 ms
+block fwd+bwd seq=128 fp32 eager: 4.085 ms
+block fwd seq=128 tf32 eager: 0.820 ms
+block fwd+bwd seq=128 tf32 eager: 5.427 ms
+block fwd seq=128 fp32 compile: 0.437 ms
+block fwd+bwd seq=128 fp32 compile: 2.519 ms
+block fwd seq=128 tf32 compile: 0.400 ms
+block fwd+bwd seq=128 tf32 compile: 2.888 ms
+block fwd seq=128 fp32 graph: 0.270 ms
+block fwd+bwd seq=128 fp32 graph: 0.747 ms
+block fwd seq=128 tf32 graph: 0.162 ms
+block fwd+bwd seq=128 tf32 graph: 0.484 ms
+block fwd seq=512 fp32 eager: 0.793 ms
+block fwd+bwd seq=512 fp32 eager: 5.241 ms
+block fwd seq=512 tf32 eager: 0.846 ms
+block fwd+bwd seq=512 tf32 eager: 5.505 ms
+block fwd seq=512 fp32 compile: 0.466 ms
+block fwd+bwd seq=512 fp32 compile: 2.164 ms
+block fwd seq=512 tf32 compile: 0.414 ms
+block fwd+bwd seq=512 tf32 compile: 3.204 ms
+block fwd seq=512 fp32 graph: 0.603 ms
+block fwd+bwd seq=512 fp32 graph: 1.627 ms
+block fwd seq=512 tf32 graph: 0.396 ms
+block fwd+bwd seq=512 tf32 graph: 1.143 ms

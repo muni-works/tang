@@ -205,6 +205,18 @@ impl Runtime {
     }
 
     /// Submit pending work and wait for it.
+    /// `cuProfilerStart` / `cuProfilerStop`: a window for `ncu --profile-from-start off`.
+    #[cfg(feature = "cuda")]
+    pub fn profiler(&self, on: bool) {
+        unsafe {
+            if on {
+                cudarc::driver::sys::cuProfilerStart();
+            } else {
+                cudarc::driver::sys::cuProfilerStop();
+            }
+        }
+    }
+
     pub fn sync(&self) {
         match self {
             Self::Wgpu { device, cache } => {
@@ -1444,6 +1456,41 @@ impl Program {
             #[cfg(feature = "opencl")]
             Runtime::OpenCl(_) => (Self::compile(rt, g, outputs, inputs), TuneReport::default()),
         }
+    }
+
+    /// [`tuned`](Self::tuned) on CUDA for a graph scheduled by `TensorGraph::place`:
+    /// the variants keep that placement's `nest` decision.
+    #[cfg(feature = "cuda")]
+    pub fn tuned_placed(
+        rt: &Runtime,
+        g: &TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        nest: bool,
+    ) -> (Self, TuneReport) {
+        use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
+        let Runtime::Cuda(d) = rt else {
+            panic!("tuned_placed needs the CUDA runtime");
+        };
+        let n = MMA_SHAPES.len()
+            + if d.arch == "sm_90a" {
+                SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
+            } else {
+                0
+            };
+        let sm = d
+            .arch
+            .trim_start_matches("sm_")
+            .trim_end_matches('a')
+            .parse()
+            .unwrap_or(0);
+        let variants: Vec<WgslProgram> = tang_compile::tensor::cuda::with_cuda_sm(sm, || {
+            std::iter::once(None)
+                .chain((0..n).map(Some))
+                .map(|v| g.to_cuda_placed(outputs, nest, v))
+                .collect()
+        });
+        Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, None)
     }
 
     /// Pick a variant per kernel. `variants[0]` is the portable lowering,

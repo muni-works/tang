@@ -1,0 +1,28 @@
+{
+ "title": "matmul512",
+ "bw": 936000000000.0,
+ "kernels": [
+  {
+   "kernel": "main0@96x128",
+   "launches": 1,
+   "us": 59.904,
+   "total_ms": 0.059904,
+   "mb": 8.943104,
+   "floor_us": 9.55459829059829,
+   "light": 0.1594985024472204,
+   "sm_pct": 18.28,
+   "dram_pct": 16.39,
+   "grid": 96,
+   "block": 128,
+   "cls": "latency",
+   "occ_pct": 8.3,
+   "regs": 168.0,
+   "waves": 1.17,
+   "long_sb": 7891.18
+  }
+ ],
+ "kernel_ms": 0.059904,
+ "floor_ms": 0.009554598290598291,
+ "step_ms": null,
+ "steps": 1.0
+}
