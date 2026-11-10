@@ -1822,7 +1822,7 @@ mod tests {
         let gx = g.backward(y, &[x]).unwrap()[0];
         let n = g.shape(x)[0].fixed().unwrap();
         let xs = ramp(n, 0.1, -0.3);
-        let got = g.eval(&[xs.clone()], &[gx]).remove(0);
+        let got = g.eval(std::slice::from_ref(&xs), &[gx]).remove(0);
         for i in 0..n {
             let want = 2.0 * xs[i] + 2.0 * (i as f64 + 1.0);
             assert!(
@@ -1900,7 +1900,7 @@ mod tests {
         let want = {
             let mut g = g0.clone();
             let gx = g.backward(y, &[x]).unwrap()[0];
-            g.eval(&[xs.clone()], &[gx]).remove(0)
+            g.eval(std::slice::from_ref(&xs), &[gx]).remove(0)
         };
         let (g1, o) = g0.substitute_maps(&[y]);
         let (mut g2, o) = g1.stabilize_softmax(&o);
@@ -1963,7 +1963,7 @@ mod tests {
         let zs = g.reduce(z, 0, Monoid::sum()).unwrap();
         let hx = g.backward(zs, &[x]).unwrap()[0];
         let xs = ramp(n, 0.2, 0.1);
-        let mut ev = g.eval(&[xs.clone()], &[gx, hx]);
+        let mut ev = g.eval(std::slice::from_ref(&xs), &[gx, hx]);
         let (gv, hv) = (ev.remove(0), ev.remove(0));
         for i in 0..n {
             assert!((gv[i] - 2.0 * xs[i] * xs[i]).abs() < 1e-12);
