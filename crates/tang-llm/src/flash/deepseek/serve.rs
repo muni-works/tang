@@ -213,7 +213,7 @@ fn slot_ctx(max: usize) -> usize {
 pub(crate) struct SlotSeq {
     pub slot: usize,
     prompt: Vec<usize>,
-    /// Positions fed to the slot (0 until the prefill ran).
+    /// Positions fed to the slot (prompt chunks while prefilling, then decode tokens).
     pos: usize,
     /// The token to feed at `pos` in the next decode step.
     feed: Option<usize>,
@@ -237,9 +237,9 @@ impl SlotSeq {
         }
     }
 
-    /// Still prefilling (nothing produced yet).
+    /// Still prefilling (prompt tokens left to feed).
     pub fn prefilling(&self) -> bool {
-        self.pos == 0 && self.done.is_none()
+        self.pos < self.prompt.len() && self.done.is_none()
     }
 
     /// The model's next token `cand` (as `forward::generate`): EOS ends it unproduced; else
@@ -259,26 +259,46 @@ impl SlotSeq {
     }
 }
 
-/// One batcher step over `seqs` (distinct slots): every sequence not yet prefilled is
-/// prefilled on its slot (chunked as the single-request path), then every running one
-/// decodes one token in ONE [`GpuModel::forward_rows`] step. Returns the tokens each
-/// sequence produced this step (index-aligned with `seqs`). Greedy.
+/// Prompt chunks one batcher step feeds, over all prefilling sequences
+/// (`DS_SERVE_PREFILL_CHUNKS`, default 1; 0 = every prompt whole in its first step). Each
+/// chunk is a [`prefill_chunk`]-token forward, so a long prompt delays the running streams'
+/// next token by at most this many chunks per step.
+fn prefill_chunks_per_step() -> usize {
+    std::env::var("DS_SERVE_PREFILL_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// One batcher step over `seqs` (distinct slots): prompt chunks for the prefilling
+/// sequences, oldest (lowest index) first, at most [`prefill_chunks_per_step`] of them
+/// (each the chunk the single-request path would feed there, so the slot ends in the same
+/// state), then every running sequence decodes one token in ONE
+/// [`GpuModel::forward_rows`] step. Returns the tokens each sequence produced this step
+/// (index-aligned with `seqs`). Greedy.
 pub(crate) fn slots_step(
     m: &mut GpuModel,
     seqs: &mut [&mut SlotSeq],
     eos: &[usize],
 ) -> Result<Vec<Vec<usize>>> {
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); seqs.len()];
+    let (chunk, budget) = (prefill_chunk(), prefill_chunks_per_step());
+    let mut left = if budget == 0 { usize::MAX } else { budget };
     for (i, q) in seqs.iter_mut().enumerate() {
-        if !q.prefilling() {
-            continue;
+        while left > 0 && q.prefilling() {
+            m.select_slot(q.slot)?;
+            if q.pos == 0 {
+                m.reset()?;
+            }
+            let end = (q.pos + chunk).min(q.prompt.len());
+            let (lg, _) = m.forward(&q.prompt[q.pos..end], q.pos, None)?;
+            q.pos = end;
+            left = left.saturating_sub(1);
+            if !q.prefilling() {
+                let cap = m.slot_cap(q.slot);
+                q.take(forward::argmax(&lg), eos, cap, &mut out[i]);
+            }
         }
-        m.select_slot(q.slot)?;
-        m.reset()?;
-        let (lg, _) = feed_chunked(&q.prompt, 0, |ids, sp| m.forward(ids, sp, None))?;
-        q.pos = q.prompt.len();
-        let cap = m.slot_cap(q.slot);
-        q.take(forward::argmax(&lg), eos, cap, &mut out[i]);
     }
     let live: Vec<usize> = (0..seqs.len())
         .filter(|&i| seqs[i].done.is_none() && seqs[i].feed.is_some() && out[i].is_empty())
@@ -777,11 +797,13 @@ impl Backend for DsServe {
                 let (produced, pre) = (&toks[k], was_prefill[li]);
                 k += 1;
                 if pre {
-                    s.usage.prompt_tokens = s.seq.prompt.len();
                     s.usage.prefill_chunks += 1;
-                    s.usage.prefill_tok_s =
-                        s.seq.prompt.len() as f64 / s.t0.elapsed().as_secs_f64().max(1e-9);
-                    s.t1 = Some(Instant::now());
+                    if !s.seq.prefilling() {
+                        s.usage.prompt_tokens = s.seq.prompt.len();
+                        s.usage.prefill_tok_s =
+                            s.seq.prompt.len() as f64 / s.t0.elapsed().as_secs_f64().max(1e-9);
+                        s.t1 = Some(Instant::now());
+                    }
                 } else {
                     s.usage.decode_steps += 1;
                     s.usage.shared_streams += shared.saturating_sub(1);
@@ -1127,6 +1149,10 @@ mod tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
+        // prompts span several chunks, fed one chunk per batcher step (the lone runs chunk
+        // the same way through feed_chunked)
+        std::env::set_var("DS_PREFILL_CHUNK", "4");
+        std::env::set_var("DS_SERVE_PREFILL_CHUNKS", "1");
         let mut a = GpuModel::open(&dir).unwrap();
         a.hc_exact = true;
         let v = a.cpu.cfg.vocab_size;
@@ -1217,6 +1243,8 @@ mod tests {
             step += 1;
             assert!(step < 200, "batcher did not finish");
         }
+        std::env::remove_var("DS_PREFILL_CHUNK");
+        std::env::remove_var("DS_SERVE_PREFILL_CHUNKS");
         for r in 0..reqs.len() {
             eprintln!(
                 "req {r}: batched {:?} {:?} lone {:?} {:?}",
