@@ -626,6 +626,11 @@ impl GpuModel {
         self.seqs.len()
     }
 
+    /// The positions slot `s`'s caches hold.
+    pub fn slot_cap(&self, s: usize) -> usize {
+        self.seqs[s].cap
+    }
+
     /// The slot the forward runs on.
     pub fn slot(&self) -> usize {
         self.cur
