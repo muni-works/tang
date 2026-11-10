@@ -51,6 +51,15 @@ const B256: (u32, u32, u32) = (256, 1, 1);
 /// it (the kernels read it from `P[0]`): any host use gives wrong answers the tests catch.
 const DYN: usize = 1 << 40;
 
+/// `DS_ROWS_CHUNK`: the most rows one [`GpuModel::forward_rows`] step takes (default 8,
+/// the row-exact kernels; 0 = no limit).
+fn rows_chunk() -> usize {
+    std::env::var("DS_ROWS_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -999,8 +1008,38 @@ impl GpuModel {
     /// attention splits per row ([`Self::attention_rows`]). Returns each row's greedy next
     /// token. Direct launches (no graph), the unfused block (bit-equal to the fused one).
     pub fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        self.forward_rows_impl(rows, false).map(|r| r.0)
+    }
+
+    /// [`Self::forward_rows`] that also reads back every row's logits `[rows][V]`.
+    pub fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        self.forward_rows_impl(rows, true)
+    }
+
+    fn forward_rows_impl(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+        logits: bool,
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
         let t = rows.len();
         anyhow::ensure!(t > 0, "empty rows step");
+        // the t <= 8 kernels give each row exactly its lone t = 1 result; the t > 8 tiles
+        // round differently in rare elements (an ulp, amplified into top-1 flips on the
+        // tiny fixture). DS_ROWS_CHUNK (default 8; 0 = one step for any t) bounds the rows
+        // per step: every weight is still read once per chunk instead of once per row.
+        let chunk = rows_chunk();
+        if chunk > 0 && t > chunk {
+            let (mut ids, mut lg) = (Vec::with_capacity(t), Vec::new());
+            for c in rows.chunks(chunk) {
+                let (a, b) = self.forward_rows_impl(c, logits)?;
+                ids.extend(a);
+                lg.extend(b);
+            }
+            return Ok((ids, lg));
+        }
         for (i, &(sl, _, pos)) in rows.iter().enumerate() {
             anyhow::ensure!(sl < self.seqs.len(), "slot {sl} >= {}", self.seqs.len());
             anyhow::ensure!(!rows[..i].iter().any(|r| r.0 == sl), "slot {sl} twice");
@@ -1057,7 +1096,12 @@ impl GpuModel {
         let out = out?;
         self.sync()?;
         let a = out.amax.dev().read::<i32>(0, out.rows)?;
-        Ok(a.into_iter().map(|i| i as usize).collect())
+        let lg = if logits {
+            out.logits.dev().read::<f32>(0, out.rows * c.vocab_size)?
+        } else {
+            Vec::new()
+        };
+        Ok((a.into_iter().map(|i| i as usize).collect(), lg))
     }
 
     /// Make slot `s`'s engram history the CPU model's (the current one goes back to its
@@ -4857,7 +4901,11 @@ mod tests {
         let Some((_, meta)) = open() else { return };
         let ids = prompt(&meta);
         let dir = Path::new(&tiny()).join("hf");
+        // the exact mHC mixes on both sides: the rows step runs the unfused block (exact
+        // mixes), and the tiny random fixture amplifies the relaxed K-split's ulp drift
+        // into top-1 flips (as `gpu_tiny_free_running`)
         let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
         let v = a.cpu.cfg.vocab_size;
         let ns = 10;
         let prompts: Vec<Vec<usize>> = (0..ns)
@@ -4888,6 +4936,7 @@ mod tests {
         }
         drop(a);
         let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
         let cap = m.cpu.cfg.max_seq_len.min(512);
         m.add_slots(ns, cap).unwrap();
         let mut gen: Vec<Vec<usize>> = Vec::new();
@@ -4927,6 +4976,120 @@ mod tests {
                 .unwrap();
             assert_eq!(argmax(&l), want[k][steps + 1], "slot {k} after rows");
         }
+    }
+
+    /// Teacher-forced: every row of a [`GpuModel::forward_rows`] step against the same token
+    /// through a lone model on that sequence, logits compared (max abs over the vocabulary,
+    /// relative to the logit scale). Separates a state bug (grows, flips with margin) from
+    /// batched-GEMM rounding (stays at ulp level).
+    #[test]
+    fn gpu_tiny_rows_logits_match_lone() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        let ns = 10;
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let v = m.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = (0..ns)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - (k % 3);
+                    p[j] = (p[j] + 7919 * k) % v;
+                    p.truncate(p.len() - k % 2);
+                }
+                p
+            })
+            .collect();
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(ns, cap).unwrap();
+        let mut lone: Vec<GpuModel> = Vec::new();
+        let mut cur = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            m.select_slot(k).unwrap();
+            let (l, _) = m.forward(p, 0, None).unwrap();
+            let mut a = GpuModel::open(&dir).unwrap();
+            a.hc_exact = true;
+            let (la, _) = a.forward(p, 0, None).unwrap();
+            assert_eq!(l, la, "slot {k} prefill");
+            cur.push(argmax(&l));
+            lone.push(a);
+        }
+        m.select_slot(0).unwrap();
+        let mut worst = 0f32;
+        let mut flips = 0;
+        for i in 0..10 {
+            // DS_ROWS_SLOTS=a,b,..: only those slots step (bisecting a failure)
+            let act: Vec<usize> = std::env::var("DS_ROWS_SLOTS")
+                .ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| (0..ns).collect());
+            let rows: Vec<(usize, usize, usize)> = act
+                .iter()
+                .map(|&k| (k, cur[k], prompts[k].len() + i))
+                .collect();
+            m.taps.borrow_mut().clear();
+            let (got, lg) = m.forward_rows_logits(&rows).unwrap();
+            for (ri, &k) in act.iter().enumerate() {
+                lone[k].taps.borrow_mut().clear();
+                let (la, _) = lone[k]
+                    .forward(&[cur[k]], prompts[k].len() + i, None)
+                    .unwrap();
+                let row = &lg[ri * v..(ri + 1) * v];
+                let scale = la.iter().fold(1f32, |a, x| a.max(x.abs()));
+                let d = la
+                    .iter()
+                    .zip(row)
+                    .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                let mut srt = la.clone();
+                srt.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let margin = srt[0] - srt[1];
+                eprintln!("step {i} slot {k}: diff {d:.3e}");
+                // DS_TAP=1 DS_ROWS_TAP=step,slot: the first tap where this row departs
+                let want_tap = std::env::var("DS_ROWS_TAP").ok().map(|v| {
+                    let w: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
+                    (w[0], w[1])
+                });
+                if want_tap == Some((i, k)) {
+                    let (mt, lt) = (m.taps.borrow(), lone[k].taps.borrow());
+                    let nr = act.len();
+                    let mut shown = 0;
+                    for (j, (name, lv)) in lt.iter().enumerate() {
+                        let Some((_, mv)) = mt
+                            .iter()
+                            .filter(|x| &x.0 == name)
+                            .nth(lt[..j].iter().filter(|x| &x.0 == name).count())
+                        else {
+                            eprintln!("tap {name}: missing in rows");
+                            continue;
+                        };
+                        if mv.len() != lv.len() * nr {
+                            eprintln!("tap {name}: len {} vs {}x{nr}", mv.len(), lv.len());
+                            continue;
+                        }
+                        let n1 = lv.len();
+                        let r = &mv[ri * n1..(ri + 1) * n1];
+                        let dd = lv
+                            .iter()
+                            .zip(r)
+                            .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                        if dd > 0.0 && shown < 12 {
+                            eprintln!("tap {name}: max abs {dd:.3e}");
+                            shown += 1;
+                        }
+                    }
+                }
+                if argmax(&la) != got[ri] {
+                    flips += 1;
+                    eprintln!("flip: step {i} slot {k}: margin {margin:.3e} diff {d:.3e}");
+                }
+                worst = worst.max(d / scale);
+                cur[k] = argmax(&la);
+            }
+        }
+        eprintln!("rows vs lone, teacher-forced: worst rel {worst:.3e}, {flips} flips");
+        assert!(worst < 1e-3, "rows logits off: rel {worst}");
     }
 
     /// As forward.rs `tiny_chunk_and_rewind_exact`, on the device.
