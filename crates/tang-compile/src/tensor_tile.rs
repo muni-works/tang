@@ -385,7 +385,15 @@ impl Ctx<'_> {
             .and_then(|n| addr.terms.get(n))
             .copied()
             .unwrap_or(0);
-        let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0);
+        // A staged guard is evaluated in the load loop, which only has the
+        // address's vars. A var that cancels in the flat address (a
+        // stride-s view read at `x + q`, `r − s·q`) still decides the
+        // padding, so that read stays in the loop body.
+        let guard_in_addr = self.guard.as_ref().is_none_or(|(cs, _)| {
+            cs.iter()
+                .all(|c| c.terms.keys().all(|k| addr.terms.contains_key(k)))
+        });
+        let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0) && guard_in_addr;
         if !shared {
             self.guard = None;
             let has_inner = addr.terms.keys().any(|k| !k.starts_with('p') && k != "r0");
