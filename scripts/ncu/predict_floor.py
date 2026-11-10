@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Predict per-kernel and per-step time from the composite floor and compare
+"""HISTORY: round 2-4 constants, superseded by floor_table.py (docs/duality.md, Corrections).
+
+Predict per-kernel and per-step time from the composite floor and compare
 with the measured traces of PR #186 (fraction of light).
 
 floor(kernel) = max(bytes / BW,                      memory

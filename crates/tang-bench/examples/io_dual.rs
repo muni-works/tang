@@ -6,12 +6,14 @@
 //! with (a) `schedule_auto`'s pick and (b) with `TUNE=1`, the GPU
 //! autotuner's pick on this machine (`tang_gpu::autotune`, M4 via wgpu
 //! here). `2-level dual` is the tile with the output held in registers
-//! (`Machine::reg_words`) and the inputs staged in shared memory
+//! (the schedule space's limit, `SCHEDULE_REG_TILE`; the sweep shows other
+//! capacities up to the register file) and the inputs staged in shared memory
 //! (`Lp::tile_levels`). Traffic in MB at f32; `floor` is the composite time floor
 //! `max(bytes/BW, flops/peak, launches×latency)` with its binding term.
 //!
 //!   cargo run --release -p tang-bench --example io_dual
-//!   TUNE=1 cargo run --release -p tang-bench --example io_dual
+//!   TUNE=1 cargo run --release -p tang-bench --example io_dual       # M4
+//!   TUNE=3090 cargo run --release -p tang-bench --example io_dual    # on a 3090
 use tang_bench::ir_gpu::naive_attention_heads;
 use tang_compile::tensor::io_lp::{Lp, Machine, TimeFloor};
 use tang_compile::tensor::{TensorGraph, TensorId};
@@ -146,7 +148,36 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
     let bound = lp.bound(mem).unwrap();
     let dual = lp.tile(mem).unwrap();
     let dual_traffic = tiled_traffic(&lp, &dual);
-    let levels = lp.tile_levels(m.reg_words, mem);
+    use tang_compile::tensor::io_lp::SCHEDULE_REG_TILE;
+    let levels = lp.tile_levels(SCHEDULE_REG_TILE, mem);
+    for rw in [
+        1024.0,
+        2048.0,
+        4096.0,
+        8192.0,
+        16384.0,
+        32768.0,
+        m.reg_words,
+    ] {
+        if let Some(l) = lp.tile_levels(rw, mem) {
+            println!(
+                "  regs {:>6} words{}: [{}] {:.2} MB",
+                rw,
+                if rw == m.reg_words {
+                    " (register file)"
+                } else {
+                    ""
+                },
+                names
+                    .iter()
+                    .zip(&l.tile)
+                    .map(|(n, v)| format!("{n}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                l.traffic * 4.0 / 1e6
+            );
+        }
+    }
     let (auto_t, auto_staged, launches) = tang_tile(g, outs, k, &lp, nest);
     let fmt = |t: &[usize]| {
         names
@@ -194,8 +225,8 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
             "  2-level dual [{}]  traffic {:.2} MB ({:.2}× bound at regs+smem {:.2} MB); in registers: {}",
             fmt(&lt.tile),
             mb(lt.traffic),
-            lt.traffic / lp.bound(m.reg_words + mem).unwrap().max(1.0),
-            mb(lp.bound(m.reg_words + mem).unwrap()),
+            lt.traffic / lp.bound(SCHEDULE_REG_TILE + mem).unwrap().max(1.0),
+            mb(lp.bound(SCHEDULE_REG_TILE + mem).unwrap()),
             (0..lp.projs.len())
                 .filter(|j| lt.in_regs & (1 << j) != 0)
                 .map(|j| format!("{:#b}", lp.projs[j]))
@@ -233,7 +264,9 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
 }
 
 fn main() {
-    let machines = if std::env::var("TUNE").is_ok() {
+    let machines = if std::env::var("TUNE").is_ok_and(|v| v == "3090") {
+        vec![Machine::RTX3090]
+    } else if std::env::var("TUNE").is_ok() {
         vec![Machine::M4]
     } else {
         vec![Machine::RTX3090, Machine::M4]
