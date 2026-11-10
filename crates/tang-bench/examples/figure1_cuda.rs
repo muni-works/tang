@@ -212,12 +212,20 @@ fn main() {
             for (split, tile, reg) in bg.schedule_candidates(t) {
                 let mut c = bg.clone();
                 c.set_schedule(t, split, tile, reg);
-                let (p, _) = Program::tuned_placed(&rt, &c, &bo, &ins, nest);
-                p.run(&rt);
-                rt.sync();
-                let got: Vec<Vec<f32>> = bo.iter().map(|o| p.read(&rt, *o)).collect();
-                let ms = (0..3).map(|_| p.time(&rt, iters)).fold(f64::INFINITY, f64::min);
-                if max_rel(&got, &want) < TOL && ms < bms {
+                // a thread mapping this GPU cannot launch is simply not a candidate
+                let tried = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (p, _) = Program::tuned_placed(&rt, &c, &bo, &ins, nest);
+                    p.run(&rt);
+                    rt.sync();
+                    let got: Vec<Vec<f32>> = bo.iter().map(|o| p.read(&rt, *o)).collect();
+                    let ms = (0..3).map(|_| p.time(&rt, iters)).fold(f64::INFINITY, f64::min);
+                    (ms, max_rel(&got, &want))
+                }));
+                let Ok((ms, err)) = tried else {
+                    eprintln!("candidate schedule {split} {tile:?} {reg:?} on {t:?}: launch failed, skipped");
+                    continue;
+                };
+                if err < TOL && ms < bms {
                     bms = ms;
                     bg = c;
                 }
