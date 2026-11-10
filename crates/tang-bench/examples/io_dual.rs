@@ -172,6 +172,43 @@ fn launch_shape(src: &str, count: u32, block: u32) -> (usize, usize, usize, f64)
     )
 }
 
+/// Read bandwidth by working-set size, bytes/s, from the probes
+/// `scripts/review/cachebw.cu` (mew 3090) and `cachebw.swift` (M4 Max);
+/// independent of every kernel raced here. `(size bytes, bandwidth)`.
+fn cache_table(m: &Machine) -> &'static [(f64, f64)] {
+    const MB: f64 = 1048576.0;
+    match m.name {
+        "3090" => &[
+            (1.0 * MB, 3446e9),
+            (2.0 * MB, 4403e9),
+            (4.0 * MB, 5734e9),
+            (8.0 * MB, 4914e9),
+            (32.0 * MB, 2080e9),
+            (128.0 * MB, 894e9),
+            (f64::INFINITY, 890e9),
+        ],
+        _ => &[
+            (1.0 * MB, 2138e9),
+            (4.0 * MB, 2213e9),
+            (8.0 * MB, 2157e9),
+            (16.0 * MB, 2153e9),
+            (32.0 * MB, 1496e9),
+            (128.0 * MB, 512e9),
+            (f64::INFINITY, 498e9),
+        ],
+    }
+}
+
+/// Highest probed bandwidth at any size ≥ the working set: what traffic
+/// that misses the workgroup's fast memory can at best be served at.
+fn cache_bw(m: &Machine, ws_bytes: f64) -> f64 {
+    cache_table(m)
+        .iter()
+        .filter(|e| e.0 >= ws_bytes)
+        .map(|e| e.1)
+        .fold(0.0, f64::max)
+}
+
 fn race(
     g: &TensorGraph,
     outs: &[TensorId],
@@ -230,7 +267,15 @@ fn race(
         else {
             continue;
         };
-        let (t, _, _) = tang_tile(&gc, outs, kk, lp, nest);
+        let (mut t, _, _) = tang_tile(&gc, outs, kk, lp, nest);
+        // nothing staged: io_report's tile is the workgroup's point range,
+        // but no operand of it is resident, so reuse is per point
+        if smem == 0.0 {
+            t = vec![1; t.len()];
+        }
+        if std::env::var("DBG").is_ok() {
+            eprintln!("{} -> {:?} {}", c.encode(&space), t, tiled_traffic(lp, &t));
+        }
         let sk = tang_compile::tensor::io_lp::StepKernel {
             bytes: tiled_traffic(lp, &t) * 4.0,
             flops,
@@ -240,7 +285,17 @@ fn race(
             smem_words: smem,
             issue: Default::default(),
         };
-        let (fl, why) = sk.floor(m);
+        // LP traffic leaves shared memory and is served by L2/SLC at the
+        // probed rate for this working set; DRAM sees at least the
+        // compulsory bytes (every array once)
+        let comp = compulsory(lp) * 4.0;
+        let mc = Machine {
+            dram_bw: cache_bw(m, comp),
+            ..*m
+        };
+        let (fl, why) = sk.floor(&mc);
+        let dram = m.launch + m.mem_latency + comp / m.dram_bw;
+        let (fl, why) = if dram > fl { (dram, "dram") } else { (fl, why) };
         // keep every candidate: the model ranks schedules, not LP tiles
         best.push((
             t,
@@ -254,14 +309,17 @@ fn race(
             ),
         ));
     }
-    let n0 = best.len();
-    // below the floor = a wrong kernel (RACE does not check outputs)
-    best.retain(|b| b.1.is_finite() && b.1 * 1e-3 >= b.3);
-    if best.len() < n0 {
-        println!(
-            "  race: dropped {} candidate(s) faster than their floor",
-            n0 - best.len()
-        );
+    best.retain(|b| b.1.is_finite());
+    // faster than its floor: either a wrong kernel (RACE does not check
+    // outputs) or the floor is not a floor; kept and counted, not dropped
+    let viol: Vec<String> = best
+        .iter()
+        .filter(|b| b.1 * 1e-3 < b.3)
+        .map(|b| format!("{:.3}<{:.3} ms ({})", b.1, b.3 * 1e3, b.2))
+        .collect();
+    println!("  floor violations: {}/{}", viol.len(), best.len());
+    for v in viol.iter().take(4) {
+        println!("    {v}");
     }
     best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     // the model's pick: argmin floor, ties (within 0.1%) to lower traffic
@@ -303,6 +361,18 @@ fn race(
             mb(tiled_traffic(lp, t))
         );
     }
+}
+
+fn compulsory(lp: &Lp) -> f64 {
+    lp.projs
+        .iter()
+        .map(|&p| {
+            (0..lp.extents.len())
+                .filter(|q| p & (1 << q) != 0)
+                .map(|q| lp.extents[q] as f64)
+                .product::<f64>()
+        })
+        .sum()
 }
 
 fn mb(w: f64) -> f64 {
@@ -443,7 +513,7 @@ fn main() {
     let machines = if std::env::var("TUNE").is_ok_and(|v| v == "3090") {
         vec![Machine::RTX3090]
     } else if std::env::var("TUNE").is_ok() {
-        vec![Machine::M4]
+        vec![Machine::M4_MAX]
     } else {
         vec![Machine::RTX3090, Machine::M4]
     };

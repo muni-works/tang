@@ -357,6 +357,18 @@ impl Machine {
         max_blocks_per_sm: 1024,
         smem_words_per_sm: 8192.0,
     };
+    /// Apple M4 Max (40-core GPU), the local bench host: 546 GB/s
+    /// (spec; `scripts/review/cachebw.swift` reads 498 GB/s at 512 MB),
+    /// 40 cores × 128 lanes × 2 × 1.578 GHz = 16.2 TFLOP/s f32, 32 KB
+    /// threadgroup memory. Earlier rounds used [`Machine::M4`] for this
+    /// host, which is the 10-core part.
+    pub const M4_MAX: Machine = Machine {
+        name: "m4max",
+        sms: 40,
+        dram_bw: 546e9,
+        flops: 16.2e12,
+        ..Machine::M4
+    };
 
     /// Bytes that must be in flight to sustain peak bandwidth.
     pub fn bandwidth_delay(&self) -> f64 {
