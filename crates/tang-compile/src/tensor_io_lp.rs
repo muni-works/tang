@@ -328,11 +328,11 @@ impl Machine {
         reg_words: 65536.0,
         dram_bw: 4.8e12,
         flops: 67e12,
-        launch: 0.0,
+        launch: 0.48e-6,
         sms: 132,
         threads_per_sm: 2048,
         regs_per_sm: 65536,
-        mem_latency: 353e-9,
+        mem_latency: 340e-9,
         clock: 1.98e9,
         max_blocks_per_sm: 256,
     };
@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn littles_law() {
         let m = Machine::H200;
-        assert!((m.bandwidth_delay() - 4.8e12 * 353e-9).abs() < 1e3);
+        assert!((m.bandwidth_delay() - 4.8e12 * 340e-9).abs() < 1e3);
         // MoE ex_gate_up at T=1 (PR #186): 320×256, 40 regs → all resident
         let occ = Occupancy {
             grid: 320,

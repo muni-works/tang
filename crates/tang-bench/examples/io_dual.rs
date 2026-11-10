@@ -13,6 +13,7 @@
 //!
 //!   cargo run --release -p tang-bench --example io_dual
 //!   TUNE=1 cargo run --release -p tang-bench --example io_dual       # M4
+//!   RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual   # time every candidate
 //!   TUNE=3090 cargo run --release -p tang-bench --example io_dual    # on a 3090
 use tang_bench::ir_gpu::naive_attention_heads;
 use tang_compile::tensor::io_lp::{Lp, Machine, TimeFloor};
@@ -128,6 +129,72 @@ fn tune(g: &TensorGraph, outs: &[TensorId]) -> Option<TensorGraph> {
         ..Default::default()
     };
     Some(autotune(&rt, g.clone(), outs, &ins, &opts).0)
+}
+
+/// `RACE=1`: time every candidate of the main kernel's schedule space on
+/// this GPU (whole program, best of 5×20 runs) and print the best time per
+/// LP tile, so the dual tiles can be compared with what wins on hardware.
+fn race(g: &TensorGraph, outs: &[TensorId], lp: &Lp, nest: bool, names: &[String]) {
+    if std::env::var("RACE").is_err() {
+        return;
+    }
+    use tang_compile::tensor::space::Space;
+    use tang_gpu::program::Runtime;
+    let Ok(rt) = Runtime::select() else {
+        println!("  race: no GPU runtime");
+        return;
+    };
+    use tang_gpu::program::Program;
+    let base = rt.lower(g, outs);
+    let mut rng = tang_bench::Rng::new(7);
+    let inputs: Vec<Vec<f32>> = (0..base.buffers.iter().filter(|b| b.input.is_some()).count())
+        .map(|i| {
+            let len = base
+                .buffers
+                .iter()
+                .find(|b| b.input == Some(i))
+                .unwrap()
+                .len;
+            (0..len).map(|_| rng.f32() - 0.5).collect()
+        })
+        .collect();
+    let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+    let k = main_kernel(g, outs);
+    let space = Space::standard();
+    let mut best: Vec<(Vec<usize>, f64, String)> = Vec::new();
+    for c in space.candidates(g, k) {
+        let mut gc = g.clone();
+        space.apply(&mut gc, k, &c);
+        let Ok(prog) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Program::compile(&rt, &gc, outs, &ins)
+        })) else {
+            continue;
+        };
+        let Ok(ms) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prog.time(&rt, 20)))
+        else {
+            continue;
+        };
+        let (t, _, _) = tang_tile(&gc, outs, main_kernel(&gc, outs), lp, nest);
+        match best.iter_mut().find(|b| b.0 == t) {
+            Some(b) if b.1 <= ms => {}
+            Some(b) => *b = (t, ms, c.encode(&space)),
+            None => best.push((t, ms, c.encode(&space))),
+        }
+    }
+    best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    for (t, ms, enc) in best.iter().take(12) {
+        println!(
+            "  race [{}]  {:.3} ms  LP traffic {:.2} MB  ({enc})",
+            names
+                .iter()
+                .zip(t)
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ms,
+            mb(tiled_traffic(lp, t))
+        );
+    }
 }
 
 fn mb(w: f64) -> f64 {
@@ -252,6 +319,7 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
             ts / bound.max(1.0)
         );
     }
+    race(g, outs, &lp, nest, &names);
     let at_bound = TimeFloor::new(m, bound * 4.0, flops, 1);
     let at_auto = TimeFloor::new(m, auto_staged * 4.0, flops, launches);
     println!(

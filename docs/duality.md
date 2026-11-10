@@ -41,9 +41,9 @@ Q8_0 GEMV by shape, H200 (#186 raw trace, `ops_t1`). The floor is defined below:
 
 | shape | MB | measured µs | floor µs | floor/meas | with L1 hypothesis |
 |---|--:|--:|--:|--:|--:|
-| 4096×2048 | 8.9 | 7.4 | 2.0 | 0.27 | 4.6 µs, 0.62 |
-| 2048×4096 | 8.9 | 9.9 | 2.0 | 0.20 | 4.6 µs, 0.47 |
-| 151936×2048 (vocab head) | 330.6 | 172.2 | 69.2 | 0.40 | 158.5 µs, 0.92 |
+| 4096×2048 | 8.9 | 7.4 | 2.5 | 0.34 | 5.1 µs, 0.69 |
+| 2048×4096 | 8.9 | 9.9 | 2.5 | 0.25 | 5.1 µs, 0.51 |
+| 151936×2048 (vocab head) | 330.6 | 172.2 | 69.7 | 0.40 | 158.9 µs, 0.92 |
 
 The mean of those measured times is the 63.5 µs. The 0.92 survives only for
 the vocab head, where a single constant (the assumed L1 rate) is compared
@@ -96,8 +96,8 @@ kernel's memory activity. That is an assumption.
 | | λ | L | status |
 |---|---|---|---|
 | 3090 | 470 ns | 0.77 µs | λ assumed. L is an empty kernel in a CUDA graph, measured in #160 on a shared GPU, independent of the traces. |
-| H200 | 353 ns | 0 | λ is a published single-SM H100 pointer chase (arXiv 2608.15764), a proxy; not measured on H200. No independent empty-kernel measurement exists on this GPU, so L = 0, the conservative value. |
-| H200, kernel ≤ 50 MB | 145 ns | 0 | L2-resident latency from the same paper. |
+| H200 | 340 ns | 0.48 µs | Both measured on an idle H200 (#196, `scripts/review/latency.cu`), independently of the traces. λ is a one-thread pointer chase over 4 GB (672 cycles, TLB misses included). L is an empty kernel in a 2000-node CUDA graph, 1 block; it is 0.54 µs at 132 blocks and 0.78 µs at 528. The published H100 figure was 353 ns. |
+| H200, kernel ≤ 50 MB | 145 ns | 0.48 µs | Measured L2 hop over 1 MB (#196). |
 
 The H200 has no byte counters on the pods, so `B` is the 3090's ncu count.
 A kernel that fits the 50 MB L2 can be served from it, so for those `B/BW` is
@@ -108,37 +108,37 @@ A kernel that fits the 50 MB L2 can be served from it, so for those `B/BW` is
 
 | kernel | MB | G×block | H200 L2? | 3090 meas µs | floor µs (term) | floor/meas | H200 meas µs | floor µs (term) | floor/meas | L1? µs | L1?/meas |
 |---|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| moe_t1 dop02_ex_gate_up | 14.7 | 320×256 | yes | 22.1 | 16.9 (stream) | 0.77 | 10.7 | 3.2 (stream) | 0.30 |  |  |
-| moe_t1 dop03_ex_down | 9.3 | 160×256 | yes | 14.7 | 11.2 (stream) | 0.76 | 5.4 | 2.1 (stream) | 0.39 |  |  |
-| moe_t1 dop05_sh_down | 1.3 | 32×256 | yes | 5.5 | 2.7 (stream) | 0.48 | 3.5 | 0.4 (stream) | 0.12 |  |  |
-| moe_t1 dop04_sh_gate_up | 2.6 | 64×256 | yes | 5.8 | 4.1 (stream) | 0.70 | 3.1 | 0.7 (stream) | 0.23 |  |  |
-| moe_t8 dop02_ex_gate_up | 100.7 | 2560×256 | no | 122.0 | 108.8 (stream) | 0.89 | 59.4 | 21.3 (stream) | 0.36 |  |  |
-| moe_t8 dop04_ex_down | 70.4 | 1280×256 | no | 92.6 | 76.4 (stream) | 0.83 | 23.6 | 15.0 (stream) | 0.64 |  |  |
-| moe_t8 dop05_sh_gate | 1.3 | 32×256 | yes | 13.3 | 2.7 (stream) | 0.20 | 12.3 | 0.4 (stream) | 0.03 |  |  |
-| moe_t8 dop06_sh_up | 1.5 | 32×256 | yes | 13.4 | 2.9 (stream) | 0.22 | 11.8 | 0.5 (stream) | 0.04 |  |  |
-| moe_t8 dop08_sh_down | 1.4 | 32×256 | yes | 11.0 | 2.7 (stream) | 0.25 | 8.5 | 0.4 (stream) | 0.05 |  |  |
-| moe_t8 dop09_y | 0.8 | 64×256 | yes | 3.8 | 2.1 (stream) | 0.56 | 2.5 | 0.3 (stream) | 0.13 |  |  |
-| moe_t48 dop08_ex_gate_up | 417.4 | 7680×256 | no | 506.3 | 447.2 (stream) | 0.88 | 182.4 | 87.3 (stream) | 0.48 |  |  |
-| moe_t48 dop10_ex_down | 228.2 | 15360×256 | no | 273.4 | 245.0 (stream) | 0.90 | 124.5 | 47.9 (stream) | 0.38 |  |  |
-| moe_t48 dop11_sh_gate | 1.6 | 48×256 | yes | 11.8 | 2.9 (stream) | 0.25 | 19.1 | 0.5 (stream) | 0.03 |  |  |
-| moe_t48 dop12_sh_up | 1.5 | 48×256 | yes | 11.7 | 2.8 (stream) | 0.24 | 17.2 | 0.5 (stream) | 0.03 |  |  |
-| moe_t48 dop14_sh_down | 1.7 | 192×256 | yes | 9.6 | 3.0 (stream) | 0.31 | 6.5 | 0.5 (stream) | 0.08 |  |  |
-| moe_t48 dop15_y | 5.5 | 384×256 | yes | 9.4 | 7.1 (stream) | 0.76 | 4.0 | 1.3 (stream) | 0.32 |  |  |
-| moe_t48 dop09_ex_silu | 2.6 | 960×256 | yes | 5.7 | 4.1 (stream) | 0.71 | 2.8 | 0.7 (stream) | 0.25 |  |  |
-| moe_t48 dop03_xq | 0.6 | 384×256 | yes | 2.9 | 1.8 (stream) | 0.63 | 2.0 | 0.3 (fill) | 0.13 |  |  |
-| moe_t48 dop18_norm | 0.6 | 384×256 | yes | 3.1 | 1.9 (stream) | 0.62 | 1.9 | 0.3 (fill) | 0.15 |  |  |
-| moe_t48 dop16_resid | 0.9 | 384×256 | yes | 3.2 | 2.2 (stream) | 0.70 | 1.6 | 0.3 (stream) | 0.21 |  |  |
-| moe_t48 dop19_xq_out | 0.5 | 384×256 | yes | 3.0 | 1.8 (stream) | 0.61 | 1.5 | 0.3 (fill) | 0.17 |  |  |
-| ops_t1 q8_0 4096x2048 | 8.9 | 256×256 | yes | 18.0 | 10.8 (stream) | 0.60 | 7.4 | 2.0 (stream) | 0.27 | 4.6 | 0.62 |
-| ops_t1 q8_0 2048x4096 | 8.9 | 256×256 | yes | – | 10.8 (stream) | – | 9.9 | 2.0 (stream) | 0.20 | 4.6 | 0.47 |
-| ops_t1 q8_0 151936x2048 | 330.6 | 9496×256 | no | 382.7 | 354.5 (stream) | 0.93 | 172.2 | 69.2 (stream) | 0.40 | 158.5 | 0.92 |
+| moe_t1 dop02_ex_gate_up | 14.7 | 320×256 | yes | 22.1 | 16.9 (stream) | 0.77 | 10.7 | 3.7 (stream) | 0.34 |  |  |
+| moe_t1 dop03_ex_down | 9.3 | 160×256 | yes | 14.7 | 11.2 (stream) | 0.76 | 5.4 | 2.6 (stream) | 0.48 |  |  |
+| moe_t1 dop05_sh_down | 1.3 | 32×256 | yes | 5.5 | 2.7 (stream) | 0.48 | 3.5 | 0.9 (stream) | 0.26 |  |  |
+| moe_t1 dop04_sh_gate_up | 2.6 | 64×256 | yes | 5.8 | 4.1 (stream) | 0.70 | 3.1 | 1.2 (stream) | 0.38 |  |  |
+| moe_t8 dop02_ex_gate_up | 100.7 | 2560×256 | no | 122.0 | 108.8 (stream) | 0.89 | 59.4 | 21.8 (stream) | 0.37 |  |  |
+| moe_t8 dop04_ex_down | 70.4 | 1280×256 | no | 92.6 | 76.4 (stream) | 0.83 | 23.6 | 15.5 (stream) | 0.66 |  |  |
+| moe_t8 dop05_sh_gate | 1.3 | 32×256 | yes | 13.3 | 2.7 (stream) | 0.20 | 12.3 | 0.9 (stream) | 0.07 |  |  |
+| moe_t8 dop06_sh_up | 1.5 | 32×256 | yes | 13.4 | 2.9 (stream) | 0.22 | 11.8 | 0.9 (stream) | 0.08 |  |  |
+| moe_t8 dop08_sh_down | 1.4 | 32×256 | yes | 11.0 | 2.7 (stream) | 0.25 | 8.5 | 0.9 (stream) | 0.11 |  |  |
+| moe_t8 dop09_y | 0.8 | 64×256 | yes | 3.8 | 2.1 (stream) | 0.56 | 2.5 | 0.8 (stream) | 0.32 |  |  |
+| moe_t48 dop08_ex_gate_up | 417.4 | 7680×256 | no | 506.3 | 447.2 (stream) | 0.88 | 182.4 | 87.8 (stream) | 0.48 |  |  |
+| moe_t48 dop10_ex_down | 228.2 | 15360×256 | no | 273.4 | 245.0 (stream) | 0.90 | 124.5 | 48.4 (stream) | 0.39 |  |  |
+| moe_t48 dop11_sh_gate | 1.6 | 48×256 | yes | 11.8 | 2.9 (stream) | 0.25 | 19.1 | 1.0 (stream) | 0.05 |  |  |
+| moe_t48 dop12_sh_up | 1.5 | 48×256 | yes | 11.7 | 2.8 (stream) | 0.24 | 17.2 | 0.9 (stream) | 0.05 |  |  |
+| moe_t48 dop14_sh_down | 1.7 | 192×256 | yes | 9.6 | 3.0 (stream) | 0.31 | 6.5 | 1.0 (stream) | 0.15 |  |  |
+| moe_t48 dop15_y | 5.5 | 384×256 | yes | 9.4 | 7.1 (stream) | 0.76 | 4.0 | 1.8 (stream) | 0.44 |  |  |
+| moe_t48 dop09_ex_silu | 2.6 | 960×256 | yes | 5.7 | 4.1 (stream) | 0.71 | 2.8 | 1.2 (stream) | 0.42 |  |  |
+| moe_t48 dop03_xq | 0.6 | 384×256 | yes | 2.9 | 1.8 (stream) | 0.63 | 2.0 | 0.7 (fill) | 0.38 |  |  |
+| moe_t48 dop18_norm | 0.6 | 384×256 | yes | 3.1 | 1.9 (stream) | 0.62 | 1.9 | 0.8 (fill) | 0.41 |  |  |
+| moe_t48 dop16_resid | 0.9 | 384×256 | yes | 3.2 | 2.2 (stream) | 0.70 | 1.6 | 0.8 (stream) | 0.50 |  |  |
+| moe_t48 dop19_xq_out | 0.5 | 384×256 | yes | 3.0 | 1.8 (stream) | 0.61 | 1.5 | 0.7 (fill) | 0.48 |  |  |
+| ops_t1 q8_0 4096x2048 | 8.9 | 256×256 | yes | 18.0 | 10.8 (stream) | 0.60 | 7.4 | 2.5 (stream) | 0.34 | 5.1 | 0.69 |
+| ops_t1 q8_0 2048x4096 | 8.9 | 256×256 | yes | – | 10.8 (stream) | – | 9.9 | 2.5 (stream) | 0.25 | 5.1 | 0.51 |
+| ops_t1 q8_0 151936x2048 | 330.6 | 9496×256 | no | 382.7 | 354.5 (stream) | 0.93 | 172.2 | 69.7 (stream) | 0.40 | 158.9 | 0.92 |
 
 3090: 23 kernels, floor/meas min 0.20 median 0.63 max 0.93; over 1: []
-h200: 24 kernels, floor/meas min 0.03 median 0.21 max 0.64; over 1: []
+h200: 24 kernels, floor/meas min 0.05 median 0.38 max 0.66; over 1: []
 
 **Result.** No kernel exceeds its floor on either GPU. On the 3090 the big
 kernels are tight (0.76–0.93). On the H200 the floor is loose everywhere
-(0.03–0.64, median 0.21). The term is always `stream` or `fill`. The kernels
+(0.05–0.66, median 0.38). The term is always `stream` or `fill`. The kernels
 are all GEMV-class or small epilogues, so this validates nothing about
 attention or scans.
 
@@ -176,12 +176,29 @@ autotuner is the timed search (`TUNE=…`). Only the M4 has autotuner picks:
 matmul 64×64 at 4096³ (32×64 at 1024³), attention 64×32 at N=4096 (16×16 at
 N=1024).
 
-**3090 attention, what wins on hardware: not measured here.** This work is
-CPU-only. The run is `TUNE=3090 cargo run --release -p tang-bench --example io_dual`
-on an idle 3090. The single-level dual's 48 rows isn't expressible in the
-space, and the two-level model's 128×32 splits the value columns, which the
-hand LP (64×64) does not. Until that run exists, the 3090 model output is an
-unverified prediction.
+**3090 attention: the autotuner keeps 16×16, against every model.**
+Replace ran this on an idle rented 3090 (#196). There was no Vulkan
+driver, so it used CUDA lowerings, not wgpu.
+
+| | N=1024 | N=4096 |
+|---|---|---|
+| autotuner pick | 16 rows × 16 keys, 24.5× bound | 16×16, 24.1× bound |
+| `schedule_auto` | 16×16 | 16×16 |
+| single-level dual | 48 × 48 | 48 × 48 |
+| two-level dual (schedule limit) | 128 × 32, value columns split | same |
+| matmul 1024³ | autotuner 64×64 (= `schedule_auto`, 1.95× bound) | |
+
+**What the measurement says about the model:**
+* **No model predicts what wins on the 3090.** The timed search picks the
+  smallest tile in its space, moving 2.8–3.0× the dual tile's traffic. The
+  model ranks by traffic; the 3090 kernel at that tile is not traffic-bound,
+  so less traffic doesn't buy time.
+* **Model and autotuner disagree across devices.** The M4 picked 64×32 at
+  N=4096. So whatever makes the M4 pick agree with the model doesn't carry to
+  the 3090's CUDA lowering.
+* **Next run:** per-tile times on the 3090. `RACE=1` in `io_dual` times every
+  candidate and prints the best time per LP tile:
+  `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`.
 
 ### What else does not hold up
 
