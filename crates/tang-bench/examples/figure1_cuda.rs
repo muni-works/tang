@@ -164,6 +164,15 @@ fn main() {
         for (name, s) in MemorySchedule::named() {
             let pl = g.place(&outs, &s);
             let (p, _) = Program::tuned_placed(&rt, &pl.graph, &pl.outputs, &ins, pl.nest);
+            if let Ok(dir) = std::env::var("FIG_DUMP") {
+                for (i, k) in p.program.kernels.iter().enumerate() {
+                    let f = format!("{dir}/{name}_{op}_k{i:02}.cu");
+                    std::fs::write(f, &k.source).unwrap();
+                }
+                for t in pl.graph.placements(&pl.outputs) {
+                    eprintln!("  {name} placement {t:?}");
+                }
+            }
             let r = measure(&rt, &p, &pl.outputs, &want, iters, name);
             emit(name, &r);
         }
