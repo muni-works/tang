@@ -397,6 +397,16 @@ impl CudaComputeDevice {
             return Some(self.finish(out));
         }
 
+        if m > SMALL_GEMM_ROWS
+            && k % 32 == 0
+            && n % 2 == 0
+            && self.tc_q4_ok(w)
+            && std::env::var("TANG_F16_GEMM").map_or(true, |v| v != "0")
+        {
+            self.gemm_f16_q4(x, w, &mut out, m, k, n);
+            return Some(self.finish(out));
+        }
+
         let chunk = (DEQUANT_CHUNK / k).clamp(1, n);
         let mut scratch = self.pool_alloc_uninit_f32(chunk * k);
         let mut row0 = 0;
@@ -448,6 +458,103 @@ impl CudaComputeDevice {
             major >= 8 && std::env::var("TANG_TC_GEMM").map_or(true, |v| v != "0")
         });
         on && matches!(w.storage(), CudaStorage::Q4(q) if q.group % 32 == 0)
+    }
+
+    /// `out = x · wᵀ` for prefill rows on f16 tensor cores straight off the 4-bit weights
+    /// (`gemm_f16_q4`), instead of dequantizing to f32 for a cuBLAS sgemm.
+    fn gemm_f16_q4(
+        &self,
+        x: &CudaBuffer,
+        w: &CudaBuffer,
+        out: &mut CudaBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let CudaStorage::Q4(q) = w.storage() else {
+            unreachable!()
+        };
+        // Block rows and occupancy (see `F16_GEMM_CUDA`). RTX 3090, Qwen3-8B shapes: 128-row
+        // blocks at two an SM win from 512 rows (up to 53 TFLOPS vs 39 at one an SM); 64-row
+        // blocks win at ~128 rows (with grouped tile order; without it a wide output's row
+        // tiles each re-read the whole weight). TANG_F16_VARIANT forces one.
+        let (name, bm) = match std::env::var("TANG_F16_VARIANT").as_deref() {
+            Ok("m128") => ("gemm_f16_q4_m128", 128),
+            Ok("m128_o2") => ("gemm_f16_q4_m128_o2", 128),
+            Ok("m64") => ("gemm_f16_q4_m64", 64),
+            Ok("m64_o2") => ("gemm_f16_q4_m64_o2", 64),
+            Ok("m64_o3") => ("gemm_f16_q4_m64", 64),
+            _ if m <= 192 => ("gemm_f16_q4_m64", 64),
+            _ => ("gemm_f16_q4_m128_o2", 128),
+        };
+        let func = |name: &'static str| {
+            let f = self.llm_funcs.borrow().get(name).cloned();
+            f.unwrap_or_else(|| {
+                let (_m, f) = self.get_func_with_arch(llm_cuda::F16_GEMM_CUDA, name, "sm_80");
+                self.llm_funcs.borrow_mut().insert(name, f.clone());
+                f
+            })
+        };
+        // f16 activations (cast once, then cp.async straight into the tiles: ~1.12x at 2048
+        // rows, RTX 3090) unless TANG_F16_ACT=f32 (the f32 loads through registers)
+        let half = std::env::var("TANG_F16_ACT").as_deref() != Ok("f32");
+        let mut xh = None;
+        let f = if half {
+            let hname = match name {
+                // 64-row blocks at three an SM (80 registers): 1.2x at 128 rows on wide outputs
+                "gemm_f16_q4_m64" | "gemm_f16_q4_m64_o2" => {
+                    if std::env::var("TANG_F16_VARIANT").as_deref() == Ok("m64") {
+                        "gemm_f16h_q4_m64"
+                    } else {
+                        "gemm_f16h_q4_m64_o3"
+                    }
+                }
+                _ => "gemm_f16h_q4_m128_o2",
+            };
+            let pairs = (m * k / 2) as u32;
+            let mut h = self.pool_alloc_uninit_f32(m * k / 2);
+            let cast = func("fg_cast");
+            unsafe {
+                self.stream
+                    .launch_builder(&cast)
+                    .arg(x.f32_data())
+                    .arg(h.f32_data_mut())
+                    .arg(&pairs)
+                    .launch(blocks(((m * k / 2).div_ceil(256).min(4096), 1, 1), 256))
+                    .unwrap();
+            }
+            xh = Some(h);
+            func(hname)
+        } else {
+            func(name)
+        };
+        // row tiles a raster group: 8 keeps resident blocks on shared weight tiles (1.45x at
+        // 2048 x 4096 x 24576, 1.8x for 64-row blocks at 128 rows); TANG_F16_GROUP=0 is plain
+        // column-fastest order
+        let gm: u32 = std::env::var("TANG_F16_GROUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let (mu, ku, nu, gu) = (m as u32, k as u32, n as u32, q.group as u32);
+        unsafe {
+            self.stream
+                .launch_builder(&f)
+                .arg(match xh.as_ref() {
+                    Some(h) => h.f32_data(),
+                    None => x.f32_data(),
+                })
+                .arg(&q.packed)
+                .arg(&q.scales)
+                .arg(&q.biases)
+                .arg(out.f32_data_mut())
+                .arg(&mu)
+                .arg(&ku)
+                .arg(&nu)
+                .arg(&gu)
+                .arg(&gm)
+                .launch(blocks((n.div_ceil(128) * m.div_ceil(bm), 1, 1), 256))
+                .unwrap();
+        }
     }
 
     /// `out = x · wᵀ` for 9..=32 rows on tensor cores (`gemm_tc_q4_m{16,32}`), K split (by
@@ -1441,7 +1548,9 @@ mod tests {
             close(&gw.to_vec(), &c.download(&cw), 0.0, "q4 to_vec");
             let got = g.download(&g.linear(&g.upload(&x), &gw, m, k, n));
             let want = c.download(&c.linear(&c.upload(&x), &cw, m, k, n));
-            close(&got, &want, 1e-4, &format!("q4 linear {m}x{k}x{n}"));
+            // prefill rows (m > 32) run on f16 tensor cores on CUDA
+            let tol = if m > SMALL_GEMM_ROWS { 4e-3 } else { 1e-4 };
+            close(&got, &want, tol, &format!("q4 linear {m}x{k}x{n}"));
 
             let wb = bf16_bits(&vals(n * k, 4, 1.0));
             let (gb, cb) = (g.upload_bf16(&wb), c.upload_bf16(&wb));
@@ -2073,6 +2182,58 @@ mod tests {
     #[test]
     fn cuda_q4_and_bf16_linear_and_embedding_vs_cpu() {
         on_gpu(q4_and_bf16_linear_and_embedding_vs_cpu::<CudaComputeDevice>);
+    }
+
+    /// The f16 prefill GEMM (`gemm_f16_q4`): ragged M and N against the 128 tile, several
+    /// group sizes, a long K. f16 operands, f32 sums: within a few 1e-3 of the f32 reference.
+    #[test]
+    fn cuda_q4_prefill_f16_gemm_vs_cpu() {
+        on_gpu(|g: &CudaComputeDevice| {
+            let c = CpuDevice::new();
+            for &(m, k, n, group) in &[
+                (33, 128, 130, 32),
+                (128, 512, 256, 64),
+                (200, 1024, 390, 128),
+                (511, 4096, 1000, 64),
+            ] {
+                let x = vals(m * k, 41, 2.0);
+                let (p, s, b) = q4(n, k, group);
+                let got =
+                    g.download(&g.linear(&g.upload(&x), &g.upload_q4(&p, &s, &b, group), m, k, n));
+                let want =
+                    c.download(&c.linear(&c.upload(&x), &c.upload_q4(&p, &s, &b, group), m, k, n));
+                close(&got, &want, 4e-3, &format!("f16 q4 gemm {m}x{k}x{n}"));
+            }
+        });
+    }
+
+    /// `cargo test --release -p tang-compute --features cuda --lib bench_q4_prefill -- --ignored --nocapture`
+    /// Prefill q4 GEMM timings at Qwen3-8B shapes; `TANG_F16_GEMM=0` for the dequant + sgemm path.
+    #[test]
+    #[ignore]
+    fn bench_q4_prefill_cuda() {
+        on_gpu(|g: &CudaComputeDevice| {
+            for &(k, n) in &[(4096, 4096), (4096, 6144), (4096, 24576), (12288, 4096)] {
+                let (p, s, b) = q4(n, k, 64);
+                let w = g.upload_q4(&p, &s, &b, 64);
+                for m in [128, 512, 2048] {
+                    let x = g.upload(&vals(m * k, 3, 2.0));
+                    g.linear(&x, &w, m, k, n);
+                    g.sync();
+                    let iters = 20;
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        g.linear(&x, &w, m, k, n);
+                    }
+                    g.sync();
+                    let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    println!(
+                        "q4 prefill m{m} {k}x{n}: {us:8.1} us {:6.1} TFLOPS",
+                        2.0 * (m * k * n) as f64 / us / 1e6
+                    );
+                }
+            }
+        });
     }
 
     #[test]

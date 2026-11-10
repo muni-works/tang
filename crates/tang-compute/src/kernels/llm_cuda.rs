@@ -1474,6 +1474,331 @@ extern "C" __global__ void __launch_bounds__(256) gemm_tc_q4_m32(
 { gemm_tc_q4_body<2>(X, Wq, S, B, Y, M, K, N, group, k_split); }
 "#
 );
+/// `gemm_f16_q4`: `y[r, n] = sum_k x[r, k] * W[n, k]` for prefill-sized M off MLX 4-bit
+/// weights on f16 tensor cores (`mma.sync.m16n8k16`, f32 accumulate; sm_80+). A block (8
+/// warps, 2 x 4) takes a 128 x 128 output tile, each warp 64 x 32. Per 32-wide K chunk the
+/// rows' activations are rounded to f16 and the columns' weights widened (s * q + b, in f32,
+/// then rounded) into padded shared tiles (row stride 40 halves: conflict-free `ldmatrix`),
+/// double-buffered, the next chunk's global loads in registers while this chunk's mma issue.
+/// No dequantized weight ever reaches global memory. A row's sums go in K order alone (never
+/// by M). Needs K % 32 == 0, group % 32 == 0. Launch: grid ceil(N / 128) * ceil(M / BM), gm row tiles a group,
+/// block 256. Entry points: `gemm_f16_q4_m{128,64}` (block rows), `_o2` with registers capped
+/// for two blocks an SM.
+pub const F16_GEMM_CUDA: &str = with_common!(
+    r#"
+#define FG_LD 40
+__device__ __forceinline__ unsigned int fg_h2(float lo, float hi) {
+    unsigned int d;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
+__device__ __forceinline__ float fg_nib(unsigned int q, int e) {
+    return __int_as_float(((q >> (4 * e)) & 0xfu) | 0x4B000000u) - 8388608.0f;
+}
+__device__ __forceinline__ void fg_ldsm4(unsigned int* r, const unsigned short* p) {
+    unsigned int a = (unsigned int)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+// MT: 16-row mma tiles per warp (block rows BM = 32 * MT, warps 2 x 4, warp tile MT*16 x 32)
+template <int MT>
+__device__ __forceinline__ void gemm_f16_q4_body(
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int gm)
+{
+    constexpr int BM = 32 * MT, AH = BM * 8 / 256;   // float4s of A a thread per chunk
+    __shared__ __align__(16) unsigned short As[2][BM * FG_LD];
+    __shared__ __align__(16) unsigned short Ws[2][128 * FG_LD];
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    unsigned int wm = warp >> 2, wn = warp & 3;
+    // tile order: a 1-D grid walked in groups of `gm` row tiles, all of a group's row tiles
+    // for one column tile before the next column tile, so blocks resident together share
+    // weight and activation tiles in L2 (gm 0: column tiles fastest)
+    unsigned int nt_n = (N + 127) / 128, nt_m = (M + BM - 1) / BM, pid = blockIdx.x, tm, tn;
+    if (gm == 0) {
+        tn = pid % nt_n; tm = pid / nt_n;
+    } else {
+        unsigned int per = gm * nt_n, first = (pid / per) * gm, rows = min(nt_m - first, gm);
+        tm = first + (pid % per) % rows; tn = (pid % per) / rows;
+    }
+    unsigned int n0 = tn * 128, m0 = tm * BM;
+    unsigned int words = K / 8, G = K / group;
+    // staging assignments: A 128 rows x 8 float4 (4 a thread), W 128 cols x 4 words (2 a thread)
+    float4 xa[AH];
+    unsigned int wq[2];
+    float ws[2], wb[2];
+    auto load = [&](unsigned int k0) {
+        #pragma unroll
+        for (int h = 0; h < AH; h++) {
+            unsigned int i = tid + h * 256, r = i >> 3, c4 = i & 7, row = m0 + r;
+            xa[h] = row < M ? *(const float4*)&X[(u64)row * K + k0 + c4 * 4]
+                            : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            unsigned int i = tid + h * 256, col = i >> 2, wi = i & 3, n = n0 + col;
+            if (n < N) {
+                wq[h] = Wq[(u64)n * words + k0 / 8 + wi];
+                u64 gi = (u64)n * G + (k0 + wi * 8) / group;
+                ws[h] = bf(S[gi]);
+                wb[h] = bf(B[gi]);
+            } else {
+                wq[h] = 0; ws[h] = 0.f; wb[h] = 0.f;
+            }
+        }
+    };
+    auto store = [&](int buf) {
+        #pragma unroll
+        for (int h = 0; h < AH; h++) {
+            unsigned int i = tid + h * 256, r = i >> 3, c4 = i & 7;
+            uint2 v = make_uint2(fg_h2(xa[h].x, xa[h].y), fg_h2(xa[h].z, xa[h].w));
+            *(uint2*)&As[buf][r * FG_LD + c4 * 4] = v;
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            unsigned int i = tid + h * 256, col = i >> 2, wi = i & 3;
+            float s = ws[h], b = wb[h];
+            unsigned int q = wq[h];
+            uint4 v;
+            v.x = fg_h2(fmaf(fg_nib(q, 0), s, b), fmaf(fg_nib(q, 1), s, b));
+            v.y = fg_h2(fmaf(fg_nib(q, 2), s, b), fmaf(fg_nib(q, 3), s, b));
+            v.z = fg_h2(fmaf(fg_nib(q, 4), s, b), fmaf(fg_nib(q, 5), s, b));
+            v.w = fg_h2(fmaf(fg_nib(q, 6), s, b), fmaf(fg_nib(q, 7), s, b));
+            *(uint4*)&Ws[buf][col * FG_LD + wi * 8] = v;
+        }
+    };
+    float acc[MT][4][4];
+    #pragma unroll
+    for (int a = 0; a < MT; a++)
+        #pragma unroll
+        for (int b = 0; b < 4; b++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.0f;
+    load(0);
+    store(0);
+    __syncthreads();
+    unsigned int chunks = K / 32;
+    // ldmatrix lane addresses: A rows lane%16, k half lane/16; B cols (lane&7)+8*(lane>>4),
+    // k half (lane>>3)&1
+    unsigned int ar = wm * MT * 16 + (lane & 15), ak = (lane >> 4) * 8;
+    unsigned int bc = wn * 32 + (lane & 7) + ((lane >> 4) << 3), bk = ((lane >> 3) & 1) * 8;
+    for (unsigned int c = 0; c < chunks; c++) {
+        int buf = c & 1;
+        if (c + 1 < chunks) load((c + 1) * 32);
+        #pragma unroll
+        for (int ks = 0; ks < 32; ks += 16) {
+            unsigned int a[MT][4], b[4][2];
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                fg_ldsm4(a[mt], &As[buf][(ar + mt * 16) * FG_LD + ks + ak]);
+            #pragma unroll
+            for (int np = 0; np < 2; np++) {
+                unsigned int r[4];
+                fg_ldsm4(r, &Ws[buf][(bc + np * 16) * FG_LD + ks + bk]);
+                b[np * 2][0] = r[0]; b[np * 2][1] = r[1];
+                b[np * 2 + 1][0] = r[2]; b[np * 2 + 1][1] = r[3];
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < 4; nt++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
+                          "+f"(acc[mt][nt][3])
+                        : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]),
+                          "r"(b[nt][0]), "r"(b[nt][1]));
+        }
+        if (c + 1 < chunks) store(buf ^ 1);
+        __syncthreads();
+    }
+    unsigned int g = lane >> 2, t = lane & 3;
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                unsigned int r = m0 + wm * MT * 16 + mt * 16 + g + h * 8;
+                unsigned int n = n0 + wn * 32 + nt * 8 + 2 * t;
+                if (r >= M) continue;
+                if (n + 1 < N)
+                    *(float2*)&Y[(u64)r * N + n] = make_float2(acc[mt][nt][2 * h], acc[mt][nt][2 * h + 1]);
+                else if (n < N)
+                    Y[(u64)r * N + n] = acc[mt][nt][2 * h];
+            }
+}
+#define FG_ENTRY(name, MT, MINB)                                                               \
+extern "C" __global__ void __launch_bounds__(256, MINB) name(                                  \
+    const float* __restrict__ X, const unsigned int* __restrict__ Wq,                          \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,                \
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,  \
+    unsigned int gm)                                                                           \
+{ gemm_f16_q4_body<MT>(X, Wq, S, B, Y, M, K, N, group, gm); }
+FG_ENTRY(gemm_f16_q4_m128, 4, 1)
+FG_ENTRY(gemm_f16_q4_m128_o2, 4, 2)
+FG_ENTRY(gemm_f16_q4_m64, 2, 1)
+FG_ENTRY(gemm_f16_q4_m64_o2, 2, 2)
+
+// ---- v2: f16 activations (cast once by `fg_cast`) ----
+// Activations and the raw 4-bit words both arrive by cp.async: activations in 3 stages, words
+// in 2, issued two chunks ahead; each chunk the next chunk's words are widened from shared
+// into a double-buffered f16 tile. Tiles are 32 halves a row, XOR-swizzled by 16-byte chunk
+// (chunk ^ (row >> 1) & 3) so ldmatrix is conflict-free without padding: 44 KB at 128 rows,
+// two blocks an SM.
+extern "C" __global__ void fg_cast(const float* __restrict__ X, unsigned int* __restrict__ H,
+                                   unsigned int pairs)
+{
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < pairs;
+         i += gridDim.x * blockDim.x) {
+        float2 v = ((const float2*)X)[i];
+        H[i] = fg_h2(v.x, v.y);
+    }
+}
+__device__ __forceinline__ unsigned int fg_swz(unsigned int r, unsigned int k) {
+    return r * 32 + ((((k >> 3) ^ (r >> 1)) & 3) << 3) + (k & 7);
+}
+__device__ __forceinline__ void fg_cp16(void* dst, const void* src, bool ok) {
+    unsigned int d = (unsigned int)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void fg_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void fg_wait0() { asm volatile("cp.async.wait_group 0;" ::: "memory"); }
+template <int MT>
+__device__ __forceinline__ void gemm_f16h_q4_body(
+    const unsigned short* __restrict__ X, const unsigned int* __restrict__ Wq,
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,
+    unsigned int gm)
+{
+    constexpr int BM = 32 * MT;
+    __shared__ __align__(16) unsigned short As[3][BM * 32];
+    __shared__ __align__(16) unsigned short Ws[2][128 * 32];
+    __shared__ __align__(16) unsigned int Raw[2][128 * 4];
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    unsigned int wm = warp >> 2, wn = warp & 3;
+    unsigned int nt_n = (N + 127) / 128, nt_m = (M + BM - 1) / BM, pid = blockIdx.x, tm, tn;
+    if (gm == 0) {
+        tn = pid % nt_n; tm = pid / nt_n;
+    } else {
+        unsigned int per = gm * nt_n, first = (pid / per) * gm, rows = min(nt_m - first, gm);
+        tm = first + (pid % per) % rows; tn = (pid % per) / rows;
+    }
+    unsigned int n0 = tn * 128, m0 = tm * BM;
+    unsigned int words = K / 8, G = K / group, chunks = K / 32;
+    auto issue = [&](unsigned int c) {
+        unsigned int k0 = c * 32;
+        #pragma unroll
+        for (int h = 0; h < BM * 4 / 256; h++) {
+            unsigned int i = tid + h * 256, r = i >> 2, ch = i & 3, row = m0 + r;
+            bool ok = row < M;
+            fg_cp16(&As[c % 3][fg_swz(r, ch * 8)], ok ? (const void*)&X[(u64)row * K + k0 + ch * 8] : (const void*)X, ok);
+        }
+        if (tid < 128) {
+            unsigned int n = n0 + tid;
+            bool ok = n < N;
+            fg_cp16(&Raw[c & 1][tid * 4], ok ? (const void*)&Wq[(u64)n * words + k0 / 8] : (const void*)Wq, ok);
+        }
+        fg_commit();
+    };
+    auto widen = [&](unsigned int c) {
+        unsigned int k0 = c * 32;
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            unsigned int i = tid + h * 256, col = i >> 2, wi = i & 3, n = n0 + col;
+            float s = 0.f, b = 0.f;
+            if (n < N) {
+                u64 gi = (u64)n * G + (k0 + wi * 8) / group;
+                s = bf(S[gi]); b = bf(B[gi]);
+            }
+            unsigned int q = Raw[c & 1][col * 4 + wi];
+            uint4 v;
+            v.x = fg_h2(fmaf(fg_nib(q, 0), s, b), fmaf(fg_nib(q, 1), s, b));
+            v.y = fg_h2(fmaf(fg_nib(q, 2), s, b), fmaf(fg_nib(q, 3), s, b));
+            v.z = fg_h2(fmaf(fg_nib(q, 4), s, b), fmaf(fg_nib(q, 5), s, b));
+            v.w = fg_h2(fmaf(fg_nib(q, 6), s, b), fmaf(fg_nib(q, 7), s, b));
+            *(uint4*)&Ws[c & 1][fg_swz(col, wi * 8)] = v;
+        }
+    };
+    float acc[MT][4][4];
+    #pragma unroll
+    for (int a = 0; a < MT; a++)
+        #pragma unroll
+        for (int b = 0; b < 4; b++)
+            #pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.0f;
+    issue(0);
+    if (chunks > 1) issue(1);
+    fg_wait0();
+    __syncthreads();
+    widen(0);
+    __syncthreads();
+    unsigned int ar = wm * MT * 16 + (lane & 15), ak = (lane >> 4) * 8;
+    unsigned int bc = wn * 32 + (lane & 7) + ((lane >> 4) << 3), bk = ((lane >> 3) & 1) * 8;
+    for (unsigned int c = 0; c < chunks; c++) {
+        if (c + 2 < chunks) issue(c + 2);
+        if (c + 1 < chunks) widen(c + 1);
+        const unsigned short* as = As[c % 3];
+        const unsigned short* wsm = Ws[c & 1];
+        #pragma unroll
+        for (int ks = 0; ks < 32; ks += 16) {
+            unsigned int a[MT][4], b[4][2];
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                fg_ldsm4(a[mt], &as[fg_swz(ar + mt * 16, ks + ak)]);
+            #pragma unroll
+            for (int np = 0; np < 2; np++) {
+                unsigned int r[4];
+                fg_ldsm4(r, &wsm[fg_swz(bc + np * 16, ks + bk)]);
+                b[np * 2][0] = r[0]; b[np * 2][1] = r[1];
+                b[np * 2 + 1][0] = r[2]; b[np * 2 + 1][1] = r[3];
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < 4; nt++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]), "+f"(acc[mt][nt][2]),
+                          "+f"(acc[mt][nt][3])
+                        : "r"(a[mt][0]), "r"(a[mt][1]), "r"(a[mt][2]), "r"(a[mt][3]),
+                          "r"(b[nt][0]), "r"(b[nt][1]));
+        }
+        fg_wait0();
+        __syncthreads();
+    }
+    unsigned int g = lane >> 2, t = lane & 3;
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                unsigned int r = m0 + wm * MT * 16 + mt * 16 + g + h * 8;
+                unsigned int n = n0 + wn * 32 + nt * 8 + 2 * t;
+                if (r >= M) continue;
+                if (n + 1 < N)
+                    *(float2*)&Y[(u64)r * N + n] = make_float2(acc[mt][nt][2 * h], acc[mt][nt][2 * h + 1]);
+                else if (n < N)
+                    Y[(u64)r * N + n] = acc[mt][nt][2 * h];
+            }
+}
+#define FGH_ENTRY(name, MT, MINB)                                                              \
+extern "C" __global__ void __launch_bounds__(256, MINB) name(                                  \
+    const unsigned short* __restrict__ X, const unsigned int* __restrict__ Wq,                 \
+    const unsigned short* __restrict__ S, const unsigned short* __restrict__ B,                \
+    float* __restrict__ Y, unsigned int M, unsigned int K, unsigned int N, unsigned int group,  \
+    unsigned int gm)                                                                           \
+{ gemm_f16h_q4_body<MT>(X, Wq, S, B, Y, M, K, N, group, gm); }
+FGH_ENTRY(gemm_f16h_q4_m128_o2, 4, 2)
+FGH_ENTRY(gemm_f16h_q4_m64, 2, 1)
+FGH_ENTRY(gemm_f16h_q4_m64_o3, 2, 3)
+"#
+);
 /// `top_k_rows`: the K largest of each row of X `[rows, n]`, a block (1024 threads) a row.
 /// Floats map to order-preserving u32 keys; four 8-bit radix rounds find the K-th largest key
 /// T; then each thread, over its own contiguous range, keeps the keys above T and the first
