@@ -4297,6 +4297,7 @@ impl TensorGraph {
                     .map_or(1, |t| t.get())
                     .min(work.div_ceil(1 << 15))
                     .min(n)
+                    .min(max_threads())
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
@@ -4343,6 +4344,18 @@ impl TensorGraph {
         }
         outputs.iter().map(|o| ev.tensor(*o)).collect()
     }
+}
+
+// Test-only cap on interpreter threads, so tests can force the inline path.
+#[cfg(test)]
+thread_local!(static MAX_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
+#[cfg(test)]
+fn max_threads() -> usize {
+    MAX_THREADS.with(|m| m.get())
+}
+#[cfg(not(test))]
+fn max_threads() -> usize {
+    usize::MAX
 }
 
 /// `out` as `Σ_t coef_t · var a_t · var b_t`, or `None` when it is not a
@@ -4977,6 +4990,23 @@ mod tests {
         let (fg, outs) = g.substitute_maps_with(&[y], false);
         assert_eq!(fg.count_comps(&outs), 2);
         close(&fg.eval(&[data], &outs)[0], &want);
+    }
+
+    #[test]
+    fn eval_inline_matches_threaded_bitwise() {
+        // big enough that the threaded path splits into several chunks
+        let mut g = TensorGraph::new();
+        let a = g.input(&[256, 128]);
+        let b = g.input(&[128, 256]);
+        let c = g.matmul(a, b).unwrap();
+        let av = ramp(256 * 128, 0.37, -1.3);
+        let bv = ramp(128 * 256, -0.11, 0.7);
+        let threaded = g.eval(&[av.clone(), bv.clone()], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(1));
+        let inline = g.eval(&[av, bv], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(usize::MAX));
+        assert_eq!(threaded.len(), inline.len());
+        assert!(threaded.iter().zip(&inline).all(|(x, y)| x.to_bits() == y.to_bits()));
     }
 
     #[test]
