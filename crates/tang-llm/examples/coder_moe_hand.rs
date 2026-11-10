@@ -413,6 +413,59 @@ fn run(dev: &Dev, dir: &Path) {
         println!("  {:>8.4} ms warm  {:>8.4} ms cold  {}", warm, c, l.name);
     }
     println!("  hand expert half: {tw:.4} warm / {tc:.4} cold ms");
+
+    // equal work: the hand half's `cx_moe_add_norm` also does the residual add, the next
+    // norm and the int8 activations. The derived half stops at the combine, so time those
+    // three as derived ops, on this window's own output, to add to the derived half.
+    {
+        use tang_llm::flash::derived_ops as dop;
+        use tang_moe::gpu::{DevBuf, Event, Stream};
+        let eps = 1e-6f64;
+        let ir_y = read_f32(&dir.join("ir_y.f32"));
+        let nr = DevBuf::from_slice(&vec![0.25f32; t * d]).unwrap();
+        let ny = DevBuf::from_slice(&ir_y).unwrap();
+        let nw = DevBuf::from_slice(&vec![1.0f32; d]).unwrap();
+        let (no, nx) = (
+            DevBuf::zeroed(t * d * 4).unwrap(),
+            DevBuf::zeroed(t * d * 4).unwrap(),
+        );
+        let nq = DevBuf::zeroed(t * d + t * d / 32 * 8).unwrap();
+        let (c, sc) = dop::engine_q8(t, d);
+        let an = dop::Op::load(&dev.gpu, dop::add_norm(t, d, eps, true).lower().unwrap(), 5).unwrap();
+        let codes = dop::Op::load(&dev.gpu, c.lower().unwrap(), 2).unwrap();
+        let scales = dop::Op::load(&dev.gpu, sc.lower().unwrap(), 2).unwrap();
+        let ns = Stream::new().unwrap();
+        let go = || {
+            an.launch(&ns, &[nr.ptr, ny.ptr, nw.ptr, no.ptr, nx.ptr]).unwrap();
+            codes.launch(&ns, &[nx.ptr, nq.ptr]).unwrap();
+            scales.launch(&ns, &[nx.ptr, nq.ptr + (t * d) as u64]).unwrap();
+        };
+        let once = || {
+            let (a, b) = (Event::new(true).unwrap(), Event::new(true).unwrap());
+            a.record(&ns).unwrap();
+            go();
+            b.record(&ns).unwrap();
+            b.sync().unwrap();
+            b.since(&a).unwrap() as f64
+        };
+        for _ in 0..3 {
+            once();
+        }
+        let w = (0..500).map(|_| once()).fold(f64::INFINITY, f64::min);
+        let mut c: Vec<f64> = (0..iters)
+            .map(|_| {
+                s.memset_zeros(&mut flush).unwrap();
+                s.synchronize().unwrap();
+                once()
+            })
+            .collect();
+        c.sort_by(f64::total_cmp);
+        println!(
+            "  derived residual + next norm + int8 (to add to the derived half): {w:.4} warm / {:.4} cold ms ({} kernels)",
+            c[c.len() / 2],
+            an.kernels() + codes.kernels() + scales.kernels()
+        );
+    }
 }
 
 fn main() {

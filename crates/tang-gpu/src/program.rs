@@ -205,6 +205,18 @@ impl Runtime {
     }
 
     /// Submit pending work and wait for it.
+    /// `cuProfilerStart` / `cuProfilerStop`: a window for `ncu --profile-from-start off`.
+    #[cfg(feature = "cuda")]
+    pub fn profiler(&self, on: bool) {
+        unsafe {
+            if on {
+                cudarc::driver::sys::cuProfilerStart();
+            } else {
+                cudarc::driver::sys::cuProfilerStop();
+            }
+        }
+    }
+
     pub fn sync(&self) {
         match self {
             Self::Wgpu { device, cache } => {

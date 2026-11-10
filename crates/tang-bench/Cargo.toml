@@ -120,3 +120,7 @@ required-features = ["cuda"]
 [[example]]
 name = "figure1_cuda"
 required-features = ["cuda"]
+
+[[example]]
+name = "floors_cuda"
+required-features = ["cuda"]
