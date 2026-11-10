@@ -119,6 +119,9 @@ fn measure(
     p.run(rt);
     rt.sync();
     let got: Vec<Vec<f32>> = outs.iter().map(|o| p.read(rt, *o)).collect();
+    for (o, (g, w)) in got.iter().zip(want).enumerate() {
+        eprintln!("  {name} output {o}: max rel err {:.3e}", max_rel(std::slice::from_ref(g), std::slice::from_ref(w)));
+    }
     for (i, k) in p.program.kernels.iter().enumerate() {
         eprintln!(
             "  {name} kernel {i}: {:.4} ms {}",
@@ -164,6 +167,12 @@ fn main() {
             let r = measure(&rt, &p, &pl.outputs, &want, iters, name);
             emit(name, &r);
         }
+        // flash with no tensor cores (every kernel transpiled, f32 arithmetic): separates
+        // the schedule from the TF32 rounding of the mma tiles
+        let pl = g.place(&outs, &MemorySchedule::flash());
+        let p = Program::new(&rt, pl.graph.to_cuda_placed(&pl.outputs, pl.nest, None), &ins);
+        let r = measure(&rt, &p, &pl.outputs, &want, iters, "flash_fp32");
+        emit("flash_fp32", &r);
         // searched: every role-level placement, each with its per-kernel lowering, then
         // every kernel's thread mappings on the winner. Only correct candidates can win.
         let mut best: Option<(f64, TensorGraph, Vec<TensorId>, bool, MemorySchedule)> = None;
