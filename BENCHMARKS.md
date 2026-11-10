@@ -3923,3 +3923,22 @@ tang ran `flash-batch-check` with `TANG_BATCH_N=1 TANG_BATCH_CTX=N TANG_CODER_KV
 - The flash backward's bf16 kernel is reported, not fixed.
 - The wrong Smem/Recompute/Hbm/Fuse placement is caught by the check but not root-caused.
 - The 13.8 s vs 8.33 s TTFT gap between batch-check and the paper's warm-server measurement is not reconciled.
+
+### For the theory review (Prove): launch, latency and the 3090 attention tile
+
+**Empty kernel and DRAM latency, H200 SXM** (`scripts/review/latency.cu`, `nvcc -O2 -arch=sm_90a`, idle RunPod secure H200, 2026-11-10; raw: `review/prove/latency_h200.txt`). Three runs agree to within 0.5 ns.
+
+| quantity | value |
+|---|---|
+| empty kernel inside a CUDA graph (2000 nodes, best of 10 replays): 1 / 132 / 528 blocks × 256 | **0.48 / 0.54 / 0.78 µs** each |
+| same, launched on a stream | 2.34 / 1.79 / 1.80 µs |
+| pointer chase, one thread, random single cycle with 64 B slots, 1 MB (L2-resident) | 145 ns (286 cycles at 1.98 GHz) |
+| same over 32 MB | 191 ns |
+| same over 4 GB (DRAM, including TLB misses) | **340 ns** (672 cycles) |
+
+A first version re-walked the warm-up run's path, so the timed chase hit L2 (151 ns at 4 GB). It is kept in the raw file and superseded.
+
+**3090 attention autotuner pick** (`TUNE=3090 io_dual` on branch `claude/paper-theory-fixes` fb1cb207). It ran on an idle rented RTX 3090; raw: `review/prove/io_dual_3090_cuda.txt`. The pod has no Vulkan driver, so `Runtime::select` ran with `--features cuda`: the tuner timed CUDA lowerings, not wgpu.
+- matmul 1024³: autotuned [p0=64 p1=64 r0=32], 1.95× bound.
+- attention fwd, 8 heads, N = 1024 and N = 4096, d = 64 causal: autotuned [p2=16 p3=64 r0=16], 24× bound. That is the same as `schedule_auto`; the dual tile is [p2=48 r0=48] and the 2-level dual [p2=128 p3=32 r0=32].
+- Per-tile kernel times were not measured: `io_dual` prints none.

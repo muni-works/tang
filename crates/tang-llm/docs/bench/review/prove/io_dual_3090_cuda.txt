@@ -1,0 +1,67 @@
+Tue Nov 10 08:00:02 UTC 2026
+NVIDIA GeForce RTX 3090, 595.91.07
+  regs   1024 words: [p0=32 p1=32 r0=128] 272.63 MB
+  regs   2048 words: [p0=64 p1=32 r0=128] 205.52 MB
+  regs   4096 words: [p0=64 p1=64 r0=64] 138.41 MB
+  regs   8192 words: [p0=128 p1=64 r0=64] 104.86 MB
+  regs  16384 words: [p0=128 p1=128 r0=32] 71.30 MB
+  regs  32768 words: [p0=256 p1=128 r0=32] 54.53 MB
+  regs  65536 words (register file): [p0=256 p1=256 r0=16] 37.75 MB
+## matmul 1024³ on 3090 (M = 12288 words)
+  LP: coords [p0,p1,r0], arrays ["0b101", "0b110", "0b11"], atomic 0b0; skipped: 0 gathered, 0 non-projective
+  primal s=[0.5, 0.5, 0.5] t=[0.0, 0.0, 0.0]  dual x=[0.5, 0.5, 0.5]  σ=1.5000  gap=0.0e0
+  bound 71.13 MB
+  dual tile    [p0=64 p1=64 r0=64]  traffic 138.41 MB (1.95× bound)
+  2-level dual [p0=64 p1=64 r0=64]  traffic 138.41 MB (2.25× bound at regs+smem 61.58 MB); in registers: 0b11
+  schedule_auto[p0=64 p1=64 r0=32]  LP traffic 138.41 MB, staged 138.41 MB (1.95× bound), 1 kernel(s)
+  autotuned    [p0=64 p1=64 r0=32]  LP traffic 138.41 MB, staged 138.41 MB (1.95× bound), 1 kernel(s)
+  floor at bound 0.076 ms (memory); at schedule_auto's traffic 0.148 ms (memory)
+  regs   1024 words: [p0=32 p1=32 r0=128] 17246.98 MB
+  regs   2048 words: [p0=64 p1=32 r0=128] 12952.01 MB
+  regs   4096 words: [p0=64 p1=64 r0=64] 8657.04 MB
+  regs   8192 words: [p0=128 p1=64 r0=64] 6509.56 MB
+  regs  16384 words: [p0=128 p1=128 r0=32] 4362.08 MB
+  regs  32768 words: [p0=256 p1=128 r0=32] 3288.33 MB
+  regs  65536 words (register file): [p0=256 p1=256 r0=16] 2214.59 MB
+## matmul 4096³ on 3090 (M = 12288 words)
+  LP: coords [p0,p1,r0], arrays ["0b101", "0b110", "0b11"], atomic 0b0; skipped: 0 gathered, 0 non-projective
+  primal s=[0.5, 0.5, 0.5] t=[0.0, 0.0, 0.0]  dual x=[0.5, 0.5, 0.5]  σ=1.5000  gap=0.0e0
+  bound 4555.45 MB
+  dual tile    [p0=64 p1=64 r0=64]  traffic 8657.04 MB (1.90× bound)
+  2-level dual [p0=64 p1=64 r0=64]  traffic 8657.04 MB (2.19× bound at regs+smem 3945.11 MB); in registers: 0b11
+  schedule_auto[p0=64 p1=64 r0=32]  LP traffic 8657.04 MB, staged 8657.04 MB (1.90× bound), 1 kernel(s)
+  autotuned    [p0=64 p1=64 r0=32]  LP traffic 8657.04 MB, staged 8657.04 MB (1.90× bound), 1 kernel(s)
+  floor at bound 4.867 ms (memory); at schedule_auto's traffic 9.249 ms (memory)
+  regs   1024 words: [p0=1 p1=1 p2=128 p3=8 p4=1 r0=32 n5_0=64] 169.87 MB
+  regs   2048 words: [p0=1 p1=1 p2=128 p3=16 p4=1 r0=32 n5_0=64] 94.37 MB
+  regs   4096 words: [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64] 56.62 MB
+  regs   8192 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=32 n5_0=64] 37.75 MB
+  regs  16384 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=64 n5_0=64] 37.75 MB
+  regs  32768 words: [p0=1 p1=1 p2=256 p3=64 p4=1 r0=64 n5_0=64] 20.97 MB
+  regs  65536 words (register file): [p0=1 p1=1 p2=512 p3=64 p4=1 r0=64 n5_0=64] 12.58 MB
+## attention fwd 8 heads N=1024 d=64 causal on 3090 (M = 12288 words)
+  LP: coords [p0,p1,p2,p3,p4,r0,n5_0], arrays ["0b1000111", "0b1100001", "0b101001", "0b11111"], atomic 0b1000000; skipped: 0 gathered, 0 non-projective
+  primal s=[0.0, 1.0, 0.0, 1.0] t=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  dual x=[0.0, 0.0, 0.5886, 0.4114, 0.0, 0.5886, 0.4114]  σ=2.0000  gap=0.0e0
+  bound 11.14 MB
+  dual tile    [p0=1 p1=1 p2=48 p3=64 p4=1 r0=48 n5_0=64]  traffic 96.47 MB (8.66× bound)
+  2-level dual [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64]  traffic 56.62 MB (6.80× bound at regs+smem 8.32 MB); in registers: 0b11111
+  schedule_auto[p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 272.63 MB, staged 272.63 MB (24.48× bound), 1 kernel(s)
+  autotuned    [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 272.63 MB, staged 272.63 MB (24.48× bound), 1 kernel(s)
+  floor at bound 0.030 ms (compute); at schedule_auto's traffic 0.291 ms (memory)
+  regs   1024 words: [p0=1 p1=1 p2=128 p3=8 p4=1 r0=32 n5_0=64] 2491.42 MB
+  regs   2048 words: [p0=1 p1=1 p2=128 p3=16 p4=1 r0=32 n5_0=64] 1384.12 MB
+  regs   4096 words: [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64] 830.47 MB
+  regs   8192 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=32 n5_0=64] 553.65 MB
+  regs  16384 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=64 n5_0=64] 553.65 MB
+  regs  32768 words: [p0=1 p1=1 p2=256 p3=64 p4=1 r0=64 n5_0=64] 285.21 MB
+  regs  65536 words (register file): [p0=1 p1=1 p2=512 p3=64 p4=1 r0=64 n5_0=64] 150.99 MB
+## attention fwd 8 heads N=4096 d=64 causal on 3090 (M = 12288 words)
+  LP: coords [p0,p1,p2,p3,p4,r0,n5_0], arrays ["0b1000111", "0b1100001", "0b101001", "0b11111"], atomic 0b1000000; skipped: 0 gathered, 0 non-projective
+  primal s=[0.0, 1.0, 0.0, 1.0] t=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  dual x=[0.0, 0.0, 0.5886, 0.4114, 0.0, 0.5886, 0.4114]  σ=2.0000  gap=0.0e0
+  bound 178.91 MB
+  dual tile    [p0=1 p1=1 p2=48 p3=64 p4=1 r0=48 n5_0=64]  traffic 1459.62 MB (8.16× bound)
+  2-level dual [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64]  traffic 830.47 MB (6.19× bound at regs+smem 134.15 MB); in registers: 0b11111
+  schedule_auto[p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 4311.74 MB, staged 4311.74 MB (24.10× bound), 1 kernel(s)
+  autotuned    [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 4311.74 MB, staged 4311.74 MB (24.10× bound), 1 kernel(s)
+  floor at bound 0.483 ms (compute); at schedule_auto's traffic 4.607 ms (memory)
+EXIT 0

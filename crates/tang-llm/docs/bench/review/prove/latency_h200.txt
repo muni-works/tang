@@ -1,0 +1,42 @@
+# H200 SXM, RunPod secure US-NC-1, driver 595.91.07, nvcc 12.8, 2026-11-10 07:55 UTC
+# nvcc -O2 -arch=sm_90a -o latency scripts/review/latency.cu && ./latency
+## first run (timed chase re-walked the warm-up's path: L2 hits, superseded)
+Tue Nov 10 07:55:04 UTC 2026
+name, driver_version, clocks.max.sm [MHz], clocks.max.memory [MHz]
+NVIDIA H200, 595.91.07, 1980 MHz, 3201 MHz
+pid
+device NVIDIA H200, 132 SMs, SM clock 1980000 kHz (attribute)
+empty kernel in a graph, 1 blocks x 256: 0.484 us each (best of 10 replays of 2000)
+empty kernel, stream launches, 1 blocks: 2.338 us each
+empty kernel in a graph, 132 blocks x 256: 0.542 us each (best of 10 replays of 2000)
+empty kernel, stream launches, 132 blocks: 1.789 us each
+empty kernel in a graph, 528 blocks x 256: 0.775 us each (best of 10 replays of 2000)
+empty kernel, stream launches, 528 blocks: 1.798 us each
+pointer chase over 1 MB (16384 slots, 64 B apart): 144.8 ns per hop (events), 286 cycles per hop (clock64)
+pointer chase over 32 MB (524288 slots, 64 B apart): 146.8 ns per hop (events), 290 cycles per hop (clock64)
+pointer chase over 4096 MB (67108864 slots, 64 B apart): 151.4 ns per hop (events), 299 cycles per hop (clock64)
+empty kernel in a graph, 1 blocks x 256: 0.483 us each (best of 10 replays of 2000)
+empty kernel in a graph, 132 blocks x 256: 0.542 us each (best of 10 replays of 2000)
+empty kernel in a graph, 528 blocks x 256: 0.775 us each (best of 10 replays of 2000)
+pointer chase over 1 MB (16384 slots, 64 B apart): 144.8 ns per hop (events), 286 cycles per hop (clock64)
+pointer chase over 32 MB (524288 slots, 64 B apart): 146.8 ns per hop (events), 290 cycles per hop (clock64)
+pointer chase over 4096 MB (67108864 slots, 64 B apart): 151.6 ns per hop (events), 299 cycles per hop (clock64)
+## fixed (timed chase on an untouched part of the cycle), 3 runs
+empty kernel in a graph, 1 blocks x 256: 0.483 us each (best of 10 replays of 2000)
+empty kernel in a graph, 132 blocks x 256: 0.542 us each (best of 10 replays of 2000)
+empty kernel in a graph, 528 blocks x 256: 0.775 us each (best of 10 replays of 2000)
+pointer chase over 1 MB (16384 slots, 64 B apart): 144.9 ns per hop (events), 286 cycles per hop (clock64)
+pointer chase over 32 MB (524288 slots, 64 B apart): 191.2 ns per hop (events), 378 cycles per hop (clock64)
+pointer chase over 4096 MB (67108864 slots, 64 B apart): 339.6 ns per hop (events), 671 cycles per hop (clock64)
+empty kernel in a graph, 1 blocks x 256: 0.484 us each (best of 10 replays of 2000)
+empty kernel in a graph, 132 blocks x 256: 0.542 us each (best of 10 replays of 2000)
+empty kernel in a graph, 528 blocks x 256: 0.775 us each (best of 10 replays of 2000)
+pointer chase over 1 MB (16384 slots, 64 B apart): 144.9 ns per hop (events), 286 cycles per hop (clock64)
+pointer chase over 32 MB (524288 slots, 64 B apart): 191.2 ns per hop (events), 378 cycles per hop (clock64)
+pointer chase over 4096 MB (67108864 slots, 64 B apart): 339.8 ns per hop (events), 672 cycles per hop (clock64)
+empty kernel in a graph, 1 blocks x 256: 0.483 us each (best of 10 replays of 2000)
+empty kernel in a graph, 132 blocks x 256: 0.542 us each (best of 10 replays of 2000)
+empty kernel in a graph, 528 blocks x 256: 0.775 us each (best of 10 replays of 2000)
+pointer chase over 1 MB (16384 slots, 64 B apart): 144.8 ns per hop (events), 286 cycles per hop (clock64)
+pointer chase over 32 MB (524288 slots, 64 B apart): 191.3 ns per hop (events), 378 cycles per hop (clock64)
+pointer chase over 4096 MB (67108864 slots, 64 B apart): 340.2 ns per hop (events), 672 cycles per hop (clock64)
