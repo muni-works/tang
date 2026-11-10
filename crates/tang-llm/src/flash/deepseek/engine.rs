@@ -1025,7 +1025,7 @@ impl GpuModel {
         let kn = self.dw(&format!("{p}.attn.kv_norm.weight"))?.v;
         let ok = rows_fused()
             && self.fast
-            && (1..=8).contains(&t)
+            && t >= 1
             && comp_batched()
             && [wqa, wkv, wqb].iter().all(|w| self.k.ks_ok(w))
             && wqa.cols == wkv.cols
@@ -1043,7 +1043,29 @@ impl GpuModel {
             .segs
             .take()
             .context("attention_rows_fused without rows")?;
-        let r = self.attention_rows_fused_impl(p, lid, x, t, &mut segs, (wqa, wkv, wqb, qn, kn));
+        // the q/kv codes buffers hold 8 rows: wider steps run the attention 8 rows at a time
+        // (the rest of the step, MoE included, still runs over every row at once)
+        let d = self.cpu.cfg.dim;
+        let ws = (wqa, wkv, wqb, qn, kn);
+        let r = (|| -> Result<Buf> {
+            if t <= 8 {
+                return self.attention_rows_fused_impl(p, lid, x, t, &mut segs, ws);
+            }
+            let y = self.fbuf(t * d)?;
+            for c0 in (0..t).step_by(8) {
+                let n = (t - c0).min(8);
+                let yc = self.attention_rows_fused_impl(
+                    p,
+                    lid,
+                    x.at(c0 * d * 4),
+                    n,
+                    &mut segs[c0..c0 + n],
+                    ws,
+                )?;
+                self.copy(y.ptr + (c0 * d * 4) as u64, yc.ptr, n * d)?;
+            }
+            Ok(y)
+        })();
         self.segs = Some(segs);
         r.map(Some)
     }
