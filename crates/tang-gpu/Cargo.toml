@@ -51,6 +51,8 @@ name = "quantum_poet"
 
 [dev-dependencies]
 approx = "0.5"
+# GPU-vs-interpreter error stats in tests/semiring_scan.rs
+tang-verify = { workspace = true }
 # the physics_surrogate example trains on the CPU first
 tang-tensor = { workspace = true }
 tang-train = { workspace = true }

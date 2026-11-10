@@ -6296,6 +6296,7 @@ dependencies = [
  "tang-otel",
  "tang-tensor",
  "tang-train",
+ "tang-verify",
  "wgpu",
 ]
 
