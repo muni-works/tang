@@ -96,7 +96,7 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
-pub use scan::{DeltaForm, Scan, ScanKind};
+pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
 #[path = "tensor_space.rs"]
 pub mod space;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
