@@ -1439,7 +1439,7 @@ impl TensorGraph {
         }
         let (s, q) = (c.args[0].src, c.args[1].src);
         let sc = self.scan_at(s)?;
-        let ScanKind::Affine { form: Some(f) } = &sc.kind else {
+        let ScanKind::Affine { form: Some(f), .. } = &sc.kind else {
             return None;
         };
         if sc.exclusive || sc.reverse || sc.dim != 1 {
