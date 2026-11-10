@@ -278,10 +278,15 @@ pub struct GpuModel {
     pub graph: bool,
     pub graph_stats: GraphStats,
     tabs: Vec<DevBuf>,
-    win: Vec<DevBuf>,
-    ckv: HashMap<usize, DevBuf>,
-    idxk: HashMap<usize, DevBuf>,
-    cst: HashMap<usize, (DevBuf, DevBuf)>,
+    /// Per-sequence device state, one entry per serving slot ([`Self::add_slots`]); the
+    /// forward runs on `seqs[cur]` ([`Self::select_slot`]).
+    seqs: Vec<SeqState>,
+    cur: usize,
+    /// Set while [`Self::forward_rows`] runs: one decode row per sequence slot. The block
+    /// splits only its attention per row (that row's slot caches, position and selection).
+    segs: Option<Vec<Seg>>,
+    /// The slot whose engram history the CPU model holds (always `cur` between calls).
+    hash_held: usize,
     qk: RefCell<HashMap<usize, Rc<DevBuf>>>,
     /// Set by [`GpuModel::block`]: `moe_finish` leaves the shared expert's output here,
     /// unsummed, for the post-mix to add (`ds_add_round` folded into `ds_hc_post`).
@@ -314,11 +319,11 @@ pub struct GpuModel {
     jrows: Vec<(usize, usize, Buf, Buf)>,
     arena: RefCell<Arena>,
     stage: RefCell<Staging>,
-    graphs: HashMap<(usize, bool), Captured>,
-    warm: HashMap<(usize, bool), (u64, u64)>,
+    graphs: HashMap<(usize, bool, usize), Captured>,
+    warm: HashMap<(usize, bool, usize), (u64, u64)>,
     /// Captured drafts by (main rows, sampler (temperature, top-p) bits), and their warm-ups.
-    spark_graphs: HashMap<(usize, Option<(u32, u32)>), SparkGraph>,
-    spark_warm: HashMap<(usize, Option<(u32, u32)>), (u64, u64)>,
+    spark_graphs: HashMap<(usize, Option<(u32, u32)>, usize), SparkGraph>,
+    spark_warm: HashMap<(usize, Option<(u32, u32)>, usize), (u64, u64)>,
     /// Debugging: each backbone layer's input stream and pre-mix (as [`Model::force`]).
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
@@ -396,6 +401,68 @@ impl Drop for GpuModel {
     }
 }
 
+/// One sequence's device state: the sliding-window rings (every layer, MTP included), the
+/// compressed KV and indexer-key caches of the KV-source layers, and the compressors'
+/// partial groups. `cap` is the positions the caches hold.
+struct SeqState {
+    win: Vec<DevBuf>,
+    ckv: HashMap<usize, DevBuf>,
+    idxk: HashMap<usize, DevBuf>,
+    cst: HashMap<usize, (DevBuf, DevBuf)>,
+    cap: usize,
+    /// The engram token history ([`Model`]'s `hash_cache`) while the slot is inactive; the
+    /// active slot's lives in the CPU model.
+    hash: Vec<i64>,
+}
+
+impl SeqState {
+    fn alloc(c: &super::Config, cap: usize) -> Result<Self> {
+        let hd = c.head_dim;
+        let upf = |v: &[f32]| -> Result<DevBuf> { Ok(DevBuf::from_slice(v)?) };
+        let n_all = c.n_layers + c.n_mtp_layers;
+        let win = (0..n_all)
+            .map(|_| upf(&vec![0f32; c.window_size * hd]))
+            .collect::<Result<_>>()?;
+        let mut ckv = HashMap::new();
+        let mut idxk = HashMap::new();
+        let mut cst = HashMap::new();
+        for &l in &c.kv_source_layers {
+            let r = c.compress_ratios[l];
+            ckv.insert(l, upf(&vec![0f32; cap / r * hd])?);
+            idxk.insert(l, upf(&vec![0f32; cap / r * c.index_head_dim])?);
+            if r > 1 {
+                cst.insert(
+                    l,
+                    (
+                        upf(&vec![0f32; r * hd])?,
+                        upf(&vec![f32::NEG_INFINITY; r * hd])?,
+                    ),
+                );
+            }
+        }
+        Ok(Self {
+            win,
+            ckv,
+            idxk,
+            cst,
+            cap,
+            hash: vec![0; cap],
+        })
+    }
+}
+
+/// One row of a [`GpuModel::forward_rows`] step: its slot, its device position params
+/// (`P[0]` = the row's position) and the step's per-sequence selection state, swapped in
+/// around the row's attention.
+struct Seg {
+    slot: usize,
+    p: Buf,
+    topk: Option<(Buf, usize)>,
+    cand: Option<(Buf, usize)>,
+    sh_ckv: usize,
+    sh_idxk: usize,
+}
+
 /// As [`super::forward::Snapshot`], on the device: views of the model's one snapshot store
 /// (a newer snapshot overwrites it).
 pub struct GpuSnapshot {
@@ -423,34 +490,14 @@ impl GpuModel {
         let s = Stream::blocking()?;
         let cpu = Model::open(dir)?;
         let c = cpu.cfg.clone();
-        let (hd, sl) = (c.head_dim, c.max_seq_len);
+        let sl = c.max_seq_len;
         let upf = |v: &[f32]| -> Result<DevBuf> { Ok(DevBuf::from_slice(v)?) };
         let tabs = cpu
             .freqs
             .iter()
             .map(|t| upf(&t.iter().flat_map(|&(a, b)| [a, b]).collect::<Vec<f32>>()))
             .collect::<Result<_>>()?;
-        let n_all = c.n_layers + c.n_mtp_layers;
-        let win = (0..n_all)
-            .map(|_| upf(&vec![0f32; c.window_size * hd]))
-            .collect::<Result<_>>()?;
-        let mut ckv = HashMap::new();
-        let mut idxk = HashMap::new();
-        let mut cst = HashMap::new();
-        for &l in &c.kv_source_layers {
-            let r = c.compress_ratios[l];
-            ckv.insert(l, upf(&vec![0f32; sl / r * hd])?);
-            idxk.insert(l, upf(&vec![0f32; sl / r * c.index_head_dim])?);
-            if r > 1 {
-                cst.insert(
-                    l,
-                    (
-                        upf(&vec![0f32; r * hd])?,
-                        upf(&vec![f32::NEG_INFINITY; r * hd])?,
-                    ),
-                );
-            }
-        }
+        let seq0 = SeqState::alloc(&c, sl)?;
         Ok(Self {
             cpu,
             k,
@@ -484,10 +531,10 @@ impl GpuModel {
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
-            win,
-            ckv,
-            idxk,
-            cst,
+            seqs: vec![seq0],
+            cur: 0,
+            segs: None,
+            hash_held: 0,
             qk: RefCell::new(HashMap::new()),
             defer_sh: Cell::new(false),
             sh: Cell::new(None),
@@ -536,7 +583,7 @@ impl GpuModel {
     /// compressors' partial groups do (in place: captured graphs hold their addresses).
     pub fn reset(&mut self) -> Result<()> {
         let hd = self.cpu.cfg.head_dim;
-        for (&l, (a, bb)) in self.cst.iter() {
+        for (&l, (a, bb)) in self.seqs[self.cur].cst.iter() {
             let n = self.cpu.cfg.compress_ratios[l] * hd;
             self.fill(a.ptr, 0, n)?;
             self.fill(bb.ptr, f32::NEG_INFINITY.to_bits() as i32, n)?;
@@ -546,6 +593,58 @@ impl GpuModel {
         self.topk = None;
         self.cand = None;
         Ok(())
+    }
+
+    /// Grow to `n` sequence slots (slot 0 is the one [`Self::open`] made, sized for the
+    /// model's `max_seq_len`); the new ones hold `cap` positions each. Each slot is its own
+    /// sequence: [`Self::select_slot`] picks the one the next forward / reset runs on.
+    pub fn add_slots(&mut self, n: usize, cap: usize) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let r = c.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        anyhow::ensure!(cap >= r && cap <= c.max_seq_len, "slot cap {cap}");
+        while self.seqs.len() < n {
+            self.seqs.push(SeqState::alloc(&c, cap)?);
+            let cur = self.cur;
+            self.cur = self.seqs.len() - 1;
+            self.reset()?;
+            self.cur = cur;
+        }
+        Ok(())
+    }
+
+    /// The sequence slots.
+    pub fn n_slots(&self) -> usize {
+        self.seqs.len()
+    }
+
+    /// The slot the forward runs on.
+    pub fn slot(&self) -> usize {
+        self.cur
+    }
+
+    /// Run the next forwards on slot `s`'s sequence. A step's transient selection state is
+    /// dropped (it is recomputed each step); captured graphs are kept per slot (they bake
+    /// the slot's cache addresses). An open snapshot belongs to the slot it was taken on.
+    pub fn select_slot(&mut self, s: usize) -> Result<()> {
+        anyhow::ensure!(s < self.seqs.len(), "slot {s} >= {}", self.seqs.len());
+        if s == self.cur {
+            return Ok(());
+        }
+        anyhow::ensure!(!self.journal_on, "slot switch under an open snapshot");
+        self.s.sync()?;
+        self.swap_hash(s);
+        self.cur = s;
+        self.sh_ckv = 0;
+        self.sh_idxk = 0;
+        self.topk = None;
+        self.cand = None;
+        self.last = None;
+        Ok(())
+    }
+
+    /// The positions slot `cur`'s caches hold.
+    fn seq_cap(&self) -> usize {
+        self.seqs[self.cur].cap
     }
 
     // scratch
@@ -861,6 +960,118 @@ impl GpuModel {
         }
     }
 
+    /// [`Self::attention`] over a [`Self::forward_rows`] step: row `i` attends on its own
+    /// slot (caches, position, the step's selection so far), one row at a time.
+    fn attention_rows(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
+        let d = self.cpu.cfg.dim;
+        let mut segs = self.segs.take().context("attention_rows without rows")?;
+        anyhow::ensure!(segs.len() == t, "rows step: {} rows for t {t}", segs.len());
+        let out = self.fbuf(t * d)?;
+        let r = (|| -> Result<()> {
+            for (i, sg) in segs.iter_mut().enumerate() {
+                self.cur = sg.slot;
+                self.p = sg.p;
+                self.topk = sg.topk.take();
+                self.cand = sg.cand.take();
+                self.sh_ckv = sg.sh_ckv;
+                self.sh_idxk = sg.sh_idxk;
+                let off = (i * d * 4) as u64;
+                let xi = Buf {
+                    ptr: x.ptr + off,
+                    len: d * 4,
+                };
+                let y = self.attention_dyn(p, lid, xi, 1)?;
+                self.copy(out.ptr + off, y.ptr, d)?;
+                sg.topk = self.topk.take();
+                sg.cand = self.cand.take();
+                sg.sh_ckv = self.sh_ckv;
+                sg.sh_idxk = self.sh_idxk;
+            }
+            Ok(())
+        })();
+        self.segs = Some(segs);
+        r.map(|_| out)
+    }
+
+    /// Batched decode over sequence slots: row `i` is token `rows[i].1` of slot `rows[i].0`
+    /// at position `rows[i].2` (> 0; distinct slots). Embedding, engram, mHC, the linears
+    /// and the MoE run ONCE over all rows (each weight read once for the batch); only the
+    /// attention splits per row ([`Self::attention_rows`]). Returns each row's greedy next
+    /// token. Direct launches (no graph), the unfused block (bit-equal to the fused one).
+    pub fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        let t = rows.len();
+        anyhow::ensure!(t > 0, "empty rows step");
+        for (i, &(sl, _, pos)) in rows.iter().enumerate() {
+            anyhow::ensure!(sl < self.seqs.len(), "slot {sl} >= {}", self.seqs.len());
+            anyhow::ensure!(!rows[..i].iter().any(|r| r.0 == sl), "slot {sl} twice");
+            anyhow::ensure!(pos > 0, "rows step: slot {sl} at position 0 (prefill it)");
+            anyhow::ensure!(
+                pos < self.seqs[sl].cap,
+                "slot {sl}: position {pos} past its cap"
+            );
+        }
+        anyhow::ensure!(!self.journal_on, "rows step under an open snapshot");
+        anyhow::ensure!(
+            self.moe_reduce.is_none(),
+            "rows step: expert parallel not wired"
+        );
+        let c = self.cpu.cfg.clone();
+        let home = self.cur;
+        self.last = None;
+        self.begin_step()?;
+        // the engram hashes, each row from its own slot's token history
+        let hashes = if c.engram_layer_ids.is_empty() {
+            None
+        } else {
+            let mut hs = Vec::with_capacity(t);
+            for &(sl, tok, pos) in rows {
+                self.swap_hash(sl);
+                hs.push(self.cpu.engram_hash(&[tok], pos).remove(0));
+            }
+            self.swap_hash(home);
+            Some(hs)
+        };
+        let ids: Vec<usize> = rows.iter().map(|r| r.1).collect();
+        let mut inp = self.inputs(&ids, 1, hashes.as_deref())?;
+        let mut segs = Vec::with_capacity(t);
+        for &(sl, _, pos) in rows {
+            let (pb, u) = self.stage(&[pos as i32, 0, 0, 0])?;
+            inp.copies.push(u);
+            segs.push(Seg {
+                slot: sl,
+                p: pb,
+                topk: None,
+                cand: None,
+                sh_ckv: 0,
+                sh_idxk: 0,
+            });
+        }
+        self.segs = Some(segs);
+        let out = self.direct(&inp, t, DYN, true, None);
+        self.segs = None;
+        self.cur = home;
+        self.sh_ckv = 0;
+        self.sh_idxk = 0;
+        self.topk = None;
+        self.cand = None;
+        let out = out?;
+        self.sync()?;
+        let a = out.amax.dev().read::<i32>(0, out.rows)?;
+        Ok(a.into_iter().map(|i| i as usize).collect())
+    }
+
+    /// Make slot `s`'s engram history the CPU model's (the current one goes back to its
+    /// slot). Host only; `self.cur` is untouched.
+    fn swap_hash(&mut self, s: usize) {
+        let held = self.hash_held;
+        if held == s {
+            return;
+        }
+        std::mem::swap(&mut self.cpu.hash_cache, &mut self.seqs[held].hash);
+        std::mem::swap(&mut self.cpu.hash_cache, &mut self.seqs[s].hash);
+        self.hash_held = s;
+    }
+
     fn attention_prefill(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
         let c = self.cpu.cfg.clone();
         let (h, hd) = (c.n_heads, c.head_dim);
@@ -892,7 +1103,7 @@ impl GpuModel {
             let s = self.span("compress");
             let (src, k) = self.compress_kv_prefill(p, lid, x, qr, t)?;
             kc = k;
-            kv1 = self.ckv[&src].ptr;
+            kv1 = self.seqs[self.cur].ckv[&src].ptr;
             self.end(s);
         }
         let s = self.span("sparse_attn");
@@ -973,7 +1184,7 @@ impl GpuModel {
             .ks_gemv2(&self.s, &wqa, &wkv, xc, xs, qr.ptr, kv.ptr, t, true)?;
         self.end(sp);
         let sp = self.span("window_kv");
-        let ring = b(&self.win[lid]);
+        let ring = b(&self.seqs[self.cur].win[lid]);
         let (kv0, split, mode, allp) = if t > 1 {
             let all = self.fbuf((win + t) * hd)?;
             self.copy(all.ptr, ring.ptr, win * hd)?;
@@ -1025,7 +1236,7 @@ impl GpuModel {
                 self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
                 self.rope(kv, t, 1, hd, lid, at, false)?;
                 self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
-                let ring = b(&self.win[lid]);
+                let ring = b(&self.seqs[self.cur].win[lid]);
                 let (kv0, split, mode) = if t > 1 {
                     // a verify window (as forward.rs): the pre-chunk ring then the chunk's rows
                     let all = self.fbuf((win + t) * hd)?;
@@ -1046,7 +1257,7 @@ impl GpuModel {
             let s = self.span("compress");
             let src = self.compress_dyn(p, lid, x, qr, t, split)?;
             kc = self.topk.as_ref().context("no top-k")?.1;
-            kv1 = self.ckv[&src].ptr;
+            kv1 = self.seqs[self.cur].ckv[&src].ptr;
             self.end(s);
         }
         let (src, ki) = match kc {
@@ -1336,7 +1547,7 @@ impl GpuModel {
 
     fn ring_seed(&self, lid: usize, kv: Buf, t: usize) -> Result<()> {
         let (hd, win) = (self.cpu.cfg.head_dim, self.cpu.cfg.window_size);
-        let ring = self.win[lid].ptr;
+        let ring = self.seqs[self.cur].win[lid].ptr;
         if t <= win {
             return self.copy(ring, kv.ptr, t * hd);
         }
@@ -1393,7 +1604,7 @@ impl GpuModel {
         let kv = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
         let sc = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
         let (kst, sst) = {
-            let (a, bb) = &self.cst[&lid];
+            let (a, bb) = &self.seqs[self.cur].cst[&lid];
             (a.ptr, bb.ptr)
         };
         let row = (hd * 4) as u64;
@@ -1449,7 +1660,7 @@ impl GpuModel {
             };
             self.rope(lat, n, 1, hd, lid, at, false)?;
             self.k.fp4_qdq(&self.s, lat.ptr, n * hd, 16, true)?;
-            self.copy(self.ckv[&lid].ptr, lat.ptr, n * hd)?;
+            self.copy(self.seqs[self.cur].ckv[&lid].ptr, lat.ptr, n * hd)?;
         }
         Ok((self.sh_ckv, kc))
     }
@@ -1476,7 +1687,7 @@ impl GpuModel {
             };
             self.rope(k, n, 1, ihd, lid, at, false)?;
             self.k.fp4_qdq(&self.s, k.ptr, n * ihd, 32, false)?;
-            self.copy(self.idxk[&lid].ptr, k.ptr, n * ihd)?;
+            self.copy(self.seqs[self.cur].idxk[&lid].ptr, k.ptr, n * ihd)?;
         }
         if owns {
             self.sh_idxk = lid;
@@ -1493,7 +1704,7 @@ impl GpuModel {
         let wts = self.index_weights(p, x, t)?;
         let score = self.fbuf(t * width)?;
         let (ti, wi, nhi, ihdi) = (t as i32, width as i32, nh as i32, ihd as i32);
-        let ik = self.idxk[&self.sh_idxk].ptr;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
         unsafe {
             self.k.go(
                 "ds_index_score",
@@ -1636,7 +1847,7 @@ impl GpuModel {
                 };
                 self.rope(lat, 1, 1, hd, lid, at, false)?;
                 self.k.fp4_qdq(&self.s, lat.ptr, hd, 16, true)?;
-                self.row_write(self.ckv[&lid].ptr, lat, hd, e, r)?;
+                self.row_write(self.seqs[self.cur].ckv[&lid].ptr, lat, hd, e, r)?;
             }
         }
         if let Some(tk) = tk {
@@ -1688,7 +1899,7 @@ impl GpuModel {
             let kv = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
             let sc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
             let (kst, sst) = {
-                let (a, bb) = &self.cst[&lid];
+                let (a, bb) = &self.seqs[self.cur].cst[&lid];
                 (b(a), b(bb))
             };
             let lat = self.fbuf(t * hd)?;
@@ -1729,12 +1940,12 @@ impl GpuModel {
             Some(k) => (
                 self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
                 k.ptr,
-                self.idxk[&lid].ptr,
+                self.seqs[self.cur].idxk[&lid].ptr,
             ),
             None => (self.dw(&norm)?.v, 0, 0),
         };
         let (hdi, ihdi, rdi, ri, ti) = (hd as i32, ihd as i32, rd as i32, r as i32, t as i32);
-        let (ckv, tab) = (self.ckv[&lid].ptr, self.tabs[lid].ptr);
+        let (ckv, tab) = (self.seqs[self.cur].ckv[&lid].ptr, self.tabs[lid].ptr);
         unsafe {
             self.k.go(
                 "ds_comp_post",
@@ -1761,7 +1972,7 @@ impl GpuModel {
         let kv = self.raw(xe.ptr, 1, &format!("{p}.attn.compressor.wkv.weight"))?;
         let sc = self.raw(xe.ptr, 1, &format!("{p}.attn.compressor.wgate.weight"))?;
         let (kst, sst) = {
-            let (a, bb) = &self.cst[&lid];
+            let (a, bb) = &self.seqs[self.cur].cst[&lid];
             (b(a), b(bb))
         };
         self.ring_write(kst, kv, 1, hd, r, e)?;
@@ -1790,7 +2001,7 @@ impl GpuModel {
         };
         self.rope(k, 1, 1, ihd, lid, at, false)?;
         self.k.fp4_qdq(&self.s, k.ptr, ihd, 32, false)?;
-        self.row_write(self.idxk[&lid].ptr, k, ihd, e, r)
+        self.row_write(self.seqs[self.cur].idxk[&lid].ptr, k, ihd, e, r)
     }
 
     /// The step's `t` indexer queries, scores and top-k rows into `out` [t][index_topk] (see
@@ -1821,7 +2032,7 @@ impl GpuModel {
         self.k.fp4_qdq(&self.s, q.ptr, t * nh * ihd, 32, false)?;
         let wts = self.index_weights(p, x, t)?;
         let score = self.fbuf(t * wmax)?;
-        let ik = self.idxk[&self.sh_idxk].ptr;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
         let (pp, ri, nhi, ihdi, wi) = (self.p.ptr, r as i32, nh as i32, ihd as i32, wmax as i32);
         let (sg, ty) = (blocks(wmax * 32, 256), t as u32);
         unsafe {
@@ -2804,7 +3015,11 @@ impl GpuModel {
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
         let d = self.cpu.cfg.dim;
-        if std::env::var_os("DS_TAP").is_none() && d % 32 == 0 && self.cpu.cfg.hc_mult <= 8 {
+        if std::env::var_os("DS_TAP").is_none()
+            && d % 32 == 0
+            && self.cpu.cfg.hc_mult <= 8
+            && self.segs.is_none()
+        {
             return self.block_fused(p, lid, x, t, sp, pre_mix, attn);
         }
         let s = self.span("hc");
@@ -2816,6 +3031,7 @@ impl GpuModel {
         self.end(s);
         let s = self.span("attn");
         let h = match attn {
+            Attn::Main if self.segs.is_some() => self.attention_rows(p, lid, h, t)?,
             Attn::Main => self.attention(p, lid, h, t, sp)?,
             Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
         };
@@ -3167,10 +3383,17 @@ impl GpuModel {
                     .collect::<Vec<_>>(),
             );
         }
+        anyhow::ensure!(
+            sp + t <= self.seq_cap(),
+            "slot {}: positions {sp}..{} past its cap {}",
+            self.cur,
+            sp + t,
+            self.seq_cap()
+        );
         let inp = self.inputs(ids, sp, hashes.as_deref())?;
         // host code of a decode step never sees the position (see `DYN`)
         let bsp = if sp == 0 { 0 } else { DYN };
-        let key = (t, all);
+        let key = (t, all, self.cur);
         let gen = self.gen();
         if std::env::var_os("DS_GRAPH_DEBUG").is_some() {
             eprintln!("step t={t} sp={sp} gen={gen:?} {:?}", self.graph_stats);
@@ -3499,7 +3722,7 @@ impl GpuModel {
                 args![idx.ptr, bi, ni, pp, ai, wi],
             )?
         };
-        let ring = b(&self.win[lid]);
+        let ring = b(&self.seqs[self.cur].win[lid]);
         self.ring_write(ring, mkv, t, hd, win, 0)?;
         let all = self.fbuf((win + bl) * hd)?;
         self.copy(all.ptr, ring.ptr, win * hd)?;
@@ -3677,6 +3900,7 @@ impl GpuModel {
         let key = (
             t + if dev_main { 1 << 20 } else { 0 },
             samp.map(|(a, b)| (a.to_bits(), b.to_bits())),
+            self.cur,
         );
         if samp.is_some() && self.spec_dev.is_none() {
             self.spec_dev = Some(SpecDev::new(blk, v)?);
@@ -3871,7 +4095,7 @@ impl GpuModel {
                 .map(|_| z(c.window_size * hd))
                 .collect::<Result<_>>()?;
             let mut cst = HashMap::new();
-            for &l in self.cst.keys() {
+            for &l in self.seqs[self.cur].cst.keys() {
                 let n = c.compress_ratios[l] * hd;
                 cst.insert(l, (z(n)?, z(n)?));
             }
@@ -3884,12 +4108,12 @@ impl GpuModel {
         );
         let mut cl = Vec::new();
         for (l, dst) in sw.iter().enumerate() {
-            cl.push((dst.ptr, self.win[l].ptr, c.window_size * hd));
+            cl.push((dst.ptr, self.seqs[self.cur].win[l].ptr, c.window_size * hd));
         }
         for (l, (a, bb)) in &sc {
             let n = c.compress_ratios[*l] * hd;
-            cl.push((a.ptr, self.cst[l].0.ptr, n));
-            cl.push((bb.ptr, self.cst[l].1.ptr, n));
+            cl.push((a.ptr, self.seqs[self.cur].cst[l].0.ptr, n));
+            cl.push((bb.ptr, self.seqs[self.cur].cst[l].1.ptr, n));
         }
         self.copy_many(0, &[&cl])?;
         self.journal_on = true;
@@ -3912,12 +4136,15 @@ impl GpuModel {
         for (l, old) in snap.win.iter().enumerate() {
             for pos in from..end.min(from + win) {
                 let o = ((pos % win) * hd * 4) as u64;
-                first.push((self.win[l].ptr + o, old.ptr + o, hd));
+                first.push((self.seqs[self.cur].win[l].ptr + o, old.ptr + o, hd));
             }
         }
         for (l, (a, bb)) in &snap.cst {
             let n = c.compress_ratios[*l] * hd;
-            let (ka, kb) = (self.cst[l].0.ptr, self.cst[l].1.ptr);
+            let (ka, kb) = (
+                self.seqs[self.cur].cst[l].0.ptr,
+                self.seqs[self.cur].cst[l].1.ptr,
+            );
             first.push((ka, a.ptr, n));
             first.push((kb, bb.ptr, n));
         }
@@ -3927,7 +4154,10 @@ impl GpuModel {
         for (lid, pos, kv, sc) in &journal {
             if *pos < from {
                 let o = ((pos % c.compress_ratios[*lid]) * hd * 4) as u64;
-                let (ka, kb) = (self.cst[lid].0.ptr, self.cst[lid].1.ptr);
+                let (ka, kb) = (
+                    self.seqs[self.cur].cst[lid].0.ptr,
+                    self.seqs[self.cur].cst[lid].1.ptr,
+                );
                 let k = seen.entry(ka + o).or_insert(0);
                 if reps.len() <= *k {
                     reps.push(Vec::new());
@@ -4549,6 +4779,154 @@ mod tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect()
+    }
+
+    /// Per-slot sequence state: three sequences interleaved step by step on one model (slot
+    /// switches between every forward, graphs on) give each lone sequence's logits bit for
+    /// bit, including a slot whose caches are smaller than slot 0's.
+    #[test]
+    fn gpu_tiny_slots_interleaved_exact() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        let mut a = GpuModel::open(&dir).unwrap();
+        let v = a.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = vec![
+            ids.clone(),
+            (0..ids.len() + 3).map(|i| (37 * i + 11) % v).collect(),
+            ids[2..].to_vec(),
+        ];
+        let steps = 12;
+        // the lone runs: prefill then greedy decode
+        let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+        for p in &prompts {
+            a.reset().unwrap();
+            let (mut l, _) = a.forward(p, 0, None).unwrap();
+            let mut w = vec![l.clone()];
+            for i in 0..steps {
+                l = a.forward(&[argmax(&l)], p.len() + i, None).unwrap().0;
+                w.push(l.clone());
+            }
+            want.push(w);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(3, cap).unwrap();
+        assert_eq!(m.n_slots(), 3);
+        let mut last: Vec<Vec<f32>> = vec![Vec::new(); 3];
+        for (k, p) in prompts.iter().enumerate().rev() {
+            m.select_slot(k).unwrap();
+            last[k] = m.forward(p, 0, None).unwrap().0;
+            assert_eq!(last[k], want[k][0], "slot {k} prefill");
+        }
+        for i in 0..steps {
+            for k in [1, 0, 2] {
+                m.select_slot(k).unwrap();
+                let tok = argmax(&last[k]);
+                last[k] = m.forward(&[tok], prompts[k].len() + i, None).unwrap().0;
+                assert_eq!(last[k], want[k][i + 1], "slot {k} step {i}");
+            }
+        }
+        // a reset clears only the selected slot
+        m.select_slot(1).unwrap();
+        m.reset().unwrap();
+        let l = m.forward(&prompts[1], 0, None).unwrap().0;
+        assert_eq!(l, want[1][0], "slot 1 after reset");
+        m.select_slot(2).unwrap();
+        let tok = argmax(&last[2]);
+        let (l, _) = m.forward(&[tok], prompts[2].len() + steps, None).unwrap();
+        a = GpuModel::open(&dir).unwrap();
+        let (mut r, _) = a.forward(&prompts[2], 0, None).unwrap();
+        for i in 0..=steps {
+            r = a
+                .forward(&[argmax(&r)], prompts[2].len() + i, None)
+                .unwrap()
+                .0;
+        }
+        assert_eq!(l, r, "slot 2 untouched by slot 1's reset");
+        assert!(m.select_slot(3).is_err());
+    }
+
+    /// Batched decode over slots ([`GpuModel::forward_rows`]): 10 sequences with different
+    /// prompts (t = 10 rows: past the grouped MoE's 8-row cap), rows in a different slot
+    /// order each step, give each lone sequence's greedy ids; a lone forward on a slot
+    /// afterwards still continues it exactly.
+    #[test]
+    fn gpu_tiny_rows_match_lone() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        let mut a = GpuModel::open(&dir).unwrap();
+        let v = a.cpu.cfg.vocab_size;
+        let ns = 10;
+        let prompts: Vec<Vec<usize>> = (0..ns)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - (k % 3);
+                    p[j] = (p[j] + 7919 * k) % v;
+                    p.truncate(p.len() - k % 2);
+                }
+                p
+            })
+            .collect();
+        let steps = 10;
+        let mut want: Vec<Vec<usize>> = Vec::new();
+        for p in &prompts {
+            a.reset().unwrap();
+            let (mut l, _) = a.forward(p, 0, None).unwrap();
+            let mut w = vec![argmax(&l)];
+            for i in 0..=steps {
+                l = a
+                    .forward(&[*w.last().unwrap()], p.len() + i, None)
+                    .unwrap()
+                    .0;
+                w.push(argmax(&l));
+            }
+            want.push(w);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(ns, cap).unwrap();
+        let mut gen: Vec<Vec<usize>> = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            m.select_slot(k).unwrap();
+            let (l, _) = m.forward(p, 0, None).unwrap();
+            gen.push(vec![argmax(&l)]);
+        }
+        m.select_slot(0).unwrap();
+        let mut mism = 0;
+        for i in 0..steps {
+            let mut order: Vec<usize> = (0..ns).collect();
+            order.rotate_left(i % ns);
+            if i % 2 == 1 {
+                order.reverse();
+            }
+            let rows: Vec<(usize, usize, usize)> = order
+                .iter()
+                .map(|&k| (k, *gen[k].last().unwrap(), prompts[k].len() + i))
+                .collect();
+            let next = m.forward_rows(&rows).unwrap();
+            for (j, &k) in order.iter().enumerate() {
+                gen[k].push(next[j]);
+            }
+        }
+        for k in 0..ns {
+            let ok = gen[k][..] == want[k][..=steps];
+            mism += (!ok) as usize;
+            eprintln!("slot {k}: rows {:?} lone {:?}", gen[k], &want[k][..=steps]);
+        }
+        assert_eq!(mism, 0, "{mism} slots differ from their lone run");
+        // a lone forward continues a slot after the rows steps
+        for k in [3, 0] {
+            m.select_slot(k).unwrap();
+            let (l, _) = m
+                .forward(&[gen[k][steps]], prompts[k].len() + steps, None)
+                .unwrap();
+            assert_eq!(argmax(&l), want[k][steps + 1], "slot {k} after rows");
+        }
     }
 
     /// As forward.rs `tiny_chunk_and_rewind_exact`, on the device.

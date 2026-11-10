@@ -135,7 +135,7 @@ impl GpuModel {
         let sc = self.dw(&format!("{p}.hc_attn_scale"))?.v.w;
         let base = self.dw(&format!("{p}.hc_attn_base"))?.v.w;
         let ql = wqa.rows as usize;
-        let ring = b(&self.win[lid]);
+        let ring = b(&self.seqs[self.cur].win[lid]);
         let (qr, kv) = (self.fbuf(t * ql)?, self.fbuf(t * hd)?);
         let (kv0, split, mode, all, ncopy) = if t > 1 {
             let all = self.fbuf((win + t) * hd)?;
