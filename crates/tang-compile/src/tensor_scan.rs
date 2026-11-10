@@ -200,6 +200,7 @@ impl TensorGraph {
             frag_cfg: [0; 4],
             segment: None,
             sorted: false,
+            detach: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
