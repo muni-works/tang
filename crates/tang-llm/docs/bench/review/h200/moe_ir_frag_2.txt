@@ -1,0 +1,66 @@
+interpreter (emulated int8) vs reference, Dims { t: 3, d: 256, e: 6, k: 2, f: 256 }: top-k match true, gu max rel 5.44e-7, y max rel 2.71e-7
+backend: Cuda — NVIDIA H200 (CUDA sm_90a)
+
+B=1 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 2.07e-7, dn 1.35e-7, y 1.43e-7
+  k 0   0.0087 ms warm    0.0134 ms cold  router
+  k 1   0.0437 ms warm    0.0132 ms cold  
+  k 2   0.0060 ms warm    0.0051 ms cold  
+  k 3   0.0067 ms warm    0.0056 ms cold  
+  k 4   0.0049 ms warm    0.0050 ms cold  
+  k 5   0.0049 ms warm    0.0049 ms cold  
+  k 6   0.0046 ms warm    0.0050 ms cold  
+  k 7   0.0050 ms warm    0.0045 ms cold  
+  k 8   0.0050 ms warm    0.0054 ms cold  x → Q8x32
+  k 9   0.0157 ms warm    0.0189 ms cold  gate|up
+  k10   0.0053 ms warm    0.0060 ms cold  SwiGLU → Q8x32
+  k11   0.0121 ms warm    0.0139 ms cold  down
+  k12   0.0056 ms warm    0.0061 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0437 warm / 0.0503 cold ms; all 13 kernels 0.1283 / 0.1070
+
+B=4 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 2.05e-7, dn 2.41e-7, y 2.27e-7
+  k 0   0.0087 ms warm    0.0094 ms cold  router
+  k 1   0.0436 ms warm    0.0134 ms cold  
+  k 2   0.0048 ms warm    0.0049 ms cold  
+  k 3   0.0068 ms warm    0.0055 ms cold  
+  k 4   0.0048 ms warm    0.0048 ms cold  
+  k 5   0.0050 ms warm    0.0049 ms cold  
+  k 6   0.0058 ms warm    0.0061 ms cold  
+  k 7   0.0051 ms warm    0.0052 ms cold  
+  k 8   0.0049 ms warm    0.0055 ms cold  x → Q8x32
+  k 9   0.0300 ms warm    0.0395 ms cold  gate|up
+  k10   0.0056 ms warm    0.0061 ms cold  SwiGLU → Q8x32
+  k11   0.0200 ms warm    0.0263 ms cold  down
+  k12   0.0060 ms warm    0.0063 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0665 warm / 0.0837 cold ms; all 13 kernels 0.1510 / 0.1379
+
+B=8 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 1.96e-7, dn 2.54e-7, y 2.59e-7
+  k 0   0.0107 ms warm    0.0116 ms cold  router
+  k 1   0.0436 ms warm    0.0134 ms cold  
+  k 2   0.0060 ms warm    0.0051 ms cold  
+  k 3   0.0070 ms warm    0.0058 ms cold  
+  k 4   0.0049 ms warm    0.0051 ms cold  
+  k 5   0.0050 ms warm    0.0053 ms cold  
+  k 6   0.0070 ms warm    0.0083 ms cold  
+  k 7   0.0062 ms warm    0.0078 ms cold  
+  k 8   0.0052 ms warm    0.0055 ms cold  x → Q8x32
+  k 9   0.0462 ms warm    0.0555 ms cold  gate|up
+  k10   0.0057 ms warm    0.0063 ms cold  SwiGLU → Q8x32
+  k11   0.0279 ms warm    0.0325 ms cold  down
+  k12   0.0055 ms warm    0.0066 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0905 warm / 0.1063 cold ms; all 13 kernels 0.1809 / 0.1685
+
+B=64 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 2.46e-7, dn 2.78e-7, y 2.16e-7
+  k 0   0.0407 ms warm    0.0415 ms cold  router
+  k 1   0.0437 ms warm    0.0137 ms cold  
+  k 2   0.0060 ms warm    0.0052 ms cold  
+  k 3   0.0070 ms warm    0.0059 ms cold  
+  k 4   0.0048 ms warm    0.0051 ms cold  
+  k 5   0.0113 ms warm    0.0113 ms cold  
+  k 6   0.0233 ms warm    0.0315 ms cold  
+  k 7   0.0204 ms warm    0.0282 ms cold  
+  k 8   0.0055 ms warm    0.0059 ms cold  x → Q8x32
+  k 9   0.1660 ms warm    0.1726 ms cold  gate|up
+  k10   0.0069 ms warm    0.0084 ms cold  SwiGLU → Q8x32
+  k11   0.0964 ms warm    0.1004 ms cold  down
+  k12   0.0065 ms warm    0.0083 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.2813 warm / 0.2956 cold ms; all 13 kernels 0.4386 / 0.4380

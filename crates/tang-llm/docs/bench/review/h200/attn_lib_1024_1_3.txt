@@ -1,0 +1,6 @@
+sdpa fwd bh=128 n=1024 d=256 causal=True: 0.274 ms 250.4 TFLOP/s rel_err 2.54e-03
+sdpa bwd bh=128 n=1024 d=256 causal=True: 1.142 ms 150.5 TFLOP/s rel_err dq 3.66e-03 dk 3.42e-03 dv 2.75e-03
+# fa3 from flash_attn_interface
+fa3 fwd bh=128 n=1024 d=256 causal=True: 0.137 ms 501.2 TFLOP/s rel_err 2.54e-03
+fa3 bwd bh=128 n=1024 d=256 causal=True: 0.573 ms 299.6 TFLOP/s rel_err dq 3.66e-03 dk 3.42e-03 dv 2.75e-03
+fa3-fp8 fwd bh=128 n=1024 d=256 causal=True: unavailable (RuntimeError: This flash attention build does not support FP8.)

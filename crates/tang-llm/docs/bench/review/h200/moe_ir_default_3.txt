@@ -1,0 +1,66 @@
+interpreter (emulated int8) vs reference, Dims { t: 3, d: 256, e: 6, k: 2, f: 256 }: top-k match true, gu max rel 5.44e-7, y max rel 2.71e-7
+backend: Cuda — NVIDIA H200 (CUDA sm_90a)
+
+B=1 Gemv ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 1.07e-7, dn 1.24e-7, y 1.33e-7
+  k 0   0.0090 ms warm    0.0133 ms cold  router
+  k 1   0.0438 ms warm    0.0132 ms cold  
+  k 2   0.0061 ms warm    0.0051 ms cold  
+  k 3   0.0069 ms warm    0.0056 ms cold  
+  k 4   0.0046 ms warm    0.0049 ms cold  
+  k 5   0.0050 ms warm    0.0049 ms cold  
+  k 6   0.0052 ms warm    0.0051 ms cold  
+  k 7   0.0051 ms warm    0.0045 ms cold  
+  k 8   0.0172 ms warm    0.0177 ms cold  gate|up
+  k 9   0.0090 ms warm    0.0118 ms cold  down
+  k10   0.0056 ms warm    0.0061 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0318 warm / 0.0356 cold ms; all 11 kernels 0.1174 / 0.0920
+  wrote /workspace/moedump/b1
+
+B=4 Gemv ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 9.84e-8, dn 1.22e-7, y 1.40e-7
+  k 0   0.0088 ms warm    0.0095 ms cold  router
+  k 1   0.0437 ms warm    0.0133 ms cold  
+  k 2   0.0060 ms warm    0.0049 ms cold  
+  k 3   0.0061 ms warm    0.0055 ms cold  
+  k 4   0.0050 ms warm    0.0049 ms cold  
+  k 5   0.0050 ms warm    0.0049 ms cold  
+  k 6   0.0060 ms warm    0.0061 ms cold  
+  k 7   0.0065 ms warm    0.0052 ms cold  
+  k 8   0.0421 ms warm    0.0463 ms cold  gate|up
+  k 9   0.0158 ms warm    0.0237 ms cold  down
+  k10   0.0056 ms warm    0.0063 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0636 warm / 0.0763 cold ms; all 11 kernels 0.1508 / 0.1306
+  wrote /workspace/moedump/b4
+
+B=8 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 1.96e-7, dn 2.54e-7, y 2.59e-7
+  k 0   0.0106 ms warm    0.0115 ms cold  router
+  k 1   0.0439 ms warm    0.0134 ms cold  
+  k 2   0.0062 ms warm    0.0051 ms cold  
+  k 3   0.0071 ms warm    0.0057 ms cold  
+  k 4   0.0050 ms warm    0.0051 ms cold  
+  k 5   0.0052 ms warm    0.0053 ms cold  
+  k 6   0.0071 ms warm    0.0082 ms cold  
+  k 7   0.0065 ms warm    0.0078 ms cold  
+  k 8   0.0053 ms warm    0.0055 ms cold  x → Q8x32
+  k 9   0.0460 ms warm    0.0555 ms cold  gate|up
+  k10   0.0056 ms warm    0.0063 ms cold  SwiGLU → Q8x32
+  k11   0.0282 ms warm    0.0324 ms cold  down
+  k12   0.0058 ms warm    0.0065 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.0909 warm / 0.1061 cold ms; all 13 kernels 0.1826 / 0.1682
+  wrote /workspace/moedump/b8
+
+B=64 Fragment ksplit (2, 1): top-k vs f64 routing of the GPU logits true; gpu vs reference max rel: gu 2.46e-7, dn 2.78e-7, y 2.16e-7
+  k 0   0.0408 ms warm    0.0413 ms cold  router
+  k 1   0.0436 ms warm    0.0136 ms cold  
+  k 2   0.0062 ms warm    0.0052 ms cold  
+  k 3   0.0071 ms warm    0.0059 ms cold  
+  k 4   0.0050 ms warm    0.0050 ms cold  
+  k 5   0.0112 ms warm    0.0113 ms cold  
+  k 6   0.0237 ms warm    0.0316 ms cold  
+  k 7   0.0203 ms warm    0.0284 ms cold  
+  k 8   0.0057 ms warm    0.0059 ms cold  x → Q8x32
+  k 9   0.1657 ms warm    0.1730 ms cold  gate|up
+  k10   0.0071 ms warm    0.0084 ms cold  SwiGLU → Q8x32
+  k11   0.0959 ms warm    0.1002 ms cold  down
+  k12   0.0066 ms warm    0.0083 ms cold  combine
+  expert half (x→Q8x32, gate|up, SwiGLU, down, combine): 0.2811 warm / 0.2957 cold ms; all 13 kernels 0.4392 / 0.4380
+  wrote /workspace/moedump/b64

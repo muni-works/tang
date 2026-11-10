@@ -1,0 +1,2 @@
+  tuned: 1 of 1 native kernels kept
+tang fwd bh=8 n=16384 d=256 causal=false: 5.174 ms 425.0 TFLOP/s rel_err 3.37e-3 (1 kernels)

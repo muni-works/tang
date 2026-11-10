@@ -1,0 +1,4 @@
+  tuned: 1 of 1 native kernels kept
+tang fwd bh=128 n=1024 d=256 causal=true: 0.315 ms 217.9 TFLOP/s rel_err 2.54e-3 (1 kernels)
+  tuned: 2 of 2 native kernels kept
+tang fwd+bwd-program bh=128 n=1024 d=256 causal=true: 2.980 ms bwd-equiv 57.6 TFLOP/s rel_err dq 2.54e-3 dk 3.22e-3 dv 2.75e-3 (9 kernels)

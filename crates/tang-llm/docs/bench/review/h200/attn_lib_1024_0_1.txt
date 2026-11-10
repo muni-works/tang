@@ -1,0 +1,19 @@
+sdpa fwd bh=128 n=1024 d=256 causal=False: 0.451 ms 304.9 TFLOP/s rel_err 2.80e-03
+sdpa bwd bh=128 n=1024 d=256 causal=False: 1.741 ms 197.3 TFLOP/s rel_err dq 4.14e-03 dk 4.29e-03 dv 3.84e-03
+Traceback (most recent call last):
+  File "/workspace/tang/scripts/hopper_attention.py", line 79, in load_fa3
+    import flash_attn_interface as fa3
+ModuleNotFoundError: No module named 'flash_attn_interface'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/tang/scripts/hopper_attention.py", line 240, in <module>
+    bench(sys.argv[2])
+  File "/workspace/tang/scripts/hopper_attention.py", line 131, in bench
+    fa3, src = load_fa3()
+               ^^^^^^^^^^
+  File "/workspace/tang/scripts/hopper_attention.py", line 83, in load_fa3
+    from kernels import get_kernel
+ModuleNotFoundError: No module named 'kernels'
+exit 1
