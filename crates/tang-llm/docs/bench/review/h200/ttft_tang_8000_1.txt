@@ -1,0 +1,16 @@
+coder: 8 of 48 layers in VRAM (21 s)
+coder: 16 of 48 layers in VRAM (42 s)
+coder: 24 of 48 layers in VRAM (63 s)
+coder: 32 of 48 layers in VRAM (84 s)
+coder: 40 of 48 layers in VRAM (105 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (126 s)
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.5 GB VRAM (46.9 GB experts), weights 127 s, kernels 136 s, total 264 s
+coder: 127 sequence slots fit (0.18 GB each, 100.0 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (64/64, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 9723904 entries
+batch-check: PASS (bitwise) (logits checksum 1c421f0bc36b005b)
+batch 1: prefilled to ~8000 tokens in 2.1 s
+batch 1: 4.32 ms a step, 231 tok/s aggregate, 231 tok/s a stream (context ~8000)
