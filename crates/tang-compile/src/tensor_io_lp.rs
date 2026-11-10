@@ -298,6 +298,8 @@ pub struct Machine {
     pub clock: f64,
     /// Hardware limit on resident workgroups per SM.
     pub max_blocks_per_sm: usize,
+    /// Shared / threadgroup memory per SM, words (spec sheet).
+    pub smem_words_per_sm: f64,
 }
 
 impl Machine {
@@ -318,6 +320,7 @@ impl Machine {
         mem_latency: 470e-9,
         clock: 1.695e9,
         max_blocks_per_sm: 32,
+        smem_words_per_sm: 25600.0,
     };
     /// H200 SXM: 4.8 TB/s HBM3e, 132 SMs × 2048 threads × 64K registers,
     /// ~600 ns DRAM latency (assumed), ~1 µs smallest kernel inside a CUDA
@@ -335,6 +338,7 @@ impl Machine {
         mem_latency: 340e-9,
         clock: 1.98e9,
         max_blocks_per_sm: 256,
+        smem_words_per_sm: 58368.0,
     };
     /// Apple M4 (10-core GPU): 32 KB threadgroup, 120 GB/s, ~4.3 TFLOP/s
     /// f32, ~10 µs per dispatch through wgpu.
@@ -351,6 +355,7 @@ impl Machine {
         mem_latency: 400e-9,
         clock: 1.5e9,
         max_blocks_per_sm: 1024,
+        smem_words_per_sm: 8192.0,
     };
 
     /// Bytes that must be in flight to sustain peak bandwidth.
@@ -372,6 +377,8 @@ pub struct Occupancy {
     /// Bytes one thread has outstanding at once (independent loads issued
     /// before the first is consumed × their width).
     pub inflight_per_thread: f64,
+    /// Shared / threadgroup words per workgroup (0 = none).
+    pub smem_words: f64,
 }
 
 impl Occupancy {
@@ -380,7 +387,15 @@ impl Occupancy {
     pub fn resident_threads(&self, m: &Machine) -> usize {
         let by_threads = m.threads_per_sm / self.block.max(1);
         let by_regs = m.regs_per_sm / (self.regs.max(1) * self.block.max(1));
-        let per_sm = by_threads.min(by_regs).clamp(1, m.max_blocks_per_sm);
+        let by_smem = if self.smem_words > 0.0 {
+            (m.smem_words_per_sm / self.smem_words) as usize
+        } else {
+            usize::MAX
+        };
+        let per_sm = by_threads
+            .min(by_regs)
+            .min(by_smem)
+            .clamp(1, m.max_blocks_per_sm);
         self.grid.min(m.sms * per_sm) * self.block
     }
     pub fn inflight_bytes(&self, m: &Machine) -> f64 {
@@ -441,6 +456,8 @@ pub struct StepKernel {
     pub grid: usize,
     pub block: usize,
     pub regs: usize,
+    /// Shared / threadgroup words per workgroup (0 = none).
+    pub smem_words: f64,
     /// Issue cost of the lowered kernel (zero = not counted).
     pub issue: IssueCost,
 }
@@ -501,6 +518,7 @@ impl StepKernel {
             block: self.block,
             regs: self.regs,
             inflight_per_thread: 0.0,
+            smem_words: self.smem_words,
         };
         self.grid as f64 / (occ.resident_threads(m) / self.block.max(1)) as f64
     }
@@ -866,6 +884,7 @@ mod tests {
             grid: 64,
             block: 256,
             regs: 32,
+            smem_words: 0.0,
             issue: IssueCost::default(),
         };
         let (t, why) = g.floor(&m);
@@ -891,6 +910,7 @@ mod tests {
             grid: 7680,
             block: 256,
             regs: 64,
+            smem_words: 0.0,
             issue: IssueCost::default(),
         };
         assert_eq!(big.floor(&m).1, "stream");
@@ -907,6 +927,7 @@ mod tests {
             grid: 9496,
             block: 256,
             regs: 36,
+            smem_words: 0.0,
             issue: IssueCost::default(),
         };
         assert_eq!(k.floor(&Machine::H200).1, "stream");
@@ -926,6 +947,7 @@ mod tests {
             grid: 320,
             block: 256,
             regs: 40,
+            smem_words: 0.0,
             inflight_per_thread: 16.0,
         };
         assert_eq!(occ.resident_threads(&m), 320 * 256);

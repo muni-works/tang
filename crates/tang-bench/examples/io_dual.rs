@@ -134,7 +134,53 @@ fn tune(g: &TensorGraph, outs: &[TensorId]) -> Option<TensorGraph> {
 /// `RACE=1`: time every candidate of the main kernel's schedule space on
 /// this GPU (whole program, best of 5×20 runs) and print the best time per
 /// LP tile, so the dual tiles can be compared with what wins on hardware.
-fn race(g: &TensorGraph, outs: &[TensorId], lp: &Lp, nest: bool, names: &[String]) {
+/// Launch shape of the lowered main kernel: (grid, block, regs/thread,
+/// smem words). Registers are counted from the source: `REG_BASE` for
+/// indices and addresses (assumed, not measured) plus every
+/// function-scope `var` word (accumulator arrays count their length).
+fn launch_shape(src: &str, count: u32, block: u32) -> (usize, usize, usize, f64) {
+    const REG_BASE: usize = 24;
+    let words = |t: &str| -> f64 {
+        t.split(|c: char| !c.is_ascii_digit())
+            .filter_map(|n| n.parse::<f64>().ok())
+            .filter(|&n| n > 0.0 && t.contains("array"))
+            .product::<f64>()
+            .max(1.0)
+    };
+    let mut smem = 0.0;
+    let mut regs = REG_BASE as f64;
+    for l in src.lines().map(str::trim) {
+        if let Some(r) = l.strip_prefix("var<workgroup>") {
+            let ty = r.split_once(':').map(|x| x.1).unwrap_or("");
+            // drop the f32/f16 width digits before multiplying
+            smem += words(&ty.replace("f32", "").replace("f16", "").replace("u32", ""));
+        } else if let Some(r) = l.strip_prefix("var ") {
+            let ty = r.split_once(':').map(|x| x.1).unwrap_or("");
+            if ty.contains("array") {
+                regs += words(&ty.replace("f32", "").replace("u32", ""));
+            } else {
+                regs += 1.0;
+            }
+        }
+    }
+    let block = block.max(1) as usize;
+    (
+        (count as usize).div_ceil(block),
+        block,
+        (regs as usize).min(255),
+        smem,
+    )
+}
+
+fn race(
+    g: &TensorGraph,
+    outs: &[TensorId],
+    lp: &Lp,
+    nest: bool,
+    names: &[String],
+    flops: f64,
+    m: &Machine,
+) {
     if std::env::var("RACE").is_err() {
         return;
     }
@@ -161,10 +207,20 @@ fn race(g: &TensorGraph, outs: &[TensorId], lp: &Lp, nest: bool, names: &[String
     let ins: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
     let k = main_kernel(g, outs);
     let space = Space::standard();
-    let mut best: Vec<(Vec<usize>, f64, String)> = Vec::new();
+    // (tile, measured ms, encoding, floor s, binding term)
+    let mut best: Vec<(Vec<usize>, f64, String, f64, &'static str, String)> = Vec::new();
     for c in space.candidates(g, k) {
         let mut gc = g.clone();
         space.apply(&mut gc, k, &c);
+        let kk = main_kernel(&gc, outs);
+        let low = rt.lower(&gc, outs);
+        let Some(lk) = low.kernels.iter().find(|x| x.node == kk) else {
+            continue;
+        };
+        if std::env::var("DUMP").is_ok() {
+            eprintln!("--- {}\n{}", c.encode(&space), lk.source);
+        }
+        let (grid, block, regs, smem) = launch_shape(&lk.source, lk.count, lk.workgroup_size);
         let Ok(prog) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Program::compile(&rt, &gc, outs, &ins)
         })) else {
@@ -174,17 +230,53 @@ fn race(g: &TensorGraph, outs: &[TensorId], lp: &Lp, nest: bool, names: &[String
         else {
             continue;
         };
-        let (t, _, _) = tang_tile(&gc, outs, main_kernel(&gc, outs), lp, nest);
-        match best.iter_mut().find(|b| b.0 == t) {
-            Some(b) if b.1 <= ms => {}
-            Some(b) => *b = (t, ms, c.encode(&space)),
-            None => best.push((t, ms, c.encode(&space))),
-        }
+        let (t, _, _) = tang_tile(&gc, outs, kk, lp, nest);
+        let sk = tang_compile::tensor::io_lp::StepKernel {
+            bytes: tiled_traffic(lp, &t) * 4.0,
+            flops,
+            grid,
+            block,
+            regs,
+            smem_words: smem,
+            issue: Default::default(),
+        };
+        let (fl, why) = sk.floor(m);
+        // keep every candidate: the model ranks schedules, not LP tiles
+        best.push((t, ms, c.encode(&space), fl, why, format!("grid {grid} block {block} regs {regs} smem {smem} waves {:.1}", sk.waves(m))));
+    }
+    let n0 = best.len();
+    // below the floor = a wrong kernel (RACE does not check outputs)
+    best.retain(|b| b.1.is_finite() && b.1 * 1e-3 >= b.3);
+    if best.len() < n0 {
+        println!("  race: dropped {} candidate(s) faster than their floor", n0 - best.len());
     }
     best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    for (t, ms, enc) in best.iter().take(12) {
+    // the model's pick: argmin floor, ties (within 0.1%) to lower traffic
+    let pick = (0..best.len()).min_by(|&i, &j| {
+        let (a, b) = (&best[i], &best[j]);
+        if (a.3 - b.3).abs() <= 1e-3 * a.3.min(b.3) {
+            tiled_traffic(lp, &a.0).partial_cmp(&tiled_traffic(lp, &b.0)).unwrap()
+        } else {
+            a.3.partial_cmp(&b.3).unwrap()
+        }
+    });
+    if let Some(p) = pick {
+        let b = &best[p];
         println!(
-            "  race [{}]  {:.3} ms  LP traffic {:.2} MB  ({enc})",
+            "  time-floor pick: rank {}/{}  {:.3} ms = {:.3}× winner  floor {:.3} ms ({})  ({})",
+            p + 1,
+            best.len(),
+            b.1,
+            b.1 / best[0].1,
+            b.3 * 1e3,
+            b.4,
+            b.2
+        );
+        println!("    pick: {}", b.5);
+    }
+    for (t, ms, enc, fl, why, occ) in best.iter().take(12) {
+        println!(
+            "  race [{}]  {:.3} ms  floor {:.3} ms ({why})  LP traffic {:.2} MB  [{occ}]  ({enc})",
             names
                 .iter()
                 .zip(t)
@@ -192,6 +284,7 @@ fn race(g: &TensorGraph, outs: &[TensorId], lp: &Lp, nest: bool, names: &[String
                 .collect::<Vec<_>>()
                 .join(" "),
             ms,
+            fl * 1e3,
             mb(tiled_traffic(lp, t))
         );
     }
@@ -319,7 +412,7 @@ fn report(name: &str, g: &TensorGraph, outs: &[TensorId], nest: bool, flops: f64
             ts / bound.max(1.0)
         );
     }
-    race(g, outs, &lp, nest, &names);
+    race(g, outs, &lp, nest, &names, flops, m);
     let at_bound = TimeFloor::new(m, bound * 4.0, flops, 1);
     let at_auto = TimeFloor::new(m, auto_staged * 4.0, flops, launches);
     println!(
