@@ -3942,3 +3942,21 @@ A first version re-walked the warm-up run's path, so the timed chase hit L2 (151
 - matmul 1024³: autotuned [p0=64 p1=64 r0=32], 1.95× bound.
 - attention fwd, 8 heads, N = 1024 and N = 4096, d = 64 causal: autotuned [p2=16 p3=64 r0=16], 24× bound. That is the same as `schedule_auto`; the dual tile is [p2=48 r0=48] and the 2-level dual [p2=128 p3=32 r0=32].
 - Per-tile kernel times were not measured: `io_dual` prints none.
+
+**3090 attention race** (`TUNE=3090 RACE=1 io_dual --features cuda`, PR #195 head 24eb7f7c, 2026-11-10 08:27 UTC; raw: `review/prove/io_dual_race_3090.txt`).
+- **Machine:** RunPod had no RTX 3090 in stock in any region or CUDA version, so this ran on mew under `flock ~/tang-gpu.lock`. mew's other GPU processes (listed at the top of the raw file) were idle: utilization was 1% before the run, and the 2 s samples in `io_dual_race_3090_util.txt` show 100% for our process throughout.
+- **Candidates:** the race times every candidate of the main kernel's schedule space, 12 per workload.
+
+| workload | candidates | fastest | slowest | spread | traffic range of candidates |
+|---|---|---|---|---|---|
+| matmul 1024³ | 12 | 0.100 ms [p0=64 p1=64 r0=32] | 0.101 ms | 1% | 138–541 MB |
+| matmul 4096³ | 12 (2 failed to launch: invalid argument) | 5.511 ms [p0=32 p1=16 r0=32] | 5.566 ms | 1% | 8.7–25.8 GB |
+| attention fwd 8×1024×64 causal | 12 | 0.072 ms (all) | 0.072 ms | <1% | 107–409 MB |
+| attention fwd 8×4096×64 causal | 12 | 0.663 ms [p2=16 p3=64 r0=16] | 0.678 ms | 2% | 1.6–10.8 GB |
+
+Per tile (queries p2 × keys r0, value columns p3):
+- N = 1024: 16×16 (p3=64) 0.072 ms, 64×16 (p3=32) 0.072 ms, 16×32 0.072 ms.
+- N = 4096: 16×16 (p3=64) **0.663 ms**, 64×16 (p3=16) 0.677, 64×32 (p3=32) 0.677, 16×32 (p3=32) 0.678.
+- 64×64 is not in the candidate space io_dual races.
+
+**Reading.** Candidate times differ by at most 2% while their LP traffic differs by 2.5–4×. On this CUDA path, matmul and attention lower to the native mma kernels (TF32 tile, flash on mma), and those take their block shape from the lowering, not from the thread-schedule tile being raced. So on CUDA the race measures the same kernel 12 times. It cannot test whether the dual's tile beats the autotuner's. The wgpu path (Vulkan), where the thread tile is the kernel's tile, would; it needs a 3090 with a Vulkan driver (mew has one).
