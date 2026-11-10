@@ -25,19 +25,29 @@ fn main() {
             let v = parse_variant("s", "j <= i").unwrap();
             let (g, outs) = naive_graph(&v, n, d, bwd).unwrap();
             let pl = g.place(&outs, &MemorySchedule::flash());
-            let ins = (0..if bwd { 4 } else { 3 }).map(|k| rand(n * d, 7 + k)).collect();
+            let ins = (0..if bwd { 4 } else { 3 })
+                .map(|k| rand(n * d, 7 + k))
+                .collect();
             (pl.graph, pl.outputs, ins, pl.nest)
         }
         "naive_fwd" | "ckpt_fwd" => {
             let v = parse_variant("s", "j <= i").unwrap();
             let (g, outs) = naive_graph(&v, n, d, false).unwrap();
-            let sched = if what == "naive_fwd" { MemorySchedule::naive() } else { MemorySchedule::checkpoint() };
+            let sched = if what == "naive_fwd" {
+                MemorySchedule::naive()
+            } else {
+                MemorySchedule::checkpoint()
+            };
             let pl = g.place(&outs, &sched);
             let ins = (0..3).map(|k| rand(n * d, 7 + k)).collect();
             (pl.graph, pl.outputs, ins, pl.nest)
         }
         "matmul1024" | "matmul512" => {
-            let (m, k, r) = if what == "matmul1024" { (1024, 1024, 1024) } else { (512, 576, 1536) };
+            let (m, k, r) = if what == "matmul1024" {
+                (1024, 1024, 1024)
+            } else {
+                (512, 576, 1536)
+            };
             let mut g = TensorGraph::new();
             let x = g.input(&[m, k]);
             let y = g.input(&[k, r]);
@@ -51,14 +61,24 @@ fn main() {
     let (p, _) = Program::tuned_placed(&rt, &g, &outs, &ins, nest);
     p.run(&rt);
     rt.sync();
-    println!("{what} n={n} d={d}: program {:.4} ms, {} kernels", p.time(&rt, 20), p.program.kernels.len());
+    println!(
+        "{what} n={n} d={d}: program {:.4} ms, {} kernels",
+        p.time(&rt, 20),
+        p.program.kernels.len()
+    );
     for (i, k) in p.program.kernels.iter().enumerate() {
         println!(
             "  kernel {i}: {:.4} ms count {} block {} {}",
             p.time_kernel(&rt, i, 20),
             k.count,
             k.workgroup_size,
-            k.source.lines().next().unwrap_or("").chars().take(60).collect::<String>()
+            k.source
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>()
         );
     }
     rt.sync();

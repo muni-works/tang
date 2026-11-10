@@ -431,14 +431,18 @@ fn run(dev: &Dev, dir: &Path) {
         );
         let nq = DevBuf::zeroed(t * d + t * d / 32 * 8).unwrap();
         let (c, sc) = dop::engine_q8(t, d);
-        let an = dop::Op::load(&dev.gpu, dop::add_norm(t, d, eps, true).lower().unwrap(), 5).unwrap();
+        let an =
+            dop::Op::load(&dev.gpu, dop::add_norm(t, d, eps, true).lower().unwrap(), 5).unwrap();
         let codes = dop::Op::load(&dev.gpu, c.lower().unwrap(), 2).unwrap();
         let scales = dop::Op::load(&dev.gpu, sc.lower().unwrap(), 2).unwrap();
         let ns = Stream::new().unwrap();
         let go = || {
-            an.launch(&ns, &[nr.ptr, ny.ptr, nw.ptr, no.ptr, nx.ptr]).unwrap();
+            an.launch(&ns, &[nr.ptr, ny.ptr, nw.ptr, no.ptr, nx.ptr])
+                .unwrap();
             codes.launch(&ns, &[nx.ptr, nq.ptr]).unwrap();
-            scales.launch(&ns, &[nx.ptr, nq.ptr + (t * d) as u64]).unwrap();
+            scales
+                .launch(&ns, &[nx.ptr, nq.ptr + (t * d) as u64])
+                .unwrap();
         };
         let once = || {
             let (a, b) = (Event::new(true).unwrap(), Event::new(true).unwrap());

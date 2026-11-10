@@ -56,12 +56,7 @@ fn max_rel(got: &[Vec<f32>], want: &[Vec<f64>]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-fn reference(
-    g: &TensorGraph,
-    outs: &[TensorId],
-    inputs: &[Vec<f32>],
-    tag: &str,
-) -> Vec<Vec<f64>> {
+fn reference(g: &TensorGraph, outs: &[TensorId], inputs: &[Vec<f32>], tag: &str) -> Vec<Vec<f64>> {
     let path = std::env::var("REF_DIR")
         .ok()
         .map(|d| std::path::PathBuf::from(d).join(format!("{tag}.f64")));
@@ -120,13 +115,22 @@ fn measure(
     rt.sync();
     let got: Vec<Vec<f32>> = outs.iter().map(|o| p.read(rt, *o)).collect();
     for (o, (g, w)) in got.iter().zip(want).enumerate() {
-        eprintln!("  {name} output {o}: max rel err {:.3e}", max_rel(std::slice::from_ref(g), std::slice::from_ref(w)));
+        eprintln!(
+            "  {name} output {o}: max rel err {:.3e}",
+            max_rel(std::slice::from_ref(g), std::slice::from_ref(w))
+        );
     }
     for (i, k) in p.program.kernels.iter().enumerate() {
         eprintln!(
             "  {name} kernel {i}: {:.4} ms {}",
             p.time_kernel(rt, i, iters.max(5)),
-            k.source.lines().next().unwrap_or("").chars().take(70).collect::<String>()
+            k.source
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(70)
+                .collect::<String>()
         );
     }
     Point {
@@ -142,7 +146,11 @@ fn measure(
 fn main() {
     let rt = Runtime::cuda().expect("cuda");
     let list = |k: &str, d: &str| -> Vec<String> {
-        std::env::var(k).unwrap_or(d.into()).split(',').map(String::from).collect()
+        std::env::var(k)
+            .unwrap_or(d.into())
+            .split(',')
+            .map(String::from)
+            .collect()
     };
     let n: usize = list("N", "4096")[0].parse().unwrap();
     let d: usize = list("D", "64")[0].parse().unwrap();
@@ -179,7 +187,11 @@ fn main() {
         // flash with no tensor cores (every kernel transpiled, f32 arithmetic): separates
         // the schedule from the TF32 rounding of the mma tiles
         let pl = g.place(&outs, &MemorySchedule::flash());
-        let p = Program::new(&rt, pl.graph.to_cuda_placed(&pl.outputs, pl.nest, None), &ins);
+        let p = Program::new(
+            &rt,
+            pl.graph.to_cuda_placed(&pl.outputs, pl.nest, None),
+            &ins,
+        );
         let r = measure(&rt, &p, &pl.outputs, &want, iters, "flash_fp32");
         emit("flash_fp32", &r);
         // searched: every role-level placement, each with its per-kernel lowering, then
@@ -192,7 +204,9 @@ fn main() {
             rt.sync();
             let got: Vec<Vec<f32>> = pl.outputs.iter().map(|o| p.read(&rt, *o)).collect();
             let err = max_rel(&got, &want);
-            let ms = (0..3).map(|_| p.time(&rt, iters)).fold(f64::INFINITY, f64::min);
+            let ms = (0..3)
+                .map(|_| p.time(&rt, iters))
+                .fold(f64::INFINITY, f64::min);
             eprintln!("candidate {s:?}: {ms:.3} ms, err {err:.2e}");
             if err < TOL && best.as_ref().is_none_or(|b| ms < b.0) {
                 best = Some((ms, pl.graph, pl.outputs, pl.nest, s));
@@ -218,7 +232,9 @@ fn main() {
                     p.run(&rt);
                     rt.sync();
                     let got: Vec<Vec<f32>> = bo.iter().map(|o| p.read(&rt, *o)).collect();
-                    let ms = (0..3).map(|_| p.time(&rt, iters)).fold(f64::INFINITY, f64::min);
+                    let ms = (0..3)
+                        .map(|_| p.time(&rt, iters))
+                        .fold(f64::INFINITY, f64::min);
                     (ms, max_rel(&got, &want))
                 }));
                 let Ok((ms, err)) = tried else {
