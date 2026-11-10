@@ -116,3 +116,7 @@ required-features = ["cuda"]
 [[example]]
 name = "scan_bench"
 required-features = ["cuda"]
+
+[[example]]
+name = "figure1_cuda"
+required-features = ["cuda"]

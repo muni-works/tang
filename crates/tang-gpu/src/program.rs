@@ -1446,6 +1446,41 @@ impl Program {
         }
     }
 
+    /// [`tuned`](Self::tuned) on CUDA for a graph scheduled by `TensorGraph::place`:
+    /// the variants keep that placement's `nest` decision.
+    #[cfg(feature = "cuda")]
+    pub fn tuned_placed(
+        rt: &Runtime,
+        g: &TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        nest: bool,
+    ) -> (Self, TuneReport) {
+        use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
+        let Runtime::Cuda(d) = rt else {
+            panic!("tuned_placed needs the CUDA runtime");
+        };
+        let n = MMA_SHAPES.len()
+            + if d.arch == "sm_90a" {
+                SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
+            } else {
+                0
+            };
+        let sm = d
+            .arch
+            .trim_start_matches("sm_")
+            .trim_end_matches('a')
+            .parse()
+            .unwrap_or(0);
+        let variants: Vec<WgslProgram> = tang_compile::tensor::cuda::with_cuda_sm(sm, || {
+            std::iter::once(None)
+                .chain((0..n).map(Some))
+                .map(|v| g.to_cuda_placed(outputs, nest, v))
+                .collect()
+        });
+        Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, None)
+    }
+
     /// Pick a variant per kernel. `variants[0]` is the portable lowering,
     /// the rest native ones with the same kernels and bindings; kernels
     /// whose sources differ are timed, the others take variant 0. Cache

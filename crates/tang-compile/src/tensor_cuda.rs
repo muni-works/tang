@@ -2019,6 +2019,24 @@ impl TensorGraph {
         nested.to_cuda_variant_scheduled(outputs, variant)
     }
 
+    /// [`to_cuda_variant`](Self::to_cuda_variant) for a graph scheduled by
+    /// [`place`](Self::place): `nest` is the placement's own decision.
+    /// With `nest` false no contraction moves into a tile and no kernel
+    /// fuses (the attention backward included), so a `Hbm` placement stays
+    /// one in the program.
+    pub fn to_cuda_placed(
+        &self,
+        outputs: &[TensorId],
+        nest: bool,
+        variant: Option<usize>,
+    ) -> WgslProgram {
+        if nest {
+            self.to_cuda_variant(outputs, variant)
+        } else {
+            self.to_cuda_variant_scheduled(outputs, variant)
+        }
+    }
+
     fn to_cuda_variant_scheduled(
         &self,
         outputs: &[TensorId],
