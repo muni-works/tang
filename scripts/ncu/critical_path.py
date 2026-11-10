@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Per-kernel fill/drain floor and the decode step's critical path, against
+"""HISTORY: round 2-4 constants, superseded by floor_table.py (docs/duality.md, Corrections).
+
+Per-kernel fill/drain floor and the decode step's critical path, against
 the traces of PR #186 (and #189's 3090 occupancy data).
 
 per kernel (mirrors tang_compile::tensor::io_lp::KernelFloor):

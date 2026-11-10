@@ -265,15 +265,19 @@ pub fn simplex(a: &[Vec<f64>], b: &[f64], c: &[f64]) -> Option<(Vec<f64>, Vec<f6
     Some((x, y, t[m][w - 1]))
 }
 
+/// Largest register tile the autotuner's space can express: `reg` ≤ 4×4
+/// points per thread × 256 threads.
+pub const SCHEDULE_REG_TILE: f64 = 4096.0;
+
 /// Peak rates of one device, for the composite time floor.
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
     pub name: &'static str,
     /// Fast memory one workgroup can stage (shared / threadgroup), words.
     pub mem_words: f64,
-    /// Register words one workgroup can hold as a register tile
-    /// (accumulators, online state): the schedule space's largest register
-    /// tile, `reg` ≤ 4×4 points per thread × 256 threads = 4096.
+    /// Register words one workgroup can hold at one workgroup per SM: the
+    /// hardware register file. (The schedule space's own limit is
+    /// [`SCHEDULE_REG_TILE`]; the two are different questions.)
     pub reg_words: f64,
     /// DRAM bandwidth, bytes/s.
     pub dram_bw: f64,
@@ -292,24 +296,31 @@ pub struct Machine {
     pub mem_latency: f64,
     /// SM clock, Hz (boost).
     pub clock: f64,
+    /// Hardware limit on resident workgroups per SM.
+    pub max_blocks_per_sm: usize,
+    /// Shared / threadgroup memory per SM, words (spec sheet).
+    pub smem_words_per_sm: f64,
 }
 
 impl Machine {
     /// RTX 3090 (GA102): 48 KB shared/block, 936 GB/s, 35.6 TFLOP/s f32,
-    /// 82 SMs × 1536 threads × 64K registers, ~470 ns DRAM latency,
-    /// ~2 µs smallest kernel in a trace (PR #186).
+    /// 82 SMs × 1536 threads × 64K registers. DRAM latency 470 ns is
+    /// assumed. Launch 0.77 µs: an empty kernel in a CUDA graph, measured
+    /// independently of the validated traces (#160).
     pub const RTX3090: Machine = Machine {
         name: "3090",
         mem_words: 12288.0,
-        reg_words: 4096.0,
+        reg_words: 65536.0,
         dram_bw: 936e9,
         flops: 35.6e12,
-        launch: 2e-6,
+        launch: 0.77e-6,
         sms: 82,
         threads_per_sm: 1536,
         regs_per_sm: 65536,
         mem_latency: 470e-9,
         clock: 1.695e9,
+        max_blocks_per_sm: 32,
+        smem_words_per_sm: 25600.0,
     };
     /// H200 SXM: 4.8 TB/s HBM3e, 132 SMs × 2048 threads × 64K registers,
     /// ~600 ns DRAM latency (assumed), ~1 µs smallest kernel inside a CUDA
@@ -317,22 +328,24 @@ impl Machine {
     pub const H200: Machine = Machine {
         name: "h200",
         mem_words: 57344.0,
-        reg_words: 4096.0,
+        reg_words: 65536.0,
         dram_bw: 4.8e12,
         flops: 67e12,
-        launch: 1e-6,
+        launch: 0.48e-6,
         sms: 132,
         threads_per_sm: 2048,
         regs_per_sm: 65536,
-        mem_latency: 600e-9,
+        mem_latency: 340e-9,
         clock: 1.98e9,
+        max_blocks_per_sm: 256,
+        smem_words_per_sm: 58368.0,
     };
     /// Apple M4 (10-core GPU): 32 KB threadgroup, 120 GB/s, ~4.3 TFLOP/s
     /// f32, ~10 µs per dispatch through wgpu.
     pub const M4: Machine = Machine {
         name: "m4",
         mem_words: 8192.0,
-        reg_words: 4096.0,
+        reg_words: 52000.0,
         dram_bw: 120e9,
         flops: 4.3e12,
         launch: 10e-6,
@@ -341,6 +354,20 @@ impl Machine {
         regs_per_sm: 65536,
         mem_latency: 400e-9,
         clock: 1.5e9,
+        max_blocks_per_sm: 1024,
+        smem_words_per_sm: 8192.0,
+    };
+    /// Apple M4 Max (40-core GPU), the local bench host: 546 GB/s
+    /// (spec; `scripts/review/cachebw.swift` reads 498 GB/s at 512 MB),
+    /// 40 cores × 128 lanes × 2 × 1.578 GHz = 16.2 TFLOP/s f32, 32 KB
+    /// threadgroup memory. Earlier rounds used [`Machine::M4`] for this
+    /// host, which is the 10-core part.
+    pub const M4_MAX: Machine = Machine {
+        name: "m4max",
+        sms: 40,
+        dram_bw: 546e9,
+        flops: 16.2e12,
+        ..Machine::M4
     };
 
     /// Bytes that must be in flight to sustain peak bandwidth.
@@ -362,6 +389,8 @@ pub struct Occupancy {
     /// Bytes one thread has outstanding at once (independent loads issued
     /// before the first is consumed × their width).
     pub inflight_per_thread: f64,
+    /// Shared / threadgroup words per workgroup (0 = none).
+    pub smem_words: f64,
 }
 
 impl Occupancy {
@@ -370,7 +399,15 @@ impl Occupancy {
     pub fn resident_threads(&self, m: &Machine) -> usize {
         let by_threads = m.threads_per_sm / self.block.max(1);
         let by_regs = m.regs_per_sm / (self.regs.max(1) * self.block.max(1));
-        let per_sm = by_threads.min(by_regs).clamp(1, 32);
+        let by_smem = if self.smem_words > 0.0 {
+            (m.smem_words_per_sm / self.smem_words) as usize
+        } else {
+            usize::MAX
+        };
+        let per_sm = by_threads
+            .min(by_regs)
+            .min(by_smem)
+            .clamp(1, m.max_blocks_per_sm);
         self.grid.min(m.sms * per_sm) * self.block
     }
     pub fn inflight_bytes(&self, m: &Machine) -> f64 {
@@ -431,6 +468,8 @@ pub struct StepKernel {
     pub grid: usize,
     pub block: usize,
     pub regs: usize,
+    /// Shared / threadgroup words per workgroup (0 = none).
+    pub smem_words: f64,
     /// Issue cost of the lowered kernel (zero = not counted).
     pub issue: IssueCost,
 }
@@ -438,8 +477,10 @@ pub struct StepKernel {
 /// Per-kernel instruction-issue cost, counted from the lowered source:
 /// L1 wavefronts (one per distinct 128-byte line a warp request touches,
 /// one wavefront per SM-cycle) and 32-bit integer thread-ops (64 per
-/// SM-cycle on Ampere and Hopper). Only requests for the DRAM operand are
-/// counted, so the term is a floor.
+/// SM-cycle on Ampere and Hopper). **A hypothesis, not a floor**: the
+/// one-wavefront-per-cycle rate is assumed, and counting only the DRAM
+/// operand was chosen after counting every request exceeded a measured
+/// time. It is not in the floor unless a caller sets it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IssueCost {
     pub wavefronts: f64,
@@ -489,11 +530,13 @@ impl StepKernel {
             block: self.block,
             regs: self.regs,
             inflight_per_thread: 0.0,
+            smem_words: self.smem_words,
         };
         self.grid as f64 / (occ.resident_threads(m) / self.block.max(1)) as f64
     }
 
-    /// Fill/drain floor of one dependent kernel:
+    /// Fill floor of one dependent kernel (see `docs/duality.md`, "The
+    /// floor as implemented"):
     ///
     /// `t ≥ launch + max(bytes/BW + latency, flops/peak, ⌈waves⌉·latency,
     ///                   issue + latency)`
@@ -777,21 +820,33 @@ pub fn attention_bound(n: usize, d: usize, mem: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn levels_match_m4_autotuner() {
-        // the M4 autotuner's picks (docs/duality.md): matmul 64×64, attention
+    fn levels_at_register_file() {
+        // with the real register file the matmul tile is not 64×64
+        let m = Machine::RTX3090;
+        let t = matmul_lp(4096, 4096, 4096)
+            .tile_levels(m.reg_words, m.mem_words)
+            .unwrap();
+        assert!(t.tile[0] * t.tile[1] > 64 * 64, "{:?}", t.tile);
+    }
+
+    #[test]
+    fn levels_at_schedule_limit() {
+        // at the schedule space's limit, NOT the register file: partly by
+        // construction (docs/duality.md)
+        // the M4 autotuner's picks: matmul 64×64, attention
         // 64 query rows × 32 keys; the single-level dual gave 52 and 32×…
         let m = Machine::M4;
         let mm = matmul_lp(4096, 4096, 4096);
-        let t = mm.tile_levels(m.reg_words, m.mem_words).unwrap();
+        let t = mm.tile_levels(SCHEDULE_REG_TILE, m.mem_words).unwrap();
         assert_eq!(&t.tile[..2], &[64, 64]);
         assert_eq!(t.in_regs, 0b100);
         let at = attention_lp(4096, 64, true);
-        let ta = at.tile_levels(m.reg_words, m.mem_words).unwrap();
+        let ta = at.tile_levels(SCHEDULE_REG_TILE, m.mem_words).unwrap();
         assert_eq!(&ta.tile[..2], &[64, 32]);
         for (lp, lt) in [(&mm, &t), (&at, &ta)] {
             // never below the bound at the total on-chip capacity, never
             // above the single-level dual tile's traffic
-            let bound = lp.bound(m.reg_words + m.mem_words).unwrap();
+            let bound = lp.bound(SCHEDULE_REG_TILE + m.mem_words).unwrap();
             assert!(lt.traffic >= bound, "{} < {bound}", lt.traffic);
             let single = lp.best_order_traffic(&lp.tile(m.mem_words).unwrap());
             assert!(lt.traffic <= single * 1.0001, "{} > {single}", lt.traffic);
@@ -799,11 +854,11 @@ mod tests {
         // the 3090: same matmul tile, 64 keys (more shared memory)
         let m = Machine::RTX3090;
         assert_eq!(
-            &mm.tile_levels(m.reg_words, m.mem_words).unwrap().tile[..2],
+            &mm.tile_levels(SCHEDULE_REG_TILE, m.mem_words).unwrap().tile[..2],
             &[64, 64]
         );
         assert_eq!(
-            &at.tile_levels(m.reg_words, m.mem_words).unwrap().tile[..2],
+            &at.tile_levels(SCHEDULE_REG_TILE, m.mem_words).unwrap().tile[..2],
             &[64, 64]
         );
     }
@@ -834,18 +889,19 @@ mod tests {
     #[test]
     fn step_chain() {
         let m = Machine::H200;
-        // a 2 MB sub-wave GEMV: fill-dominated on the H200
+        // a 1 MB sub-wave GEMV: fill-dominated on the H200
         let g = StepKernel {
-            bytes: 2e6,
+            bytes: 1e6,
             flops: 0.0,
             grid: 64,
             block: 256,
             regs: 32,
+            smem_words: 0.0,
             issue: IssueCost::default(),
         };
         let (t, why) = g.floor(&m);
         assert_eq!(why, "fill");
-        assert!((t - (1e-6 + 2e6 / 4.8e12 + 600e-9)).abs() < 1e-12);
+        assert!((t - (m.launch + 1e6 / 4.8e12 + m.mem_latency)).abs() < 1e-12);
         // ten in a chain cost ten floors; independent ones overlap
         let ks = vec![g; 10];
         let chain: Vec<Vec<usize>> = (0..10)
@@ -858,7 +914,7 @@ mod tests {
         let (tf, b) = step_floor(&m, &ks, &free);
         // all independent: bounded by bandwidth or one kernel's floor
         assert_eq!(b, "bandwidth");
-        assert!(tf < tc / 4.0, "{tf}");
+        assert!(tf < tc, "{tf}");
         // a big streaming kernel binds on bandwidth
         let big = StepKernel {
             bytes: 400e6,
@@ -866,41 +922,44 @@ mod tests {
             grid: 7680,
             block: 256,
             regs: 64,
+            smem_words: 0.0,
             issue: IssueCost::default(),
         };
         assert_eq!(big.floor(&m).1, "stream");
     }
 
     #[test]
-    fn issue_q8_0_gemv() {
-        // PR #186 ops_t1: the GGUF Q8_0 GEMV, 119.35 MB, 256×256, 36 regs;
-        // measured 144.2 µs (3090) and 63.5 µs (H200)
-        let k = StepKernel {
-            bytes: 119.35e6,
+    fn issue_q8_0_vocab_head() {
+        // the 151936×2048 Q8_0 GEMV, measured 171.6 µs on the H200 (#186 raw
+        // trace); a hypothesis term, see `IssueCost`
+        let bytes = 151936.0 * 2048.0 / 32.0 * 34.0;
+        let mut k = StepKernel {
+            bytes,
             flops: 0.0,
-            grid: 256,
+            grid: 9496,
             block: 256,
             regs: 36,
-            issue: IssueCost::q8_0_gemv(119.35e6),
+            smem_words: 0.0,
+            issue: IssueCost::default(),
         };
-        let (t3, w3) = k.floor(&Machine::RTX3090);
-        let (th, wh) = k.floor(&Machine::H200);
-        assert_eq!(w3, "stream");
-        assert_eq!(wh, "issue");
-        // sound (≤ measured) and within 15% on the H200
-        assert!(t3 <= 144.2e-6 && th <= 63.5e-6, "{t3} {th}");
-        assert!(th >= 0.85 * 63.5e-6, "{th}");
+        assert_eq!(k.floor(&Machine::H200).1, "stream");
+        k.issue = IssueCost::q8_0_gemv(bytes);
+        let (t, why) = k.floor(&Machine::H200);
+        assert_eq!(why, "issue");
+        assert!(t < 171.6e-6 && t > 0.85 * 171.6e-6, "{t}");
+        assert_eq!(k.floor(&Machine::RTX3090).1, "stream");
     }
 
     #[test]
     fn littles_law() {
         let m = Machine::H200;
-        assert!((m.bandwidth_delay() - 2.88e6).abs() < 1e3);
+        assert!((m.bandwidth_delay() - 4.8e12 * 340e-9).abs() < 1e3);
         // MoE ex_gate_up at T=1 (PR #186): 320×256, 40 regs → all resident
         let occ = Occupancy {
             grid: 320,
             block: 256,
             regs: 40,
+            smem_words: 0.0,
             inflight_per_thread: 16.0,
         };
         assert_eq!(occ.resident_threads(&m), 320 * 256);

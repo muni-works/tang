@@ -9,6 +9,246 @@ Experiment: `cargo run --release -p tang-bench --example io_dual`
 (`TUNE=1` adds the GPU autotuner's pick on the local device). Lean:
 `proofs/TangProofs/Duality.lean`, `Trace*.lean`.
 
+## Corrections after the paper review (read this first)
+
+This section overrides the rounds below where they disagree. Rounds 2–4 are
+kept as history. Their machine constants (600 ns H200 latency, 1–2 µs launch
+taken from the traces, `reg_words = 4096`) are superseded.
+
+### Which numbers are right
+
+Commands, from the repo root:
+
+```bash
+python3 scripts/ncu/floor_table.py
+```
+
+```bash
+cargo run --release -p tang-bench --example io_dual
+```
+
+| claim in the paper | verdict | right number |
+|---|---|---|
+| Q8 GEMV "63.5 µs measured" | **not one kernel** | `dop00_gemv_q8_0` in `ops_t1` is the mean of three shapes launched under one name, grouped by name in #186's table. See the shapes below. |
+| Q8 GEMV "58.7 µs / 0.92" (round 4) | **withdraw** | Computed from that mean, with a hypothesized L1 term. |
+| Q8 GEMV "26.5 µs / 0.42" (round 3) | **superseded** | Same mean, older constants. |
+| "0.92" in `fraction-of-light.md` | different quantity | The vocab head's 3090 throughput as a fraction of peak (864 / 936 GB/s), not predicted/measured. |
+| attention traffic "2–2.8×" | **should be 2.0–3.0×** | `schedule_auto` / single-level dual tile: 3090 2.83× (N=1024), 2.95× (N=4096); M4 1.97×, 1.99×. |
+| reviewer's 1.76× | a different ratio | Single-level dual / two-level dual on the 3090 at N=4096 (1460 / 830 MB). |
+| reviewer's 2.0× | correct for the M4 | |
+
+Q8_0 GEMV by shape, H200 (#186 raw trace, `ops_t1`). The floor is defined below:
+
+| shape | MB | measured µs | floor µs | floor/meas | with L1 hypothesis |
+|---|--:|--:|--:|--:|--:|
+| 4096×2048 | 8.9 | 7.4 | 2.5 | 0.34 | 5.1 µs, 0.69 |
+| 2048×4096 | 8.9 | 9.9 | 2.5 | 0.25 | 5.1 µs, 0.51 |
+| 151936×2048 (vocab head) | 330.6 | 172.2 | 69.7 | 0.40 | 158.9 µs, 0.92 |
+
+The mean of those measured times is the 63.5 µs. The 0.92 survives only for
+the vocab head, where a single constant (the assumed L1 rate) is compared
+with one asymptote.
+
+### The L1 wavefront term is a hypothesis, not a floor
+
+Round 4 called it "derived, not fitted" and "sound". That overclaimed:
+* The rate (one line per SM-cycle) is assumed; no counter validates it.
+* Counting every request gave 77 µs on the mean-of-shapes row, above the
+  measured 63.5. I then counted only the weight requests. That choice was
+  made after seeing the overshoot. It is a fork in the analysis.
+* The integer counts read from the source are about 5× low. Replace's
+  `sm__inst_executed` (#194, `3090-inst/`) gives 0.148 warp instructions per
+  DRAM byte on this GEMV; my source count is 0.029.
+* Plain instruction issue cannot be the limit. Those measured counts give
+  32 µs of issue time on the 3090 (of 145 µs) and 17 µs on the H200 (of
+  63.5 µs) at 4 instructions per SM-cycle. `ex_gate_up` T=1: 1.1 µs of 10.7.
+
+`IssueCost` is now off unless a caller sets it, and is not in the table's
+floor column. What remains unexplained: the H200 big kernels run at 0.30–0.64
+of the floor, and this repo has no validated term for that gap.
+
+### The floor as implemented
+
+```text
+T = L + max( λ + B/BW,  F/P,  ⌈G/S⌉·λ )
+S = SMs · min(threads_per_SM / block, regs_per_SM / (regs · block), hw limit)
+```
+
+`StepKernel::floor`, with `L` launch, `λ` DRAM latency, `B` bytes, `F/P` flops
+over peak, `G` workgroups. The Little's-law term
+`B·λ / (resident threads · bytes per thread)` lives only in `TimeFloor`; it is
+not in this formula, and it never bound with bytes per thread counted from the
+schedule (round 2). The paper's formula should be this one.
+
+Justifying `⌈G/S⌉·λ`: if every workgroup makes at least one DRAM round trip,
+each occupies a slot for at least `λ`. A slot then hosts at most `⌊T/λ⌋`
+workgroups, so `S·⌊T/λ⌋ ≥ G`, which gives `T ≥ ⌈G/S⌉·λ`. It is a makespan
+bound for unit jobs on `S` machines. It needs `S` to be an upper bound on
+resident workgroups; smem limits are left out, so `S` can only be too large.
+**The term binds on none of the kernels in the table**, so it is justified but
+carries no weight in the validation. `flops` is 0 in the table (not populated).
+
+Adding `L` to the rest assumes the empty-kernel overhead does not overlap the
+kernel's memory activity. That is an assumption.
+
+**Constants:**
+
+| | λ | L | status |
+|---|---|---|---|
+| 3090 | 470 ns | 0.77 µs | λ assumed. L is an empty kernel in a CUDA graph, measured in #160 on a shared GPU, independent of the traces. |
+| H200 | 340 ns | 0.48 µs | Both measured on an idle H200 (#196, `scripts/review/latency.cu`), independently of the traces. λ is a one-thread pointer chase over 4 GB (672 cycles, TLB misses included). L is an empty kernel in a 2000-node CUDA graph, 1 block; it is 0.54 µs at 132 blocks and 0.78 µs at 528. The published H100 figure was 353 ns. |
+| H200, kernel ≤ 50 MB | 145 ns | 0.48 µs | Measured L2 hop over 1 MB (#196). |
+
+The H200 has no byte counters on the pods, so `B` is the 3090's ncu count.
+A kernel that fits the 50 MB L2 can be served from it, so for those `B/BW` is
+**not a proven floor on the H200** (column "H200 L2?"). #189's repack reached
+1.02 of peak that way.
+
+### Per-kernel floor table (every kernel ≥ 0.5 MB with bytes on both GPUs)
+
+| kernel | MB | G×block | H200 L2? | 3090 meas µs | floor µs (term) | floor/meas | H200 meas µs | floor µs (term) | floor/meas | L1? µs | L1?/meas |
+|---|--:|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| moe_t1 dop02_ex_gate_up | 14.7 | 320×256 | yes | 22.1 | 16.9 (stream) | 0.77 | 10.7 | 3.7 (stream) | 0.34 |  |  |
+| moe_t1 dop03_ex_down | 9.3 | 160×256 | yes | 14.7 | 11.2 (stream) | 0.76 | 5.4 | 2.6 (stream) | 0.48 |  |  |
+| moe_t1 dop05_sh_down | 1.3 | 32×256 | yes | 5.5 | 2.7 (stream) | 0.48 | 3.5 | 0.9 (stream) | 0.26 |  |  |
+| moe_t1 dop04_sh_gate_up | 2.6 | 64×256 | yes | 5.8 | 4.1 (stream) | 0.70 | 3.1 | 1.2 (stream) | 0.38 |  |  |
+| moe_t8 dop02_ex_gate_up | 100.7 | 2560×256 | no | 122.0 | 108.8 (stream) | 0.89 | 59.4 | 21.8 (stream) | 0.37 |  |  |
+| moe_t8 dop04_ex_down | 70.4 | 1280×256 | no | 92.6 | 76.4 (stream) | 0.83 | 23.6 | 15.5 (stream) | 0.66 |  |  |
+| moe_t8 dop05_sh_gate | 1.3 | 32×256 | yes | 13.3 | 2.7 (stream) | 0.20 | 12.3 | 0.9 (stream) | 0.07 |  |  |
+| moe_t8 dop06_sh_up | 1.5 | 32×256 | yes | 13.4 | 2.9 (stream) | 0.22 | 11.8 | 0.9 (stream) | 0.08 |  |  |
+| moe_t8 dop08_sh_down | 1.4 | 32×256 | yes | 11.0 | 2.7 (stream) | 0.25 | 8.5 | 0.9 (stream) | 0.11 |  |  |
+| moe_t8 dop09_y | 0.8 | 64×256 | yes | 3.8 | 2.1 (stream) | 0.56 | 2.5 | 0.8 (stream) | 0.32 |  |  |
+| moe_t48 dop08_ex_gate_up | 417.4 | 7680×256 | no | 506.3 | 447.2 (stream) | 0.88 | 182.4 | 87.8 (stream) | 0.48 |  |  |
+| moe_t48 dop10_ex_down | 228.2 | 15360×256 | no | 273.4 | 245.0 (stream) | 0.90 | 124.5 | 48.4 (stream) | 0.39 |  |  |
+| moe_t48 dop11_sh_gate | 1.6 | 48×256 | yes | 11.8 | 2.9 (stream) | 0.25 | 19.1 | 1.0 (stream) | 0.05 |  |  |
+| moe_t48 dop12_sh_up | 1.5 | 48×256 | yes | 11.7 | 2.8 (stream) | 0.24 | 17.2 | 0.9 (stream) | 0.05 |  |  |
+| moe_t48 dop14_sh_down | 1.7 | 192×256 | yes | 9.6 | 3.0 (stream) | 0.31 | 6.5 | 1.0 (stream) | 0.15 |  |  |
+| moe_t48 dop15_y | 5.5 | 384×256 | yes | 9.4 | 7.1 (stream) | 0.76 | 4.0 | 1.8 (stream) | 0.44 |  |  |
+| moe_t48 dop09_ex_silu | 2.6 | 960×256 | yes | 5.7 | 4.1 (stream) | 0.71 | 2.8 | 1.2 (stream) | 0.42 |  |  |
+| moe_t48 dop03_xq | 0.6 | 384×256 | yes | 2.9 | 1.8 (stream) | 0.63 | 2.0 | 0.7 (fill) | 0.38 |  |  |
+| moe_t48 dop18_norm | 0.6 | 384×256 | yes | 3.1 | 1.9 (stream) | 0.62 | 1.9 | 0.8 (fill) | 0.41 |  |  |
+| moe_t48 dop16_resid | 0.9 | 384×256 | yes | 3.2 | 2.2 (stream) | 0.70 | 1.6 | 0.8 (stream) | 0.50 |  |  |
+| moe_t48 dop19_xq_out | 0.5 | 384×256 | yes | 3.0 | 1.8 (stream) | 0.61 | 1.5 | 0.7 (fill) | 0.48 |  |  |
+| ops_t1 q8_0 4096x2048 | 8.9 | 256×256 | yes | 18.0 | 10.8 (stream) | 0.60 | 7.4 | 2.5 (stream) | 0.34 | 5.1 | 0.69 |
+| ops_t1 q8_0 2048x4096 | 8.9 | 256×256 | yes | – | 10.8 (stream) | – | 9.9 | 2.5 (stream) | 0.25 | 5.1 | 0.51 |
+| ops_t1 q8_0 151936x2048 | 330.6 | 9496×256 | no | 382.7 | 354.5 (stream) | 0.93 | 172.2 | 69.7 (stream) | 0.40 | 158.9 | 0.92 |
+
+3090: 23 kernels, floor/meas min 0.20 median 0.63 max 0.93; over 1: []
+h200: 24 kernels, floor/meas min 0.05 median 0.38 max 0.66; over 1: []
+
+**Result.** No kernel exceeds its floor on either GPU. On the 3090 the big
+kernels are tight (0.76–0.93). On the H200 the floor is loose everywhere
+(0.05–0.66, median 0.38). The term is always `stream` or `fill`. The kernels
+are all GEMV-class or small epilogues, so this validates nothing about
+attention or scans.
+
+### The two-level match was partly by construction
+
+`reg_words = 4096` was the schedule space's largest register tile. The sweep
+in `io_dual` shows how narrow that is. Matmul 4096³ and attention N=4096 on
+the M4 (`[rows × columns, keys]`):
+
+| register words | matmul tile, MB | attention tile, MB |
+|---|---|---|
+| 2048 | 64×32, 12952 | 64×32, 32; 1636 |
+| **4096** | **64×64, 8657** | **64×64, 32; 1091** |
+| 8192 | 128×64, 6510 | 128×32, 32; 830 |
+| 16384 | 128×128, 4362 | 128×64, 64; 554 |
+| 52000 (register file, see below) | 256×128, 3288 | 512×32, 64; 226 |
+
+* The match holds only for capacities in [4096, 8192). With the actual
+  register file the model predicts tiles far larger than the autotuner picks.
+* The autotuner cannot choose those. Its space stops at 4×4 registers × 256
+  threads, and at key chunks of 16 or 32. Both M4 picks (64×64 matmul, chunk
+  32 attention) sit at that boundary. So the honest statement is: *inside
+  the schedule space the two-level model picks the corner the autotuner
+  picks*. It does not show that the register file sets the tile.
+* The model charges nothing for lost occupancy from a large register tile,
+  which is likely why real hardware wouldn't want the file-sized tile. That
+  is untested.
+* The M4 register file: about 208 KB per core is published for Apple 7/8
+  (`philipturner/metal-benchmarks`); M4 is a later GPU, so it is a proxy. The
+  3090's 65536 words is 256 KB per SM.
+
+**`schedule_auto` and the autotuner are different things.** `schedule_auto` is
+a static heuristic: 64×64 matmul and 16×16 attention on every device. The
+autotuner is the timed search (`TUNE=…`). Only the M4 has autotuner picks:
+matmul 64×64 at 4096³ (32×64 at 1024³), attention 64×32 at N=4096 (16×16 at
+N=1024).
+
+**3090 attention: the autotuner keeps 16×16, against every model.**
+Replace ran this on an idle rented 3090 (#196). There was no Vulkan
+driver, so it used CUDA lowerings, not wgpu.
+
+| | N=1024 | N=4096 |
+|---|---|---|
+| autotuner pick | 16 rows × 16 keys, 24.5× bound | 16×16, 24.1× bound |
+| `schedule_auto` | 16×16 | 16×16 |
+| single-level dual | 48 × 48 | 48 × 48 |
+| two-level dual (schedule limit) | 128 × 32, value columns split | same |
+| matmul 1024³ | autotuner 64×64 (= `schedule_auto`, 1.95× bound) | |
+
+**What the measurement says about the model:**
+* **No model predicts what wins on the 3090.** The timed search picks the
+  smallest tile in its space, moving 2.8–3.0× the dual tile's traffic. The
+  model ranks by traffic; the 3090 kernel at that tile is not traffic-bound,
+  so less traffic doesn't buy time.
+* **Model and autotuner disagree across devices.** The M4 picked 64×32 at
+  N=4096. So whatever makes the M4 pick agree with the model doesn't carry to
+  the 3090's CUDA lowering.
+* **Next run:** per-tile times on the 3090. `RACE=1` in `io_dual` times every
+  candidate and prints the best time per LP tile:
+  `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`.
+
+### M4 per-tile race (every autotuner candidate timed, `RACE=1 TUNE=1 cargo run --release -p tang-bench --example io_dual`)
+
+| kernel | best on hardware | two-level / dual tile | schedule_auto | autotuner | spread of top 5 |
+|---|---|---|---|---|---|
+| matmul 1024³ | 64×64×16, 0.551 ms | 64×64 (two-level) 0.551–0.559 ms | 64×64×32, 0.559 ms | 32×64×16, 0.554 ms | 1.4%, traffic 138–206 MB |
+| matmul 4096³ | 64×64×32, 29.59 ms | 64×64 (two-level) | same | same | 3.5% |
+| attention N=1024 | key chunk 16, 16×64, 3.86 ms | dual 32×64: 4.77 ms (+23%) | same as best | same as best | — |
+| attention N=4096 | 64×64, 51.5 ms | dual 32×64: 57.2 ms (+11%) | 16×64: 54.8 ms (+6%) | 64×64 (= best) | — |
+
+- Matmul time is flat across traffic: the top 5 tiles span 1.5× in LP traffic but ≤3.5% in time. The traffic objective does not rank these tiles.
+- Attention: the one-level dual tile loses on both sizes. At N=1024 the lowest-traffic tile (64×64, 71 MB) is 29% slower than the 273 MB winner. Traffic is not what decides attention on the M4 either.
+- matmul 4096³ lists a split-K=256 subgroup candidate at 0.098 ms; that is faster than peak FLOPs allow, so the kernel is wrong (not checked for correctness in RACE mode) and is excluded.
+- 3090 per-tile race not run yet (needs an idle 3090: `RACE=1 TUNE=3090 cargo run --release -p tang-bench --features cuda --example io_dual`).
+
+### What else does not hold up
+
+* Rounds 3–4's step floors and lever bounds use the mean bytes-per-thread
+  spreading and the old constants. Round 4's fusion "−25 to −38% of wall"
+  used a 6.9 µs τ; Replace's #194 removed 96 of 548 launches and the step got
+  *slower* (4.05 → 4.44 ms). Those bounds are upper bounds only and should
+  not be cited as predictions.
+* Round 2's "class flip at 16 B per thread" was a fit, as it said.
+
+### Lean: exactly what is mechanized
+
+`proofs/` is on main; `lake build` passes (9055 jobs) with no `sorry` and no
+axioms beyond Lean's and Mathlib's. Everything is over ℝ or an abstract monoid,
+not floating point, and nothing connects these definitions to the Rust IR
+automatically (except the exported `stabilize_softmax` trace).
+
+| topic | theorem | statement |
+|---|---|---|
+| view composition | `Form.eval_compose`, `View.read_compose` | Composing affine views (any integer coefficients and offsets) reads the same element as reading through both. |
+| fusion | `substitute_map_sound`, `substitute_map_sound₂` | Splicing a map into a commutative-monoid comprehension through composed views preserves its value. |
+| split / tiled reductions | `split_reduction` | Folding a monoid over chunks and combining equals folding over the concatenation. |
+| online softmax | `OSM.combine_assoc`, `OSM.combine_comm`, `OSM.sem_combine`, `OSM.run_eq_softmax` | The state monoid is associative and commutative, and running it equals two-pass softmax. |
+| derived gradients | `vjp_sum_comp`, `vjp_fiber`, `softmax_avg_deriv` | The VJP of a sum of affine-read, differentiable scalar terms is the sum of per-element adjoints, and the flash backward identity holds. |
+| stabilizing max | `stabilized_softmax_eq`, `stabilized_softmax_hasFDerivAt`, `softmaxShift_deriv_shift` | Subtracting any `c(x)` leaves softmax unchanged, and its derivative in `c` is zero. |
+| exported trace | `combine_eq_osm` | The combine `stabilize_softmax` actually emitted equals `OSM.combine`. |
+| IO duality | `weak_duality`, `box_hbl`, `box_volume`, `tiles_needed` | For arrays read through **coordinate subsets**, fitting tile exponents sum to at most covering HBL exponents, and **box** tilings of `V` points need at least `V/M^σ` tiles. |
+
+**Outside the mechanization:**
+* Strides and multi-term addresses (`x[t+k]`) in the IO results. Fusion
+  covers any affine view; `Duality` covers only subsets `φ_j ⊆ coords`.
+* Arbitrary, non-box schedules: the discrete HBL inequality is not mechanized,
+  so the lower bound for general schedules is cited (Christ et al.).
+* Traffic counting (red-blue pebbling), gather bounds, the time floor,
+  floating-point error, and correctness of the lowering to CUDA/WGSL/MSL.
+
 ## The LP
 
 A kernel iterates a box `V = ∏_q [N_q]` (point dims, reduce dims, and the
@@ -146,7 +386,7 @@ flash kernel, with its `c` marked atomic. Traffic is in MB at f32.
   the *bound* uses one level at `regs + smem` words. That is sound and
   loses nothing at this scale. L2 is not modeled.
 
-## Round 2: registers, bytes in flight, H200
+## Round 2 (history; see Corrections): registers, bytes in flight, H200
 
 ### Two-level dual tile (`Lp::tile_levels`)
 
@@ -268,7 +508,7 @@ The next measurement that would separate these: ncu
 `l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss` and
 `lts__average_gcomp_input_sector_*` on a host with H100/H200 counters.
 
-## Round 3: fill/drain and the step's critical path
+## Round 3 (history; see Corrections): fill/drain and the step's critical path
 
 Replace's #189 found that the H200 decode step isn't limited by steady-state
 bandwidth. Its GEMVs are small, and each pays a fill and a drain, summed
@@ -381,7 +621,7 @@ Each lever, and its assumptions:
   until the issue limit is fixed (the aligned Q8 repack in the derived
   path, #189).
 
-## Round 4: instruction issue, prefetch charged, fusion
+## Round 4 (history; see Corrections): instruction issue, prefetch charged, fusion
 
 ### Instruction-issue term (`IssueCost`)
 
