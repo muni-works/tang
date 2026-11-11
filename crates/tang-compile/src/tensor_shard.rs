@@ -1179,6 +1179,10 @@ pub fn plan_auto(
     // included); adopt the group if the step got cheaper.
     let mut near: Vec<TensorId> = weights.iter().copied().filter(|t| !plan.inputs.contains_key(t)).collect();
     near.sort_by_key(|t| t.n());
+    // repeated layers repeat their neighbourhoods: search each shape pattern
+    // once, then replay its answer (one cost check) at the other layers
+    type Sig = (Vec<usize>, Vec<Vec<usize>>);
+    let mut memo: HashMap<Sig, Option<Vec<(usize, usize)>>> = HashMap::new();
     for t in failed {
         if plan.inputs.contains_key(&t) {
             continue;
@@ -1190,6 +1194,23 @@ pub fn plan_auto(
             .filter(|u| *u != t && !plan.inputs.contains_key(u))
             .collect();
         let shape = fixed(&g.nodes[t.n()].shape);
+        let sig: Sig = (shape.clone(), hood.iter().map(|u| fixed(&g.nodes[u.n()].shape)).collect());
+        if let Some(known) = memo.get(&sig) {
+            // (hood index + 1, dim); 0 is t itself
+            if let Some(rel) = known {
+                let mut trial = plan.clone();
+                for &(k, e) in rel {
+                    let u = if k == 0 { t } else { hood[k - 1] };
+                    trial.inputs.insert(u, WeightPlace::Split(e));
+                }
+                let c = cost(&trial);
+                if c < best * (1.0 - 1e-9) {
+                    best = c;
+                    plan = trial;
+                }
+            }
+            continue;
+        }
         let mut adopt: Option<(f64, Vec<(TensorId, usize)>)> = None;
         for d in 0..shape.len() {
             if shape[d] % world != 0 || shape[d] < world {
@@ -1228,6 +1249,10 @@ pub fn plan_auto(
                 adopt = Some((cur, group));
             }
         }
+        let rel = adopt.as_ref().map(|(_, group)| {
+            group.iter().map(|&(u, e)| (if u == t { 0 } else { 1 + hood.iter().position(|h| *h == u).unwrap() }, e)).collect()
+        });
+        memo.insert(sig, rel);
         if let Some((c, group)) = adopt {
             best = c;
             for (u, e) in group {
