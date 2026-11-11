@@ -1073,6 +1073,38 @@ pub fn prefill_schedule(g: &TensorGraph, outs: &[TensorId], bf16: Bf16) -> (Tens
     let (g, o) = g.merge_reduce_dims(&o);
     let (mut g, o) = g.split_reduce_dims(&o);
     g.schedule_auto(&o);
+    // maps read only by tensor-core tiles are recomputed while the tile
+    // stages its operand (RMSNorm's apply, SwiGLU, rope) instead of
+    // written and read back (`VISION_INLINE_MAPS=0`: keep them)
+    if std::env::var("VISION_INLINE_MAPS").as_deref() != Ok("0") {
+        let n = g.nodes().len();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for j in 0..n {
+            if let Op::Comp(c) = &g.nodes()[j].op {
+                for a in &c.args {
+                    readers[a.src.index()].push(j);
+                }
+            }
+        }
+        let tiled = |j: usize| {
+            let nd = &g.nodes()[j];
+            nd.tile != (0, 0, 0) || matches!(&nd.op, Op::Comp(c) if c.monoid.is_some() && c.tuple == 1)
+        };
+        let maps: Vec<usize> = (0..n)
+            .filter(|&i| {
+                let nd = &g.nodes()[i];
+                let Op::Comp(c) = &nd.op else { return false };
+                !nd.inline
+                    && c.monoid.is_none()
+                    && !o.iter().any(|t| t.index() == i)
+                    && !readers[i].is_empty()
+                    && readers[i].iter().all(|&j| tiled(j))
+            })
+            .collect();
+        for i in maps {
+            g.set_inline(TensorId::from_index(i), true);
+        }
+    }
     // row reductions with few rows and long rows (RMSNorm's Σx², 1521 rows
     // of 1024) run one thread per row unless split across a workgroup
     let numel = |d: &[Dim]| d.iter().map(|x| x.n()).product::<usize>();
