@@ -1286,6 +1286,7 @@ impl TensorGraph {
                 points: 0,
                 count: 0,
                 workgroup_size: 64,
+                writes: Vec::new(),
             };
         }
         let ps = fixed(&sc.points(self));
