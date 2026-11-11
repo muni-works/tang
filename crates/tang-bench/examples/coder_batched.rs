@@ -226,6 +226,7 @@ fn main() {
                 .map(|l| l.split(' ').map(|v| v.parse().unwrap()).collect())
                 .collect();
             let (mut agree, mut worst) = (0, 0.0f64);
+            let mut per = Vec::new();
             for (a, w) in last.iter().zip(&want) {
                 agree += usize::from(top1(a) == top1(w));
                 let scale = w.iter().fold(1e-30f64, |m, &x| m.max(x.abs() as f64));
@@ -236,10 +237,12 @@ fn main() {
                     .fold(0.0, f64::max)
                     / scale;
                 worst = worst.max(e);
+                per.push(format!("{e:.1e}"));
             }
             println!(
                 "check B={nb}: {streams} streams x {steps} teacher-forced steps vs the reference \
-                 run: top-1 agree {agree}/{streams}, worst logit rel err {worst:.2e}"
+                 run: top-1 agree {agree}/{streams}, worst logit rel err {worst:.2e}; per stream [{}]",
+                per.join(" ")
             );
         }
     }
