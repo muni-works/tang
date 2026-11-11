@@ -1168,14 +1168,14 @@ impl Program {
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .expect("begin capture");
             // TANG_GRAPH_DAG=1: independent kernels on side streams (a DAG
-            // graph, not a chain); TANG_GRAPH_STREAMS of them (default 4)
+            // graph, not a chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
             let dag = std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "1");
             let fused = matches!(&self.storage, Storage::Cuda { fused: Some(_), .. });
             if dag && !fused {
                 let n = std::env::var("TANG_GRAPH_STREAMS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(4usize)
+                    .unwrap_or(2usize)
                     .max(1);
                 self.launch_dag(d, n);
             } else {
