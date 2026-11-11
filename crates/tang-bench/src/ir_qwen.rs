@@ -45,6 +45,10 @@ use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 
+/// The same model as one full-sequence graph, its step derived.
+#[path = "ir_qwen_prefill.rs"]
+pub mod prefill;
+
 /// Quantization group: one scale and bias per 64 weights of a row.
 pub const GROUP: usize = 64;
 
@@ -148,16 +152,20 @@ impl DecodeGraph {
             .unwrap_or_else(|| panic!("no input {name}"))
     }
 
-    /// `(output, input)` pairs written in place: `state` and the caches.
+    /// `(output, input)` pairs written in place: `state` (when the graph
+    /// has one; a derived step does not) and the caches.
     pub fn inplace(&self) -> Vec<(TensorId, usize)> {
-        let mut v = vec![(self.outputs[1], self.input("state"))];
-        for l in 0..(self.outputs.len() - 2) / 2 {
+        let state = self.inputs.iter().position(|s| s.name == "state");
+        let base = if state.is_some() { 2 } else { 1 };
+        let mut v: Vec<(TensorId, usize)> =
+            state.map(|k| (self.outputs[1], k)).into_iter().collect();
+        for l in 0..(self.outputs.len() - base) / 2 {
             v.push((
-                self.outputs[2 + 2 * l],
+                self.outputs[base + 2 * l],
                 self.input(&format!("model.layers.{l}.k_cache")),
             ));
             v.push((
-                self.outputs[3 + 2 * l],
+                self.outputs[base + 1 + 2 * l],
                 self.input(&format!("model.layers.{l}.v_cache")),
             ));
         }
