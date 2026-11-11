@@ -2091,9 +2091,25 @@ mod tests {
             p.run(&rt);
             p.read(&rt, outs[0])
         };
-        // all fused; then only the 640-block kernel is small enough, so
-        // nothing fuses (a run of one stays a launch)
-        for (max_blocks, fused) in [(0, 1), (700, 3)] {
+        // all fused; then cap at the smallest grid, so only that kernel is
+        // small enough and nothing fuses (a run of one stays a launch). The
+        // cap comes from the lowering, so grid changes there don't break it.
+        let grids: Vec<u32> = {
+            let p = lower();
+            p.program
+                .kernels
+                .iter()
+                .map(|k| k.count.div_ceil(k.workgroup_size))
+                .collect()
+        };
+        let smallest = *grids.iter().min().unwrap();
+        assert!(grids.len() >= 2, "grids {grids:?}");
+        assert_eq!(
+            grids.iter().filter(|&&b| b == smallest).count(),
+            1,
+            "grids {grids:?}"
+        );
+        for (max_blocks, fused) in [(0, 1), (smallest, grids.len())] {
             let mut p = lower();
             let (launches, phases, _) = p.megakernel(&rt, &MegaOpts::default(), 0, max_blocks);
             assert_eq!(launches, fused, "max_blocks {max_blocks}");
