@@ -122,8 +122,12 @@ pub struct Case {
 }
 
 pub fn case(m: &Model, k: usize, p0: usize) -> Case {
-    use crate::derive_all::{seed, spec, vocab, weights};
-    let w = weights(m);
+    case_with(m, k, p0, &crate::derive_all::weights(m))
+}
+
+/// [`case`] with the weights `w` (by input name).
+pub fn case_with(m: &Model, k: usize, p0: usize, w: &std::collections::HashMap<String, Vec<f64>>) -> Case {
+    use crate::derive_all::{seed, spec, vocab};
     let toks: Vec<f64> = (0..p0 + k).map(|i| ((37 * i + 5) % vocab(m)) as f64).collect();
     let full_ins = |t: &[f64]| -> Vec<Vec<f64>> {
         m.inputs.iter().map(|(n, _)| if n == "tokens" { t.to_vec() } else { w[n].clone() }).collect()

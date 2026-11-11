@@ -286,6 +286,8 @@ pub mod ring_ports;
 pub mod derive_all;
 /// Multi-GPU decode: the derived step split across ranks (EP + TP), checked on CPU.
 pub mod ir_shard;
+/// Per-rank native weight loading for the sharded DeepSeek step.
+pub mod ds_shard_load;
 /// Prompt-lookup speculative decoding over a derived k-token window.
 pub mod prompt_lookup;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
