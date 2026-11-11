@@ -265,6 +265,8 @@ pub mod ir_control;
 pub mod ir_msl;
 #[path = "ir_qwen.rs"]
 pub mod ir_qwen;
+/// DeepSeek-V4.1-Flash as one prefill graph over symbolic T (decode derived by derive_step).
+pub mod ir_ds_prefill;
 pub mod qwen_session;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
