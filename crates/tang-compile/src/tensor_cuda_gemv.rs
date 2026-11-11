@@ -310,6 +310,21 @@ impl TensorGraph {
                     "to_cuda_decode: node {root} reads a block-format buffer without an int8 GEMV"
                 );
                 if blocky(root) {
+                    // a Q8x32 map reading staged statistics (the norm
+                    // that feeds an int8 GEMV): one native kernel
+                    let lw = Lowering {
+                        g: self,
+                        reads: &reads,
+                        packed: &packed,
+                        opts,
+                    };
+                    if let Some(kern) = lw.staged_map(root) {
+                        k.source = kern.source;
+                        k.workgroup_size = kern.threads as u32;
+                        k.count = (kern.blocks * kern.threads) as u32;
+                        native.push(true);
+                        continue;
+                    }
                     let st = self.nodes[root].precision.storage;
                     let src = super::cuda::wgsl_to_cuda(&k.source, k.workgroup_size);
                     k.source = super::cuda_int8::q8x32_writer(
@@ -572,6 +587,184 @@ impl TensorGraph {
                 self.nodes[i].inline = true;
             }
         }
+    }
+}
+
+impl TensorGraph {
+    /// Schedule (decode): a small Sum / Max reduction — an RMSNorm's sum
+    /// of squares, per-head norm statistics, a scalar gate — read only
+    /// through maps (directly or through inlined maps) by maps that are
+    /// kernels of their own is marked inline, so each such map is one
+    /// `staged_map` kernel that recomputes the statistic per block in
+    /// shared memory (`ss` then `x·rsqrt(ss)·w` in one launch, also for a
+    /// map stored as Q8x32). Bounded work: at most 2¹⁶ products a
+    /// statistic and 2²¹ over all the blocks of a reader. `inplace` are
+    /// the in-place cache updates (they visit one row of their longest
+    /// dim). Returns how many reductions it inlined.
+    pub fn schedule_staged_stats(&mut self, outputs: &[TensorId], inplace: &[TensorId]) -> usize {
+        let n = self.nodes.len();
+        let live = self.live(outputs);
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            match &self.nodes[i].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if !readers[a.src.n()].contains(&i) {
+                            readers[a.src.n()].push(i);
+                        }
+                    }
+                }
+                // anything else reads whole buffers: not a staged reader
+                Op::Reshape(t) => readers[t.n()].push(usize::MAX),
+                Op::Scan(sc) => sc
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                Op::Operator(o) => o
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                _ => {}
+            }
+        }
+        // the kernels a value reaches through inlined maps (`None`: a
+        // reader that is not a map)
+        fn finals(g: &TensorGraph, readers: &[Vec<usize>], i: usize, out: &mut Vec<usize>) -> bool {
+            for &r in &readers[i] {
+                if r == usize::MAX {
+                    return false;
+                }
+                let Some(rc) = g.comp_at(r) else { return false };
+                if rc.monoid.is_some() || rc.tuple != 0 || g.nodes[r].int_mma.is_some() {
+                    return false;
+                }
+                if g.nodes[r].inline {
+                    if !finals(g, readers, r, out) {
+                        return false;
+                    }
+                } else if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+            true
+        }
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        let mut count = 0;
+        for p in (0..n).filter(|&p| live[p]) {
+            let Some(pc) = self.comp_at(p) else { continue };
+            let kind = pc.monoid.as_ref().map(Monoid::kind);
+            if !matches!(kind, Some(super::MonoidKind::Sum | super::MonoidKind::Max))
+                || self.nodes[p].inline
+                || is_output(p)
+                || pc.body_outs.len() != 1
+                || pc.tuple != 0
+                || pc.red.is_empty()
+                || pc.has_gather()
+                || numel(&pc.out) > 1024
+            {
+                continue;
+            }
+            let mut fs = Vec::new();
+            if readers[p].is_empty() || !finals(self, &readers, p, &mut fs) {
+                continue;
+            }
+            let work = numel(&pc.out) * numel(&pc.red);
+            let blocks = |f: usize| {
+                let out = &self.comp_at(f).unwrap().out;
+                let k = numel(out);
+                let k = if inplace.iter().any(|t| t.n() == f) {
+                    k / out.iter().map(|d| d.n()).max().unwrap_or(1)
+                } else {
+                    k
+                };
+                k.div_ceil(256)
+            };
+            if work > 1 << 16 || fs.iter().any(|&f| work * blocks(f) > 1 << 21) {
+                continue;
+            }
+            self.nodes[p].inline = true;
+            count += 1;
+        }
+        count
+    }
+}
+
+impl TensorGraph {
+    /// Schedule (decode): a small materialized map (≤ 1024 points; a GDN
+    /// layer's per-head gates `α = exp(softplus(·)·A)`, `β = σ(·)`) read
+    /// only by comps is evaluated inside each reader instead of launched
+    /// on its own, when the readers' spaces total at most 2²² points (a
+    /// few transcendentals per point are free next to the reader's loads).
+    /// Not outputs, in-place updates' operands, maps read through
+    /// reshapes or by non-comps, or maps over inlined reductions. Returns
+    /// how many maps it inlined.
+    pub fn schedule_small_maps(&mut self, outputs: &[TensorId], inplace: &[TensorId]) -> usize {
+        let n = self.nodes.len();
+        let live = self.live(outputs);
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            match &self.nodes[i].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if !readers[a.src.n()].contains(&i) {
+                            readers[a.src.n()].push(i);
+                        }
+                    }
+                }
+                Op::Reshape(t) => readers[t.n()].push(usize::MAX),
+                Op::Scan(sc) => sc
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                Op::Operator(o) => o
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                _ => {}
+            }
+        }
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        let mut count = 0;
+        for i in (0..n).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            if c.monoid.is_some()
+                || c.tuple != 0
+                || c.width() != 1
+                || self.nodes[i].inline
+                || is_output(i)
+                || numel(&c.out) > 1024
+                || self.nodes[i].precision.storage != super::Format::F32
+                || readers[i].is_empty()
+                || c.args.iter().any(|a| a.view.guard || a.view.gather.is_some())
+                // over an inlined reduction (a staged statistic): stays
+                || c.args.iter().any(|a| {
+                    let p = a.src.n();
+                    self.nodes[p].inline || self.comp_at(p).is_some_and(|pc| pc.monoid.is_some() && self.nodes[p].inline)
+                })
+            {
+                continue;
+            }
+            let ok = readers[i].iter().all(|&r| {
+                r != usize::MAX
+                    && !inplace.iter().any(|t| t.n() == r)
+                    && self.comp_at(r).is_some_and(|rc| {
+                        rc.args
+                            .iter()
+                            .all(|a| a.src.n() != i || !(a.view.guard || a.view.gather.is_some()))
+                    })
+                    && self.nodes[r].int_mma.is_none()
+            });
+            let work: usize = readers[i]
+                .iter()
+                .filter(|&&r| r != usize::MAX)
+                .map(|&r| self.comp_at(r).map_or(0, |rc| numel(&rc.space())))
+                .sum();
+            if ok && work <= 1 << 22 {
+                self.nodes[i].inline = true;
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -2813,22 +3006,29 @@ impl Lowering<'_> {
     /// producer is recomputed per block instead of launched as a kernel
     /// of its own (a decode step's statistics are a few thousand
     /// elements; the launch and the dependency cost more).
-    /// `TANG_STAGED_MAP=0` disables it.
+    /// Coder-next schedules them only with `TANG_STAGED_MAP=1`;
+    /// `TANG_STAGED_MAP=0` disables it everywhere.
     fn staged_map(&self, root: usize) -> Option<Kernel> {
         if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("0") {
             return None;
         }
         let g = self.g;
         let c = g.comp_at(root)?;
+        // stored as Q8x32: whole warps store blocks of 32 (`tang_q8x32_store`)
+        let st = g.nodes[root].precision.storage;
+        let q8 = matches!(st, super::Format::Q8x32 | super::Format::Q8x32F);
         if c.monoid.is_some()
             || self.packed.contains_key(&root)
-            || g.nodes[root].precision.storage != super::Format::F32
+            || !(st == super::Format::F32 || q8)
         {
             return None;
         }
         let pts = fixed(c.points());
         let pk = pts.len();
         let w = c.width();
+        if q8 && (w != 1 || !numel(c.points()).is_multiple_of(32)) {
+            return None;
+        }
         let mut leaves = Vec::new();
         let mut staged = Vec::new();
         let args = c
@@ -2852,6 +3052,9 @@ impl Lowering<'_> {
         writeln!(s, "#define TANG_TILES {blocks}").unwrap();
         writeln!(s, "#define TANG_THREADS {threads}").unwrap();
         s.push_str(PRELUDE);
+        if q8 {
+            s.push_str(&super::cuda_int8::q8x32_store(st == super::Format::Q8x32F));
+        }
         let mut params: Vec<String> = self
             .reads
             .iter()
@@ -2886,8 +3089,13 @@ impl Lowering<'_> {
         let y = emit(&mut s, &c.body, &c.body_outs, "x_", "    ", &|v| {
             vals[v as usize].clone()
         });
-        for (slot, v) in y.iter().enumerate() {
-            writeln!(s, "    out[t * {w} + {slot}] = {v};").unwrap();
+        if q8 {
+            // codes then the per-32 scales after the n code bytes
+            writeln!(s, "    tang_q8x32_store(out, t, {}, {n}u);", y[0]).unwrap();
+        } else {
+            for (slot, v) in y.iter().enumerate() {
+                writeln!(s, "    out[t * {w} + {slot}] = {v};").unwrap();
+            }
         }
         writeln!(s, "}}").unwrap();
         Some(Kernel {
