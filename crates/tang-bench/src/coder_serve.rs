@@ -60,6 +60,8 @@ struct Slot {
     prog: Program,
     tokens: Vec<u32>,
     params: [f32; 4],
+    /// Handed out by `alloc_slot` (running or parked) until `free_slot`.
+    allocated: bool,
 }
 
 pub struct DerivedCoder {
@@ -228,6 +230,7 @@ impl DerivedCoder {
                 prog,
                 tokens: Vec::new(),
                 params: greedy,
+                allocated: false,
             })
             .collect();
         let mut me = DerivedCoder {
@@ -473,17 +476,20 @@ impl ServeEngine for DerivedCoder {
     fn slot_tokens(&self, slot: usize) -> &[u32] {
         &self.slots[slot].tokens
     }
+    /// A slot no request holds (a just-allocated slot is still empty until its prefill, so
+    /// emptiness can't mark it free); `Err` when all are held, and the batcher evicts a
+    /// parked one with `free_slot`.
     fn alloc_slot(&mut self) -> Result<usize> {
         let s = (0..self.slots.len())
-            .min_by_key(|&s| self.slots[s].tokens.len())
-            .unwrap();
-        if !self.slots[s].tokens.is_empty() {
-            self.clear_slot(s);
-        }
+            .find(|&s| !self.slots[s].allocated)
+            .context("every sequence slot is allocated")?;
+        self.clear_slot(s);
+        self.slots[s].allocated = true;
         Ok(s)
     }
     fn free_slot(&mut self, slot: usize) {
         self.clear_slot(slot);
+        self.slots[slot].allocated = false;
     }
     fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
         self.feed(slot, ids)
