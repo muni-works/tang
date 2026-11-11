@@ -246,7 +246,7 @@ fn mask_attention(
         let mut member = lit(-0.5);
         for s in 0..KK {
             let (ix, val) = (v[at + 2 + 2 * s], v[at + 3 + 2 * s]);
-            member = member + sel(val + lit(1e29), pick(ix, j, lit(1.0)), lit(0.0));
+            member += sel(val + lit(1e29), pick(ix, j, lit(1.0)), lit(0.0));
         }
         let inner = sel(member, x, lit(id));
         if causal {

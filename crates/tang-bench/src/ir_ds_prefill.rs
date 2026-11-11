@@ -1027,7 +1027,7 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
     let (d, h, hd, hc) = (dm.dim, dm.n_heads, dm.head_dim, dm.hc);
     let (ql, g, ol) = (dm.q_lora_rank, dm.o_groups, dm.o_lora_rank);
     let (nh, ihd, kk) = (dm.index_n_heads, dm.index_head_dim, dm.index_topk);
-    let (ne, ka, inter) = (dm.n_experts, dm.n_active, dm.moe_inter);
+    let (ne, ka, _inter) = (dm.n_experts, dm.n_active, dm.moe_inter);
     let win = dm.window as f64;
     let mut b = B {
         g: TensorGraph::new(),
