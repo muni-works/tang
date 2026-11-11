@@ -249,7 +249,10 @@ fn main() {
         let mut sh: Vec<_> = sh.into_iter().collect();
         sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
         for (k, (n, ms)) in sh.iter().take(30) {
-            println!("  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}", 1e3 * ms / *n as f64);
+            println!(
+                "  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}",
+                1e3 * ms / *n as f64
+            );
         }
         // by kind: (native, int8, first line)
         let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
