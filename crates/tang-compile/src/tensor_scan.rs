@@ -76,7 +76,16 @@ pub struct DeltaStep {
 
 impl DeltaStep {
     /// Input positions `(k, v, α, β, init, q)`.
-    pub fn slots(&self) -> (usize, usize, Option<usize>, Option<usize>, usize, Option<usize>) {
+    pub fn slots(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        Option<usize>,
+        Option<usize>,
+        usize,
+        Option<usize>,
+    ) {
         let mut i = 2;
         let mut next = |on: bool| {
             on.then(|| {
@@ -325,7 +334,11 @@ impl Scan {
                 let al = ia.map_or(1.0, |i| ins[i][p]);
                 let be = ib.map_or(1.0, |i| ins[i][p]);
                 for c in 0..m {
-                    ks[c] = if d.delta { (0..n).map(|i| k[i] * s[i * m + c]).sum() } else { 0.0 };
+                    ks[c] = if d.delta {
+                        (0..n).map(|i| k[i] * s[i * m + c]).sum()
+                    } else {
+                        0.0
+                    };
                 }
                 for i in 0..n {
                     for c in 0..m {

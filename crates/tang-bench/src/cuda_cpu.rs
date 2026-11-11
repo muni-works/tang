@@ -72,7 +72,9 @@ static inline unsigned max(unsigned a, unsigned b) { return a > b ? a : b; }
 static inline float min(float a, float b) { return std::fmin(a, b); }
 static inline float max(float a, float b) { return std::fmax(a, b); }
 static inline float __fdividef(float a, float b) { return a / b; }
-static inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+// glibc 2.40+ declares rsqrtf (extern): ours under another name
+static inline float tang_rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+#define rsqrtf tang_rsqrtf
 static inline float __frcp_rn(float x) { return 1.0f / x; }
 static inline float tang_sw_h2f(unsigned short h) {
     unsigned s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
@@ -468,7 +470,10 @@ mod tests {
             .collect();
         // the router's top-k is the warp select (not the generic combine)
         assert!(
-            dp.program.kernels.iter().any(|k| k.source.contains("warp select"))
+            dp.program
+                .kernels
+                .iter()
+                .any(|k| k.source.contains("warp select"))
                 || std::env::var("TANG_TOPK_SELECT").is_ok_and(|v| v == "0"),
             "no top-k warp select"
         );
@@ -737,13 +742,26 @@ mod tests {
         use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, View};
         let arg = |src, forms: Vec<Form>| Arg {
             src,
-            view: View { gather: None, guard: false, forms },
+            view: View {
+                gather: None,
+                guard: false,
+                forms,
+            },
         };
-        for (rows, n, k, argmax) in [(2usize, 1500usize, 512usize, false), (3, 5000, 32, false), (1, 300, 64, false), (2, 3000, 1, true)] {
+        for (rows, n, k, argmax) in [
+            (2usize, 1500usize, 512usize, false),
+            (3, 5000, 32, false),
+            (1, 300, 64, false),
+            (2, 3000, 1, true),
+        ] {
             let mut g = TensorGraph::new();
             let x = g.input(&[rows, n]);
             let j = g.iota(&[rows, n], 1);
-            let m = if argmax { Monoid::argmax() } else { Monoid::topk(k) };
+            let m = if argmax {
+                Monoid::argmax()
+            } else {
+                Monoid::topk(k)
+            };
             let top = g
                 .comp_tuple(
                     &[rows, 2 * k],
@@ -757,19 +775,33 @@ mod tests {
                         let mut o = vec![v[1], v[0]];
                         for _ in 1..k {
                             o.push(<tang_expr::ExprId as tang::Scalar>::from_f64(0.0));
-                            o.push(<tang_expr::ExprId as tang::Scalar>::from_f64(-(f32::MAX as f64)));
+                            o.push(<tang_expr::ExprId as tang::Scalar>::from_f64(
+                                -(f32::MAX as f64),
+                            ));
                         }
                         o
                     },
                 )
                 .unwrap();
             // values on a coarse grid: many ties
-            let vals: Vec<f64> = (0..rows * n).map(|i| ((i * 7919 + 13) % 97) as f64 * 0.25 - 9.0).collect();
+            let vals: Vec<f64> = (0..rows * n)
+                .map(|i| ((i * 7919 + 13) % 97) as f64 * 0.25 - 9.0)
+                .collect();
             let want = g.eval(&[vals.clone()], &[top]).remove(0);
             let dp = g.to_cuda_decode(&[top], &DecodeOpts::default());
-            let src = &dp.program.kernels.iter().map(|k| k.source.clone()).collect::<Vec<_>>().join("\n");
+            let src = &dp
+                .program
+                .kernels
+                .iter()
+                .map(|k| k.source.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
             // argmax (k < 32) stays on the generic warp combine
-            assert_eq!(src.contains("block select"), k >= 32, "block select lowering");
+            assert_eq!(
+                src.contains("block select"),
+                k >= 32,
+                "block select lowering"
+            );
             let vf: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
             let got = super::run(&dp, &[vf], &[top]).remove(0);
             assert_eq!(got.len(), want.len());
@@ -786,21 +818,33 @@ mod tests {
     #[test]
     fn ds_step_kernels_run_on_the_cpu() {
         use crate::ir_ds_prefill::tests::{rel, step_case};
-        let (st, ins, ids, want, engram) = step_case(&crate::ir_ds_prefill::DsDims::tiny_full(), 5, 1);
+        let (st, ins, ids, want, engram) =
+            step_case(&crate::ir_ds_prefill::DsDims::tiny_full(), 5, 1);
         assert!(!engram.is_empty());
         let dp = st.graph.to_cuda_decode(&ids, &DecodeOpts::default());
         let words: Vec<Vec<f32>> = ins
             .iter()
-            .map(|v| v.iter().map(|&x| if x.is_nan() { 0.0 } else { x as f32 }).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|&x| if x.is_nan() { 0.0 } else { x as f32 })
+                    .collect()
+            })
             .collect();
         let got = super::run(&dp, &words, &ids);
         let mut worst = 0.0f64;
         for (g, w) in got.iter().zip(&want) {
-            let (a, b): (Vec<f64>, Vec<f64>) =
-                g.iter().zip(w).filter(|(_, w)| !w.is_nan()).map(|(a, b)| (*a as f64, *b)).unzip();
+            let (a, b): (Vec<f64>, Vec<f64>) = g
+                .iter()
+                .zip(w)
+                .filter(|(_, w)| !w.is_nan())
+                .map(|(a, b)| (*a as f64, *b))
+                .unzip();
             worst = worst.max(rel(&a, &b));
         }
-        eprintln!("ds tiny_full step: {} CUDA kernels on the CPU vs interpreter: rel err {worst:.2e}", dp.program.kernels.len());
+        eprintln!(
+            "ds tiny_full step: {} CUDA kernels on the CPU vs interpreter: rel err {worst:.2e}",
+            dp.program.kernels.len()
+        );
         assert!(worst < 1e-4, "{worst}");
     }
 
@@ -819,7 +863,13 @@ mod tests {
         let ins = |t: &[f64]| -> Vec<Vec<f64>> {
             m.inputs
                 .iter()
-                .map(|(n, _)| if n == "tokens" { t.to_vec() } else { w[n].clone() })
+                .map(|(n, _)| {
+                    if n == "tokens" {
+                        t.to_vec()
+                    } else {
+                        w[n].clone()
+                    }
+                })
                 .collect()
         };
         let mut caches: Option<Vec<Vec<f32>>> = None;
@@ -864,11 +914,10 @@ mod tests {
             }
             let got = super::run(&dp, &step_ins, &outs);
             let grown = pos + k;
-            let want = m
-                .g
-                .bind(&[("T", grown)])
-                .unwrap()
-                .eval(&ins(&toks[..grown]), &[m.logits]);
+            let want =
+                m.g.bind(&[("T", grown)])
+                    .unwrap()
+                    .eval(&ins(&toks[..grown]), &[m.logits]);
             let g64: Vec<f64> = got[0].iter().map(|&x| x as f64).collect();
             worst = worst.max(rel(&g64, &want[0][pos * vocab..grown * vocab]));
             *cs = got[1..].to_vec();
@@ -895,14 +944,19 @@ mod tests {
                 StepInput::New(_) => toks.clone(),
                 StepInput::Same(i) => w[&m.inputs[i].0].clone(),
                 StepInput::Cache(c) => {
-                    let n: usize = concrete(st.graph.shape(st.caches[c].input), 1).iter().product();
+                    let n: usize = concrete(st.graph.shape(st.caches[c].input), 1)
+                        .iter()
+                        .product();
                     (0..n).map(|j| ((j * 13 % 7) as f64 - 3.0) * 0.05).collect()
                 }
             })
             .collect();
         let mut ids = st.outputs.clone();
         ids.extend(st.caches.iter().map(|c| c.updated));
-        let g = st.graph.split_bilinear_min(&ids, 1, 1).expect("something splits");
+        let g = st
+            .graph
+            .split_bilinear_min(&ids, 1, 1)
+            .expect("something splits");
         let a = st.graph.eval(&ins, &ids);
         // (the factors come after their readers: evaluate in dependency order)
         let (g, gids) = g.eliminate_dead(&ids);
@@ -920,7 +974,10 @@ mod tests {
         for m in [qwen(), coder()] {
             for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
                 let (e, nk) = chunked_then_decode(&m, ks);
-                eprintln!("{} chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}", m.name);
+                eprintln!(
+                    "{} chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}",
+                    m.name
+                );
                 assert!(e < 1e-4, "{} {ks:?}: {e}", m.name);
             }
         }

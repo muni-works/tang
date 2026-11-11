@@ -195,7 +195,9 @@ impl TensorGraph {
                 // some of them)
                 let mut seed = 0x9e37_79b9_u64;
                 let mut rnd = || {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     ((seed >> 11) as f64 / (1u64 << 53) as f64) * 16.0 - 8.0
                 };
                 let (mut linear, mut live) = (true, false);
@@ -203,7 +205,11 @@ impl TensorGraph {
                     let mut x: Vec<f64> = (0..c.args.len())
                         .map(|_| {
                             let v = rnd().round() / 2.0;
-                            if v == 0.0 { 0.5 } else { v }
+                            if v == 0.0 {
+                                0.5
+                            } else {
+                                v
+                            }
                         })
                         .collect();
                     x[b] = 1.0;
@@ -218,8 +224,7 @@ impl TensorGraph {
                     live |= one != 0.0;
                 }
                 let linear = linear && live;
-                (leaf && deps[b][np] && cols.iter().any(|&x| x) && linear)
-                    .then_some((b, cols))
+                (leaf && deps[b][np] && cols.iter().any(|&x| x) && linear).then_some((b, cols))
             }) {
                 // A: space (points without the columns, j), body with B = 1
                 let keep: Vec<usize> = (0..np).filter(|&d| !cols[d]).collect();

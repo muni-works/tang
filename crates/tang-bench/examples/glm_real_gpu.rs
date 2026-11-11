@@ -73,7 +73,11 @@ fn build(rt: &Runtime, st: &StepGraph, inputs: &[Vec<f32>]) -> (Program, Vec<Ten
         "lowered: {} kernels ({} native, {} top-k block select)",
         dp.program.kernels.len(),
         dp.native.iter().filter(|n| **n).count(),
-        dp.program.kernels.iter().filter(|k| k.source.contains("block select")).count()
+        dp.program
+            .kernels
+            .iter()
+            .filter(|k| k.source.contains("block select"))
+            .count()
     );
     let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
     (Program::new(rt, dp.program, &refs), outs)
@@ -205,7 +209,11 @@ fn check_step(run: &RealRun, rt: &Runtime) -> bool {
         .inputs
         .iter()
         .map(|&si| {
-            let k = st.inputs.iter().position(|&x| x == si).expect("an input of the sampled step");
+            let k = st
+                .inputs
+                .iter()
+                .position(|&x| x == si)
+                .expect("an input of the sampled step");
             if si == StepInput::Same(pg.input("sample.params")) {
                 greedy.iter().map(|&x| x as f32).collect()
             } else {
@@ -218,7 +226,10 @@ fn check_step(run: &RealRun, rt: &Runtime) -> bool {
     p0.run(rt);
     let plain_logits = p0.read(rt, pouts[0]);
     let same_bits = plain_logits.len() == logits.len()
-        && plain_logits.iter().zip(&logits).all(|(a, b)| a.to_bits() == b.to_bits());
+        && plain_logits
+            .iter()
+            .zip(&logits)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
     let ms0 = p0.time(rt, 20);
     let pass = worst < 1e-3 && greedy_ok && same_as_cpu && repro && same_bits;
     println!(
@@ -260,7 +271,12 @@ fn decode(run: &RealRun, rt: &Runtime, args: &[String], n: usize) -> bool {
                 nm => run.input32(nm).unwrap(),
             },
             StepInput::Cache(c) => {
-                let len: usize = st.graph.shape(st.caches[c].input).iter().map(|d| d.n()).product();
+                let len: usize = st
+                    .graph
+                    .shape(st.caches[c].input)
+                    .iter()
+                    .map(|d| d.n())
+                    .product();
                 if st.caches[c].state {
                     vec![0.0; len]
                 } else {
@@ -331,7 +347,12 @@ fn decode(run: &RealRun, rt: &Runtime, args: &[String], n: usize) -> bool {
     let a = gen("run 1");
     // reset caches for a second run: rows to NaN, states to zero
     for c in 0..st.caches.len() {
-        let len: usize = st.graph.shape(st.caches[c].input).iter().map(|d| d.n()).product();
+        let len: usize = st
+            .graph
+            .shape(st.caches[c].input)
+            .iter()
+            .map(|d| d.n())
+            .product();
         let fill = if st.caches[c].state { 0.0 } else { f32::NAN };
         prog.write(rt, prog.input(cache_ins[c].0), &vec![fill; len]);
     }
@@ -342,7 +363,11 @@ fn decode(run: &RealRun, rt: &Runtime, args: &[String], n: usize) -> bool {
     if temp > 0.0 {
         println!(
             "sampled decode (T {temp}, top-p {top_p}, top-k {top_k}, seed {seed}): run to run {}",
-            if repro { "identical: PASS" } else { "DIFFERENT: FAIL" }
+            if repro {
+                "identical: PASS"
+            } else {
+                "DIFFERENT: FAIL"
+            }
         );
         return repro;
     }
