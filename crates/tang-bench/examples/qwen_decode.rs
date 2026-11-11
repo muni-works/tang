@@ -926,6 +926,7 @@ fn model(args: &[String]) {
             reps,
             &pos,
             &set_pos,
+            &|p: &tang_gpu::program::Program| p.read(&rt, dec.outs[0]),
         );
         autotune::report(&t);
         let path = std::env::var("TANG_TUNE_OUT")

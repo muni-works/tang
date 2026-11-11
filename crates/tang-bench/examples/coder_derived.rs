@@ -293,6 +293,7 @@ fn main() {
             reps,
             &pos,
             &set_pos,
+            &|p: &Program| p.read(&rt, outs[0]),
         );
         autotune::report(&t);
         let path = std::env::var("TANG_TUNE_OUT")

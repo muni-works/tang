@@ -124,6 +124,17 @@ fn time_sigs(
     m
 }
 
+/// Same logits as the reference: relative max error under 1e-3 and the same argmax.
+fn same_output(o: &[f32], r: &[f32]) -> bool {
+    if o.len() != r.len() || o.iter().any(|x| !x.is_finite()) {
+        return false;
+    }
+    let scale = r.iter().fold(0f32, |a, x| a.max(x.abs())).max(1e-6);
+    let err = o.iter().zip(r).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+    let am = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap()).unwrap_or(0);
+    err / scale < 1e-3 && am(o) == am(r)
+}
+
 /// Better than `base` at every position, and by `MIN_GAIN` in total.
 fn wins(t: &[f64], base: &[f64]) -> bool {
     let (a, b): (f64, f64) = (t.iter().sum(), base.iter().sum());
@@ -161,8 +172,29 @@ pub fn tune_step<F: FnMut() -> Program>(
     reps: usize,
     pos: &[usize],
     set_pos: &dyn Fn(usize),
+    check: &dyn Fn(&Program) -> Vec<f32>,
 ) -> Tuned {
     tune::set_entries(HashMap::new());
+    // correctness: every variant's output (the logits) at pos[0] must match
+    // the default step's — a faster wrong kernel is never a choice
+    let out_at = |p: &Program| {
+        set_pos(pos[0]);
+        p.run(rt);
+        rt.sync();
+        check(p)
+    };
+    let reference = {
+        let (p, _) = build_forced(rt, &mut build, Choice::new()).expect("default step lowers");
+        out_at(&p)
+    };
+    let correct = |p: &Program| -> bool {
+        let o = out_at(p);
+        let ok = same_output(&o, &reference);
+        if !ok {
+            msg("  wrong output: rejected");
+        }
+        ok
+    };
     // step level: whole-step time per value, one knob at a time
     let mut step_choice = Choice::new();
     if !step_grid.is_empty() {
@@ -179,6 +211,9 @@ pub fn tune_step<F: FnMut() -> Program>(
                     msg(&format!("step {k}={v}: does not lower"));
                     continue;
                 };
+                if !correct(&p) {
+                    continue;
+                }
                 p.capture(rt);
                 let ms: f64 = pos.iter().map(|&q| { set_pos(q); step_ms(rt, &p, 20) }).sum();
                 msg(&format!("step {k}={v}: {ms:.3} ms"));
@@ -224,6 +259,10 @@ pub fn tune_step<F: FnMut() -> Program>(
                 msg(&format!("{k}={v}: does not lower, skipped"));
                 continue;
             };
+            if !correct(&p) {
+                msg(&format!("{k}={v}: wrong output, skipped"));
+                continue;
+            }
             let readers = sample(&r, 3, |ks| ks.iter().any(|x| x == k));
             let t = time_sigs(rt, &p, &readers, reps, pos, set_pos);
             let mut won = 0;
@@ -243,7 +282,24 @@ pub fn tune_step<F: FnMut() -> Program>(
     }
     // verify the combined choices; drop the ones that don't hold up
     tune::set_entries(best.clone());
-    let (p1, _) = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers");
+    let (mut p1, _) = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers");
+    if !correct(&p1) {
+        // a combination went wrong: keep each signature's single best knob
+        msg("combined choices give a wrong output: one knob per signature");
+        for (sig, c) in best.iter_mut() {
+            let m = &best_ms[sig];
+            let k = m.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0.clone();
+            c.retain(|kk, _| *kk == k);
+        }
+        tune::set_entries(best.clone());
+        p1 = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers").0;
+        if !correct(&p1) {
+            msg("still wrong: no per-kernel choices kept");
+            best.clear();
+            tune::set_entries(HashMap::new());
+            p1 = build_forced(rt, &mut build, with_step(&Choice::new())).expect("lowers").0;
+        }
+    }
     let tuned_sample: BTreeMap<&str, Vec<usize>> =
         all.iter().filter(|(s, _)| best.contains_key(**s)).map(|(s, v)| (*s, v.clone())).collect();
     let t1 = time_sigs(rt, &p1, &tuned_sample, reps, pos, set_pos);
