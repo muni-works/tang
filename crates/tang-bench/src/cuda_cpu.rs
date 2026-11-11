@@ -72,7 +72,9 @@ static inline unsigned max(unsigned a, unsigned b) { return a > b ? a : b; }
 static inline float min(float a, float b) { return std::fmin(a, b); }
 static inline float max(float a, float b) { return std::fmax(a, b); }
 static inline float __fdividef(float a, float b) { return a / b; }
-static inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+// glibc 2.40+ declares rsqrtf (extern): ours under another name
+static inline float tang_rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+#define rsqrtf tang_rsqrtf
 static inline float __frcp_rn(float x) { return 1.0f / x; }
 static inline float tang_sw_h2f(unsigned short h) {
     unsigned s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
