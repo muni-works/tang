@@ -27,12 +27,19 @@ fn words_of_bytes(b: &[u8]) -> Vec<f32> {
 }
 
 fn env(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let opt = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
+    let opt = |k: &str| {
+        args.iter()
+            .position(|a| a == k)
+            .map(|i| args[i + 1].clone())
+    };
     let path = args.first().cloned().unwrap_or_else(gguf_path);
     let nb: usize = opt("--batch").map_or(1, |v| v.parse().unwrap());
     let ctx: usize = opt("--ctx").map_or(256, |v| v.parse().unwrap());

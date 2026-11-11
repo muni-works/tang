@@ -954,8 +954,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     }
     let units = g.k / 128;
     // half-super-blocks a lane (more loads in flight a lane), then lanes a row
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL")
-        .unwrap_or(2);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL").unwrap_or(2);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1078,8 +1077,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
 fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     let units = g.k / 128;
     // units a lane (`TANG_GEMV_Q8_UPL`, default 1): more independent loads in flight a thread
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_Q8_UPL")
-        .unwrap_or(1);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_Q8_UPL").unwrap_or(1);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1358,8 +1356,7 @@ __device__ __forceinline__ float tang_e8m0(unsigned s) {
 fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
     let fp4 = g.fmt == Format::Mxfp4;
     let units = g.k / 128;
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_DS_UPL")
-        .unwrap_or(1);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_DS_UPL").unwrap_or(1);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;

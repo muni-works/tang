@@ -17,9 +17,9 @@
 //!   ([`Program::with_shared_at`]): no B-wide step for one row, no cache copies.
 //! - **Snapshots**: a slot's ring/state blocks (running) and its K/V rows (positional).
 use std::cell::Cell;
-use tang::Scalar;
 use std::path::Path;
 use std::time::Instant;
+use tang::Scalar;
 
 use anyhow::{ensure, Context, Result};
 use tang_compile::tensor::int8_sched::BlockOpts;
@@ -153,10 +153,16 @@ fn gate_running(st: &mut StepGraph, active_k: usize) -> Result<usize> {
         };
         let gated = st
             .graph
-            .comp(&shape, &[], vec![plain(u, r), plain(old, r), av], None, |v| {
-                let c = v[2] - tang_expr::ExprId::from_f64(0.5);
-                vec![tang_expr::with_graph(|g| g.select(c, v[0], v[1]))]
-            })
+            .comp(
+                &shape,
+                &[],
+                vec![plain(u, r), plain(old, r), av],
+                None,
+                |v| {
+                    let c = v[2] - tang_expr::ExprId::from_f64(0.5);
+                    vec![tang_expr::with_graph(|g| g.select(c, v[0], v[1]))]
+                },
+            )
             .map_err(|e| anyhow::anyhow!("gate cache {c}: {e:?}"))?;
         st.caches[c].updated = gated;
     }
@@ -184,8 +190,11 @@ impl BatchedCoder {
             shape: vec![Dim::Sym(SEQ)],
         });
         tys.push(None);
-        let (tokens_k, params_k, active_k) =
-            (pg.input("tokens"), pg.input("sample.params"), pg.input("active"));
+        let (tokens_k, params_k, active_k) = (
+            pg.input("tokens"),
+            pg.input("sample.params"),
+            pg.input("active"),
+        );
         let spec = StepSpec {
             seq: SEQ,
             new: 1,
@@ -225,7 +234,10 @@ impl BatchedCoder {
             t0.elapsed().as_secs_f64()
         );
         let rt = runtime();
-        ensure!(matches!(rt, Runtime::Cuda(_)), "the batched derived engine needs CUDA");
+        ensure!(
+            matches!(rt, Runtime::Cuda(_)),
+            "the batched derived engine needs CUDA"
+        );
         ensure!(
             st_s.caches.len() == st_1.caches.len() && st_g.caches.len() == st_1.caches.len(),
             "batched and solo steps cache different things"
@@ -252,12 +264,21 @@ impl BatchedCoder {
             bytes as f64 / 1e9,
             t1.elapsed().as_secs_f64()
         );
-        let mk = |st: &StepGraph, prog: Program, outs: Vec<TensorId>, sampled: bool, active: Option<usize>| -> Result<Step> {
+        let mk = |st: &StepGraph,
+                  prog: Program,
+                  outs: Vec<TensorId>,
+                  sampled: bool,
+                  active: Option<usize>|
+         -> Result<Step> {
             Ok(Step {
                 prog,
                 pos_in: find(st, StepInput::Pos).context("pos input")?,
                 tok_in: find(st, StepInput::New(tokens_k)).context("token input")?,
-                params_in: if sampled { find(st, StepInput::New(params_k)) } else { None },
+                params_in: if sampled {
+                    find(st, StepInput::New(params_k))
+                } else {
+                    None
+                },
                 active_in: active,
                 cache_in: (0..st.caches.len())
                     .map(|c| find(st, StepInput::Cache(c)).expect("cache input"))
@@ -291,7 +312,11 @@ impl BatchedCoder {
             let kind = if c1.state || c1.ring.is_some() {
                 Kind::Running
             } else {
-                ensure!(c1.axis == 0 && w1 % ctx == 0, "row cache {c}: axis {}", c1.axis);
+                ensure!(
+                    c1.axis == 0 && w1 % ctx == 0,
+                    "row cache {c}: axis {}",
+                    c1.axis
+                );
                 Kind::Rows { row: w1 / ctx }
             };
             caches.push((kind, w1));
@@ -450,13 +475,21 @@ impl BatchedCoder {
         }
         let mut all_greedy = true;
         for &(s, t) in rows {
-            ensure!(self.slots[s].tokens.len() < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
+            ensure!(
+                self.slots[s].tokens.len() < self.ctx,
+                "slot {s} is past its context ({} tokens)",
+                self.ctx
+            );
             tok[s] = t as f32;
             act[s] = 1.0;
             params[4 * s..4 * s + 4].copy_from_slice(&self.slots[s].params);
             all_greedy &= self.slots[s].params[TEMPERATURE] <= 0.0;
         }
-        let st = if all_greedy { &self.greedy } else { &self.sampled };
+        let st = if all_greedy {
+            &self.greedy
+        } else {
+            &self.sampled
+        };
         let p = &st.prog;
         p.write(&self.rt, p.input(st.pos_in), &pos);
         p.write(&self.rt, p.input(st.tok_in), &tok);
@@ -482,7 +515,11 @@ impl BatchedCoder {
     /// next token.
     fn step_solo(&mut self, s: usize, tok: u32, read: bool) -> Result<Option<u32>> {
         let pos = self.slots[s].tokens.len();
-        ensure!(pos < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
+        ensure!(
+            pos < self.ctx,
+            "slot {s} is past its context ({} tokens)",
+            self.ctx
+        );
         let (st, bp) = (&self.solo[s], &self.sampled);
         let p = &st.prog;
         p.write(&self.rt, p.input(st.pos_in), &[pos as f32]);
@@ -566,10 +603,13 @@ impl BatchedCoder {
     }
 
     fn rows(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-        self.caches.iter().enumerate().filter_map(|(c, &(k, w))| match k {
-            Kind::Rows { row } => Some((c, w, row)),
-            Kind::Running => None,
-        })
+        self.caches
+            .iter()
+            .enumerate()
+            .filter_map(|(c, &(k, w))| match k {
+                Kind::Rows { row } => Some((c, w, row)),
+                Kind::Running => None,
+            })
     }
 }
 
@@ -606,7 +646,10 @@ impl ServeEngine for BatchedCoder {
     }
     /// Slot 0, the caller having extended `tokens`: step `tokens[pos0..pos0 + t]`.
     fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>> {
-        ensure!(pos0 + t <= self.slots[0].tokens.len(), "window past the sequence");
+        ensure!(
+            pos0 + t <= self.slots[0].tokens.len(),
+            "window past the sequence"
+        );
         // the caller extended `tokens` past this window (a span, window by window): step
         // these `t`, which re-appends them, and put the span's tail back
         let ids = self.slots[0].tokens[pos0..pos0 + t].to_vec();
@@ -684,11 +727,17 @@ impl ServeEngine for BatchedCoder {
     }
     fn set_slot_sampling(&mut self, slot: usize, s: RowSampling) -> Result<()> {
         if s.presence != 0.0 && !self.presence_noted.replace(true) {
-            eprintln!("coder derived: presence penalty not supported on the device sampler; ignored");
+            eprintln!(
+                "coder derived: presence penalty not supported on the device sampler; ignored"
+            );
         }
         let mut p = [0.0f32; 4];
         p[TEMPERATURE] = s.temperature.max(0.0);
-        p[TOP_P] = if s.top_p > 0.0 && s.top_p < 1.0 { s.top_p } else { 1.0 };
+        p[TOP_P] = if s.top_p > 0.0 && s.top_p < 1.0 {
+            s.top_p
+        } else {
+            1.0
+        };
         p[TOP_K] = s.top_k as f32;
         p[SEED] = (s.seed & 0xff_ffff) as f32;
         self.slots[slot].params = p;
@@ -726,10 +775,14 @@ impl ServeEngine for BatchedCoder {
             .rows()
             .map(|(c, w, row)| {
                 let o = slot * w;
-                p.read_words(&self.rt, self.sampled.cache(c), o + from * row..o + to * row)
-                    .iter()
-                    .flat_map(|x| x.to_le_bytes())
-                    .collect()
+                p.read_words(
+                    &self.rt,
+                    self.sampled.cache(c),
+                    o + from * row..o + to * row,
+                )
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect()
             })
             .collect();
         Ok(Positional::from_parts(from, to, bufs))

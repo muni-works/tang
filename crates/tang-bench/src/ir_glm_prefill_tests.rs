@@ -744,7 +744,11 @@ fn glm_sampler_rides_the_derived_step() {
     let w = weights(&pg);
     let cap = 9;
     let all = tokens(cap, d.vocab);
-    for params in [[0.0, 1.0, 0.0, 0.0], [0.8, 0.9, 6.0, 1234.0], [1.3, 1.0, 0.0, 7.0]] {
+    for params in [
+        [0.0, 1.0, 0.0, 0.0],
+        [0.8, 0.9, 6.0, 1234.0],
+        [1.3, 1.0, 0.0, 7.0],
+    ] {
         let ins = |toks: &[usize]| -> Vec<Vec<f64>> {
             pg.inputs
                 .iter()

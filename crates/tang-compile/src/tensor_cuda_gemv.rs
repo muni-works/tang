@@ -224,7 +224,12 @@ impl TensorGraph {
             .unwrap_or_default();
         let rd: Vec<String> = reads
             .iter()
-            .map(|&r| format!("{:?}/{:?}", self.nodes[r].shape, self.nodes[r].precision.storage))
+            .map(|&r| {
+                format!(
+                    "{:?}/{:?}",
+                    self.nodes[r].shape, self.nodes[r].precision.storage
+                )
+            })
             .collect();
         super::tune::hash_hex(&format!(
             "{:?}|{:?}|{red}|{:?}|{}",
@@ -2209,8 +2214,7 @@ impl Lowering<'_> {
                 // lane loads k·32 f32 activations per 16 bytes of weight
                 // and a window is bound by those loads, not by DRAM. Up
                 // to `TANG_WIN_TILE` (32) points a lane
-                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE")
-                    .unwrap_or(32);
+                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE").unwrap_or(32);
                 let w4: Vec<&Leaf> = leaves
                     .iter()
                     .filter(|l| l.pack == Some(Packing::U4))
@@ -2935,7 +2939,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -2965,7 +2971,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    __shared__ float si[{p}];").unwrap();
         writeln!(s, "    __shared__ float sv[{p}];").unwrap();
         writeln!(s, "    const int tid = threadIdx.x;").unwrap();
@@ -2979,7 +2990,11 @@ impl Lowering<'_> {
         writeln!(s, "    for (int i = tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "    if (tid == 0) cnt = 0;").unwrap();
         writeln!(s, "    __syncthreads();").unwrap();
-        writeln!(s, "    for (int base = 0; base < {n_red}; base += {threads}) {{").unwrap();
+        writeln!(
+            s,
+            "    for (int base = 0; base < {n_red}; base += {threads}) {{"
+        )
+        .unwrap();
         writeln!(s, "      {{").unwrap();
         writeln!(s, "        const int r = base + tid;").unwrap();
         writeln!(s, "        float ej = 0.0f, ew = -3.40282347e38f;").unwrap();
@@ -2999,14 +3014,29 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         // only what beats the current k-th survives to the next sort
-        writeln!(s, "        const float tv = sv[{}], tj = si[{}];", k - 1, k - 1).unwrap();
-        writeln!(s, "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{").unwrap();
+        writeln!(
+            s,
+            "        const float tv = sv[{}], tj = si[{}];",
+            k - 1,
+            k - 1
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{"
+        )
+        .unwrap();
         writeln!(s, "          const int q = atomicAdd(&cnt, 1);").unwrap();
         writeln!(s, "          si[{k} + q] = ej; sv[{k} + q] = ew;").unwrap();
         writeln!(s, "        }}").unwrap();
@@ -3014,19 +3044,40 @@ impl Lowering<'_> {
         writeln!(s, "      __syncthreads();").unwrap();
         writeln!(s, "      const int c = cnt;").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
-        writeln!(s, "      if (c > {} || base + {threads} >= {n_red}) {{", chunk - threads).unwrap();
+        writeln!(
+            s,
+            "      if (c > {} || base + {threads} >= {n_red}) {{",
+            chunk - threads
+        )
+        .unwrap();
         writeln!(s, "      for (int i = {k} + c + tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
         // bitonic sort of all P, best first
         writeln!(s, "      for (int size = 2; size <= {p}; size <<= 1) {{").unwrap();
-        writeln!(s, "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{").unwrap();
+        writeln!(
+            s,
+            "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{"
+        )
+        .unwrap();
         writeln!(s, "          for (int i = tid; i < {p}; i += {threads}) {{").unwrap();
         writeln!(s, "            const int j = i ^ stride;").unwrap();
         writeln!(s, "            if (j > i) {{").unwrap();
-        writeln!(s, "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);").unwrap();
-        writeln!(s, "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);").unwrap();
+        writeln!(
+            s,
+            "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);"
+        )
+        .unwrap();
         writeln!(s, "              if ((i & size) == 0 ? jb : ib) {{").unwrap();
-        writeln!(s, "                float a = si[i]; si[i] = si[j]; si[j] = a;").unwrap();
+        writeln!(
+            s,
+            "                float a = si[i]; si[i] = si[j]; si[j] = a;"
+        )
+        .unwrap();
         writeln!(s, "                a = sv[i]; sv[i] = sv[j]; sv[j] = a;").unwrap();
         writeln!(s, "              }}").unwrap();
         writeln!(s, "            }}").unwrap();
@@ -3793,7 +3844,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -3824,7 +3877,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    const int lane = threadIdx.x;").unwrap();
         writeln!(s, "    const int pt = blockIdx.x;").unwrap();
         let mut rem = "pt".to_string();
@@ -3853,9 +3911,14 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        vj[e] = ej; vw[e] = ew;").unwrap();
@@ -3870,9 +3933,21 @@ impl Lowering<'_> {
         writeln!(s, "        int bl = lane;").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int o = 16; o > 0; o >>= 1) {{").unwrap();
-        writeln!(s, "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);").unwrap();
-        writeln!(s, "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);").unwrap();
-        writeln!(s, "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);").unwrap();
+        writeln!(
+            s,
+            "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);"
+        )
+        .unwrap();
         writeln!(s, "            if (ow > bw || (ow == bw && (oj < bj || (oj == bj && ol < bl)))) {{ bj = oj; bw = ow; bl = ol; }}").unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        if (lane == bl) {{").unwrap();
@@ -3915,8 +3990,16 @@ fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[Str
         "{indent}    float ai = ta[2 * ia], av = ta[2 * ia + 1], bi = tb[2 * ib], bv = tb[2 * ib + 1];"
     )
     .unwrap();
-    writeln!(s, "{indent}    bool fa = av > bv || (av == bv && ai <= bi);").unwrap();
-    writeln!(s, "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;").unwrap();
+    writeln!(
+        s,
+        "{indent}    bool fa = av > bv || (av == bv && ai <= bi);"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;"
+    )
+    .unwrap();
     writeln!(s, "{indent}    if (fa) ia++; else ib++;").unwrap();
     writeln!(s, "{indent}  }}").unwrap();
     for i in 0..w {

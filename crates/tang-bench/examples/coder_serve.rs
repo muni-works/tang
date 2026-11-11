@@ -40,8 +40,12 @@ fn top2(l: &[f32]) -> (usize, f32, usize, f32) {
     (a, l[a], b, l[b])
 }
 
-fn greedy(e: &mut dyn tang_llm::flash::serve::ServeEngine, slot: Option<usize>, ids: &[u32], n: usize)
-    -> anyhow::Result<(Vec<u32>, Vec<Vec<f32>>)> {
+fn greedy(
+    e: &mut dyn tang_llm::flash::serve::ServeEngine,
+    slot: Option<usize>,
+    ids: &[u32],
+    n: usize,
+) -> anyhow::Result<(Vec<u32>, Vec<Vec<f32>>)> {
     let mut out = Vec::new();
     let mut lg = Vec::new();
     let mut cur = match slot {
@@ -68,7 +72,8 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
     let path = std::path::PathBuf::from(&args[0]);
     let ctx: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(4096);
     let n = 64;
-    let tok = tang_llm::flash::tokenize::FlashTokenizer::from_gguf(&tang_llm::gguf::Gguf::open(&path)?)?;
+    let tok =
+        tang_llm::flash::tokenize::FlashTokenizer::from_gguf(&tang_llm::gguf::Gguf::open(&path)?)?;
     let prompts = [
         "Write a Python function that returns the n-th Fibonacci number iteratively.",
         "Explain what a Rust lifetime is in two sentences.",
@@ -77,22 +82,29 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
     ];
     let ids: Vec<Vec<u32>> = prompts
         .iter()
-        .map(|p| tok.encode(&format!("<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n")))
+        .map(|p| {
+            tok.encode(&format!(
+                "<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            ))
+        })
         .collect::<anyhow::Result<_>>()?;
     // hand: one sequence, reset between prompts
     let no_hand = args.iter().any(|a| a == "--no-hand");
     let mut h = Vec::new();
     if !no_hand {
-    let mut hand = tang_llm::flash::coder::Coder::load(
-        &path,
-        tang_llm::flash::coder::CoderOpts { max_ctx: ctx, mtp: None },
-    )?;
-    hand.use_graphs = true;
-    for p in &ids {
-        ServeEngine::reset(&mut hand);
-        h.push(greedy(&mut hand, None, p, n)?);
-    }
-    drop(hand);
+        let mut hand = tang_llm::flash::coder::Coder::load(
+            &path,
+            tang_llm::flash::coder::CoderOpts {
+                max_ctx: ctx,
+                mtp: None,
+            },
+        )?;
+        hand.use_graphs = true;
+        for p in &ids {
+            ServeEngine::reset(&mut hand);
+            h.push(greedy(&mut hand, None, p, n)?);
+        }
+        drop(hand);
     }
     let mut d = tang_bench::coder_serve::DerivedCoder::load(&path, ctx, 4)?;
     let mut all_ok = true;
@@ -128,7 +140,11 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         } else {
             "equal".into()
         };
-        let maxdiff = hl[0].iter().zip(&dl[0]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let maxdiff = hl[0]
+            .iter()
+            .zip(&dl[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         println!("prompt {i}: {} tokens, hand==derived {}/{n} ({note}); first-step max |dlogit| {maxdiff:.4}; slots deterministic {slots_same}", p.len(), k);
         all_ok &= slots_same;
     }

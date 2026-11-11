@@ -130,20 +130,32 @@ fn rel_err(o: &[f32], r: &[f32]) -> f64 {
         return f64::INFINITY;
     }
     let scale = r.iter().fold(0f32, |a, x| a.max(x.abs())).max(1e-6) as f64;
-    o.iter().zip(r).fold(0f64, |a, (x, y)| a.max((*x as f64 - *y as f64).abs())) / scale
+    o.iter()
+        .zip(r)
+        .fold(0f64, |a, (x, y)| a.max((*x as f64 - *y as f64).abs()))
+        / scale
 }
 
 fn argmax(v: &[f32]) -> usize {
-    (0..v.len()).max_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0)
+    (0..v.len())
+        .max_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0)
 }
 
 /// Better than `base` at every position, and by `MIN_GAIN` in total.
 fn wins(t: &[f64], base: &[f64]) -> bool {
     let (a, b): (f64, f64) = (t.iter().sum(), base.iter().sum());
-    t.len() == base.len() && t.iter().zip(base).all(|(x, y)| *x <= *y * 1.01) && a < b * (1.0 - MIN_GAIN)
+    t.len() == base.len()
+        && t.iter().zip(base).all(|(x, y)| *x <= *y * 1.01)
+        && a < b * (1.0 - MIN_GAIN)
 }
 
-fn time_sigs_at(rt: &Runtime, p: &Program, s: &BTreeMap<&str, Vec<usize>>, reps: usize) -> HashMap<String, f64> {
+fn time_sigs_at(
+    rt: &Runtime,
+    p: &Program,
+    s: &BTreeMap<&str, Vec<usize>>,
+    reps: usize,
+) -> HashMap<String, f64> {
     s.iter()
         .map(|(sig, ks)| {
             let n = p.program.kernels.len();
@@ -152,14 +164,19 @@ fn time_sigs_at(rt: &Runtime, p: &Program, s: &BTreeMap<&str, Vec<usize>>, reps:
                 .filter(|&&i| i < n)
                 .map(|&i| p.time_kernel(rt, i, reps))
                 .collect();
-            (sig.to_string(), t.iter().sum::<f64>() / t.len().max(1) as f64)
+            (
+                sig.to_string(),
+                t.iter().sum::<f64>() / t.len().max(1) as f64,
+            )
         })
         .collect()
 }
 
 /// Whole-step device ms: best of 3 × `iters` replays.
 pub fn step_ms(rt: &Runtime, p: &Program, iters: usize) -> f64 {
-    (0..3).map(|_| p.time(rt, iters)).fold(f64::INFINITY, f64::min)
+    (0..3)
+        .map(|_| p.time(rt, iters))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Tune one step. `build` lowers and allocates the step (sharing the live
@@ -197,12 +214,19 @@ pub fn tune_step<F: FnMut() -> Program>(
         (a, n)
     };
     let tol = (20.0 * noise).max(1e-3);
-    msg(&format!("output check: default's own spread {noise:.2e}, tolerance {tol:.2e}"));
+    msg(&format!(
+        "output check: default's own spread {noise:.2e}, tolerance {tol:.2e}"
+    ));
     let correct = |p: &Program| -> bool {
         let o = out_at(p);
         let e = rel_err(&o, &reference);
         let ok = o.iter().all(|x| x.is_finite()) && e <= tol && argmax(&o) == argmax(&reference);
-        msg(&format!("  output err {e:.2e}, argmax {} vs {}: {}", argmax(&o), argmax(&reference), if ok { "ok" } else { "rejected" }));
+        msg(&format!(
+            "  output err {e:.2e}, argmax {} vs {}: {}",
+            argmax(&o),
+            argmax(&reference),
+            if ok { "ok" } else { "rejected" }
+        ));
         ok
     };
     // step level: whole-step time per value, one knob at a time
@@ -210,7 +234,13 @@ pub fn tune_step<F: FnMut() -> Program>(
     if !step_grid.is_empty() {
         let (mut p, _) = build_forced(rt, &mut build, Choice::new()).expect("default step lowers");
         p.capture(rt);
-        let mut best: f64 = pos.iter().map(|&q| { set_pos(q); step_ms(rt, &p, 20) }).sum();
+        let mut best: f64 = pos
+            .iter()
+            .map(|&q| {
+                set_pos(q);
+                step_ms(rt, &p, 20)
+            })
+            .sum();
         drop(p);
         msg(&format!("step {step_name}: default {best:.3} ms"));
         for (k, vals) in step_grid {
@@ -225,7 +255,13 @@ pub fn tune_step<F: FnMut() -> Program>(
                     continue;
                 }
                 p.capture(rt);
-                let ms: f64 = pos.iter().map(|&q| { set_pos(q); step_ms(rt, &p, 20) }).sum();
+                let ms: f64 = pos
+                    .iter()
+                    .map(|&q| {
+                        set_pos(q);
+                        step_ms(rt, &p, 20)
+                    })
+                    .sum();
                 msg(&format!("step {k}={v}: {ms:.3} ms"));
                 if ms < best * (1.0 - MIN_GAIN / 3.0) {
                     best = ms;
@@ -247,8 +283,10 @@ pub fn tune_step<F: FnMut() -> Program>(
         *m.entry(s.as_str()).or_default() += 1;
         m
     });
-    let consulted: std::collections::BTreeSet<&str> =
-        r0.iter().flat_map(|(_, _, ks)| ks.iter().map(|k| k.as_str())).collect();
+    let consulted: std::collections::BTreeSet<&str> = r0
+        .iter()
+        .flat_map(|(_, _, ks)| ks.iter().map(|k| k.as_str()))
+        .collect();
     msg(&format!(
         "{} kernels, {} signatures, knobs consulted: {:?}",
         r0.len(),
@@ -283,35 +321,53 @@ pub fn tune_step<F: FnMut() -> Program>(
                 let prev = cur.get(*k).copied().unwrap_or(base.iter().sum());
                 if ms < prev && wins(&tv, base) {
                     cur.insert(k.to_string(), ms);
-                    best.entry(sig).or_default().insert(k.to_string(), v.to_string());
+                    best.entry(sig)
+                        .or_default()
+                        .insert(k.to_string(), v.to_string());
                     won += 1;
                 }
             }
-            msg(&format!("{k}={v}: {} kernels read it, better on {won} signatures", readers.len()));
+            msg(&format!(
+                "{k}={v}: {} kernels read it, better on {won} signatures",
+                readers.len()
+            ));
         }
     }
     // verify the combined choices; drop the ones that don't hold up
     tune::set_entries(best.clone());
-    let (mut p1, _) = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers");
+    let (mut p1, _) =
+        build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers");
     if !correct(&p1) {
         // a combination went wrong: keep each signature's single best knob
         msg("combined choices give a wrong output: one knob per signature");
         for (sig, c) in best.iter_mut() {
             let m = &best_ms[sig];
-            let k = m.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0.clone();
+            let k = m
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0
+                .clone();
             c.retain(|kk, _| *kk == k);
         }
         tune::set_entries(best.clone());
-        p1 = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers").0;
+        p1 = build_forced(rt, &mut build, with_step(&Choice::new()))
+            .expect("tuned lowers")
+            .0;
         if !correct(&p1) {
             msg("still wrong: no per-kernel choices kept");
             best.clear();
             tune::set_entries(HashMap::new());
-            p1 = build_forced(rt, &mut build, with_step(&Choice::new())).expect("lowers").0;
+            p1 = build_forced(rt, &mut build, with_step(&Choice::new()))
+                .expect("lowers")
+                .0;
         }
     }
-    let tuned_sample: BTreeMap<&str, Vec<usize>> =
-        all.iter().filter(|(s, _)| best.contains_key(**s)).map(|(s, v)| (*s, v.clone())).collect();
+    let tuned_sample: BTreeMap<&str, Vec<usize>> = all
+        .iter()
+        .filter(|(s, _)| best.contains_key(**s))
+        .map(|(s, v)| (*s, v.clone()))
+        .collect();
     let t1 = time_sigs(rt, &p1, &tuned_sample, reps, pos, set_pos);
     drop(p1);
     let mut sigs = Vec::new();
@@ -321,7 +377,9 @@ pub fn tune_step<F: FnMut() -> Program>(
         let d0 = &t0[*sig];
         let d: f64 = d0.iter().sum::<f64>() / d0.len() as f64;
         let (ms, choice) = match (best.get(*sig), t1.get(*sig)) {
-            (Some(c), Some(v)) if wins(v, d0) => (v.iter().sum::<f64>() / v.len() as f64, c.clone()),
+            (Some(c), Some(v)) if wins(v, d0) => {
+                (v.iter().sum::<f64>() / v.len() as f64, c.clone())
+            }
             _ => (d, Choice::new()),
         };
         sum0 += d * n;
@@ -340,7 +398,10 @@ pub fn tune_step<F: FnMut() -> Program>(
         let g = |s: &SigResult| (s.default_ms - s.tuned_ms) * s.instances as f64;
         g(b).partial_cmp(&g(a)).unwrap()
     });
-    let keep: HashMap<String, Choice> = sigs.iter().map(|s| (s.sig.clone(), s.choice.clone())).collect();
+    let keep: HashMap<String, Choice> = sigs
+        .iter()
+        .map(|s| (s.sig.clone(), s.choice.clone()))
+        .collect();
     let mut entries = keep;
     if !step_choice.is_empty() {
         entries.insert(format!("step:{step_name}"), step_choice.clone());
@@ -367,9 +428,17 @@ pub fn write_cache(path: &std::path::Path, gpu: &str, step_name: &str, t: &Tuned
         })
         .map(|l| l.to_string())
         .collect();
-    let kv = |c: &Choice| c.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",");
+    let kv = |c: &Choice| {
+        c.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     if !t.step_choice.is_empty() {
-        lines.push(format!("{step_key}\t{}\t\t\t{step_name} step", kv(&t.step_choice)));
+        lines.push(format!(
+            "{step_key}\t{}\t\t\t{step_name} step",
+            kv(&t.step_choice)
+        ));
     }
     for s in &t.sigs {
         lines.push(format!(

@@ -575,9 +575,8 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
     // each head dim's cached values contiguously (batched decode at long
     // context: P·V was ~half the step, its V loads strided by kvh·hd)
     let vt_arg = if std::env::var("TANG_CODER_VT").as_deref() == Ok("1") {
-        let vt = b
-            .g
-            .comp(
+        let vt =
+            b.g.comp(
                 &[Dim::Fixed(kvh * hd), T],
                 &[],
                 vec![arg(v, vec![unit(2, 1), unit(2, 0)])],
