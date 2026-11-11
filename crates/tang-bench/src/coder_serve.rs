@@ -119,14 +119,18 @@ impl DerivedCoder {
         let sampled = which != "0";
         let mut step_outs = vec![pg.logits];
         if sampled {
-            let s = if which == "bisect" {
-                append_sampler(&mut pg.g, pg.logits, SampleSpec::default())
+            let (s, shape) = if which == "bisect" {
+                let s = append_sampler(&mut pg.g, pg.logits, SampleSpec::default());
+                (s, vec![tang_compile::tensor::Dim::Fixed(4)])
             } else {
-                append_sampler_topk(&mut pg.g, pg.logits)
+                // per-row params ([T, 4]): a step input of each new row, like the tokens
+                let s = append_sampler_topk(&mut pg.g, pg.logits);
+                let t = tang_compile::tensor::Dim::Sym(crate::ir_coder_prefill::SEQ);
+                (s, vec![t, tang_compile::tensor::Dim::Fixed(4)])
             };
             pg.inputs.push(CoderInput {
                 name: "sample.params".into(),
-                shape: vec![tang_compile::tensor::Dim::Fixed(4)],
+                shape,
             });
             tys.push(None);
             step_outs.push(s.token);
@@ -164,15 +168,16 @@ impl DerivedCoder {
         let params_k = sampled.then(|| pg.input("sample.params"));
         let input_k = |want: StepInput| st.inputs.iter().position(|s| *s == want);
         let params_in = match params_k {
-            Some(k) => Some(input_k(StepInput::Same(k)).context("sampler params input")?),
+            Some(k) => Some(
+                input_k(StepInput::Same(k))
+                    .or_else(|| input_k(StepInput::New(k)))
+                    .context("sampler params input")?,
+            ),
             None => None,
         };
         let pos_in = input_k(StepInput::Pos).context("pos input")?;
-        let tok_in = st
-            .inputs
-            .iter()
-            .position(|s| matches!(s, StepInput::New(_)))
-            .context("token input")?;
+        let tokens_k = pg.input("tokens");
+        let tok_in = input_k(StepInput::New(tokens_k)).context("token input")?;
 
         // slot 0: weights streamed in from the mapping, one tensor at a time
         let first = Program::with_plan(&rt, wprog.clone(), &empty, &plan);
@@ -274,11 +279,7 @@ impl DerivedCoder {
                 .collect();
             greedy_var = Some(GreedyVar {
                 pos_in: in2(StepInput::Pos).context("greedy pos input")?,
-                tok_in: st2
-                    .inputs
-                    .iter()
-                    .position(|s| matches!(s, StepInput::New(_)))
-                    .context("greedy token input")?,
+                tok_in: in2(StepInput::New(tokens_k)).context("greedy token input")?,
                 outs: low2.outs,
                 swaps: swaps2,
             });

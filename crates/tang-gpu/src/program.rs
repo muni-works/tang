@@ -1555,6 +1555,45 @@ impl Program {
     }
 
     /// Device-side copy of `src`'s tensor `src_t` into this program's
+    /// Device copy of `n` raw storage words: `src`'s tensor `src_t` from word `src_off`
+    /// into this program's `dst` from word `dst_off` (CUDA; queued with the kernels). A
+    /// slice of a buffer, e.g. one stream's block of a batched cache.
+    #[cfg(feature = "cuda")]
+    pub fn copy_words(
+        &self,
+        rt: &Runtime,
+        dst: TensorId,
+        dst_off: usize,
+        src: &Program,
+        src_t: TensorId,
+        src_off: usize,
+        n: usize,
+    ) {
+        assert!(dst_off + n <= self.words_of(dst), "copy_words past dst");
+        assert!(src_off + n <= src.words_of(src_t), "copy_words past src");
+        if n == 0 {
+            return;
+        }
+        let (ds, ss) = (self.slot_of(dst), src.slot_of(src_t));
+        let (Runtime::Cuda(dev), Storage::Cuda { slots: d, .. }, Storage::Cuda { slots: s, .. }) =
+            (rt, &self.storage, &src.storage)
+        else {
+            panic!("copy_words: CUDA only")
+        };
+        use cudarc::driver::DevicePtr;
+        let (dp, _a) = d[ds].device_ptr(&dev.stream);
+        let (sp, _b) = s[ss].device_ptr(&dev.stream);
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                dp + (dst_off * 4) as u64,
+                sp + (src_off * 4) as u64,
+                n * 4,
+                dev.stream.cu_stream(),
+            )
+        }
+        .expect("dtod");
+    }
+
     /// tensor `dst` (same runtime; queued in order with the kernels).
     pub fn copy(&self, rt: &Runtime, dst: TensorId, src: &Program, src_t: TensorId) {
         let (db, sb) = (
