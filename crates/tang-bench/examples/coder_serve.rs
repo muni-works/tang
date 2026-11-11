@@ -66,7 +66,7 @@ fn greedy(e: &mut dyn tang_llm::flash::serve::ServeEngine, slot: Option<usize>, 
 fn selftest(args: &[String]) -> anyhow::Result<()> {
     use tang_llm::flash::serve::ServeEngine;
     let path = std::path::PathBuf::from(&args[0]);
-    let ctx: usize = args.get(1).map_or(4096, |v| v.parse().unwrap());
+    let ctx: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(4096);
     let n = 64;
     let tok = tang_llm::flash::tokenize::FlashTokenizer::from_gguf(&tang_llm::gguf::Gguf::open(&path)?)?;
     let prompts = [
@@ -80,17 +80,20 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         .map(|p| tok.encode(&format!("<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n")))
         .collect::<anyhow::Result<_>>()?;
     // hand: one sequence, reset between prompts
+    let no_hand = args.iter().any(|a| a == "--no-hand");
+    let mut h = Vec::new();
+    if !no_hand {
     let mut hand = tang_llm::flash::coder::Coder::load(
         &path,
         tang_llm::flash::coder::CoderOpts { max_ctx: ctx, mtp: None },
     )?;
     hand.use_graphs = true;
-    let mut h = Vec::new();
     for p in &ids {
         ServeEngine::reset(&mut hand);
         h.push(greedy(&mut hand, None, p, n)?);
     }
     drop(hand);
+    }
     let mut d = tang_bench::coder_serve::DerivedCoder::load(&path, ctx, 4)?;
     let mut all_ok = true;
     for (i, p) in ids.iter().enumerate() {
@@ -102,6 +105,11 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         d.free_slot(0);
         let again = greedy(&mut d, Some(0), p, n)?;
         let slots_same = per_slot.iter().all(|x| x.0 == per_slot[0].0) && again.0 == per_slot[0].0;
+        if no_hand {
+            println!("prompt {i}: slots deterministic {slots_same}");
+            all_ok &= slots_same;
+            continue;
+        }
         let (ht, hl) = &h[i];
         let (dt, dl) = &per_slot[0];
         let k = ht.iter().zip(dt).take_while(|(a, b)| a == b).count();
@@ -119,6 +127,26 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         println!("prompt {i}: {} tokens, hand==derived {}/{n} ({note}); first-step max |dlogit| {maxdiff:.4}; slots deterministic {slots_same}", p.len(), k);
         all_ok &= slots_same;
     }
-    println!("selftest: slots deterministic {all_ok}");
+    // the server's C=4 shape: four prefills, then decode_batch over all four rows at once
+    let mut solo = Vec::new();
+    for p in &ids {
+        d.free_slot(0);
+        solo.push(greedy(&mut d, Some(0), p, n)?.0);
+    }
+    let mut cur = Vec::new();
+    for (s, p) in ids.iter().enumerate() {
+        d.free_slot(s);
+        cur.push(d.prefill_slot(s, p)?);
+    }
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); ids.len()];
+    for _ in 0..n {
+        let rows: Vec<(usize, u32)> = cur.iter().enumerate().map(|(s, &t)| (s, t)).collect();
+        for (s, &t) in cur.iter().enumerate() {
+            outs[s].push(t);
+        }
+        cur = d.decode_batch(&rows)?;
+    }
+    let batched_same: Vec<bool> = outs.iter().zip(&solo).map(|(a, b)| a == b).collect();
+    println!("selftest: slots deterministic {all_ok}; batched (4 rows a decode_batch) == solo {batched_same:?}");
     Ok(())
 }
