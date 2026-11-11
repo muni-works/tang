@@ -32,6 +32,11 @@ pub fn all_models() -> Vec<Model> {
 }
 
 pub fn qwen() -> Model {
+    qwen_ctx(16, CAP)
+}
+
+/// The tiny Qwen3 with position tables of `ctx` rows and caches of `cap`.
+pub fn qwen_ctx(ctx: usize, cap: usize) -> Model {
     use crate::ir_qwen::prefill::prefill_graph;
     let dims = crate::ir_qwen::QwenDims {
         d_model: 128,
@@ -41,7 +46,7 @@ pub fn qwen() -> Model {
         ff: 192,
         vocab: 256,
         layers: 2,
-        ctx: 16,
+        ctx,
         eps: 1e-6,
         theta: 1e4,
         kv_f16: false,
@@ -69,7 +74,7 @@ pub fn qwen() -> Model {
         logits: pg.logits,
         g: pg.g,
         named,
-        cap: CAP,
+        cap,
     }
 }
 

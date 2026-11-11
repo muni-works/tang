@@ -2162,6 +2162,33 @@ impl Lowering<'_> {
                     .filter(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= 16)
                     .min_by(|a, b| cost(Some(*a)).total_cmp(&cost(Some(*b))))
                     .filter(|&c| cost(Some(c)) < 0.75 * base);
+            } else if std::env::var("TANG_REG2").as_deref() != Ok("0") {
+                // a 4-bit GEMV whose register dim the weight ignores (the
+                // rows of a short window, `[k, rows]`): tile the weight
+                // rows too, so each lane's activation loads serve several
+                // rows and its packed words several tokens. Without it a
+                // lane loads k·32 f32 activations per 16 bytes of weight
+                // and a window is bound by those loads, not by DRAM. Up
+                // to `TANG_WIN_TILE` (32) points a lane
+                let cap: usize = std::env::var("TANG_WIN_TILE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32);
+                let w4: Vec<&Leaf> = leaves
+                    .iter()
+                    .filter(|l| l.pack == Some(Packing::U4))
+                    .collect();
+                if t1 > 1 && w4.iter().all(|l| l.addr.coefs[d1] == 0) {
+                    reg2 = (0..pk)
+                        .filter(|&d| {
+                            d != d1
+                                && pts[d] > 1
+                                && free(d)
+                                && w4.iter().all(|l| l.addr.coefs[d] != 0)
+                        })
+                        .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
+                        .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                }
             }
         }
         let (t1, t2) = (reg.map_or(1, |r| r.1), reg2.map_or(1, |r| r.1));
@@ -2495,9 +2522,23 @@ impl Lowering<'_> {
             }
             c
         };
+        // f32 vector leaves tiled along a register dim (a window's
+        // activations, one copy per token) stream a float4 at a time inside
+        // the chunk instead of all `vec` up front: k·vec registers spill
+        let stream = vec % 4 == 0
+            && std::env::var("TANG_WIN_STREAM").as_deref() != Ok("0")
+            && leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            && leaves
+                .iter()
+                .enumerate()
+                .any(|(i, l)| class[i] == 1 && l.pack.is_none() && nr_of(l) > 1);
+        let streamed = |i: usize| stream && class[i] == 1 && leaves[i].pack.is_none();
         for (i, l) in leaves.iter().enumerate() {
             let nr = nr_of(l);
             let at0 = leaf_at0(l);
+            if streamed(i) {
+                continue;
+            }
             match class[i] {
                 0 => {
                     writeln!(s, "        float h{i}[{nr}];").unwrap();
@@ -2553,10 +2594,34 @@ impl Lowering<'_> {
                 _ => {}
             }
         }
+        if stream {
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int q = 0; q < {}; q++) {{", vec / 4).unwrap();
+            for (i, l) in leaves.iter().enumerate() {
+                if !streamed(i) {
+                    continue;
+                }
+                let nr = nr_of(l);
+                let a = addr_expr(&l.addr, &leaf_at0(l));
+                writeln!(s, "        float4 v{i}[{nr}];").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(
+                    s,
+                    "        for (int r = 0; r < {nr}; r++) v{i}[r] = __ldg((const float4*)(b{} + ({a})) + q);",
+                    l.buf
+                )
+                .unwrap();
+            }
+        }
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int r = 0; r < {rt}; r++) {{").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
-        writeln!(s, "        for (int e = 0; e < {vec}; e++) {{").unwrap();
+        if stream {
+            writeln!(s, "        for (int e4 = 0; e4 < 4; e4++) {{").unwrap();
+            writeln!(s, "        const int e = q * 4 + e4;").unwrap();
+        } else {
+            writeln!(s, "        for (int e = 0; e < {vec}; e++) {{").unwrap();
+        }
         let ri_ = |l: &Leaf| -> String {
             match (dep1(l), dep2(l)) {
                 (true, true) => "r".into(),
@@ -2581,6 +2646,7 @@ impl Lowering<'_> {
                         "(((&w{i}[{}][e >> 2].x)[(e >> 1) & 1] >> (16 * (e & 1))) & 0xffffu)",
                         ri_(l)
                     )),
+                    None if streamed(i) => format!("(&v{i}[{}].x)[e & 3]", ri_(l)),
                     None => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
                 },
                 _ => load(l.buf, l.pack, &addr_expr(&l.addr, &coords)),
@@ -2598,6 +2664,9 @@ impl Lowering<'_> {
         self.combine(&mut s, monoid, w, ind, |k| format!("acc[r][{k}]"), &el);
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        }}").unwrap();
+        if stream {
+            writeln!(s, "        }}").unwrap();
+        }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    }}").unwrap();
 
@@ -2813,10 +2882,7 @@ impl Lowering<'_> {
     fn topk_select(&self, root: usize) -> Option<Kernel> {
         let c = self.g.comp_at(root)?;
         let m = c.monoid.as_ref()?;
-        if !super::step::gather::is_topk(m) {
-            return None;
-        }
-        let k = m.width / 2;
+        let k = m.topk_k()?;
         // `TANG_TOPK_SELECT=0`: the generic combine (a baseline to time)
         if std::env::var("TANG_TOPK_SELECT").is_ok_and(|v| v == "0") {
             return None;
