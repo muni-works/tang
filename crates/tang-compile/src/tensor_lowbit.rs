@@ -402,9 +402,25 @@ extern "C" __global__ void vq_gemv(const unsigned* __restrict__ codes,
     )
 }
 
-/// Weights per f16 scale/bias pair in the packed affine format (one warp
-/// lane per two weights).
+/// Weights per f16 scale/bias pair in the packed affine format.
 pub const AFF_GROUP: usize = 64;
+/// Weights per packed chunk: one GPU lane's unit of work, `bits` u32 words.
+pub const AFF_CHUNK: usize = 32;
+/// Columns a warp's 32 chunks span (the packing's stripe: rows must be a
+/// multiple of this wide).
+pub const AFF_SPAN: usize = 1024;
+
+/// Where weight `col` of a row lives in the packing: (chunk within the
+/// row, index `k` within the chunk). Lane `l` of superchunk `sc` holds, at
+/// step `s` (0..8), columns `sc·1024 + s·128 + 4l .. +4` as `k = 4s..4s+4`
+/// — so at every step the warp's 32 lanes read 128 contiguous columns of
+/// `x'` (coalesced), and each lane still loads its codes as `bits`
+/// adjacent words.
+pub fn aff_slot(col: usize) -> (usize, usize) {
+    let (sc, rem) = (col / AFF_SPAN, col % AFF_SPAN);
+    let (step, lane, t) = (rem / 128, rem % 128 / 4, rem % 4);
+    (sc * 32 + lane, 4 * step + t)
+}
 
 /// A `rows × cols` matrix in the packed affine format the GPTQ study
 /// picked (`g3g64h`: 3-bit codes, f16 scale and bias per 64 weights,
@@ -416,8 +432,13 @@ pub struct AffineMatrix {
     pub rows: usize,
     pub cols: usize,
     pub bits: usize,
-    /// Codes, `bits` each, row-major, as one little-endian bit stream in
-    /// u32 words (code `i` starts at bit `bits · i`), plus one pad word.
+    /// Codes, row-major, in chunks of [`AFF_CHUNK`] weights placed by
+    /// [`aff_slot`], `bits` u32 words per chunk, so a lane loads its chunk
+    /// in one go. Within a chunk, by index `k`: 4-bit: word
+    /// `t` holds weights `8t..8t+8`, a nibble each, low first. 3-bit (bit
+    /// planes): words 0 and 1 hold the low two bits of weights 0..16 and
+    /// 16..32 (2 bits each, low first), word 2 the high bit of weight `k`
+    /// at bit `k`.
     pub codes: Vec<u32>,
     /// f16 bits, one per `AFF_GROUP` weights, row-major.
     pub scales: Vec<u16>,
@@ -441,16 +462,21 @@ impl AffineMatrix {
         signs: Vec<f32>,
     ) -> Self {
         assert!(bits == 3 || bits == 4);
-        assert!(q.len() == rows * cols && cols % AFF_GROUP == 0 && cols % VQ_HB == 0);
+        assert!(q.len() == rows * cols && cols % AFF_SPAN == 0 && cols % VQ_HB == 0);
         assert!(scales.len() == rows * cols / AFF_GROUP && biases.len() == scales.len());
         assert!(signs.is_empty() || signs.len() == cols);
-        let mut codes = vec![0u32; (q.len() * bits).div_ceil(32) + 1];
+        let mut codes = vec![0u32; q.len() / AFF_CHUNK * bits];
         for (i, &c) in q.iter().enumerate() {
-            assert!((c as usize) < 1 << bits);
-            let (word, bit) = (i * bits / 32, i * bits % 32);
-            let both = (c as u64) << bit;
-            codes[word] |= both as u32;
-            codes[word + 1] |= (both >> 32) as u32;
+            let c = c as u32;
+            assert!(c < 1 << bits);
+            let (ch, k) = aff_slot(i % cols);
+            let w = (i / cols * (cols / AFF_CHUNK) + ch) * bits;
+            if bits == 4 {
+                codes[w + k / 8] |= c << (4 * (k % 8));
+            } else {
+                codes[w + k / 16] |= (c & 3) << (2 * (k % 16));
+                codes[w + 2] |= (c >> 2) << k;
+            }
         }
         AffineMatrix {
             rows,
@@ -501,9 +527,24 @@ impl AffineMatrix {
 
     /// Code `i` (row-major).
     pub fn code(&self, i: usize) -> usize {
-        let (word, bit) = (i * self.bits / 32, i * self.bits % 32);
-        let both = self.codes[word] as u64 | (self.codes[word + 1] as u64) << 32;
-        ((both >> bit) & ((1u64 << self.bits) - 1)) as usize
+        let (ch, k) = aff_slot(i % self.cols);
+        let w = (i / self.cols * (self.cols / AFF_CHUNK) + ch) * self.bits;
+        let c = if self.bits == 4 {
+            self.codes[w + k / 8] >> (4 * (k % 8)) & 15
+        } else {
+            (self.codes[w + k / 16] >> (2 * (k % 16)) & 3) | (self.codes[w + 2] >> k & 1) << 2
+        };
+        c as usize
+    }
+
+    /// Scale and bias interleaved per group (f16 bits): the kernel's
+    /// `half2` parameter stream.
+    pub fn scale_bias(&self) -> Vec<u16> {
+        self.scales
+            .iter()
+            .zip(&self.biases)
+            .flat_map(|(&s, &b)| [s, b])
+            .collect()
     }
 
     /// Dequantize to the original (un-rotated) basis: the reference.
@@ -549,46 +590,100 @@ impl AffineMatrix {
     }
 }
 
+/// Superchunks (1024 columns) each lane of [`affine_cuda_src`]'s kernels
+/// loads before any math (a 4096-wide row is 4, so all of it).
+pub const AFF_UNROLL: usize = 4;
+
 /// CUDA source for the decode GEMV of an [`AffineMatrix`] with `bits`-bit
-/// codes: `aff{bits}_gemv`, one warp per row; per 64-wide group, lane `j`
-/// reads its two codes (`2·bits` contiguous bits) from a 64-bit window,
-/// accumulates `scale · (q0 x0 + q1 x1) + bias · (x0 + x1)` against a
-/// float2 of `x'`, and the warp reduces once per row. `x'` comes from
-/// `vq_rotate` (same Hadamard block). Launch:
-/// `aff{bits}_gemv<<<ceil(rows/8), 256>>>(codes, scales, biases, xr, y, rows, cols)`.
+/// codes: `aff{bits}_gemv`, one warp per row, plus `aff_xsum` (the
+/// per-group sums `Σ x'` over 64 columns: once per token, shared by every
+/// matrix with that input).
+///
+/// Lane `l` first loads its chunk's `bits` adjacent words for
+/// [`AFF_UNROLL`] superchunks (1024 columns each; the warp: contiguous
+/// spans), then per superchunk, for steps `s = 0..8`, reads the float4 of
+/// `x'` at columns `s·128 + 4l` (the warp: 512 contiguous bytes,
+/// L1-resident). Codes go into the mantissa of 1.0f —
+/// `as_float(0x3F800000 | q << (23 - bits)) = 1 + q/2^bits`, exact, one
+/// shift and one OR, no int→float convert — so per group the row gets
+/// `scale · Σ q x' + bias · Σ x' = A · D + B · Σ x'` with
+/// `D = Σ (1 + q/2^bits) x'`, `A = 2^bits · scale`, `B = bias − A`. The
+/// warp reduces once. `x'` comes from `vq_rotate` (same Hadamard block;
+/// q/k/v and gate/up share one). Launch: `aff_xsum<<<cols/64/8, 256>>>(xr,
+/// xsum, cols)` then `aff{bits}_gemv<<<ceil(rows/8), 256>>>(codes,
+/// scale_bias, xr, xsum, y, rows, cols)`; `cols % 1024 == 0`.
 pub fn affine_cuda_src(bits: usize) -> String {
     assert!(bits == 3 || bits == 4);
+    let sh = 23 - bits;
+    let (load, nib) = if bits == 4 {
+        (
+            "uint4 u = *reinterpret_cast<const uint4*>(codes + base);\n      uw[j][0] = u.x; uw[j][1] = u.y; uw[j][2] = u.z; uw[j][3] = u.w;",
+            // step s: nibbles 16(s&1).. of word s>>1
+            format!("unsigned c = uw[j][s >> 1] >> (16 * (s & 1));\n        float f0 = __uint_as_float(0x3F800000u | (c & 15u) << {sh}), f1 = __uint_as_float(0x3F800000u | (c >> 4 & 15u) << {sh}),\n              f2 = __uint_as_float(0x3F800000u | (c >> 8 & 15u) << {sh}), f3 = __uint_as_float(0x3F800000u | (c >> 12 & 15u) << {sh});"),
+        )
+    } else {
+        (
+            "uw[j][0] = codes[base]; uw[j][1] = codes[base + 1]; uw[j][2] = codes[base + 2];",
+            // step s: byte (s&3) of word s>>2 (low 2 bits), nibble s of word 2 (high bit)
+            format!("unsigned lo = uw[j][s >> 2] >> (8 * (s & 3)), hi = uw[j][2] >> (4 * s);\n        float f0 = __uint_as_float(0x3F800000u | ((lo & 3u) | (hi & 1u) << 2) << {sh}),\n              f1 = __uint_as_float(0x3F800000u | ((lo >> 2 & 3u) | (hi & 2u) << 1) << {sh}),\n              f2 = __uint_as_float(0x3F800000u | ((lo >> 4 & 3u) | (hi & 4u)) << {sh}),\n              f3 = __uint_as_float(0x3F800000u | ((lo >> 6 & 3u) | (hi & 8u) >> 1) << {sh});"),
+        )
+    };
     format!(
         r#"#include <cuda_fp16.h>
+#ifndef AFF_XSUM_DEFINED
+#define AFF_XSUM_DEFINED
+extern "C" __global__ void aff_xsum(const float* __restrict__ xr, float* __restrict__ xsum, int cols) {{
+  int lane = threadIdx.x & 31, g = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (g >= cols / {group}) return;
+  float a = xr[g * {group} + lane] + xr[g * {group} + 32 + lane];
+  for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+  if (lane == 0) xsum[g] = a;
+}}
+#endif
 extern "C" __global__ void aff{bits}_gemv(const unsigned* __restrict__ codes,
-                                     const __half* __restrict__ scales,
-                                     const __half* __restrict__ biases,
-                                     const float* __restrict__ xr, float* __restrict__ y,
-                                     int rows, int cols) {{
+                                     const __half2* __restrict__ sb,
+                                     const float* __restrict__ xr, const float* __restrict__ xsum,
+                                     float* __restrict__ y, int rows, int cols) {{
   int lane = threadIdx.x & 31, r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (r >= rows) return;
-  int groups = cols / {group};
-  const float2* x2 = reinterpret_cast<const float2*>(xr);
+  int supers = cols / {span}, groups = cols / {group};
+  const float4* x4 = reinterpret_cast<const float4*>(xr);
+  const __half2* p = sb + (size_t)r * groups;
   float acc = 0.f;
-  for (int g = 0; g < groups; ++g) {{
-    size_t i = (size_t)r * cols + (size_t)g * {group} + 2 * lane;
-    size_t bit = i * {bits};
-    unsigned long long w = (unsigned long long)codes[bit >> 5] |
-                           ((unsigned long long)codes[(bit >> 5) + 1] << 32);
-    unsigned c = (unsigned)(w >> (bit & 31));
-    float q0 = (float)(c & {mask}), q1 = (float)((c >> {bits}) & {mask});
-    float2 v = x2[g * {half} + lane];
-    size_t gi = (size_t)r * groups + g;
-    acc += __half2float(scales[gi]) * (q0 * v.x + q1 * v.y) + __half2float(biases[gi]) * (v.x + v.y);
+  for (int s0 = 0; s0 < supers; s0 += {nu}) {{
+    unsigned uw[{nu}][{bits}];
+#pragma unroll
+    for (int j = 0; j < {nu}; ++j) {{
+      size_t base = ((size_t)r * supers * 32 + min(s0 + j, supers - 1) * 32 + lane) * {bits};
+      {load}
+    }}
+#pragma unroll
+    for (int j = 0; j < {nu}; ++j) {{
+      int sc = s0 + j;
+      if (sc >= supers) break;
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {{
+        float4 v = __ldg(x4 + sc * 256 + s * 32 + lane);
+        int g = sc * 16 + 2 * s + (lane >> 4);
+        float2 sbg = __half22float2(p[g]);
+        {nib}
+        float a = sbg.x * {mul}.f, d = f0 * v.x + f1 * v.y + f2 * v.z + f3 * v.w;
+        // each of the group's 16 lanes holds a quarter of its 64 columns: B·Σx' once per group
+        acc += a * d + ((lane & 15) == 0 ? (sbg.y - a) * __ldg(xsum + g) : 0.f);
+      }}
+    }}
   }}
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (lane == 0) y[r] = acc;
 }}
 "#,
         bits = bits,
+        nu = AFF_UNROLL,
+        span = AFF_SPAN,
         group = AFF_GROUP,
-        half = AFF_GROUP / 2,
-        mask = (1 << bits) - 1
+        mul = 1 << bits,
+        load = load,
+        nib = nib,
     )
 }
 
@@ -828,7 +923,7 @@ mod tests {
     #[test]
     fn affine_gemv_matches_dequant_reference() {
         for (bits, seed) in [(3, Some(11)), (4, Some(11)), (3, None)] {
-            let (rows, cols) = (24, 512);
+            let (rows, cols) = (24, 2048);
             let w = weights(rows, cols);
             let m = AffineMatrix::encode(&w, rows, cols, bits, seed);
             let deq = m.dequant();
@@ -867,8 +962,42 @@ mod tests {
 
     #[test]
     fn affine_cuda_src_names_kernels() {
-        assert!(affine_cuda_src(3).contains("aff3_gemv") && affine_cuda_src(3).contains("& 7)"));
-        assert!(affine_cuda_src(4).contains("aff4_gemv") && affine_cuda_src(4).contains("& 15)"));
+        assert!(
+            affine_cuda_src(3).contains("aff3_gemv")
+                && affine_cuda_src(3).contains("uw[j][2] >> (4 * s)")
+                && affine_cuda_src(3).contains("aff_xsum")
+        );
+        assert!(
+            affine_cuda_src(4).contains("aff4_gemv") && affine_cuda_src(4).contains("uint4 u =")
+        );
+    }
+
+    /// Writes GPU test vectors for bench/lowbit/vq_bench.cu's correctness
+    /// check: `aff{3,4}.bin` = rows, cols (u32), codes (u32), scale/bias
+    /// (f16 pairs), x' (f32, already rotated), y = the CPU gemv (f32).
+    /// `VQ_CU_DIR=. cargo test -p tang-compile --lib affine_vectors_dump -- --ignored`
+    #[test]
+    #[ignore]
+    fn affine_vectors_dump() {
+        let dir = std::env::var("VQ_CU_DIR").unwrap_or_else(|_| ".".into());
+        let (rows, cols) = (96, 4096);
+        let w = weights(rows, cols);
+        for bits in [3, 4] {
+            let m = AffineMatrix::encode(&w, rows, cols, bits, Some(13));
+            let x: Vec<f32> = (0..cols)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect();
+            let (xr, y) = (rotate_x(&x, &m.signs), m.gemv(&x));
+            let mut b = Vec::new();
+            b.extend((rows as u32).to_le_bytes());
+            b.extend((cols as u32).to_le_bytes());
+            m.codes.iter().for_each(|v| b.extend(v.to_le_bytes()));
+            m.scale_bias()
+                .iter()
+                .for_each(|v| b.extend(v.to_le_bytes()));
+            xr.iter().chain(&y).for_each(|v| b.extend(v.to_le_bytes()));
+            std::fs::write(format!("{dir}/aff{bits}.bin"), b).unwrap();
+        }
     }
 
     /// Writes the kernel source for bench/lowbit/vq_bench.cu:
