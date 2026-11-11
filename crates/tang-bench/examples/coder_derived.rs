@@ -126,7 +126,9 @@ fn main() {
         t1.elapsed().as_secs_f64()
     );
     // one CUDA graph a step (writes and cache copies stay outside it)
-    prog.capture(&rt);
+    if !args.iter().any(|a| a == "--no-graph") {
+        prog.capture(&rt);
+    }
     let pos_in = st.inputs.iter().position(|s| *s == StepInput::Pos).unwrap();
     let tok_in = st
         .inputs

@@ -1,0 +1,20 @@
+Qwen3-Coder-Next (unsloth UD-Q4_K_XL GGUF, 49.6 GB) at real size, derived decode step vs the
+hand coder engine, NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB), 2026-11-11.
+Branch claude/derive-integrate; runner examples/coder_derived (CUDA graph, int8 GEMVs on the
+GGUF's Q4_K/Q5_K/Q8_0, residual stream materialized, one-row GDN scan folded).
+
+Correctness (fixed 21-token prompt, greedy 64 tokens):
+  derived vs hand engine (tang-llm flash-bench, qwen3next):  64/64 ids identical
+  derived vs flash-ref (CPU f32, teacher-forced; run at 5fc5ceb7):  top-1 agrees 63/64, max top-1 logprob gap 0.1455
+
+Device time per decode step:
+                         ctx 128              ctx 4096
+  derived                6.367 ms (157.1 tok/s)   7.424 ms (134.7 tok/s)
+  hand engine            ~5.06 ms (197.6 tok/s)   ~5.13 ms (195.0 tok/s)   (flash-bench wall tok/s)
+
+History of the derived step: 113 ms (first correct run, 5fc5ceb7) -> 10.15 ms (residual stream
+materialized) -> 6.35 ms (one-row scan folded, CUDA graph) -> 6.37 ms (residual keep narrowed to
+the residual adds, which fixed a wrong-output regression of the broader keep).
+Kernel profile at 6.35 ms (each kernel alone, 8.93 ms summed over 1961 kernels): native warp
+reductions 3.76 ms / 654, dense int8 GEMVs 2.18 ms / 332, WGSL kernels 2.03 ms / 806, routed
+expert int8 GEMVs 0.84 ms / 143, LM head 0.23 ms.

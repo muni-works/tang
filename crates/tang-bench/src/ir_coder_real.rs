@@ -200,8 +200,8 @@ pub fn lower_real_step(
     }
 }
 
-/// The maps of shape `[k, d_model]` read by more than one comp: the
-/// residual stream of the step.
+/// The residual adds of shape `[k, d_model]` (`a + b` of two plain reads)
+/// read by more than one comp: the residual stream of the step.
 fn residual_stream(
     g: &tang_compile::tensor::TensorGraph,
     pg: &CoderPrefill,
@@ -225,10 +225,21 @@ fn residual_stream(
             }
         }
     }
+    // a residual add: the sum of two args, each a plain (ungathered) read
+    let is_add = |c: &tang_compile::tensor::Comp| {
+        use tang_expr::Node;
+        let nodes = c.body.nodes_slice();
+        let var = |e: tang_expr::ExprId| matches!(nodes[e.index() as usize], Node::Var(_));
+        c.args.len() == 2
+            && c.args.iter().all(|a| !a.view.is_gather() && !a.view.guard)
+            && c.body_outs.len() == 1
+            && matches!(nodes[c.body_outs[0].index() as usize], Node::Add(x, y) if var(x) && var(y))
+    };
     (0..n)
         .filter(|&i| {
             g.comp_at(i)
-                .is_some_and(|c| c.red.is_empty() && c.monoid.is_none())
+                .is_some_and(|c| c.red.is_empty() && c.monoid.is_none() && is_add(c))
+                && g.nodes()[i].precision.storage == tang_compile::tensor::Format::F32
                 && g.nodes()[i].shape.len() == 2
                 && g.nodes()[i].shape[1].n() == dm
                 && readers[i] >= 2
