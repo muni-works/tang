@@ -381,6 +381,18 @@ impl DerivedCoder {
                 me.swaps.len()
             );
         }
+        // TANG_CODER_DERIVED_PROFILE=1: the slowest kernels of the sampled step, timed alone
+        if std::env::var("TANG_CODER_DERIVED_PROFILE").as_deref() == Ok("1") {
+            let p = &me.slots[0].prog;
+            let mut t: Vec<(f64, usize)> =
+                p.order().iter().map(|&i| (p.time_kernel(&me.rt, i, 5), i)).collect();
+            let total: f64 = t.iter().map(|x| x.0).sum();
+            t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            eprintln!("coder derived: profile {} kernels, sum {total:.3} ms", t.len());
+            for (ms, i) in t.iter().take(15) {
+                eprintln!("  {ms:8.4} ms  k{i} (order {})", p.order().iter().position(|x| x == i).unwrap());
+            }
+        }
         let kv_mb: usize = me.rows.iter().map(|&(_, w)| w * ctx * 4).sum::<usize>() >> 20;
         eprintln!(
             "coder derived: {} slot(s), ctx {ctx}, {ncache} caches ({kv_mb} MB of K/V a slot), graphs {}, sampler {}, ready in {:.1} s",
