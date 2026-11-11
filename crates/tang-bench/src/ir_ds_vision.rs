@@ -776,7 +776,7 @@ impl E {
     }
 
     /// Full (bidirectional) softmax attention: `q`, `k` `[N, H·hd]`, `v`
-    /// at column `vbase` of `qkv`; `[H, N, hd]`.
+    /// at column `vbase` of `qkv`; `[N, H·hd]`.
     fn attention(
         &mut self,
         q: TensorId,
@@ -852,38 +852,24 @@ impl E {
                 |v| vec![v[0] * v[1]],
             )
             .unwrap();
-        // normalized in place, [h, i, d] (the flash epilogue's layout)
-        self.g
-            .comp(
-                &[fx(heads), fx(n), fx(hd)],
-                &[],
-                vec![arg(o, ident(3)), arg(z, vec![unit(3, 0), unit(3, 1), konst(3, 0)])],
-                None,
-                |v| vec![v[0] / v[1]],
-            )
-            .unwrap()
-    }
-
-    /// `y[i, n] = Σ_{h,d} a[h, i, d]·w[n, h·hd + d] + b[n]`: the output
-    /// projection reading the attention in its `[h, i, d]` layout.
-    fn proj_heads(&mut self, a: TensorId, w: TensorId, b: TensorId) -> TensorId {
-        let (h, n, hd) = (self.n(a, 0), self.n(a, 1), self.n(a, 2));
-        let c = self.n(w, 0);
+        // normalized, written as [i, h, d] so the projection is a plain
+        // linear over [N, H·hd]
         let y = self
             .g
             .comp(
-                &[fx(n), fx(c)],
-                &[fx(h), fx(hd)],
+                &[fx(n), fx(heads), fx(hd)],
+                &[],
                 vec![
-                    arg(a, vec![unit(4, 2), unit(4, 0), unit(4, 3)]),
-                    arg(w, vec![unit(4, 1), form(4, &[(2, hd as i64), (3, 1)], 0)]),
+                    arg(o, vec![unit(3, 1), unit(3, 0), unit(3, 2)]),
+                    arg(z, vec![unit(3, 1), unit(3, 0), konst(3, 0)]),
                 ],
-                Some(Monoid::sum()),
-                |v| vec![v[0] * v[1]],
+                None,
+                |v| vec![v[0] / v[1]],
             )
             .unwrap();
-        self.map2(y, b, |a, b| a + b)
+        self.g.reshape(y, &[fx(n), fx(heads * hd)]).unwrap()
     }
+
 }
 
 /// `|x|` as a select.
@@ -1005,7 +991,7 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         let q = e.rope(qkv, 0, h, hd, ang);
         let k = e.rope(qkv, c, h, hd, ang);
         let o = e.attention(q, k, qkv, 2 * c, h, hd);
-        let a = e.proj_heads(o, wo, bo);
+        let a = e.linear(o, wo, Some(bo));
         x = e.add(x, a);
         let xn = e.rms(x, n2, vd.eps);
         let gu = e.linear(xn, w1, None);
