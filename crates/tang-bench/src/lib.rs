@@ -265,6 +265,8 @@ pub mod ir_control;
 pub mod ir_msl;
 #[path = "ir_qwen.rs"]
 pub mod ir_qwen;
+/// Qwen3-Coder-Next as one prefill graph, checked against tang-llm's CPU reference.
+pub mod ir_coder_prefill;
 pub mod qwen_session;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).

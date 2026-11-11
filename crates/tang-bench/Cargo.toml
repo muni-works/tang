@@ -94,6 +94,8 @@ nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
 tang-derive-wasm = { path = "../tang-derive-wasm" }
+# ir_coder_prefill: the qwen3next CPU reference (flash::reference) as the oracle
+tang-llm  = { workspace = true }
 
 [[example]]
 name = "algebraic_bits"
