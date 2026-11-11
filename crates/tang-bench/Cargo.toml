@@ -79,6 +79,10 @@ name = "coder_derived"
 required-features = ["cuda", "gguf"]
 
 [[example]]
+name = "glm_real_gpu"
+required-features = ["cuda", "gguf"]
+
+[[example]]
 name = "ds_real_gpu"
 required-features = ["cuda"]
 
