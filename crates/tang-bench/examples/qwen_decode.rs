@@ -714,6 +714,8 @@ fn model(args: &[String]) {
     eprintln!("dims: {dims:?}");
     dims.kv_f16 = std::env::var("TANG_KV_F32").is_err();
     let rt = runtime();
+    let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
+    eprintln!("tuning cache for {}: {tuned} entries", rt.name());
     for (k, v) in apply_tuning(&rt, &dims) {
         eprintln!("tuned {k}={v}");
     }
@@ -893,6 +895,45 @@ fn model(args: &[String]) {
         let k: usize = k.parse().unwrap();
         let ngram: usize = opt("--ngram").map_or(3, |v| v.parse().unwrap());
         spec_decode(&rt, &dims, &dec, &ids, first, &out, k, ngram, ctx);
+    }
+    // --tune: the autotuner over the decode step on the live buffers (variant
+    // steps share `dec`'s weights and caches); TANG_TUNE_OUT or tune/<gpu>.tsv
+    #[cfg(feature = "cuda")]
+    if args.iter().any(|a| a == "--tune") {
+        use tang_bench::autotune;
+        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let pos: Vec<usize> = opt("--bench")
+            .unwrap_or_else(|| "128,4096".into())
+            .split(',')
+            .map(|v| v.parse::<usize>().unwrap().min(ctx - 200) - 1)
+            .collect();
+        let set_pos = |q: usize| dec.feed(&rt, &[first], q);
+        let t = autotune::tune_step(
+            &rt,
+            "qwen3-8b",
+            &[],
+            || {
+                Step::new(
+                    &rt,
+                    &dims,
+                    1,
+                    ctx,
+                    &|dg| vec![Vec::new(); dg.inputs.len()],
+                    Some(&dec),
+                )
+                .prog
+            },
+            reps,
+            &pos,
+            &set_pos,
+            &|p: &tang_gpu::program::Program| p.read(&rt, dec.outs[0]),
+        );
+        autotune::report(&t);
+        let path = std::env::var("TANG_TUNE_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| tang_compile::tensor::tune::repo_file(rt.name()));
+        autotune::write_cache(&path, rt.name(), "qwen3-8b", &t);
+        println!("tuning cache written: {}", path.display());
     }
     // device time of one step at a few context lengths
     if let Some(ls) = opt("--bench") {

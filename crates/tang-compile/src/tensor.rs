@@ -50,6 +50,9 @@ pub mod cuda_gemv;
 mod cuda_int8;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
+/// Measured schedule choices (the tuning cache) behind the lowering knobs.
+#[path = "tensor_tune.rs"]
+pub mod tune;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
@@ -111,6 +114,9 @@ pub mod space;
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
+/// Multi-GPU decode: placements, collectives and per-rank programs.
+#[path = "tensor_shard.rs"]
+pub mod shard;
 /// Decode as the finite difference of prefill: the `T → T + k` step and
 /// its KV cache, derived from the full-sequence graph.
 #[path = "tensor_step.rs"]
@@ -2522,6 +2528,7 @@ impl TensorGraph {
     pub fn schedule_inline_up_to(&mut self, outputs: &[TensorId], factor: usize) {
         let live = self.live(outputs);
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
         let mut consumer_space = vec![0usize; n];
@@ -2581,6 +2588,7 @@ impl TensorGraph {
                 && uses[i] == 1
                 && !is_output(i)
                 && !reshaped[i]
+                && !scan_input[i]
                 && (c.monoid.is_none() || consumer_reduces[i])
                 && consumer_space[i] <= factor * numel(c.points())
             {
@@ -2702,6 +2710,7 @@ impl TensorGraph {
             })
             .collect();
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         // a map every one of whose consumers reduces may be recomputed in
         // each of them (flash backward recomputes dS in dQ and dK alike)
@@ -2763,7 +2772,7 @@ impl TensorGraph {
                         .iter()
                         .filter(|a| !a.view.depends_on(lane) && recomputable[a.src.n()])
                         .map(|a| a.src.n())
-                        .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
+                        .filter(|&p| !is_output(p) && !scan_input[p] && self.comp_at(p).is_some())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -3023,7 +3032,7 @@ impl TensorGraph {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // (consumer, arg index) pairs per producer; a reshape reader
+        // (consumer, arg index) pairs per producer; a reshape or scan reader
         // pins the layout
         let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
         let mut pinned = vec![false; n];
@@ -3035,6 +3044,7 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => pinned[src.n()] = true,
+                Op::Scan(s) => s.inputs.iter().for_each(|t| pinned[t.n()] = true),
                 _ => {}
             }
         }
@@ -4385,6 +4395,7 @@ impl TensorGraph {
                     .map_or(1, |t| t.get())
                     .min(work.div_ceil(1 << 15))
                     .min(n)
+                    .min(max_threads())
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
@@ -4431,6 +4442,18 @@ impl TensorGraph {
         }
         outputs.iter().map(|o| ev.tensor(*o)).collect()
     }
+}
+
+// Test-only cap on interpreter threads, so tests can force the inline path.
+#[cfg(test)]
+thread_local!(static MAX_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
+#[cfg(test)]
+fn max_threads() -> usize {
+    MAX_THREADS.with(|m| m.get())
+}
+#[cfg(not(test))]
+fn max_threads() -> usize {
+    usize::MAX
 }
 
 /// `out` as `Σ_t coef_t · var a_t · var b_t`, or `None` when it is not a
@@ -5109,6 +5132,26 @@ mod tests {
         let (fg, outs) = g.substitute_maps_with(&[y], false);
         assert_eq!(fg.count_comps(&outs), 2);
         close(&fg.eval(&[data], &outs)[0], &want);
+    }
+
+    #[test]
+    fn eval_inline_matches_threaded_bitwise() {
+        // big enough that the threaded path splits into several chunks
+        let mut g = TensorGraph::new();
+        let a = g.input(&[256, 128]);
+        let b = g.input(&[128, 256]);
+        let c = g.matmul(a, b).unwrap();
+        let av = ramp(256 * 128, 0.37, -1.3);
+        let bv = ramp(128 * 256, -0.11, 0.7);
+        let threaded = g.eval(&[av.clone(), bv.clone()], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(1));
+        let inline = g.eval(&[av, bv], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(usize::MAX));
+        assert_eq!(threaded.len(), inline.len());
+        assert!(threaded
+            .iter()
+            .zip(&inline)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
     }
 
     #[test]

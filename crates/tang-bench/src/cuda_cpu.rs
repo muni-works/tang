@@ -466,6 +466,12 @@ mod tests {
                     .collect()
             })
             .collect();
+        // the router's top-k is the warp select (not the generic combine)
+        assert!(
+            dp.program.kernels.iter().any(|k| k.source.contains("warp select"))
+                || std::env::var("TANG_TOPK_SELECT").is_ok_and(|v| v == "0"),
+            "no top-k warp select"
+        );
         let got = super::run(&dp, &words, &outs);
         let mut worst = 0.0f64;
         for (oi, (gv, wv)) in got.iter().zip(&want).enumerate() {

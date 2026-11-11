@@ -51,6 +51,8 @@ metal = ["dep:metal"]
 # CUDA backend of tang-gpu's program runner for `TensorGraph::to_cuda`
 # programs (cudarc, dynamic loading of libcuda/libnvrtc at run time).
 cuda = ["tang-gpu/cuda"]
+# ds_multi_gpu collectives on device buffers (tang-moe NCCL; libnccl loaded at run time)
+nccl = ["cuda", "dep:tang-moe", "tang-moe/nccl"]
 # Vulkan decode kernels as GLSL -> SPIR-V (shaderc, built from source).
 glsl = ["tang-gpu/glsl"]
 # OpenCL decode kernels (`to_opencl_decode`) on tang-gpu's OpenCL runtime: TANG_BACKEND=opencl
@@ -98,6 +100,10 @@ required-features = ["cuda", "gguf"]
 name = "ds_real_gpu"
 required-features = ["cuda"]
 
+[[example]]
+name = "ds_multi_gpu"
+required-features = ["cuda"]
+
 [dependencies]
 tang        = { workspace = true, features = ["std"] }
 tang-la     = { workspace = true, features = ["std"] }
@@ -115,6 +121,7 @@ serde_json = "1"
 tokenizers = { workspace = true }
 tang-otel = { workspace = true, optional = true }
 tang-llm = { workspace = true, optional = true }
+tang-moe = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

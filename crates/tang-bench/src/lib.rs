@@ -272,6 +272,9 @@ pub mod ir_ds_spark;
 /// Qwen3-Coder-Next as one prefill graph, checked against tang-llm's CPU reference.
 pub mod ir_coder_prefill;
 pub mod qwen_session;
+/// Measured per-kernel schedule choices: sweep, select, write the tuning cache.
+#[cfg(feature = "cuda")]
+pub mod autotune;
 
 /// GLM-5.3 as one prefill graph over symbolic T; its step via `derive_step`.
 pub mod ir_glm_prefill;
@@ -284,6 +287,8 @@ pub mod ir_glm_real;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Multi-GPU decode: the derived step split across ranks (EP + TP), checked on CPU.
+pub mod ir_shard;
 /// Prompt-lookup speculative decoding over a derived k-token window.
 pub mod prompt_lookup;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
