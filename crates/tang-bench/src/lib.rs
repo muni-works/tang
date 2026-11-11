@@ -305,6 +305,9 @@ pub mod ir_coder_real;
 /// Qwen3-Coder-Next served from its derived step (`TANG_CODER_ENGINE=derived`).
 #[cfg(feature = "coder-serve")]
 pub mod coder_serve;
+/// The batched variant: one step over every slot (`TANG_CODER_DERIVED_BATCH=1`).
+#[cfg(feature = "coder-serve")]
+pub mod coder_serve_batch;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]

@@ -18,7 +18,7 @@ MODEL_DIR=${MODEL_DIR:-/root/models/coder-next}
 OUT=${OUT:-/root/coder-serve-check}
 CTX=${CTX:-8192}
 MAX_TOKENS=${MAX_TOKENS:-128}
-ENGINES=${ENGINES:-hand derived}
+ENGINES=${ENGINES:-hand derived derived-batch}
 GGUF=$(ls "$MODEL_DIR"/*.gguf | head -1)
 mkdir -p "$OUT"
 cd "$REPO"
@@ -85,7 +85,7 @@ th = [threading.Thread(target=run, args=(i,)) for i in range(len(PROMPTS))]
 res["c4"] = out4
 res["c4_wall_ms"] = (time.time() - t0) * 1e3
 res["c4_agg_tok_s"] = sum(x["tokens"] for x in out4) / (res["c4_wall_ms"] / 1e3)
-if mode == "derived":
+if mode.startswith("derived"):
     a = req(PROMPTS[1], 0.8, 7); b = req(PROMPTS[1], 0.8, 7); c = req(PROMPTS[1], 0.8, 8)
     res["sampled"] = {"same_seed_equal": a["text"] == b["text"], "other_seed_differs": a["text"] != c["text"],
                       "a": a["text"][:200], "c": c["text"][:200]}
@@ -95,7 +95,11 @@ EOF
 port=8931
 for eng in $ENGINES; do
   echo "=== serve: $eng"
-  if [ "$eng" = derived ]; then export TANG_CODER_ENGINE=derived; else unset TANG_CODER_ENGINE; fi
+  unset TANG_CODER_ENGINE TANG_CODER_DERIVED_BATCH
+  case $eng in
+    derived) export TANG_CODER_ENGINE=derived ;;
+    derived-batch) export TANG_CODER_ENGINE=derived TANG_CODER_DERIVED_BATCH=1 ;;
+  esac
   # bitwise-greedy windows on the hand engine so its batched output is comparable
   TANG_SERVE_DETERMINISTIC=1 TANG_SERVE_WIDE=0 "$BIN" "$GGUF" --port $port --ctx "$CTX" --batch 4 \
     --no-suffix --snapshots 0 > "$OUT/serve-$eng.log" 2>&1 &
@@ -114,7 +118,7 @@ done
 
 python3 - "$OUT" <<'EOF'
 import json, sys, os, statistics as st
-o = sys.argv[1]; r = {e: json.load(open(f"{o}/{e}.json")) for e in ("hand", "derived") if os.path.exists(f"{o}/{e}.json")}
+o = sys.argv[1]; r = {e: json.load(open(f"{o}/{e}.json")) for e in ("hand", "derived", "derived-batch") if os.path.exists(f"{o}/{e}.json")}
 s = {}
 for e, x in r.items():
     s[e] = {
@@ -126,18 +130,21 @@ for e, x in r.items():
       "c4_aggregate_tok_s": x["c4_agg_tok_s"],
     }
     if "sampled" in x: s[e]["sampled"] = {k: v for k, v in x["sampled"].items() if k.endswith(("equal", "differs"))}
-if len(r) == 2:
-    h, d = r["hand"], r["derived"]
-    s["greedy_equal_c1"] = [a["text"] == b["text"] for a, b in zip(h["c1"], d["c1"])]
-    s["greedy_equal_c4"] = [a["text"] == b["text"] for a, b in zip(h["c4"], d["c4"])]
-    s["derived_c1_equals_c4"] = [a["text"] == b["text"] for a, b in zip(d["c1"], d["c4"])]
-    def common(a, b):
-        n = 0
-        for x, y in zip(a, b):
-            if x != y: break
-            n += 1
-        return n
-    s["common_prefix_chars_c1"] = [(common(a["text"], b["text"]), len(a["text"])) for a, b in zip(h["c1"], d["c1"])]
+def common(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y: break
+        n += 1
+    return n
+for e in r:
+    if e == "hand" or "hand" not in r: continue
+    h, d = r["hand"], r[e]
+    s[e]["greedy_equal_hand_c1"] = [a["text"] == b["text"] for a, b in zip(h["c1"], d["c1"])]
+    s[e]["greedy_equal_hand_c4"] = [a["text"] == b["text"] for a, b in zip(h["c4"], d["c4"])]
+    s[e]["c1_equals_c4"] = [a["text"] == b["text"] for a, b in zip(d["c1"], d["c4"])]
+    s[e]["common_prefix_chars_c1"] = [(common(a["text"], b["text"]), len(a["text"])) for a, b in zip(h["c1"], d["c1"])]
+if "derived" in r and "derived-batch" in r:
+    s["batch_equals_per_slot_c4"] = [a["text"] == b["text"] for a, b in zip(r["derived"]["c4"], r["derived-batch"]["c4"])]
 json.dump(s, open(f"{o}/summary.json", "w"), indent=1)
 print(json.dumps(s, indent=1))
 EOF
