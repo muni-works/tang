@@ -45,6 +45,10 @@ pub fn register() {
 }
 
 fn load_boxed(path: &Path, ctx: usize, slots: usize) -> Result<Box<dyn ServeEngine>> {
+    // TANG_CODER_DERIVED_BATCH=1: one batched step over the slots (coder_serve_batch.rs)
+    if slots > 1 && std::env::var("TANG_CODER_DERIVED_BATCH").as_deref() == Ok("1") {
+        return Ok(Box::new(crate::coder_serve_batch::BatchedCoder::load(path, ctx, slots)?));
+    }
     Ok(Box::new(DerivedCoder::load(path, ctx, slots)?))
 }
 

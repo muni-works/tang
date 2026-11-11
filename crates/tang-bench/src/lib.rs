@@ -309,6 +309,9 @@ pub mod ir_shard;
 /// Prompt-lookup speculative decoding over a derived k-token window.
 pub mod prompt_lookup;
 pub mod ring_ports;
+/// The batched variant: one step over every slot (`TANG_CODER_DERIVED_BATCH=1`).
+#[cfg(feature = "coder-serve")]
+pub mod coder_serve_batch;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]
