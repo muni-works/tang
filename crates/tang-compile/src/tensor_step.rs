@@ -1307,17 +1307,39 @@ mod tests {
     /// checked against a prefill of the grown sequence: the new output
     /// rows, and every cache's filled rows. Returns the worst error.
     fn check_steps(g: &TensorGraph, outs: &[TensorId], p0: usize, ks: &[usize]) -> f64 {
-        check_steps_skewed(g, outs, p0, ks, 0)
+        check_steps_with(g, outs, p0, ks, (0, 0), Rows::All)
     }
 
-    /// [`check_steps`] feeding the step `p0 + skew` as its position (a
-    /// negative control when `skew != 0`).
     fn check_steps_skewed(
         g: &TensorGraph,
         outs: &[TensorId],
         p0: usize,
         ks: &[usize],
         skew: usize,
+    ) -> f64 {
+        check_steps_with(g, outs, p0, ks, (skew, 0), Rows::All)
+    }
+
+    /// A carried state's value in a prefill of `t` rows: a scan's row
+    /// `t − 1`, or a reduction's whole value.
+    fn state_of(g: &TensorGraph, c: &CacheSlot, v: &[f64], t: usize) -> Vec<f64> {
+        if g.shape(c.node).contains(&T) {
+            rows(v, &concrete(g.shape(c.node), t), c.axis, t - 1, t)
+        } else {
+            v.to_vec()
+        }
+    }
+
+    /// [`check_steps`] feeding the step `p0 + skew.0` as its position and
+    /// carried states from a prefill of `p0 − skew.1` rows (negative
+    /// controls when nonzero), and outputs for `rows`.
+    fn check_steps_with(
+        g: &TensorGraph,
+        outs: &[TensorId],
+        p0: usize,
+        ks: &[usize],
+        skew: (usize, usize),
+        rows_of: Rows,
     ) -> f64 {
         let cap = 16;
         let tmax = p0 + ks.iter().sum::<usize>();
@@ -1333,12 +1355,25 @@ mod tests {
                 new: k,
                 capacity: cap,
             };
-            let step = derive_step(g, outs, &spec).unwrap();
+            let opts = StepOptions {
+                rows: rows_of,
+                batch: None,
+            };
+            let step = derive_step_with(g, outs, &spec, &opts).unwrap();
             let cache_nodes: Vec<TensorId> = step.caches.iter().map(|c| c.node).collect();
             if caches.is_empty() {
                 let pg = g.bind(&[("T", pos)]).unwrap();
                 let vals = pg.eval(&prefill_inputs(&data, tmax, pos), &cache_nodes);
-                for (c, v) in step.caches.iter().zip(vals) {
+                let sp = pos - skew.1;
+                let svals = g
+                    .bind(&[("T", sp)])
+                    .unwrap()
+                    .eval(&prefill_inputs(&data, tmax, sp), &cache_nodes);
+                for ((c, v), sv) in step.caches.iter().zip(vals).zip(svals) {
+                    if c.state {
+                        caches.insert(c.node, state_of(g, c, &sv, sp));
+                        continue;
+                    }
                     let shape = concrete(g.shape(c.node), pos);
                     let cshape = concrete(g.shape(c.node), cap);
                     let mut buf = vec![f64::NAN; cshape.iter().product()];
@@ -1359,7 +1394,7 @@ mod tests {
                 .inputs
                 .iter()
                 .map(|si| match *si {
-                    StepInput::Pos => vec![(pos + skew) as f64],
+                    StepInput::Pos => vec![(pos + skew.0) as f64],
                     StepInput::Same(i) => data[i].1.clone(),
                     StepInput::New(i) => {
                         let (shape, v) = &data[i];
@@ -1380,13 +1415,29 @@ mod tests {
             let want = fg.eval(&prefill_inputs(&data, tmax, grown), &ref_ids);
             for (o, (gv, wv)) in outs.iter().zip(got.iter().zip(&want)) {
                 let shape = concrete(g.shape(*o), grown);
-                let a = g.shape(*o).iter().position(|&d| d == T).unwrap();
-                let e = max_err(gv, &rows(wv, &shape, a, pos, grown));
+                let e = match g.shape(*o).iter().position(|&d| d == T) {
+                    Some(a) => {
+                        let r0 = if rows_of == Rows::Last {
+                            grown - 1
+                        } else {
+                            pos
+                        };
+                        max_err(gv, &rows(wv, &shape, a, r0, grown))
+                    }
+                    // a running total: the whole value
+                    None => max_err(gv, wv),
+                };
                 worst = worst.max(e);
             }
             for (ci, c) in step.caches.iter().enumerate() {
-                let cshape = concrete(g.shape(c.node), cap);
                 let gv = &got[outs.len() + ci];
+                if c.state {
+                    let e = max_err(gv, &state_of(g, c, &want[outs.len() + ci], grown));
+                    worst = worst.max(e);
+                    caches.insert(c.node, gv.clone());
+                    continue;
+                }
+                let cshape = concrete(g.shape(c.node), cap);
                 let wshape = concrete(g.shape(c.node), grown);
                 let wv = &want[outs.len() + ci];
                 let e = max_err(
@@ -1530,5 +1581,123 @@ mod tests {
                 assert!(msg.contains("causal"), "{mask:?} {prep:?}: {msg}");
             }
         }
+    }
+    fn sigmoid(x: ExprId) -> ExprId {
+        lit(1.0) / (lit(1.0) + (-x).exp())
+    }
+
+    /// A linear-attention-like layer over `x [T, dm]`: `delta_scan` state
+    /// (plain linear attention, or the gated delta rule with L2-normed
+    /// keys, `α = σ(x·wa)`, `β = σ(x·wb)`), its readout, an output
+    /// projection.
+    fn scan_layer(g: &mut TensorGraph, x: TensorId, dm: usize, n: usize, delta: bool) -> TensorId {
+        let (wq, wk, wv, wo) = (
+            g.input(&[dm, n]),
+            g.input(&[dm, n]),
+            g.input(&[dm, n]),
+            g.input(&[n, dm]),
+        );
+        let q = g.matmul(x, wq).unwrap();
+        let k = g.matmul(x, wk).unwrap();
+        let v = g.matmul(x, wv).unwrap();
+        let k = g
+            .map(&[k], |v| lit(2.0) * sigmoid(v[0]) - lit(1.0))
+            .unwrap();
+        let s = if delta {
+            let sq = g.map(&[k], |v| v[0] * v[0]).unwrap();
+            let ss = g.reduce(sq, 1, Monoid::sum()).unwrap();
+            let ssb = g.broadcast(ss, &[T, Dim::Fixed(n)]).unwrap();
+            let kn = g
+                .map(&[k, ssb], |v| v[0] * (v[1] + lit(1e-6)).sqrt().recip())
+                .unwrap();
+            let (wa, wb) = (g.input(&[dm, 1]), g.input(&[dm, 1]));
+            let a = g.matmul(x, wa).unwrap();
+            let b = g.matmul(x, wb).unwrap();
+            let a = g.map(&[a], |v| sigmoid(v[0] + lit(2.0))).unwrap();
+            let b = g.map(&[b], |v| sigmoid(v[0])).unwrap();
+            let a = g.reshape(a, &[T]).unwrap();
+            let b = g.reshape(b, &[T]).unwrap();
+            g.delta_scan(kn, v, Some(a), Some(b), 0, true).unwrap()
+        } else {
+            g.delta_scan(k, v, None, None, 0, false).unwrap()
+        };
+        let o = g.scan_readout(s, q, 1.0 / (n as f64).sqrt()).unwrap();
+        g.matmul(o, wo).unwrap()
+    }
+
+    /// Attention, linear attention and a gated-delta-rule layer as
+    /// residual blocks, then `y = h + cumsum_t(h)/(t + 1)` (a monoid scan
+    /// and a position), and `pooled = Σ_t y` (a reduction over the
+    /// sequence into no sequence axis). Outputs `[y, pooled]`.
+    fn hybrid() -> (TensorGraph, Vec<TensorId>) {
+        let (dm, dh, n) = (6, 4, 4);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[T, Dim::Fixed(dm)]);
+        let a = attention(&mut g, x, dm, dh, Mask::Select);
+        let h = g.map(&[x, a], |v| v[0] + v[1]).unwrap();
+        let l = scan_layer(&mut g, h, dm, n, false);
+        let h = g.map(&[h, l], |v| v[0] + v[1]).unwrap();
+        let d = scan_layer(&mut g, h, dm, n, true);
+        let h = g.map(&[h, d], |v| v[0] + v[1]).unwrap();
+        let cs = g.scan(&[h], 0, Monoid::sum(), false, false).unwrap();
+        let t = g.iota(&[T, Dim::Fixed(dm)], 0);
+        let y = g
+            .map(&[h, cs, t], |v| v[0] + v[1] / (v[2] + lit(1.0)))
+            .unwrap();
+        let pooled = g.reduce(y, 0, Monoid::sum()).unwrap();
+        (g, vec![y, pooled])
+    }
+
+    /// Scan states and a running total are carried: K/V rows (NaN tail),
+    /// the linear-attention and delta-rule states, the cumsum state and the
+    /// pooled total; steps k = 1, 4, chained, all rows or the last.
+    #[test]
+    fn running_states_match_prefill() {
+        let (g, outs) = hybrid();
+        let step = derive_step(&g, &outs, &spec(1)).unwrap();
+        let kinds: Vec<(bool, Vec<Dim>)> = step
+            .caches
+            .iter()
+            .map(|c| (c.state, g.shape(c.node).to_vec()))
+            .collect();
+        eprintln!("hybrid caches (state, prefill shape): {kinds:?}");
+        assert_eq!(step.caches.iter().filter(|c| !c.state).count(), 2); // K, V
+        assert_eq!(step.caches.iter().filter(|c| c.state).count(), 4);
+        for ks in [&[1usize][..], &[4], &[4, 1, 2]] {
+            for rows in [Rows::All, Rows::Last] {
+                let e = check_steps_with(&g, &outs, 5, ks, (0, 0), rows);
+                eprintln!("hybrid ks={ks:?} {rows:?}: max rel err {e:.2e}");
+                assert!(e < 1e-12, "{ks:?} {rows:?}: {e}");
+            }
+        }
+        // negative control: states from a prefill one row short
+        let e = check_steps_with(&g, &outs, 5, &[1], (0, 1), Rows::All);
+        eprintln!("hybrid, stale states: max rel err {e:.2e}");
+        assert!(e > 1e-3, "{e}");
+    }
+
+    /// A reverse scan reads the future; a cached row computed from a
+    /// running total would go stale. Both are refused.
+    #[test]
+    fn anticausal_states_are_refused() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[T, Dim::Fixed(3)]);
+        let r = g.scan(&[x], 0, Monoid::sum(), false, true).unwrap();
+        let msg = derive_step(&g, &[r], &spec(1)).err().unwrap().0;
+        assert!(msg.contains("revers"), "{msg}");
+
+        // attention whose keys read the running total
+        let mut g = TensorGraph::new();
+        let x = g.input(&[T, Dim::Fixed(4)]);
+        let tot = g.reduce(x, 0, Monoid::sum()).unwrap();
+        let totb = g.broadcast(tot, &[T, Dim::Fixed(4)]).unwrap();
+        let xk = g.map(&[x, totb], |v| v[0] + v[1]).unwrap();
+        let wq = g.input(&[4, 4]);
+        let q = g.matmul(x, wq).unwrap();
+        let kt = g.transpose(xk, &[1, 0]).unwrap();
+        let s = g.matmul(q, kt).unwrap();
+        let y = select_softmax_v(&mut g, s, x, 4, 0.5);
+        let msg = derive_step(&g, &[y], &spec(1)).err().unwrap().0;
+        assert!(msg.contains("running state"), "{msg}");
     }
 }
