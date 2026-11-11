@@ -100,7 +100,12 @@ impl Format {
             Format::F16 | Format::BF16 => 2,
             Format::E4M3(_) | Format::E5M2(_) => 1,
             Format::Fp8Accum => 4,
-            Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => 1,
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => 1,
         }
     }
 
@@ -151,9 +156,12 @@ impl Format {
             Format::BF16 => f32::from_bits(0x7f7f_0000) as f64,
             Format::E4M3(_) => 448.0,
             Format::E5M2(_) => 57344.0,
-            Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
-                f32::MAX as f64
-            }
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => f32::MAX as f64,
         }
     }
 
@@ -218,7 +226,12 @@ impl Format {
             Format::E5M2(_) => sat(round_to(x, 2, -14, f64::INFINITY), 57344.0),
             Format::Fp8Accum => truncate_to(x as f32 as f64, FP8_ACCUM_BITS),
             // per block: see `round_blocks`
-            Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => x,
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => x,
         }
     }
 }
