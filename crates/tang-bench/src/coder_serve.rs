@@ -260,6 +260,7 @@ impl DerivedCoder {
                 let _ = me.token(0);
             }
             let wall = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            me.zero_rows(0, 0, 20);
             me.clear_slot(0);
             eprintln!(
                 "coder derived: step {dev:.3} ms device, {} cache copies {copies:.3} ms, \
