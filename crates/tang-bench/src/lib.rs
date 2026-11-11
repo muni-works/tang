@@ -277,6 +277,8 @@ pub mod ir_glm_prefill;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Multi-GPU decode: the derived step split across ranks (EP + TP), checked on CPU.
+pub mod ir_shard;
 /// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_coder_real;

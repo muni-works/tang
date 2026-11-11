@@ -117,6 +117,15 @@ impl Runtime {
         CudaDevice::new(0).map(Self::Cuda)
     }
 
+    /// CUDA device `ordinal` (one rank of a multi-GPU program).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_on(ordinal: usize) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::new(ordinal).map(Self::Cuda)
+    }
+
     /// CUDA device 0 set up for [`Program::capture`]
     /// ([`CudaDevice::new_capturable`]).
     #[cfg(feature = "cuda")]

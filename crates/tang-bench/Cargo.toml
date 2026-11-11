@@ -82,6 +82,10 @@ required-features = ["cuda", "gguf"]
 name = "ds_real_gpu"
 required-features = ["cuda"]
 
+[[example]]
+name = "ds_multi_gpu"
+required-features = ["cuda"]
+
 [dependencies]
 tang        = { workspace = true, features = ["std"] }
 tang-la     = { workspace = true, features = ["std"] }
