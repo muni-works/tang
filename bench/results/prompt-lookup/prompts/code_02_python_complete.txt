@@ -1,0 +1,42 @@
+import json
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class User:
+    id: int
+    name: str
+    email: str
+    is_admin: bool = False
+    tags: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "email": self.email,
+            "is_admin": self.is_admin,
+            "tags": self.tags,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "User":
+        return cls(
+            id=d["id"],
+            name=d["name"],
+            email=d["email"],
+            is_admin=d.get("is_admin", False),
+            tags=d.get("tags", []),
+        )
+
+
+@dataclass
+class Project:
+    id: int
+    title: str
+    owner: User
+    members: list[User] = field(default_factory=list)
+    archived: bool = False
+
+    def to_dict(self) -> dict:

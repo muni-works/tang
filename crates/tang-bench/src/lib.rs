@@ -277,6 +277,11 @@ pub mod ir_glm_prefill;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Prompt-lookup speculative decoding over a derived k-token window.
+pub mod prompt_lookup;
+/// Generated CUDA decode kernels run on the CPU (host g++), for checks
+/// without a GPU.
+pub mod cuda_cpu;
 /// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_coder_real;
