@@ -1525,7 +1525,7 @@ pub(crate) mod tests {
     }
 
     /// Image spliced into the real DS prefill: the real image planned at an
-    /// 4-position budget (`VISION_SPAN`; 1 × 1 token, so the f64 expert
+    /// 8-position budget (`VISION_SPAN`; 2 × 2 tokens, so the f64 expert
     /// tables fit), its
     /// real encoder rows and delimiters in the span, `DS_REAL_LAYERS` (0,2)
     /// real layers; graph prefill logits against the reference with the
@@ -1539,7 +1539,7 @@ pub(crate) mod tests {
         use tang_compile::tensor::step::{seed_cache, StepInput};
         let Some(mut run) = RealRun::from_env() else { return eprintln!("no checkpoint") };
         let vd0 = VisionDims::from_config(&run.cfg).unwrap();
-        let budget: usize = std::env::var("VISION_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let budget: usize = std::env::var("VISION_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let vd = VisionDims { max_tokens: budget, min_pixels: 0, ..vd0.clone() };
         run.vocab_ids.push(vd.image_token_id);
         run.vocab_ids.sort_unstable();
