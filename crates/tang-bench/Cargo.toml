@@ -136,3 +136,7 @@ required-features = ["cuda"]
 [[example]]
 name = "floors_cuda"
 required-features = ["cuda"]
+
+[[example]]
+name = "attention_fragments"
+required-features = ["metal"]
