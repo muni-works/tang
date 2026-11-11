@@ -5006,7 +5006,10 @@ mod tests {
         let inline = g.eval(&[av, bv], &[c]).remove(0);
         MAX_THREADS.with(|m| m.set(usize::MAX));
         assert_eq!(threaded.len(), inline.len());
-        assert!(threaded.iter().zip(&inline).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(threaded
+            .iter()
+            .zip(&inline)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
     }
 
     #[test]
