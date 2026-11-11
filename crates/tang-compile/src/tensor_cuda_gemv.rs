@@ -393,8 +393,10 @@ impl TensorGraph {
                 Some(d) => lw.inplace_update(root, d),
                 // OpenCL prefill: the register-block kernel, else the tiled WGSL one
                 None if tiles.contains(&root) => mma(),
-                None => lw
-                    .topk_select(root)
+                // CUDA only: shared atomics, not in the OpenCL transpile
+                None => (target == DecodeTarget::Cuda)
+                    .then(|| lw.topk_select(root))
+                    .flatten()
                     .or_else(|| mma())
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
