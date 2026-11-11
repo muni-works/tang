@@ -545,3 +545,193 @@ fn kda_per_channel_gate_state_matches_prefill() {
     eprintln!("kda, stale state: max rel err {e:.2e}");
     assert!(e > 1e-3, "{e}");
 }
+
+/// A scan's per-row output feeding attention whose K and V are cached
+/// (KDA → DSA in GLM): row t's keys read the scan state at t, final once
+/// computed, so the rows cache like any other. Prefill to 5, steps [1],
+/// [4], [4, 1, 2], NaN past the filled cache rows.
+#[test]
+fn scan_rows_feed_cached_attention() {
+    let (dm, n, dh) = (6, 4, 4);
+    let mut g = TensorGraph::new();
+    let x = g.input(&[T, Dim::Fixed(dm)]);
+    // linear attention: S_t = S_{t−1} + k_t·v_tᵀ, o_t = S_tᵀ·q_t
+    let (wq, wk, wv, wo) = (
+        g.input(&[dm, n]),
+        g.input(&[dm, n]),
+        g.input(&[dm, n]),
+        g.input(&[n, dm]),
+    );
+    let q = g.matmul(x, wq).unwrap();
+    let k = g.matmul(x, wk).unwrap();
+    let k = g
+        .map(&[k], |v| lit(2.0) * sigmoid(v[0]) - lit(1.0))
+        .unwrap();
+    let v = g.matmul(x, wv).unwrap();
+    let st = g.delta_scan(k, v, None, None, 0, false).unwrap();
+    let ro = g.scan_readout(st, q, 0.5).unwrap();
+    let lo = g.matmul(ro, wo).unwrap();
+    let h = g.map(&[x, lo], |v| v[0] + v[1]).unwrap();
+    // causal attention over h: its K, V rows come from the scan's rows
+    let (aq, ak, av) = (g.input(&[dm, dh]), g.input(&[dm, dh]), g.input(&[dm, dh]));
+    let q2 = g.matmul(h, aq).unwrap();
+    let k2 = g.matmul(h, ak).unwrap();
+    let v2 = g.matmul(h, av).unwrap();
+    let kt = g.transpose(k2, &[1, 0]).unwrap();
+    let s = g.matmul(q2, kt).unwrap();
+    let (it, ij) = (g.iota(&[T, T], 0), g.iota(&[T, T], 1));
+    let scale = 0.5;
+    let p2 = |s: TensorId| pick_arg(s, &[Some(0), Some(1)], 2);
+    let m = g
+        .comp(
+            &[T],
+            &[T],
+            vec![p2(s), p2(it), p2(ij)],
+            Some(Monoid::max()),
+            move |v| vec![sel(vis(v[1], v[2]), v[0] * lit(scale), lit(-1e30))],
+        )
+        .unwrap();
+    let l = g
+        .comp(
+            &[T],
+            &[T],
+            vec![p2(s), pick_arg(m, &[Some(0)], 2), p2(it), p2(ij)],
+            Some(Monoid::sum()),
+            move |v| {
+                vec![sel(
+                    vis(v[2], v[3]),
+                    (v[0] * lit(scale) - v[1]).exp(),
+                    lit(0.0),
+                )]
+            },
+        )
+        .unwrap();
+    let sp = [T, Dim::Fixed(dh), T];
+    let (it3, ij3) = (g.iota(&sp, 0), g.iota(&sp, 2));
+    let id3 = [Some(0), Some(1), Some(2)];
+    let y = g
+        .comp(
+            &[T, Dim::Fixed(dh)],
+            &[T],
+            vec![
+                pick_arg(s, &[Some(0), Some(2)], 3),
+                pick_arg(m, &[Some(0)], 3),
+                pick_arg(l, &[Some(0)], 3),
+                pick_arg(v2, &[Some(2), Some(1)], 3),
+                pick_arg(it3, &id3, 3),
+                pick_arg(ij3, &id3, 3),
+            ],
+            Some(Monoid::sum()),
+            move |v| {
+                let pv = (v[0] * lit(scale) - v[1]).exp() * v[3] / v[2];
+                vec![sel(vis(v[4], v[5]), pv, lit(0.0))]
+            },
+        )
+        .unwrap();
+    let outs = [y];
+    let step = derive_step_with(&g, &outs, &spec(1), &StepOptions::default()).unwrap();
+    let rows_n = step.caches.iter().filter(|c| !c.state).count();
+    let states_n = step.caches.iter().filter(|c| c.state).count();
+    assert_eq!((rows_n, states_n), (2, 1), "K/V rows + the scan state");
+
+    let tmax = 13;
+    let cap = 16;
+    let mut shapes: Vec<(usize, Vec<Dim>)> = g
+        .nodes()
+        .iter()
+        .filter_map(|nd| match nd.op {
+            Op::Input(i) => Some((i, nd.shape.clone())),
+            _ => None,
+        })
+        .collect();
+    shapes.sort_by_key(|x| x.0);
+    let data: Vec<Vec<f64>> = shapes
+        .iter()
+        .map(|(i, sh)| {
+            let n: usize = sh
+                .iter()
+                .map(|&d| if d == T { tmax } else { d.n() })
+                .product();
+            rand(n, 53 + *i as u64, 0.8)
+        })
+        .collect();
+    let inputs_at = |t: usize| {
+        let mut ins = data.clone();
+        ins[0] = data[0][..t * dm].to_vec();
+        ins
+    };
+    let conc = |sh: &[Dim], t: usize| -> Vec<usize> {
+        sh.iter().map(|&d| if d == T { t } else { d.n() }).collect()
+    };
+    let prefill =
+        |t: usize, ids: &[TensorId]| g.bind(&[("T", t)]).unwrap().eval(&inputs_at(t), ids);
+    for ks in [&[1usize][..], &[4], &[4, 1, 2]] {
+        let mut pos = 5;
+        let mut caches: HashMap<TensorId, Vec<f64>> = HashMap::new();
+        let mut worst = 0.0f64;
+        for &k in ks {
+            let step = derive_step_with(&g, &outs, &spec(k), &StepOptions::default()).unwrap();
+            if caches.is_empty() {
+                let nodes: Vec<TensorId> = step.caches.iter().map(|c| c.node).collect();
+                let vals = prefill(pos, &nodes);
+                for (c, v) in step.caches.iter().zip(vals) {
+                    let shape = conc(g.shape(c.node), pos);
+                    let buf = if c.state {
+                        rows(&v, &shape, c.axis, pos - 1, pos)
+                    } else {
+                        let inner: usize = shape[c.axis + 1..].iter().product();
+                        let outer: usize = shape[..c.axis].iter().product();
+                        let mut buf = vec![f64::NAN; conc(g.shape(c.node), cap).iter().product()];
+                        for o in 0..outer {
+                            for r in 0..pos {
+                                let s0 = (o * pos + r) * inner;
+                                let d0 = (o * cap + r) * inner;
+                                buf[d0..d0 + inner].copy_from_slice(&v[s0..s0 + inner]);
+                            }
+                        }
+                        buf
+                    };
+                    caches.insert(c.node, buf);
+                }
+            }
+            let ins: Vec<Vec<f64>> = step
+                .inputs
+                .iter()
+                .map(|si| match *si {
+                    StepInput::Pos => vec![pos as f64],
+                    StepInput::New(_) => data[0][pos * dm..(pos + k) * dm].to_vec(),
+                    StepInput::Same(i) => data[i].clone(),
+                    StepInput::Cache(c) => caches[&step.caches[c].node].clone(),
+                })
+                .collect();
+            let mut ids = step.outputs.clone();
+            ids.extend(step.caches.iter().map(|c| c.updated));
+            let got = step.graph.eval(&ins, &ids);
+            let grown = pos + k;
+            let mut rids = vec![y];
+            rids.extend(step.caches.iter().map(|c| c.node));
+            let want = prefill(grown, &rids);
+            worst = worst.max(max_err(
+                &got[0],
+                &rows(&want[0], &[grown, dh], 0, pos, grown),
+            ));
+            for (ci, c) in step.caches.iter().enumerate() {
+                let (gv, wv) = (&got[1 + ci], &want[1 + ci]);
+                let wshape = conc(g.shape(c.node), grown);
+                let e = if c.state {
+                    max_err(gv, &rows(wv, &wshape, c.axis, grown - 1, grown))
+                } else {
+                    max_err(
+                        &rows(gv, &conc(g.shape(c.node), cap), c.axis, 0, grown),
+                        &rows(wv, &wshape, c.axis, 0, grown),
+                    )
+                };
+                worst = worst.max(e);
+                caches.insert(c.node, gv.clone());
+            }
+            pos = grown;
+        }
+        eprintln!("scan rows -> cached attention, ks={ks:?}: max rel err {worst:.2e}");
+        assert!(worst < 1e-12, "{ks:?}: {worst}");
+    }
+}

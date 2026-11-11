@@ -233,10 +233,18 @@ pub fn derive_step_with(
         let modes = d.modes_with(o.n(), mode);
         outs.push(d.get(o.n(), modes)?);
     }
-    // a cached row must not depend on a carried state: the state changes
-    // with every new row, so the old rows' cached values would go stale
+    // a cached row must not depend on a running total (a reduction over
+    // the sequence into no sequence axis): every row reads the total over
+    // all rows, which changes with every new one, so the old rows' cached
+    // values would go stale. A scan's output is per row (row t reads the
+    // state at t, final once computed), so rows built from it cache fine.
+    let seq = Dim::Sym(spec.seq);
     for r in d.caches.iter().filter(|c| !c.state) {
-        for st in d.caches.iter().filter(|c| c.state) {
+        for st in d
+            .caches
+            .iter()
+            .filter(|c| c.state && !g.shape(c.node).contains(&seq))
+        {
             if g.depends_on(r.node.n(), st.node.n()) {
                 return err(format!(
                     "step: cached rows of {:?} depend on the running state {:?}; \
