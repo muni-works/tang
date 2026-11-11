@@ -70,7 +70,9 @@ pub struct DerivedCoder {
     outs: Vec<TensorId>,
     pos_in: usize,
     tok_in: usize,
-    params_in: usize,
+    /// The sampler's params input (`None`: built without the sampler,
+    /// `TANG_CODER_DERIVED_SAMPLER=0`; greedy argmax on the host).
+    params_in: Option<usize>,
     /// (cache input, its update) for rings and states, copied back after each step.
     swaps: Vec<(usize, TensorId)>,
     /// Running state: ring and state cache inputs, in cache order.
@@ -93,15 +95,21 @@ impl DerivedCoder {
         let dims = dims_from_gguf(&g).map_err(anyhow::Error::msg)?;
         let mut pg = prefill_graph(&dims);
         let mut tys = bind(&pg, &g).map_err(anyhow::Error::msg)?;
-        let s = append_sampler(&mut pg.g, pg.logits, SampleSpec::default());
-        pg.inputs.push(CoderInput {
-            name: "sample.params".into(),
-            shape: vec![tang_compile::tensor::Dim::Fixed(4)],
-        });
-        tys.push(None);
+        let sampled = std::env::var("TANG_CODER_DERIVED_SAMPLER").as_deref() != Ok("0");
+        let mut step_outs = vec![pg.logits];
+        if sampled {
+            let s = append_sampler(&mut pg.g, pg.logits, SampleSpec::default());
+            pg.inputs.push(CoderInput {
+                name: "sample.params".into(),
+                shape: vec![tang_compile::tensor::Dim::Fixed(4)],
+            });
+            tys.push(None);
+            step_outs.push(s.token);
+        }
+        let nout = step_outs.len();
         let st = tang_compile::tensor::step::derive_step(
             &pg.g,
-            &[pg.logits, s.token],
+            &step_outs,
             &tang_compile::tensor::step::StepSpec {
                 seq: crate::ir_coder_prefill::SEQ,
                 new: 1,
@@ -128,9 +136,12 @@ impl DerivedCoder {
         let wprog = low.program.program;
         let storage = low.storage;
         let outs = low.outs;
-        let params_k = pg.input("sample.params");
+        let params_k = sampled.then(|| pg.input("sample.params"));
         let input_k = |want: StepInput| st.inputs.iter().position(|s| *s == want);
-        let params_in = input_k(StepInput::Same(params_k)).context("sampler params input")?;
+        let params_in = match params_k {
+            Some(k) => Some(input_k(StepInput::Same(k)).context("sampler params input")?),
+            None => None,
+        };
         let pos_in = input_k(StepInput::Pos).context("pos input")?;
         let tok_in = st
             .inputs
@@ -145,7 +156,7 @@ impl DerivedCoder {
         let mut weights = Vec::new();
         for (k, si) in st.inputs.iter().enumerate() {
             let StepInput::Same(i) = *si else { continue };
-            if i == params_k {
+            if Some(i) == params_k {
                 continue;
             }
             let t = g.info(&pg.inputs[i].name)?;
@@ -195,7 +206,7 @@ impl DerivedCoder {
         for (c, cs) in st.caches.iter().enumerate() {
             let k = cache_in(c);
             if cs.state || cs.ring.is_some() {
-                swaps.push((k, outs[2 + c]));
+                swaps.push((k, outs[nout + c]));
                 running.push(k);
             } else {
                 ensure!(cs.axis == 0, "row cache {c} on axis {}", cs.axis);
@@ -270,18 +281,19 @@ impl DerivedCoder {
         }
         let kv_mb: usize = me.rows.iter().map(|&(_, w)| w * ctx * 4).sum::<usize>() >> 20;
         eprintln!(
-            "coder derived: {} slot(s), ctx {ctx}, {ncache} caches ({kv_mb} MB of K/V a slot), graphs {}, ready in {:.1} s",
+            "coder derived: {} slot(s), ctx {ctx}, {ncache} caches ({kv_mb} MB of K/V a slot), graphs {}, sampler {}, ready in {:.1} s",
             me.slots.len(),
             if capture { "on" } else { "off" },
+            if me.params_in.is_some() { "on the device" } else { "off (host argmax)" },
             t0.elapsed().as_secs_f64()
         );
         Ok(me)
     }
 
     fn write_params(&self, s: usize) {
+        let Some(k) = self.params_in else { return };
         let sl = &self.slots[s];
-        sl.prog
-            .write(&self.rt, sl.prog.input(self.params_in), &sl.params);
+        sl.prog.write(&self.rt, sl.prog.input(k), &sl.params);
     }
 
     /// Zero a slot's running state (rings and states) and the K/V rows its sequence wrote:
@@ -326,7 +338,19 @@ impl DerivedCoder {
     /// Slot `s`'s sampled (or greedy) token from its last step.
     fn token(&self, s: usize) -> u32 {
         let p = &self.slots[s].prog;
-        p.read(&self.rt, self.outs[1])[0] as u32
+        if self.params_in.is_some() {
+            return p.read(&self.rt, self.outs[1])[0] as u32;
+        }
+        // no sampler: the first maximum of the logits
+        let l = p.read(&self.rt, self.outs[0]);
+        let l = &l[l.len() - self.vocab..];
+        let mut a = 0;
+        for (i, &x) in l.iter().enumerate() {
+            if x > l[a] {
+                a = i;
+            }
+        }
+        a as u32
     }
 
     /// Step `ids` through slot `s` from its current end (appending them), returning the
@@ -481,6 +505,11 @@ impl ServeEngine for DerivedCoder {
         Ok(out)
     }
     fn set_slot_sampling(&mut self, slot: usize, s: RowSampling) -> Result<()> {
+        ensure!(
+            self.params_in.is_some() || !s.sampled(),
+            "TANG_CODER_DERIVED_SAMPLER=0: greedy only (temperature {})",
+            s.temperature
+        );
         if s.presence != 0.0 && !self.presence_noted.replace(true) {
             eprintln!("coder derived: presence penalty not supported on the device sampler; ignored");
         }
