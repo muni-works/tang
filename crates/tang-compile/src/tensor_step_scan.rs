@@ -9,8 +9,10 @@
 //!   U_t` from the cached `S_{p0−1}`, by folding it into the first new row
 //!   (`U'_0 = A_0·S + U_0`) and scanning the new rows from zero. Any `A`:
 //!   linear attention, Mamba-2, the (gated) delta rule, a per-channel gate
-//!   written as an explicit `A` (GLM's KDA). The step's scan has no
-//!   [`DeltaForm`](super::super::DeltaForm) (`U'_0` is not `β·k·vᵀ`).
+//!   written as an explicit `A` (GLM's KDA). With a
+//!   [`DeltaForm`](super::super::DeltaForm) the fold skips the dense
+//!   `O(n²·m)` product: `A·S = α·(S − β·k·(kᵀS))`, `O(n·m)`. The step's
+//!   own scan (k > 1) has no `DeltaForm` (`U'_0` is not `β·k·vᵀ`).
 //! - **Running reduction**: `total = cached ⊕ reduce(new rows)` (see
 //!   `Deriver::comp`).
 //!
@@ -20,7 +22,7 @@ use tang::Scalar;
 use tang_expr::ExprId;
 
 use super::super::{
-    Arg, Comp, Dim, Form, Monoid, Scan, ScanKind, Semiring, ShapeError, TensorId, View,
+    Arg, Comp, DeltaForm, Dim, Form, Monoid, Scan, ScanKind, Semiring, ShapeError, TensorId, View,
 };
 use super::{err, CacheSlot, Deriver, Mode, Modes, StepInput};
 
@@ -167,30 +169,21 @@ impl Deriver<'_> {
                 let u = new_in(self, sc.inputs[1])?;
                 let input = self.sg.input(&st_shape);
                 self.inputs.push(StepInput::Cache(self.caches.len()));
-                let r = step_shape.len(); // [P…, n, m]
-                let nn = step_shape[r - 2];
-                // AS[P…, i, c] = Σ_j A[P…, i, j]·S[P…\dim, j, c]: space (P…, i, c, j)
-                let mut a_picks: Vec<Option<usize>> = (0..r - 1).map(Some).collect();
-                a_picks.push(Some(r));
-                let mut s_picks: Vec<Option<usize>> =
-                    (0..r - 2).filter(|&d| d != dim).map(Some).collect();
-                s_picks.extend([Some(r), Some(r - 1)]);
-                let as_ = self.sg.comp(
-                    &step_shape,
-                    &[nn],
-                    vec![
-                        Arg {
-                            src: a,
-                            view: View::pick(r + 1, &a_picks),
-                        },
-                        Arg {
-                            src: input,
-                            view: View::pick(r + 1, &s_picks),
-                        },
-                    ],
-                    Some(Monoid::sum()),
-                    |v| vec![v[0] * v[1]],
-                )?;
+                // [P…, n, m]
+                let r = step_shape.len();
+                // AS[P…, i, c] = Σ_j A[P…, i, j]·S[P…\dim, j, c]: space (P…,
+                // i, c, j), O(n³) a step; a delta-rule A = α·(I − β·k·kᵀ)
+                // factors to O(n²) (see `delta_as`)
+                let factored = match &sc.kind {
+                    ScanKind::Affine { form: Some(f), .. } => {
+                        Some(self.delta_as(sc, f, input, &step_shape, dim)?)
+                    }
+                    _ => None,
+                };
+                let as_ = match factored {
+                    Some(t) => t,
+                    None => self.dense_as(a, input, &step_shape, dim)?,
+                };
                 let t = self.sg.iota(&step_shape, dim);
                 let u0 = self.sg.comp(
                     &step_shape,
@@ -232,5 +225,129 @@ impl Deriver<'_> {
                 "step: scan node {n} is a log/max-plus or banded scan (not derived yet)"
             )),
         }
+    }
+
+    /// `AS[P…, i, c] = Σ_j A[P…, i, j]·S[P…\dim, j, c]` for a dense `A`.
+    fn dense_as(
+        &mut self,
+        a: TensorId,
+        input: TensorId,
+        step_shape: &[Dim],
+        dim: usize,
+    ) -> Result<TensorId, ShapeError> {
+        let r = step_shape.len();
+        let nn = step_shape[r - 2];
+        let mut a_picks: Vec<Option<usize>> = (0..r - 1).map(Some).collect();
+        a_picks.push(Some(r));
+        let mut s_picks: Vec<Option<usize>> = (0..r - 2).filter(|&d| d != dim).map(Some).collect();
+        s_picks.extend([Some(r), Some(r - 1)]);
+        self.sg.comp(
+            step_shape,
+            &[nn],
+            vec![
+                Arg {
+                    src: a,
+                    view: View::pick(r + 1, &a_picks),
+                },
+                Arg {
+                    src: input,
+                    view: View::pick(r + 1, &s_picks),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+    }
+
+    /// `AS` of a delta-rule scan, `A = α·(I − β·k·kᵀ)` (the [`DeltaForm`]'s
+    /// gates and keys), without forming `A`: `AS[P…, i, c] = α·(S[i, c] −
+    /// β·kᵢ·(kᵀS)[c])`, one `O(n·m)` reduction `(kᵀS)[P…, c] = Σ_j k_j·S[j,
+    /// c]` and a map, where the dense product costs `O(n²·m)`.
+    fn delta_as(
+        &mut self,
+        sc: &Scan,
+        f: &DeltaForm,
+        input: TensorId,
+        step_shape: &[Dim],
+        dim: usize,
+    ) -> Result<TensorId, ShapeError> {
+        let r = step_shape.len();
+        let p = r - 2;
+        let new_in = |d: &mut Self, t: TensorId| {
+            let m = d.modes_with(t.n(), Mode::New);
+            d.get(t.n(), m)
+        };
+        let k = new_in(self, sc.inputs[f.k])?;
+        let alpha = f.alpha.map(|i| new_in(self, sc.inputs[i])).transpose()?;
+        let beta = f.beta.map(|i| new_in(self, sc.inputs[i])).transpose()?;
+        let pts: Vec<Option<usize>> = (0..p).map(Some).collect();
+        let with = |extra: &[Option<usize>]| {
+            let mut v = pts.clone();
+            v.extend_from_slice(extra);
+            v
+        };
+        // the state has no `dim`
+        let s_pts: Vec<Option<usize>> = (0..p).filter(|&d| d != dim).map(Some).collect();
+        let s_with = |extra: &[Option<usize>]| {
+            let mut v = s_pts.clone();
+            v.extend_from_slice(extra);
+            v
+        };
+        let mut args = vec![Arg {
+            src: input,
+            view: View::pick(r, &s_with(&[Some(p), Some(p + 1)])),
+        }];
+        if f.delta {
+            // (kᵀS)[P…, c] = Σ_j k[P…, j]·S[j, c]: space (P…, c, j)
+            let mut ks_shape = step_shape[..p].to_vec();
+            ks_shape.push(step_shape[p + 1]);
+            let ks = self.sg.comp(
+                &ks_shape,
+                &[step_shape[p]],
+                vec![
+                    Arg {
+                        src: k,
+                        view: View::pick(p + 2, &with(&[Some(p + 1)])),
+                    },
+                    Arg {
+                        src: input,
+                        view: View::pick(p + 2, &s_with(&[Some(p + 1), Some(p)])),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )?;
+            args.push(Arg {
+                src: k,
+                view: View::pick(r, &with(&[Some(p)])),
+            });
+            args.push(Arg {
+                src: ks,
+                view: View::pick(r, &with(&[Some(p + 1)])),
+            });
+        }
+        let ia = alpha.map(|t| {
+            args.push(Arg {
+                src: t,
+                view: View::pick(r, &pts),
+            });
+            args.len() - 1
+        });
+        let ib = beta.map(|t| {
+            args.push(Arg {
+                src: t,
+                view: View::pick(r, &pts),
+            });
+            args.len() - 1
+        });
+        let delta = f.delta;
+        self.sg.comp(step_shape, &[], args, None, |x| {
+            let mut v = x[0];
+            if delta {
+                let kk = x[1] * x[2];
+                v = v - ib.map_or(kk, |b| x[b] * kk);
+            }
+            vec![ia.map_or(v, |a| x[a] * v)]
+        })
     }
 }

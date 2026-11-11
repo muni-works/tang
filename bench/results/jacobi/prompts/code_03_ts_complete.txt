@@ -1,0 +1,19 @@
+export type Shape =
+  | { kind: "circle"; radius: number }
+  | { kind: "rect"; width: number; height: number }
+  | { kind: "triangle"; base: number; height: number };
+
+export function area(s: Shape): number {
+  switch (s.kind) {
+    case "circle":
+      return Math.PI * s.radius * s.radius;
+    case "rect":
+      return s.width * s.height;
+    case "triangle":
+      return 0.5 * s.base * s.height;
+  }
+}
+
+export function perimeter(s: Shape): number {
+  switch (s.kind) {
+    case "circle":
