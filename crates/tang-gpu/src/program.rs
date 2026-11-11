@@ -1992,6 +1992,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn cuda_megakernel_matches_launches() {
         use tang_compile::tensor::cuda_mega::MegaOpts;
