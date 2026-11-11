@@ -1270,6 +1270,27 @@ mod tests {
         drop(got);
         bind(&mut w, &u_step);
         let mut step_ins = ins(&mut w, &mains[t_pre * nt * d..], &next[t_pre..]);
+        let sins: Vec<Vec<f64>> = st
+            .inputs
+            .iter()
+            .map(|&si| match si {
+                StepInput::Pos => vec![t_pre as f64],
+                StepInput::New(i) | StepInput::Same(i) => std::mem::take(&mut step_ins[i]),
+                StepInput::Cache(c) => caches[c].clone(),
+            })
+            .collect();
+        let t0 = Instant::now();
+        let sgot = st.graph.eval(&sins, &st.outputs);
+        let sids: Vec<u32> = sgot[0].iter().map(|&x| x as u32).collect();
+        let esl = rel(&sgot[1], &rlg[t_pre]);
+        let esc = rel(&sgot[2], &rcf[t_pre]);
+        eprintln!(
+            "derived step at row {t_pre}: drafts {:?} (reference {:?}), logits err {esl:.2e}, conf err {esc:.2e}, {:.1?}, peak RSS {:.1} GB",
+            sids, rids[t_pre], t0.elapsed(), rss_gb()
+        );
+        assert_eq!(sids, rids[t_pre]);
+        assert!(el < 1e-9 && ec < 1e-9 && esl < 1e-9 && esc < 1e-9);
+    }
 
     /// Rows `[0, rows)` of quantized weight `name` as a device buffer in its
     /// native format: the codes and scales of those rows.
@@ -1507,22 +1528,6 @@ mod tests {
             .iter()
             .map(|&si| match si {
                 StepInput::Pos => vec![t_pre as f64],
-                StepInput::New(i) | StepInput::Same(i) => std::mem::take(&mut step_ins[i]),
-                StepInput::Cache(c) => caches[c].clone(),
-            })
-            .collect();
-        let t0 = Instant::now();
-        let sgot = st.graph.eval(&sins, &st.outputs);
-        let sids: Vec<u32> = sgot[0].iter().map(|&x| x as u32).collect();
-        let esl = rel(&sgot[1], &rlg[t_pre]);
-        let esc = rel(&sgot[2], &rcf[t_pre]);
-        eprintln!(
-            "derived step at row {t_pre}: drafts {:?} (reference {:?}), logits err {esl:.2e}, conf err {esc:.2e}, {:.1?}, peak RSS {:.1} GB",
-            sids, rids[t_pre], t0.elapsed(), rss_gb()
-        );
-        assert_eq!(sids, rids[t_pre]);
-        assert!(el < 1e-9 && ec < 1e-9 && esl < 1e-9 && esc < 1e-9);
-
                 StepInput::New(_) => toks[t_pre..t_pre + 1].to_vec(),
                 StepInput::Same(i) => std::mem::take(&mut base[i]),
                 StepInput::Cache(c) => caches[c].clone(),
