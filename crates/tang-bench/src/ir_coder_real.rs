@@ -199,8 +199,9 @@ pub fn lower_real_step(
     }
     // multi-output kernels: residual adds folded into their norms (and
     // norms into their Q8x32 copies), conv windows into the convs, ring
-    // and state updates as side jobs of earlier launches; TANG_COKERNEL=0: off
-    if std::env::var("TANG_COKERNEL").as_deref() != Ok("0") {
+    // and state updates as side jobs of earlier launches. Opt-in with TANG_COKERNEL=1 (measured
+    // slower on coder-next: 6.43 vs 6.18 ms); the megakernel builds on it
+    if std::env::var("TANG_COKERNEL").as_deref() == Ok("1") {
         let (a, b) = graph.schedule_cokernels(&outs, &opts);
         eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
     }
