@@ -411,7 +411,11 @@ impl TensorGraph {
                 Some(d) => lw.inplace_update(root, d),
                 // OpenCL prefill: the register-block kernel, else the tiled WGSL one
                 None if tiles.contains(&root) => mma(),
-                None => mma()
+                // CUDA only: shared atomics, not in the OpenCL transpile
+                None => (target == DecodeTarget::Cuda)
+                    .then(|| lw.topk_select(root))
+                    .flatten()
+                    .or_else(|| mma())
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
@@ -2158,6 +2162,33 @@ impl Lowering<'_> {
                     .filter(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= 16)
                     .min_by(|a, b| cost(Some(*a)).total_cmp(&cost(Some(*b))))
                     .filter(|&c| cost(Some(c)) < 0.75 * base);
+            } else if std::env::var("TANG_REG2").as_deref() != Ok("0") {
+                // a 4-bit GEMV whose register dim the weight ignores (the
+                // rows of a short window, `[k, rows]`): tile the weight
+                // rows too, so each lane's activation loads serve several
+                // rows and its packed words several tokens. Without it a
+                // lane loads k·32 f32 activations per 16 bytes of weight
+                // and a window is bound by those loads, not by DRAM. Up
+                // to `TANG_WIN_TILE` (32) points a lane
+                let cap: usize = std::env::var("TANG_WIN_TILE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32);
+                let w4: Vec<&Leaf> = leaves
+                    .iter()
+                    .filter(|l| l.pack == Some(Packing::U4))
+                    .collect();
+                if t1 > 1 && w4.iter().all(|l| l.addr.coefs[d1] == 0) {
+                    reg2 = (0..pk)
+                        .filter(|&d| {
+                            d != d1
+                                && pts[d] > 1
+                                && free(d)
+                                && w4.iter().all(|l| l.addr.coefs[d] != 0)
+                        })
+                        .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
+                        .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                }
             }
         }
         let (t1, t2) = (reg.map_or(1, |r| r.1), reg2.map_or(1, |r| r.1));
@@ -2491,9 +2522,23 @@ impl Lowering<'_> {
             }
             c
         };
+        // f32 vector leaves tiled along a register dim (a window's
+        // activations, one copy per token) stream a float4 at a time inside
+        // the chunk instead of all `vec` up front: k·vec registers spill
+        let stream = vec % 4 == 0
+            && std::env::var("TANG_WIN_STREAM").as_deref() != Ok("0")
+            && leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            && leaves
+                .iter()
+                .enumerate()
+                .any(|(i, l)| class[i] == 1 && l.pack.is_none() && nr_of(l) > 1);
+        let streamed = |i: usize| stream && class[i] == 1 && leaves[i].pack.is_none();
         for (i, l) in leaves.iter().enumerate() {
             let nr = nr_of(l);
             let at0 = leaf_at0(l);
+            if streamed(i) {
+                continue;
+            }
             match class[i] {
                 0 => {
                     writeln!(s, "        float h{i}[{nr}];").unwrap();
@@ -2549,10 +2594,34 @@ impl Lowering<'_> {
                 _ => {}
             }
         }
+        if stream {
+            writeln!(s, "        #pragma unroll").unwrap();
+            writeln!(s, "        for (int q = 0; q < {}; q++) {{", vec / 4).unwrap();
+            for (i, l) in leaves.iter().enumerate() {
+                if !streamed(i) {
+                    continue;
+                }
+                let nr = nr_of(l);
+                let a = addr_expr(&l.addr, &leaf_at0(l));
+                writeln!(s, "        float4 v{i}[{nr}];").unwrap();
+                writeln!(s, "        #pragma unroll").unwrap();
+                writeln!(
+                    s,
+                    "        for (int r = 0; r < {nr}; r++) v{i}[r] = __ldg((const float4*)(b{} + ({a})) + q);",
+                    l.buf
+                )
+                .unwrap();
+            }
+        }
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int r = 0; r < {rt}; r++) {{").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
-        writeln!(s, "        for (int e = 0; e < {vec}; e++) {{").unwrap();
+        if stream {
+            writeln!(s, "        for (int e4 = 0; e4 < 4; e4++) {{").unwrap();
+            writeln!(s, "        const int e = q * 4 + e4;").unwrap();
+        } else {
+            writeln!(s, "        for (int e = 0; e < {vec}; e++) {{").unwrap();
+        }
         let ri_ = |l: &Leaf| -> String {
             match (dep1(l), dep2(l)) {
                 (true, true) => "r".into(),
@@ -2577,6 +2646,7 @@ impl Lowering<'_> {
                         "(((&w{i}[{}][e >> 2].x)[(e >> 1) & 1] >> (16 * (e & 1))) & 0xffffu)",
                         ri_(l)
                     )),
+                    None if streamed(i) => format!("(&v{i}[{}].x)[e & 3]", ri_(l)),
                     None => format!("(&v{i}[{}][e >> 2].x)[e & 3]", ri_(l)),
                 },
                 _ => load(l.buf, l.pack, &addr_expr(&l.addr, &coords)),
@@ -2594,6 +2664,9 @@ impl Lowering<'_> {
         self.combine(&mut s, monoid, w, ind, |k| format!("acc[r][{k}]"), &el);
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        }}").unwrap();
+        if stream {
+            writeln!(s, "        }}").unwrap();
+        }
         writeln!(s, "    }}").unwrap();
         writeln!(s, "    }}").unwrap();
 
@@ -2794,6 +2867,150 @@ impl Lowering<'_> {
             writeln!(s, "{indent}  {a} = {};", tmp[k]).unwrap();
         }
         writeln!(s, "{indent}}}").unwrap();
+    }
+
+    /// A [`Monoid::topk`]`(k)` reduction (argmax is `k = 1`) as a block
+    /// select instead of the generic combine's k²/2 compare-selects a
+    /// step: one block per point keeps its best `k` `(index, value)` pairs
+    /// sorted in shared memory; each chunk of `P − k` reduce elements
+    /// (body evaluated per element) lands behind them and a bitonic sort
+    /// of all `P` (a power of two ≥ 2k) restores the order — value
+    /// descending, the smaller index first on a tie, the monoid's order.
+    /// Any row length; `P · 8` bytes of shared memory. The body's element
+    /// must be one pair followed by identity pairs (as `comp_tuple` bodies
+    /// for top-k write it).
+    fn topk_select(&self, root: usize) -> Option<Kernel> {
+        let c = self.g.comp_at(root)?;
+        let m = c.monoid.as_ref()?;
+        let k = m.topk_k()?;
+        // `TANG_TOPK_SELECT=0`: the generic combine (a baseline to time)
+        if std::env::var("TANG_TOPK_SELECT").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        // small k (the argmax) is cheaper as the generic warp combine
+        if k < 32 || c.tuple != 1 || c.width() != 2 * k || c.red.is_empty() {
+            return None;
+        }
+        // the element is (j, w) then identity pairs
+        let nv = c.args.len();
+        for probe in 0..3 {
+            let v: Vec<f64> = (0..nv)
+                .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
+                .collect();
+            let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
+            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+                return None;
+            }
+        }
+        let pts = fixed(c.points());
+        let red = fixed(&c.red);
+        let (pk, rk) = (pts.len(), red.len());
+        let mut leaves = Vec::new();
+        let args = c
+            .args
+            .iter()
+            .map(|a| self.tree(a, pk + rk, &mut leaves))
+            .collect::<Option<Vec<_>>>()?;
+        let n_red: usize = red.iter().product();
+        let n_pts: usize = pts.iter().product();
+        let p = (2 * k).next_power_of_two().max(1024);
+        let chunk = p - k;
+        let threads = 256;
+        let mut s = String::new();
+        writeln!(s, "// Auto-generated by tang-compile: top-{k} block select").unwrap();
+        writeln!(s, "#define TANG_TILES {n_pts}").unwrap();
+        writeln!(s, "#define TANG_THREADS {threads}").unwrap();
+        s.push_str(PRELUDE);
+        let mut params: Vec<String> = self
+            .reads
+            .iter()
+            .map(|&j| format!("const float* __restrict__ b{j}"))
+            .collect();
+        params.push("float* __restrict__ out".into());
+        params.push("unsigned count".into());
+        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(s, "    __shared__ float si[{p}];").unwrap();
+        writeln!(s, "    __shared__ float sv[{p}];").unwrap();
+        writeln!(s, "    const int tid = threadIdx.x;").unwrap();
+        writeln!(s, "    const int pt = blockIdx.x;").unwrap();
+        let mut rem = "pt".to_string();
+        for d in (0..pk).rev() {
+            writeln!(s, "    const int p{d} = ({rem}) % {};", pts[d]).unwrap();
+            rem = format!("({rem}) / {}", pts[d]);
+        }
+        writeln!(s, "    __shared__ int cnt;").unwrap();
+        writeln!(s, "    for (int i = tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
+        writeln!(s, "    if (tid == 0) cnt = 0;").unwrap();
+        writeln!(s, "    __syncthreads();").unwrap();
+        writeln!(s, "    for (int base = 0; base < {n_red}; base += {threads}) {{").unwrap();
+        writeln!(s, "      {{").unwrap();
+        writeln!(s, "        const int r = base + tid;").unwrap();
+        writeln!(s, "        float ej = 0.0f, ew = -3.40282347e38f;").unwrap();
+        writeln!(s, "        if (r < {n_red}) {{").unwrap();
+        let mut rr = "r".to_string();
+        for d in (0..rk).rev() {
+            writeln!(s, "          const int p{} = ({rr}) % {};", pk + d, red[d]).unwrap();
+            rr = format!("({rr}) / {}", red[d]);
+        }
+        let coords: Vec<String> = (0..pk + rk).map(|d| format!("p{d}")).collect();
+        let mut ctr = 0usize;
+        let el = |i: usize| {
+            let l: &Leaf = &leaves[i];
+            load(l.buf, l.pack, &addr_expr(&l.addr, &coords))
+        };
+        let vals: Vec<String> = args
+            .iter()
+            .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
+            .collect();
+        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
+            vals[v as usize].clone()
+        });
+        writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
+        writeln!(s, "        }}").unwrap();
+        // only what beats the current k-th survives to the next sort
+        writeln!(s, "        const float tv = sv[{}], tj = si[{}];", k - 1, k - 1).unwrap();
+        writeln!(s, "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{").unwrap();
+        writeln!(s, "          const int q = atomicAdd(&cnt, 1);").unwrap();
+        writeln!(s, "          si[{k} + q] = ej; sv[{k} + q] = ew;").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "      }}").unwrap();
+        writeln!(s, "      __syncthreads();").unwrap();
+        writeln!(s, "      const int c = cnt;").unwrap();
+        writeln!(s, "      __syncthreads();").unwrap();
+        writeln!(s, "      if (c > {} || base + {threads} >= {n_red}) {{", chunk - threads).unwrap();
+        writeln!(s, "      for (int i = {k} + c + tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
+        writeln!(s, "      __syncthreads();").unwrap();
+        // bitonic sort of all P, best first
+        writeln!(s, "      for (int size = 2; size <= {p}; size <<= 1) {{").unwrap();
+        writeln!(s, "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{").unwrap();
+        writeln!(s, "          for (int i = tid; i < {p}; i += {threads}) {{").unwrap();
+        writeln!(s, "            const int j = i ^ stride;").unwrap();
+        writeln!(s, "            if (j > i) {{").unwrap();
+        writeln!(s, "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);").unwrap();
+        writeln!(s, "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);").unwrap();
+        writeln!(s, "              if ((i & size) == 0 ? jb : ib) {{").unwrap();
+        writeln!(s, "                float a = si[i]; si[i] = si[j]; si[j] = a;").unwrap();
+        writeln!(s, "                a = sv[i]; sv[i] = sv[j]; sv[j] = a;").unwrap();
+        writeln!(s, "              }}").unwrap();
+        writeln!(s, "            }}").unwrap();
+        writeln!(s, "          }}").unwrap();
+        writeln!(s, "          __syncthreads();").unwrap();
+        writeln!(s, "        }}").unwrap();
+        writeln!(s, "      }}").unwrap();
+        writeln!(s, "      if (tid == 0) cnt = 0;").unwrap();
+        writeln!(s, "      __syncthreads();").unwrap();
+        writeln!(s, "      }}").unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "    for (int i = tid; i < {k}; i += {threads}) {{").unwrap();
+        writeln!(s, "      out[pt * {} + 2 * i] = si[i];", 2 * k).unwrap();
+        writeln!(s, "      out[pt * {} + 2 * i + 1] = sv[i];", 2 * k).unwrap();
+        writeln!(s, "    }}").unwrap();
+        writeln!(s, "}}").unwrap();
+        Some(Kernel {
+            source: s,
+            threads,
+            blocks: n_pts,
+        })
     }
 
     /// A map reading packed inputs (the dequantization of a weight a
@@ -3523,7 +3740,8 @@ const TOPK_UNROLL_MAX: usize = 8;
 /// `acc ← top-k(acc ∪ el)` as a plain two-pointer merge of the two sorted
 /// lists (same order as [`Monoid::topk`]: larger value, then smaller
 /// index). Minimal and looped so nvrtc compiles it; a dedicated top-k
-/// kernel replaces it.
+/// kernel replaces it ([`Lowering::topk_select`] for k ≥ 32; this
+/// remains for 8 < k < 32).
 fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[String]) {
     let w = 2 * k;
     writeln!(s, "{indent}{{ float ta[{w}], tb[{w}], to[{w}];").unwrap();

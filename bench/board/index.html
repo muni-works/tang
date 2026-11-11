@@ -114,12 +114,15 @@ function render(rows) {
     const mr = rows.filter((r) => r.model === m);
     html += `<h2>${esc(m)}</h2><div class="charts">`;
     const groups = {};
-    for (const r of mr) (groups[`${shortGpu(r.gpu)} · ctx ${r.context}`] ||= []).push(r);
+    // one chart per (GPU, what was timed, knobs): a staged0 or cokernel run
+    // isn't a point on the default's line
+    const what = (r) => r.kind === "window" ? `window ${r.window}` : r.kind === "spec" ? `spec k=${r.window} ${r.prompt || ""}` : "step";
+    for (const r of mr) (groups[`${shortGpu(r.gpu)} · ${what(r)} · ctx ${r.context ?? "–"}${r.config ? ` · ${r.config}` : ""}`] ||= []).push(r);
     for (const k of Object.keys(groups).sort()) html += chart(groups[k], k);
     html += `</div><div class="legend"><span class="sw" style="border-color:var(--derived)"></span>derived
       <span class="sw" style="border-color:var(--hand);border-top-style:dashed"></span>hand · tok/s per run, oldest to newest; hover a point for ms and commit</div>`;
     html += `<div class="wrap"><table><thead><tr>
-      <th class="l">date</th><th class="l">commit</th><th class="l">branch</th><th class="l">GPU</th><th>ctx</th>
+      <th class="l">date</th><th class="l">commit</th><th class="l">branch</th><th class="l">GPU</th><th class="l">timed</th><th class="l">config</th><th>ctx</th>
       <th>hand ms</th><th>hand tok/s</th><th>derived ms</th><th>derived tok/s</th><th>derived / hand</th>
       <th>ids</th><th>kernels</th></tr></thead><tbody>`;
     for (const r of mr.slice().sort(order).reverse()) {
@@ -127,7 +130,8 @@ function render(rows) {
       const ids = r.ids_matched == null ? "–"
         : `<span class="${r.ids_matched ? "ok" : "bad"}">${r.ids_matched ? "✓" : "✗"} ${esc(r.ids || "")}</span>`;
       html += `<tr title="${esc(r.source)}"><td class="l">${esc(r.date)}</td><td class="l"><code>${esc(r.commit)}</code></td>
-        <td class="l">${esc(r.branch)}</td><td class="l">${esc(shortGpu(r.gpu))}</td><td>${r.context}</td>
+        <td class="l">${esc(r.branch)}</td><td class="l">${esc(shortGpu(r.gpu))}</td><td class="l">${esc(what(r))}${r.acceptance != null ? ` <small title="draft acceptance; greedy ${fmt(r.greedy_tok_s)} tok/s">${Math.round(r.acceptance * 100)}%</small>` : ""}</td>
+        <td class="l">${r.config ? `<code>${esc(r.config)}</code>` : "default"}${r.note ? ` <small title="${esc(r.note)}">ⓘ</small>` : ""}</td><td>${r.context ?? "–"}</td>
         <td>${fmt(r.hand_ms, 3)}</td><td>${fmt(r.hand_tok_s)}${r.hand_ctx ? ` <small title="hand bench ran at ctx ${r.hand_ctx}">@${r.hand_ctx}</small>` : ""}</td>
         <td>${fmt(r.derived_ms, 3)}</td><td>${fmt(r.derived_tok_s)}</td>
         <td class="${ratio == null ? "" : ratio >= 1 ? "faster" : "slower"}">${ratio == null ? "–" : (ratio * 100).toFixed(0) + "%"}</td>

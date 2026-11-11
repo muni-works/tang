@@ -28,7 +28,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 case ${1:?ref or install|status} in
   install)
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$here/gpu-runner" -cf - . | s 'mkdir -p ~/runner/bin && tar -C ~/runner/bin -xf -'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$here/gpu-runner" -cf - . -C "$here" bench_board.py | s 'mkdir -p ~/runner/bin && tar -C ~/runner/bin -xf -'
     s "RESTART=${RESTART:-0} bash ~/runner/bin/start.sh"; exit ;;
   status) s 'python3 ~/runner/bin/runner.py status'; exit ;;
 esac
@@ -48,6 +48,12 @@ job=$(python3 -c 'import json,sys; j=json.loads(sys.argv[1]); j["ref"]=sys.argv[
 id=$(printf '%s' "$job" | s 'python3 ~/runner/bin/runner.py submit -')
 echo "job $id queued on $pod" >&2
 # one server-side wait loop, 60 s between checks
-s "d=~/runner/jobs/$id; until [ -f \$d/DONE ]; do sleep 60; done; cat \$d/result.json"
-echo
+result=$(s "d=~/runner/jobs/$id; until [ -f \$d/DONE ]; do sleep 60; done; cat \$d/result.json")
+printf '%s\n' "$result"
 echo "log: ssh $addr cat runner/jobs/$id/log.txt" >&2
+# the job's board rows go to bench/results/board.jsonl on main (BOARD_PUSH=0: don't)
+if [ "${BOARD_PUSH:-1}" != 0 ]; then
+  printf '%s' "$result" | python3 -c 'import json,sys
+for r in json.load(sys.stdin).get("board") or []: print(json.dumps(r))' \
+    | "$here/board-push.sh" "gpu-runner $pod job $id ($ref)" || echo "board: push failed" >&2
+fi

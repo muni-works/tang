@@ -82,6 +82,11 @@ def checkout(ref, log):
                           capture_output=True, text=True).stdout.strip()
 
 
+def log_line(log, msg):
+    with open(log, "a") as f:
+        f.write(msg + "\n")
+
+
 def model_dir(name, log):
     if not name:
         return None
@@ -89,19 +94,36 @@ def model_dir(name, log):
     if name in NO_COPY or not os.path.isdir(vol):
         return vol
     local = os.path.join(MODELS, name)
-    # copy once (rsync is a no-op when it's already there); write then mark
-    if not os.path.exists(os.path.join(local, ".runner-complete")):
-        os.makedirs(local, exist_ok=True)
-        rc, s = sh(f"rsync -a {vol}/ {local}/ && touch {local}/.runner-complete", log)
-        if rc:
-            return vol
+    if os.path.exists(os.path.join(local, ".runner-complete")):
+        return local  # a finished local copy: container disk, faster than the volume
+    # a complete volume copy (its .complete marker) is used in place: copying a 50 GB GGUF
+    # first held a job up for 1h43m
+    if os.path.exists(os.path.join(vol, ".complete")):
+        log_line(log, f"[runner] model {name}: {vol} (volume, no copy)")
+        return vol
+    # otherwise copy once (rsync is a no-op when it's already there); write then mark
+    os.makedirs(local, exist_ok=True)
+    rc, _ = sh(f"rsync -a {vol}/ {local}/ && touch {local}/.runner-complete", log)
+    if rc:
+        return vol
     return local
 
 
-def board_rows(out, model, ref, log):
+def board_rows(out, model, ref, log, env):
+    """Board rows from the job's OUT dir (else its log), labeled with the job's
+    TANG_* env; appended to the local board and returned in result.json, from
+    which gpu-run.sh pushes them to main (the pod holds no credentials)."""
     parser = os.path.join(HERE, "..", "bench_board.py")
-    p = subprocess.run([sys.executable, parser, "parse", out, "--model", model, "--branch", ref,
-                        "--source", "gpu-runner"], capture_output=True, text=True)
+    if not os.path.exists(parser):  # installed copy: bench_board.py beside runner.py
+        parser = os.path.join(HERE, "bench_board.py")
+    config = " ".join(f"{k}={v}" for k, v in sorted(env.items()) if k.startswith("TANG_"))
+    p = None
+    for src in (out, log):
+        cmd = [sys.executable, parser, "parse", src, "--model", model, "--branch", ref,
+               "--source", "gpu-runner"] + (["--config", config] if config else [])
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip():
+            break
     if p.returncode or not p.stdout.strip():
         with open(log, "a") as f:
             f.write(f"\n[runner] no board rows: {p.stderr.strip()[-500:]}\n")
@@ -155,8 +177,8 @@ def run(job_id, job, queued_at):
 
     res["exit"] = rc
     res["ok"] = rc == 0
-    if kind in ("check", "race") and model:
-        res["board"] = board_rows(out, model, res["ref"], log)
+    if model:  # every job with a model: check, race and cmd
+        res["board"] = board_rows(out, model, res["ref"], log, job.get("env", {}))
     summ = os.path.join(out, "summary.txt")
     if os.path.exists(summ):
         res["summary"] = open(summ, errors="replace").read()[-4000:]
@@ -173,12 +195,27 @@ def next_job():
     return names[0] if names else None
 
 
+def compiles(path):
+    """`path` parses as Python (a half-copied runner.py doesn't take over)."""
+    try:
+        compile(open(path).read(), path, "exec")
+        return True
+    except (SyntaxError, ValueError, OSError):
+        return False
+
+
 def serve():
     os.makedirs(JOBS, exist_ok=True)
     with open(os.path.join(HOME, "runner.pid"), "w") as f:
         f.write(str(os.getpid()))
     print(f"[runner] {now()} serving {JOBS}", flush=True)
+    me = os.path.abspath(__file__)
+    born = os.path.getmtime(me)
     while True:
+        # a reinstalled runner.py takes over between jobs (never under a running one)
+        if os.path.getmtime(me) != born and compiles(me):
+            print(f"[runner] {now()} runner.py changed: re-exec", flush=True)
+            os.execv(sys.executable, [sys.executable, me, "serve"])
         name = next_job()
         if not name:
             time.sleep(2)

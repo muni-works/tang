@@ -1,8 +1,10 @@
 //! Schedule GGUF block-format weights onto the int8 GEMV ([`IntMma`],
 //! `tensor_cuda_int8.rs`) in any graph: every contraction `Σ_k W[(i,) r,
-//! k]·X[…, k]` whose weight is a graph input stored Q4_K / Q5_K / Q8_0
-//! reads a Q8x32 copy of its activation and runs as the int8 GEMV
-//! ([`Stage::Gemv`]: decode, few positions). A block-format input that any
+//! k]·X[…, k]` whose weight is a graph input stored Q4_K / Q5_K / Q8_0 (or
+//! DeepSeek's Fp8B32 / Mxfp4) reads a Q8x32 copy of its activation and runs
+//! as the int8 GEMV ([`Stage::Gemv`]: decode, few positions). A weight's
+//! rows may be picked by a position coordinate (a block-diagonal weight's
+//! group) and the activation may be a 32-aligned slice of a wider row. A block-format input that any
 //! other kernel reads is demoted to f32 (the host uploads its dequantized
 //! values, `tensor::gguf::dequantize`: the same values).
 
@@ -28,7 +30,10 @@ pub struct BlockSchedule {
 }
 
 fn int8_format(f: Format) -> bool {
-    matches!(f, Format::Q4K | Format::Q5K | Format::Q8_0)
+    matches!(
+        f,
+        Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Fp8B32 | Format::Mxfp4
+    )
 }
 
 impl TensorGraph {
@@ -80,19 +85,34 @@ impl TensorGraph {
         let rank = np + 1;
         let wn = w.forms.len();
         let unit = |f: &super::Form, d: usize| *f == super::Form::unit(rank, d);
-        if wn < 2 || !unit(&w.forms[wn - 1], kd) || !unit(&w.forms[wn - 2], np - 1) {
+        // `d` with coefficient 1 plus position terms only (a block-diagonal
+        // weight's group, a grouped activation's slice)
+        let on = |f: &super::Form, d: usize| {
+            f.coefs[d] == 1 && (np - 1..=kd).all(|j| j == d || f.coefs[j] == 0)
+        };
+        let free = |f: &super::Form| f.coefs[np - 1] == 0 && f.coefs[kd] == 0;
+        let wl = self.nodes[c.args[wi].src.n()].shape.last()?.fixed()?;
+        if wn < 2 || !unit(&w.forms[wn - 1], kd) || !on(&w.forms[wn - 2], np - 1) || wl != k {
             return None;
         }
-        if w.forms[..wn - 2]
-            .iter()
-            .any(|f| f.coefs.iter().any(|&q| q != 0))
-        {
+        if !w.forms[..wn - 2].iter().all(free) {
             return None;
         }
-        // X: k along its last dim, contiguous; the copy is Q8x32 in 32s
+        // X: k along its last dim, contiguous, a slice starting at a 32;
+        // the copy is Q8x32 in 32s
         let xs = self.nodes[c.args[xi].src.n()].shape.clone();
         let xl = xs.last()?.fixed()?;
-        if xa.is_gather() || !unit(xa.forms.last()?, kd) || xl != k || xl % 32 != 0 {
+        let xf = xa.forms.last()?;
+        if xa.is_gather()
+            || !on(xf, kd)
+            || xf.offset % 32 != 0
+            || xf
+                .coefs
+                .iter()
+                .enumerate()
+                .any(|(j, &q)| j != kd && q % 32 != 0)
+            || xl % 32 != 0
+        {
             return None;
         }
         if xa.forms[..xa.forms.len() - 1]

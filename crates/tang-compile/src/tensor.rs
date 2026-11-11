@@ -109,6 +109,9 @@ pub mod space;
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
+/// Multi-GPU decode: placements, collectives and per-rank programs.
+#[path = "tensor_shard.rs"]
+pub mod shard;
 /// Decode as the finite difference of prefill: the `T → T + k` step and
 /// its KV cache, derived from the full-sequence graph.
 #[path = "tensor_step.rs"]
@@ -517,6 +520,19 @@ impl Monoid {
             }
             out
         })
+    }
+
+    /// `Some(k)` when this is [`Monoid::topk`]`(k)` (same identity, same
+    /// combine at probe points).
+    pub fn topk_k(&self) -> Option<usize> {
+        if self.width < 2 || self.width % 2 != 0 {
+            return None;
+        }
+        let k = self.width / 2;
+        let id_ok = (0..k).all(|r| {
+            self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64)
+        });
+        (id_ok && self.matches(&Monoid::topk(k))).then_some(k)
     }
 
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
@@ -4311,6 +4327,10 @@ impl TensorGraph {
                     Op::Comp(c) => Some(Compiled {
                         body: Prog::new(&c.body, &c.body_outs),
                         combine: c.monoid.as_ref().map(|m| Prog::new(&m.combine, &m.outs)),
+                        topk: c
+                            .monoid
+                            .as_ref()
+                            .and_then(|m| if emulate { None } else { m.topk_k() }),
                         direct: c
                             .args
                             .iter()
@@ -4592,6 +4612,9 @@ struct Scratch {
 struct Compiled {
     body: Prog,
     combine: Option<Prog>,
+    /// `Some(k)` when the monoid is [`Monoid::topk`]`(k)`: the reduce
+    /// merges natively (O(k) a combine instead of the k²/2 selects).
+    topk: Option<usize>,
     /// Per arg: a precomputed flat-address read, when the arg reads a
     /// plain buffer (see [`direct_read`]).
     direct: Vec<Option<Direct>>,
@@ -4874,6 +4897,10 @@ impl Evaluator<'_> {
                 }
                 continue;
             }
+            if let Some(kk) = k.topk {
+                topk_merge(vals, elem, kk, pair);
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(elem);
             combine.eval(pair, vals, cprog);
@@ -4883,6 +4910,38 @@ impl Evaluator<'_> {
             }
         }
     }
+}
+
+/// [`Monoid::topk`]'s combine, natively: merge the sorted `(index,
+/// value)` lists `acc` and `el` (value descending, smaller index first on
+/// a tie; an exact tie takes `el`'s pair, as the select form does) into
+/// `acc`, using `tmp` (≥ 2k) as scratch.
+fn topk_merge(acc: &mut [f64], el: &[f64], k: usize, tmp: &mut [f64]) {
+    let better = |x: (f64, f64), y: (f64, f64)| {
+        let d = x.1 - y.1;
+        if d > 0.0 {
+            true
+        } else if -d > 0.0 {
+            false
+        } else {
+            y.0 - x.0 > 0.0
+        }
+    };
+    let (mut i, mut j) = (0, 0);
+    for r in 0..k {
+        let a = (acc[2 * i], acc[2 * i + 1]);
+        let b = (el[2 * j], el[2 * j + 1]);
+        let (p, q) = if better(a, b) {
+            i += 1;
+            a
+        } else {
+            j += 1;
+            b
+        };
+        tmp[2 * r] = p;
+        tmp[2 * r + 1] = q;
+    }
+    acc[..2 * k].copy_from_slice(&tmp[..2 * k]);
 }
 
 /// Advance row-major coordinates `idx` in `shape` by one (last dim fastest).
