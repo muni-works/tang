@@ -202,7 +202,7 @@ pub fn lower_real_step(
 
 /// The residual adds of shape `[k, d_model]` (`a + b` of two plain reads)
 /// read by more than one comp: the residual stream of the step.
-fn residual_stream(
+pub(crate) fn residual_stream(
     g: &tang_compile::tensor::TensorGraph,
     pg: &CoderPrefill,
 ) -> Vec<tang_compile::tensor::TensorId> {

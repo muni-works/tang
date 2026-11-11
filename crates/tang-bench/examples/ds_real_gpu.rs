@@ -5,11 +5,17 @@
 //! `ir_ds_real::tests::real_layers_match_reference`) in compact tables.
 //! Prefills `DS_REAL_T` tokens (default 3) on the interpreter, seeds the
 //! caches, runs the derived one-token step on the device and compares its
-//! logits and updated caches with the interpreter's step (f32 device, f64
-//! reference).
+//! logits and updated caches with the interpreter's step (f64).
+//!
+//! `DS_NATIVE=1`: the weights in the checkpoint's formats
+//! (`ir_ds_real::lower_native_step`: dense fp8 as `Fp8B32`, routed experts
+//! as `Mxfp4`, the int8 GEMV with Q8x32 activations), checked against the
+//! interpreter with that Q8x32 rounding emulated (and reported against the
+//! pure step). Otherwise every weight is uploaded dequantized to f32.
+//! `DS_TIME_ITERS` (default 20): timed steps after the check.
 //!
 //! ```text
-//! DS41_DIR=/workspace/ds41-l02 ds_real_gpu
+//! DS41_DIR=/workspace/ds41-l02 DS_NATIVE=1 ds_real_gpu
 //! ```
 //!
 //! Exits 1 when the device disagrees by more than 1e-3 of the output scale.
@@ -53,13 +59,14 @@ fn main() {
         )
     });
     let rows = used.iter().map(|u| u.len()).max().unwrap();
-    let dm: DsDims = dims_from_config(
+    let mut dm: DsDims = dims_from_config(
         &run.cfg,
         &run.layer_ids,
         run.vocab_ids.len(),
         rows,
         8.max(t_pre + 1),
     );
+    clamp_index_topk(&mut dm);
     let t0 = Instant::now();
     let pg = prefill_graph(&dm);
     let mut w = run.dense_inputs(&pg.inputs, &dm).unwrap();
@@ -112,6 +119,60 @@ fn main() {
     eprintln!("CPU prefill + interpreter step: {:.1?}", t0.elapsed());
 
     let rt = runtime();
+    let iters: usize = std::env::var("DS_TIME_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    if std::env::var("DS_NATIVE").as_deref() == Ok("1") {
+        let t0 = Instant::now();
+        let ns = lower_native_step(&pg, &st, &|n| native_format_of(&run, n));
+        let emu = ns.graph.eval_emulated(&step_ins, &ns.outs);
+        let words = run
+            .native_words(&pg, &st, &ns, &used, rows, &step_ins)
+            .unwrap();
+        let bytes: usize = words.iter().map(|w| 4 * w.len()).sum();
+        let nk = ns.program.program.kernels.len();
+        let native = ns.program.native.iter().filter(|n| **n).count();
+        let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
+        let prog = Program::new(&rt, ns.program.program, &refs);
+        eprintln!(
+            "{}: native lowering ({} int8 GEMVs, demoted {:?}) + upload of {:.2} GB in {:.1?}",
+            rt.name(),
+            ns.sched.gemvs,
+            ns.demoted,
+            bytes as f64 / 1e9,
+            t0.elapsed()
+        );
+        prog.run(&rt);
+        let (mut worst, mut worst_pure) = (0.0f64, 0.0f64);
+        for ((o, e), p) in ns.outs.iter().zip(&emu).zip(&want) {
+            let got: Vec<f64> = prog.read(&rt, *o).iter().map(|&x| x as f64).collect();
+            let keep = |x: &[f64]| -> Vec<f64> {
+                x.iter()
+                    .zip(p)
+                    .filter(|(_, w)| !w.is_nan())
+                    .map(|(a, _)| *a)
+                    .collect()
+            };
+            let (g, e, p) = (keep(&got), keep(e), keep(p));
+            worst = worst.max(rel(&g, &e));
+            worst_pure = worst_pure.max(rel(&g, &p));
+        }
+        let ms = prog.time(&rt, iters);
+        let ok = worst < 1e-3;
+        println!(
+            "deepseek-v4.1 real size, layers {:?}, step at position {t_pre}: {nk} kernels ({native} native), \
+             GPU vs emulated interpreter rel err {worst:.2e} (vs pure f64 step {worst_pure:.2e}), \
+             {ms:.3} ms device (native fp8 / fp4 weights, {} layers): {}",
+            run.layer_ids,
+            dm.n_layers,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
     let t0 = Instant::now();
     let (g, outs) = st.graph.substitute_maps(&ids);
     let (g, outs) = g.eliminate_common(&outs);
@@ -137,7 +198,7 @@ fn main() {
             .unzip();
         worst = worst.max(rel(&gk, &wk));
     }
-    let ms = prog.time(&rt, 20);
+    let ms = prog.time(&rt, iters);
     let ok = worst < 1e-3;
     println!(
         "deepseek-v4.1 real size, layers {:?}, step at position {t_pre}: {nk} kernels ({native} native), \

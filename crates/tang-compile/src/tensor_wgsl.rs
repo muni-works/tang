@@ -1185,7 +1185,9 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1198,7 +1200,14 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1235,7 +1244,9 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1248,7 +1259,14 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1271,7 +1289,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1289,7 +1309,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1306,7 +1328,14 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1330,7 +1359,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1345,7 +1376,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
             // only the FP8 tile reads it; this fallback body is replaced
@@ -1360,7 +1393,14 @@ pub(super) fn quant(f: Format, e: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
