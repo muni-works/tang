@@ -112,6 +112,47 @@ def main():
             cells.append(f"{a:,.0f} / {c:,.0f}")
         print(f"| {name} | " + " | ".join(cells) + " |")
 
+    print()
+    print("Batch 1 on real multi-GPU layouts (native precision, 4k ctx). A forward of a w-token window")
+    print("reads the dense weights once and every distinct routed expert the window picks.")
+    print("Collectives: 12 us per NVLink all-reduce (assumed small-message NCCL latency).")
+    nat = PREC["native (fp8 dense, fp4 experts, bf16 head)"]
+    dense = dense_bytes(nat["dense"], nat["head"])
+    exp1 = expert * nat["expert"]
+    ar = 12e-6
+
+    def step_time(layout, n, bw, w):
+        dist = distinct(w)
+        # expected busiest rank under EP: ~ 1.4x the mean for small pick counts
+        rank_exp = L * max(1.0, 1.4 * dist / n) * exp1 if n > 1 else L * dist * exp1
+        kv = w * kv_bytes(4096)
+        if layout == "1 GPU":
+            return (dense + L * dist * exp1 + kv) / bw
+        if layout == "EP, dense replicated":
+            return (dense + rank_exp + kv) / bw + L * ar
+        if layout == "EP + TP dense":
+            return (dense / n + rank_exp + kv / n) / bw + 2 * L * ar
+        raise ValueError(layout)
+
+    specs = [("plain", 1, 1.0), ("prompt lookup (w 4, 1.7 tok/step, assumed)", 4, 1.7),
+             ("DSpark MTP (w 7, 4.76 tok/step, measured acceptance)", 7, 4.76)]
+    print("| layout | GPUs | " + " | ".join(s[0] for s in specs) + " |")
+    print("|---|---|" + "---|" * len(specs))
+    for layout, name, n, bw in [("EP, dense replicated", "8x H100", 8, 3.35e12),
+                                ("EP + TP dense", "8x H100", 8, 3.35e12),
+                                ("EP, dense replicated", "8x H200", 8, 4.8e12),
+                                ("EP + TP dense", "8x H200", 8, 4.8e12),
+                                ("EP + TP dense", "4x H200", 4, 4.8e12),
+                                ("EP + TP dense", "4x B200", 4, 8e12),
+                                ("EP + TP dense", "4x RTX PRO 6000 (PCIe, 25 us AR assumed)", 4, 1.79e12)]:
+        cells = []
+        for _, w, acc in specs:
+            t = step_time(layout, n, bw, w)
+            if "PCIe" in name:
+                t += 2 * L * 13e-6
+            cells.append(f"{acc / t:,.0f}")
+        print(f"| {layout} | {name} | " + " | ".join(cells) + " |")
+
 
 if __name__ == "__main__":
     main()
