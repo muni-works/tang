@@ -629,9 +629,9 @@ fn glm_dsa_dense_step_matches_prefill() {
     }
 }
 
-/// The two GLM idioms the step refuses, each alone: KDA's causal conv (a
-/// shifted read along `T`) and a data-dependent attention mask (the
-/// indexer's selection).
+/// Two GLM idioms, each alone: KDA's causal conv (a guarded shifted read
+/// along `T`; derives with a ring cache) and a data-dependent attention
+/// mask (the indexer's selection; refused).
 #[test]
 fn glm_derive_step_probes() {
     use tang_compile::tensor::Monoid;
@@ -658,7 +658,8 @@ fn glm_derive_step_probes() {
         .unwrap();
     let r = derive_step(&g, &[y], &spec).map(|_| ()).map_err(|e| e.0);
     eprintln!("probe [causal conv, guarded shifted read]: {r:?}");
-    assert!(r.is_err());
+    // derives since ring caches (a 3-row buffer of x)
+    assert!(r.is_ok());
     // data-dependent mask: o[i] = Σ_j select(m[i, j] − ½, x[j], 0), m from data and j ≤ i
     let mut g = TensorGraph::new();
     let x = g.input(&[T]);

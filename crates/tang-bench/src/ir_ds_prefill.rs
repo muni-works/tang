@@ -1060,7 +1060,7 @@ pub fn derived_step(pg: &PrefillGraph, dm: &DsDims, k: usize) -> Result<StepGrap
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tang_compile::tensor::step::StepInput;
+    use tang_compile::tensor::step::{seed_cache, StepInput};
 
     type Weights = HashMap<String, Vec<f64>>;
 
@@ -1730,13 +1730,6 @@ mod tests {
             .collect()
     }
 
-    fn pad_rows(src: &[f64], shape: &[usize], cap: usize) -> Vec<f64> {
-        let inner: usize = shape[1..].iter().product();
-        let mut out = vec![f64::NAN; cap * inner];
-        out[..src.len()].copy_from_slice(src);
-        out
-    }
-
     /// What derive_step makes of the DS graph: the cache it picks, and its
     /// steps against prefills of the grown sequence.
     #[test]
@@ -1765,7 +1758,8 @@ mod tests {
             let mut caches: Vec<Vec<f64>> = nodes
                 .iter()
                 .zip(vals)
-                .map(|(&n, v)| pad_rows(&v, &shape_at(&pg, n, p0), dm.ctx))
+                .zip(&step.caches)
+                .map(|((&n, v), c)| seed_cache(c, &shape_at(&pg, n, p0), &v, p0, dm.ctx))
                 .collect();
             let mut worst = 0.0f64;
             for &k in ks {
