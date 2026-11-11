@@ -6,6 +6,7 @@
 //! OpenAI-compatible server.
 
 pub mod advertise;
+pub mod auth;
 pub mod batch;
 pub mod blocks;
 pub mod chat;
@@ -23,7 +24,9 @@ pub mod image_server;
 pub mod kvcomp;
 pub mod kvstore;
 pub mod model;
+pub mod model_id;
 pub mod node;
+pub mod pair;
 pub mod queue;
 pub mod qwen3vl;
 pub mod retention;

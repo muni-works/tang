@@ -24,7 +24,7 @@ use crate::queue::{Priority, Queue, Ticket};
 use crate::sample::Sampling;
 use crate::telemetry::{End, Trace};
 use axum::extract::{Request as HttpRequest, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -90,6 +90,10 @@ struct Node {
     /// Serialize model loads and heavy inference across the judge and image workers.
     resources: Arc<crate::image_server::Gate>,
     image: Option<crate::image_server::ImageModel>,
+    /// The node's Ed25519 identity (clients pin its fingerprint).
+    identity: Arc<crate::auth::Identity>,
+    /// The host name.
+    name: String,
 }
 
 #[derive(Default)]
@@ -475,6 +479,9 @@ where
     let _otel = crate::telemetry::init();
     let resources = Arc::<crate::image_server::Gate>::default();
     let image = image.map(|(root, make)| crate::image_server::mount(root, make, resources.clone()));
+    let identity = Arc::new(crate::auth::Identity::load_or_create(
+        crate::auth::identity_path().as_deref(),
+    )?);
     let node = Arc::new(Node {
         id: crate::node::node_id(),
         queue: Queue::new(),
@@ -483,6 +490,8 @@ where
         dtype: opts.dtype,
         resources,
         image: image.as_ref().map(|service| service.model.clone()),
+        identity,
+        name: crate::advertise::host_name(),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let worker = node.clone();
@@ -508,8 +517,66 @@ where
     ready_rx.recv()??;
 
     let advert_node = node.clone();
-    let advert_keyed = opts.key.is_some();
-    let app = App { node };
+    let auth = Arc::new(crate::auth::Auth::new(
+        crate::advertise::reachable(&opts.addr),
+        opts.key,
+        crate::auth::keys_path(),
+    ));
+    if auth.beyond && auth.static_key.is_none() && auth.clients().is_empty() {
+        eprintln!(
+            "tang-llm: not paired yet: every route but /health and /pair/* answers 401 until a client pairs (`tang-llm pair`)"
+        );
+    }
+    let pairing = Arc::new(crate::pair::Pairing::new(
+        auth.clone(),
+        node.identity.clone(),
+        node.id.clone(),
+        node.name.clone(),
+    ));
+    let router = router(App { node }, auth, pairing.clone(), image.map(|i| i.router));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
+        let local = listener.local_addr()?;
+        eprintln!("tang-llm: listening on http://{local}");
+        let advert = crate::advertise::start(
+            &local.to_string(),
+            &advert_node.id,
+            &(advert_node.hardware)(),
+            &advert_node.identity.fingerprint(),
+        );
+        if let Some(advert) = advert {
+            // Keep `pair` in the TXT record current; dropped (withdrawn) with the server.
+            tokio::spawn(async move {
+                let mut open = false;
+                loop {
+                    let now = pairing.is_open();
+                    if now != open {
+                        advert.set_pair(now);
+                        open = now;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            });
+        }
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
+        anyhow::Ok(())
+    })
+}
+
+/// Every route: `/health` and `/pair/*` open, the rest behind [`crate::auth::gate`].
+fn router(
+    app: App,
+    auth: Arc<crate::auth::Auth>,
+    pairing: Arc<crate::pair::Pairing>,
+    image: Option<Router>,
+) -> Router {
     let health_app = app.clone();
     let mut api = Router::new()
         .route("/v1/chat/completions", post(chat))
@@ -521,34 +588,13 @@ where
         .route("/models/unload", post(unload_model))
         .with_state(app);
     if let Some(image) = image {
-        api = api.merge(image.router);
+        api = api.merge(image);
     }
-    let api = match opts.key {
-        Some(key) => api.layer(middleware::from_fn_with_state(
-            std::sync::Arc::new(key),
-            require_key,
-        )),
-        None => api,
-    };
-    let router = Router::new()
+    let api = api.layer(middleware::from_fn_with_state(auth, crate::auth::gate));
+    Router::new()
         .route("/health", get(health).with_state(health_app))
-        .merge(api);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
-        let local = listener.local_addr()?;
-        eprintln!("tang-llm: listening on http://{local}");
-        let _advert = crate::advertise::start(
-            &local.to_string(),
-            &advert_node.id,
-            &(advert_node.hardware)(),
-            advert_keyed,
-        );
-        axum::serve(listener, router).await?;
-        anyhow::Ok(())
-    })
+        .merge(crate::pair::router(pairing))
+        .merge(api)
 }
 
 /// The model's thread: runs jobs from the queue, interactive first.
@@ -1185,28 +1231,18 @@ where
     }
 }
 
-/// Turn away requests without the key (compared in constant time).
+/// Turn away requests without the key (compared in constant time). The image-only server's
+/// gate; the chat server's is [`crate::auth::gate`].
 pub(crate) async fn require_key(
     State(key): State<std::sync::Arc<String>>,
     req: HttpRequest,
     next: Next,
 ) -> Response {
-    let given = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if same(given.as_bytes(), key.as_bytes()) {
-        return next.run(req).await;
+    match crate::auth::bearer(req.headers()) {
+        Some(given) if crate::auth::same(given.as_bytes(), key.as_bytes()) => next.run(req).await,
+        Some(_) => crate::auth::unauthorized("bad key"),
+        None => crate::auth::unauthorized("missing key"),
     }
-    let body =
-        json!({"error": {"message": "missing or wrong API key", "type": "invalid_request_error"}});
-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
-}
-
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
@@ -1250,15 +1286,21 @@ async fn props(State(app): State<App>) -> Response {
 }
 
 /// `GET /node`: see `docs/node.md` for the shape.
-async fn node_info(State(app): State<App>) -> Json<Value> {
+async fn node_info(
+    State(app): State<App>,
+    caller: Option<axum::Extension<crate::auth::Caller>>,
+) -> Json<Value> {
     let node = app.node.clone();
-    let v = tokio::task::spawn_blocking(move || describe(&node))
+    // `prompt_cache_keys` only for a caller the gate let through (every caller of a node beyond
+    // loopback presents a key; on loopback without a key the gate is open by design).
+    let keys = caller.is_some();
+    let v = tokio::task::spawn_blocking(move || describe(&node, keys))
         .await
         .unwrap_or_else(|e| json!({ "error": e.to_string() }));
     Json(v)
 }
 
-fn describe(node: &Node) -> Value {
+fn describe(node: &Node, cache_keys: bool) -> Value {
     let hw = (node.hardware)();
     let hex = |h: &u64| format!("{h:016x}");
     let ms = |t: Instant| t.elapsed().as_millis() as u64;
@@ -1276,9 +1318,12 @@ fn describe(node: &Node) -> Value {
                 .map(crate::kvstore::Store::block_hashes)
                 .unwrap_or_default();
             disk.sort_unstable();
+            let ident = crate::model_id::identify(&m.path, Some(node.dtype));
             json!({
                 "id": m.name,
                 "path": m.path,
+                "weights_hash": ident.weights_hash,
+                "quant": ident.quant,
                 "context_window": m.ctx,
                 "vision": m.vision,
                 "loaded_at": m.loaded_at,
@@ -1293,7 +1338,7 @@ fn describe(node: &Node) -> Value {
                     "block_positions": crate::blocks::BLOCK,
                     "memory_blocks": blocks.iter().map(hex).collect::<Vec<_>>(),
                     "disk_blocks": disk.iter().map(hex).collect::<Vec<_>>(),
-                    "prompt_cache_keys": m.kv.keys.iter().map(|(k, n)| json!({ "key": k, "cached_tokens": n })).collect::<Vec<_>>(),
+                    "prompt_cache_keys": cache_keys.then(|| m.kv.keys.iter().map(|(k, n)| json!({ "key": k, "cached_tokens": n })).collect::<Vec<_>>()),
                 },
             })
         })
@@ -1339,9 +1384,12 @@ fn describe(node: &Node) -> Value {
         .into_iter()
         .map(|m| {
             let need = crate::node::need(&m.path, node.dtype).ok();
+            let ident = crate::model_id::identify(&m.path, None);
             json!({
                 "id": m.id,
                 "path": m.path,
+                "weights_hash": ident.weights_hash,
+                "quant": ident.quant,
                 "size_bytes": m.size_bytes,
                 "load_bytes": need.map(|n| n.total()),
                 "loaded": loaded_ids.contains(&m.id),
@@ -1351,6 +1399,11 @@ fn describe(node: &Node) -> Value {
     json!({
         "schema": crate::node::SCHEMA,
         "node_id": node.id,
+        "identity": {
+            "fingerprint": node.identity.fingerprint(),
+            "public_key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, node.identity.public_key()),
+        },
+        "name": node.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hardware": hw.json(),
         "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk },
@@ -1738,6 +1791,8 @@ mod tests {
             dtype: crate::model::Dtype::F32,
             resources: Default::default(),
             image: None,
+            identity: std::sync::Arc::new(crate::auth::Identity::load_or_create(None).unwrap()),
+            name: "test".into(),
         });
         let mut worker = super::Worker {
             node,
@@ -2217,6 +2272,8 @@ mod tests {
             dtype: crate::model::Dtype::F32,
             resources: Default::default(),
             image: None,
+            identity: std::sync::Arc::new(crate::auth::Identity::load_or_create(None).unwrap()),
+            name: "test".into(),
         });
         let endless = Endless {
             steps: steps.clone(),
@@ -2334,6 +2391,8 @@ mod step_failures {
             dtype: crate::model::Dtype::F32,
             resources: Default::default(),
             image: None,
+            identity: std::sync::Arc::new(crate::auth::Identity::load_or_create(None).unwrap()),
+            name: "test".into(),
         });
         fn load(_: &str) -> anyhow::Result<Lanes> {
             unreachable!()
@@ -2522,6 +2581,8 @@ mod context_limits {
             dtype: crate::model::Dtype::F32,
             resources: Default::default(),
             image: None,
+            identity: std::sync::Arc::new(crate::auth::Identity::load_or_create(None).unwrap()),
+            name: "test".into(),
         });
         fn load(_: &str) -> anyhow::Result<Window> {
             unreachable!()
@@ -2926,4 +2987,330 @@ async fn collect_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "generation ended unexpectedly",
     )
+}
+
+/// Pairing and the gate end to end, over HTTP, with a Rust client doing the client's side.
+#[cfg(test)]
+mod node_auth {
+    use super::{App, Node, NodeState, Queue};
+    use crate::auth::{Auth, Identity};
+    use crate::pair::{client, Pairing};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct Server {
+        url: String,
+        pairing: Arc<Pairing>,
+        http: reqwest::Client,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn server(static_key: Option<&str>) -> Server {
+        let dir = std::env::temp_dir().join(format!(
+            "tang-node-auth-{}",
+            crate::auth::hex(&crate::auth::random_bytes::<8>())
+        ));
+        let identity =
+            Arc::new(Identity::load_or_create(Some(&dir.join("node-identity"))).unwrap());
+        let node = Arc::new(Node {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            queue: Queue::new(),
+            state: Mutex::new(NodeState::default()),
+            hardware: Arc::new(crate::node::Hardware::default),
+            dtype: crate::model::Dtype::Bf16,
+            resources: Arc::default(),
+            image: None,
+            identity: identity.clone(),
+            name: "testnode".into(),
+        });
+        // Bound to loopback for the test, but gated as a node beyond it.
+        let auth = Arc::new(Auth::new(
+            true,
+            static_key.map(String::from),
+            Some(dir.join("node-keys.json")),
+        ));
+        let pairing = Arc::new(Pairing::new(
+            auth.clone(),
+            identity,
+            node.id.clone(),
+            node.name.clone(),
+        ));
+        let router = super::router(App { node }, auth, pairing.clone(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        Server {
+            url,
+            pairing,
+            http: reqwest::Client::new(),
+            dir,
+        }
+    }
+
+    impl Server {
+        async fn req(
+            &self,
+            method: reqwest::Method,
+            path: &str,
+            key: Option<&str>,
+            body: Option<Value>,
+        ) -> (u16, Value) {
+            let mut r = self.http.request(method, format!("{}{path}", self.url));
+            if let Some(k) = key {
+                r = r.header("authorization", format!("Bearer {k}"));
+            }
+            if let Some(b) = body {
+                r = r
+                    .header("content-type", "application/json")
+                    .body(b.to_string());
+            }
+            let resp = r.send().await.unwrap();
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap();
+            (
+                status,
+                serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            )
+        }
+        async fn get(&self, path: &str, key: Option<&str>) -> (u16, Value) {
+            self.req(reqwest::Method::GET, path, key, None).await
+        }
+        async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+            self.req(reqwest::Method::POST, path, None, Some(body))
+                .await
+        }
+
+        /// `/pair/start` with `code`: the pending client state, the confirm to send, the answer.
+        async fn start(
+            &self,
+            client_id: &str,
+            code: &str,
+        ) -> Result<(String, client::Pending, [u8; 32], Value), (u16, Value)> {
+            let c = client::start(code);
+            let (st, v) = self
+                .post(
+                    "/pair/start",
+                    json!({ "client_id": client_id, "client_name": "cam's mac", "spake": B64.encode(&c.msg) }),
+                )
+                .await;
+            if st != 200 {
+                return Err((st, v));
+            }
+            let node_msg = B64.decode(v["spake"].as_str().unwrap()).unwrap();
+            let identity = B64.decode(v["identity"].as_str().unwrap()).unwrap();
+            let (pending, confirm) = c
+                .answer(
+                    client_id,
+                    &node_msg,
+                    &identity,
+                    v["node_id"].as_str().unwrap(),
+                )
+                .unwrap();
+            Ok((
+                v["pair_id"].as_str().unwrap().to_string(),
+                pending,
+                confirm,
+                v,
+            ))
+        }
+
+        async fn finish(&self, pair_id: &str, confirm: &[u8]) -> (u16, Value) {
+            self.post(
+                "/pair/finish",
+                json!({ "pair_id": pair_id, "confirm": B64.encode(confirm) }),
+            )
+            .await
+        }
+
+        /// A whole pairing with the right code: the key.
+        async fn pair(&self, client_id: &str) -> String {
+            let (st, v) = self.post("/pair/open", json!({})).await;
+            assert_eq!(st, 200, "{v}");
+            let code = v["code"].as_str().unwrap().to_string();
+            let (pair_id, pending, confirm, _) = self.start(client_id, &code).await.unwrap();
+            let (st, v) = self.finish(&pair_id, &confirm).await;
+            assert_eq!(st, 200, "{v}");
+            let node_confirm = B64.decode(v["confirm"].as_str().unwrap()).unwrap();
+            let key_box = B64.decode(v["key_box"].as_str().unwrap()).unwrap();
+            pending.key(&node_confirm, &key_box).unwrap()
+        }
+    }
+
+    fn wrong(code: &str) -> String {
+        format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_end_to_end() {
+        let s = server(None).await;
+        // Unpaired beyond loopback: gated routes say so, /health and /pair/* stay open.
+        assert_eq!(
+            s.get("/node", None).await,
+            (401, json!({"error": "not paired"}))
+        );
+        assert_eq!(
+            s.get("/v1/models", Some("tnk_x")).await,
+            (401, json!({"error": "not paired"}))
+        );
+        assert_eq!(s.get("/health", None).await.0, 200);
+        assert_eq!(
+            s.start("c1", "000000").await.err().unwrap(),
+            (403, json!({"error": "no pairing window"}))
+        );
+
+        // A window: the code, its life, the fingerprint; `pair` would show in Bonjour.
+        let (st, v) = s.post("/pair/open", json!({})).await;
+        assert_eq!(st, 200);
+        let code = v["code"].as_str().unwrap().to_string();
+        assert_eq!(v["expires_in"], 120);
+        assert_eq!(v["fingerprint"], s.pairing.identity.fingerprint());
+        assert!(s.pairing.is_open());
+
+        // One exchange at a time.
+        let (pid, _, confirm, answer) = s.start("c1", &wrong(&code)).await.unwrap();
+        assert_eq!(answer["name"], "testnode");
+        assert_eq!(answer["node_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            B64.decode(answer["identity"].as_str().unwrap()).unwrap(),
+            s.pairing.identity.public_key()
+        );
+        assert_eq!(
+            s.start("c2", &code).await.err().unwrap(),
+            (409, json!({"error": "pairing busy"}))
+        );
+        // Wrong code: 401, and it counts.
+        assert_eq!(
+            s.finish(&pid, &confirm).await,
+            (401, json!({"error": "wrong code"}))
+        );
+        for _ in 0..3 {
+            let (pid, _, confirm, _) = s.start("c1", &wrong(&code)).await.unwrap();
+            assert_eq!(s.finish(&pid, &confirm).await.0, 401);
+        }
+        // Four down; the fifth closes the window, even for the right code after it.
+        let (pid, _, confirm, _) = s.start("c1", &wrong(&code)).await.unwrap();
+        assert_eq!(s.finish(&pid, &confirm).await.0, 401);
+        assert!(!s.pairing.is_open());
+        assert_eq!(s.start("c1", &code).await.err().unwrap().0, 403);
+        assert_eq!(
+            s.finish(&pid, &confirm).await,
+            (410, json!({"error": "pairing expired"}))
+        );
+
+        // Expiry: a window that runs out between start and finish.
+        s.pairing
+            .open_with("424242".into(), Duration::from_millis(300));
+        let (pid, _, confirm, _) = s.start("c1", "424242").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            s.finish(&pid, &confirm).await,
+            (410, json!({"error": "pairing expired"}))
+        );
+
+        // Four wrong, then the right code still pairs; the key works.
+        let (_, v) = s.post("/pair/open", json!({})).await;
+        let code = v["code"].as_str().unwrap().to_string();
+        for _ in 0..4 {
+            let (pid, _, confirm, _) = s.start("c1", &wrong(&code)).await.unwrap();
+            assert_eq!(s.finish(&pid, &confirm).await.0, 401);
+        }
+        let (pid, pending, confirm, _) = s.start("c1", &code).await.unwrap();
+        let (st, v) = s.finish(&pid, &confirm).await;
+        assert_eq!(st, 200, "{v}");
+        let key = pending
+            .key(
+                &B64.decode(v["confirm"].as_str().unwrap()).unwrap(),
+                &B64.decode(v["key_box"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+        assert!(key.starts_with("tnk_"));
+        // One pairing per window.
+        assert!(!s.pairing.is_open());
+        // The file has the hash, never the key.
+        let stored = std::fs::read_to_string(s.dir.join("node-keys.json")).unwrap();
+        assert!(
+            !stored.contains(&key) && stored.contains(&crate::auth::sha256_hex(key.as_bytes()))
+        );
+        assert!(stored.contains("cam's mac"));
+
+        let (st, node) = s.get("/node", Some(&key)).await;
+        assert_eq!(st, 200, "{node}");
+        assert_eq!(node["schema"], 2);
+        assert_eq!(node["name"], "testnode");
+        assert_eq!(
+            node["identity"]["fingerprint"],
+            s.pairing.identity.fingerprint()
+        );
+        assert_eq!(
+            node["identity"]["public_key"],
+            B64.encode(s.pairing.identity.public_key())
+        );
+        assert_eq!(
+            s.get("/node", None).await,
+            (401, json!({"error": "missing key"}))
+        );
+        assert_eq!(
+            s.get("/node", Some("tnk_nope")).await,
+            (401, json!({"error": "bad key"}))
+        );
+
+        // A second client; un-pairing needs the client's own key.
+        let key2 = s.pair("c2").await;
+        assert_eq!(s.get("/v1/models", Some(&key2)).await.0, 200);
+        let del = reqwest::Method::DELETE;
+        assert_eq!(
+            s.req(del.clone(), "/pair/c1", Some(&key2), None).await,
+            (401, json!({"error": "bad key"}))
+        );
+        assert_eq!(
+            s.req(del.clone(), "/pair/c1", None, None).await,
+            (401, json!({"error": "missing key"}))
+        );
+        assert_eq!(s.req(del, "/pair/c1", Some(&key), None).await.0, 204);
+        assert_eq!(
+            s.get("/node", Some(&key)).await,
+            (401, json!({"error": "bad key"}))
+        );
+        assert_eq!(s.get("/node", Some(&key2)).await.0, 200);
+        // `tang-llm unpair all` from another process: the running server follows.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::auth::remove_keys(&s.dir.join("node-keys.json"), "all").unwrap();
+        assert_eq!(
+            s.get("/node", Some(&key2)).await,
+            (401, json!({"error": "not paired"}))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn static_key_counts_as_one_more_key() {
+        let s = server(Some("s3cret")).await;
+        assert_eq!(
+            s.get("/node", None).await,
+            (401, json!({"error": "missing key"}))
+        );
+        assert_eq!(
+            s.get("/node", Some("nope")).await,
+            (401, json!({"error": "bad key"}))
+        );
+        let (st, node) = s.get("/node", Some("s3cret")).await;
+        assert_eq!((st, node["schema"].clone()), (200, json!(2)));
+        let key = s.pair("c1").await;
+        assert_eq!(s.get("/v1/models", Some(&key)).await.0, 200);
+        assert_eq!(s.get("/v1/models", Some("s3cret")).await.0, 200);
+    }
 }

@@ -4,7 +4,9 @@
 //! The TXT record carries just enough to draw the node before pairing (`/node` itself is
 //! behind the API key when there is one): `v` (TXT shape), `id` (the node id), `kind`
 //! (`metal`, `cuda` or `cpu`), `gpu` (the device name), `mem` (total VRAM or unified memory,
-//! bytes), `unified` (`1` when the GPU shares RAM), `key` (`1` when requests need a key).
+//! bytes), `unified` (`1` when the GPU shares RAM), `key` (`1` when requests need a key: every
+//! advertised node from v2 on), and from v2 `fp` (the identity fingerprint clients pin) and
+//! `pair` (`1` while a pairing window is open). See frog's `docs/node-protocol.md`, section 3.
 //!
 //! `TANG_NO_BONJOUR=1` turns it off. Loopback-only servers never advertise: nothing else could
 //! reach them.
@@ -14,12 +16,45 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 pub const SERVICE: &str = "_frog-node._tcp.local.";
 /// Version of the TXT record's shape.
-pub const TXT_VERSION: u32 = 1;
+pub const TXT_VERSION: u32 = 2;
 
 /// Keeps the advertisement up while held; dropping it withdraws it.
 pub struct Advert {
     daemon: mdns_sd::ServiceDaemon,
     fullname: String,
+    /// What to re-register with when `pair` changes.
+    host: String,
+    port: u16,
+    props: Vec<(String, String)>,
+}
+
+impl Advert {
+    /// Say whether a pairing window is open (re-registers the service with the new TXT).
+    pub fn set_pair(&self, open: bool) {
+        let mut props = self.props.clone();
+        if let Some(p) = props.iter_mut().find(|(k, _)| k == "pair") {
+            p.1 = if open { "1" } else { "0" }.into();
+        }
+        match service(&self.host, self.port, &props) {
+            Ok(info) => {
+                if let Err(e) = self.daemon.register(info) {
+                    eprintln!("tang-llm: updating the Bonjour record: {e}");
+                }
+            }
+            Err(e) => eprintln!("tang-llm: updating the Bonjour record: {e}"),
+        }
+    }
+}
+
+fn service(
+    host: &str,
+    port: u16,
+    props: &[(String, String)],
+) -> anyhow::Result<mdns_sd::ServiceInfo> {
+    Ok(
+        mdns_sd::ServiceInfo::new(SERVICE, host, &format!("{host}.local."), "", port, props)?
+            .enable_addr_auto(),
+    )
 }
 
 impl Drop for Advert {
@@ -43,7 +78,7 @@ pub fn reachable(addr: &str) -> bool {
 }
 
 /// The TXT properties for this node.
-pub fn txt(id: &str, hw: &Hardware, key: bool) -> Vec<(String, String)> {
+pub fn txt(id: &str, hw: &Hardware, fp: &str, pair: bool) -> Vec<(String, String)> {
     vec![
         ("v".into(), TXT_VERSION.to_string()),
         ("id".into(), id.to_string()),
@@ -52,7 +87,10 @@ pub fn txt(id: &str, hw: &Hardware, key: bool) -> Vec<(String, String)> {
         ("gpu".into(), hw.name.chars().take(64).collect()),
         ("mem".into(), hw.total_bytes.to_string()),
         ("unified".into(), if hw.unified { "1" } else { "0" }.into()),
-        ("key".into(), if key { "1" } else { "0" }.into()),
+        // Advertised means beyond loopback, and beyond loopback always takes a key.
+        ("key".into(), "1".into()),
+        ("fp".into(), fp.to_string()),
+        ("pair".into(), if pair { "1" } else { "0" }.into()),
     ]
 }
 
@@ -77,27 +115,25 @@ pub fn host_name() -> String {
 
 /// Advertise the server at `addr` (if it's reachable from elsewhere and not turned off).
 /// Failures are reported once and never stop the server.
-pub fn start(addr: &str, id: &str, hw: &Hardware, key: bool) -> Option<Advert> {
+pub fn start(addr: &str, id: &str, hw: &Hardware, fp: &str) -> Option<Advert> {
     if std::env::var_os("TANG_NO_BONJOUR").is_some_and(|v| v != "0") || !reachable(addr) {
         return None;
     }
     let port = addr.to_socket_addrs().ok()?.next()?.port();
     let host = host_name();
-    let props = txt(id, hw, key);
+    let props = txt(id, hw, fp, false);
     let result = (|| -> anyhow::Result<Advert> {
         let daemon = mdns_sd::ServiceDaemon::new()?;
-        let info = mdns_sd::ServiceInfo::new(
-            SERVICE,
-            &host,
-            &format!("{host}.local."),
-            "",
-            port,
-            &props[..],
-        )?
-        .enable_addr_auto();
+        let info = service(&host, port, &props)?;
         let fullname = info.get_fullname().to_string();
         daemon.register(info)?;
-        Ok(Advert { daemon, fullname })
+        Ok(Advert {
+            daemon,
+            fullname,
+            host: host.clone(),
+            port,
+            props,
+        })
     })();
     match result {
         Ok(a) => {
@@ -123,6 +159,13 @@ mod tests {
         assert!(reachable("192.168.2.10:8911"));
     }
 
+    fn get_pair_closed(hw: &Hardware) -> Option<String> {
+        txt("ab", hw, "fp", false)
+            .into_iter()
+            .find(|(k, _)| k == "pair")
+            .map(|(_, v)| v)
+    }
+
     #[test]
     fn txt_carries_the_card() {
         let hw = Hardware {
@@ -132,9 +175,13 @@ mod tests {
             total_bytes: 24 << 30,
             free_bytes: 1,
         };
-        let t = txt("ab", &hw, true);
+        let fp = "3f2a91c0aaaabbbbccccddddeeeeffff";
+        let t = txt("ab", &hw, fp, true);
         let get = |k: &str| t.iter().find(|(a, _)| a == k).map(|(_, b)| b.as_str());
-        assert_eq!(get("v"), Some("1"));
+        assert_eq!(get("v"), Some("2"));
+        assert_eq!(get("fp"), Some(fp));
+        assert_eq!(get("pair"), Some("1"));
+        assert_eq!(get_pair_closed(&hw), Some("0".to_string()));
         assert_eq!(get("kind"), Some("cuda"));
         assert_eq!(get("mem"), Some("25769803776"));
         assert_eq!(get("unified"), Some("0"));
