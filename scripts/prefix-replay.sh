@@ -21,6 +21,9 @@ cargo build --release -p tang-llm --features cuda --bin tang-llm 2>&1 | tail -2
 LLM=${CARGO_TARGET_DIR:-target}/release/tang-llm
 free -g | head -2 | tee "$OUT/mem.txt"
 
+pid=
+trap '[ -n "$pid" ] && kill $pid 2>/dev/null' EXIT
+if curl -sf localhost:8931/v1/models >/dev/null 2>&1; then echo "port 8931 already serving" >&2; exit 1; fi
 for mode in $MODES; do
   state=$(mktemp -d)
   extra=()
@@ -42,9 +45,9 @@ for mode in $MODES; do
   # VRAM once loaded, before the run grows the host cache.
   nvidia-smi --query-gpu=memory.used,memory.total --format=csv | tee "$OUT/vram-$mode.txt"
   LABEL=$mode OUT=$OUT URL=http://127.0.0.1:8931 python3 scripts/prefix-replay.py | tee -a "$OUT/summary.txt"
-  grep -E "sequence slots fit|cache:" "$log" | tail -2 | tee -a "$OUT/summary.txt"
+  { grep -E "sequence slots fit|cache:" "$log" || true; } | tail -2 | tee -a "$OUT/summary.txt"
   { grep -c "spilled slot" "$log" || true; } | sed 's/^/spills logged: /' | tee -a "$OUT/summary.txt"
   ps -o rss= -p $pid | awk '{printf "server RSS %.1f GB\n", $1/1048576}' | tee -a "$OUT/summary.txt"
-  kill $pid; wait $pid 2>/dev/null || true
+  kill $pid; wait $pid 2>/dev/null || true; pid=
   rm -rf "$state"
 done
