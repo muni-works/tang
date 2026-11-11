@@ -356,6 +356,42 @@ pub fn append_sampler(g: &mut TensorGraph, logits: TensorId, spec: SampleSpec) -
     }
 }
 
+/// Greedy token ids `[seq]` of `logits [seq, V]` on the device: the first maximum (the
+/// host's argmax), in two passes over `V/128`-wide chunks so a one-row step spreads it over
+/// the SMs. Ties within and across chunks go to the lower id.
+pub fn append_argmax(g: &mut TensorGraph, logits: TensorId) -> TensorId {
+    let sh = g.shape(logits).to_vec();
+    let (t, v) = (sh[0], sh[1]);
+    let vn = v.n();
+    let nb = (1..=128.min(vn)).rev().find(|b| vn % b == 0).unwrap();
+    let cl = vn / nb;
+    let vid = g.iota(&[t, v], 1);
+    let chunked = |x: TensorId| arg(x, vec![u(3, 0), form(3, &[(1, cl as i64), (2, 1)], 0)]);
+    let best1 = g
+        .comp_tuple(
+            &[t, Dim::Fixed(nb), Dim::Fixed(2)],
+            &[Dim::Fixed(cl)],
+            vec![chunked(vid), chunked(logits)],
+            Some(Monoid::argmax()),
+            |x| vec![x[0], x[1]],
+        )
+        .unwrap_or_else(|e| panic!("argmax (chunks): {e:?}"));
+    let best = g
+        .comp_tuple(
+            &[t, Dim::Fixed(2)],
+            &[Dim::Fixed(nb)],
+            vec![
+                arg(best1, vec![u(2, 0), u(2, 1), Form::constant(2, 0)]),
+                arg(best1, vec![u(2, 0), u(2, 1), Form::constant(2, 1)]),
+            ],
+            Some(Monoid::argmax()),
+            |x| vec![x[0], x[1]],
+        )
+        .unwrap_or_else(|e| panic!("argmax (merge): {e:?}"));
+    g.comp(&[t], &[], vec![arg(best, vec![u(1, 0), Form::constant(1, 0)])], None, |x| vec![x[0]])
+        .unwrap()
+}
+
 /// Candidates [`append_sampler_topk`] keeps: the hand sampler's `MAX_K`.
 pub const TOPK_CANDIDATES: usize = 64;
 
@@ -804,6 +840,27 @@ mod tests {
     #[test]
     fn topk_sampler_matches_exact_host_sampler() {
         check_topk(257);
+    }
+
+    /// The device argmax is the host's first maximum, ties included, split or not.
+    #[test]
+    fn device_argmax_is_first_max() {
+        for v in [257, 1000] {
+            let mut rs = rows(9, v, 5);
+            rs[2][17] = 100.0;
+            rs[2][201] = 100.0;
+            rs[4][3] = 50.0;
+            rs[4][v - 1] = 50.0;
+            let mut g = TensorGraph::new();
+            let l = g.input(&[Dim::Sym(SEQ), Dim::Fixed(v)]);
+            let a = append_argmax(&mut g, l);
+            let out = g.bind(&[(SEQ, rs.len())]).unwrap().eval(&[rs.concat()], &[a]).remove(0);
+            for (r, row) in rs.iter().enumerate() {
+                assert_eq!(out[r] as usize, sample_host(row, [0.0; 4], 0, 64.0).0, "v {v} row {r}");
+            }
+            assert_eq!(out[2] as usize, 17);
+            assert_eq!(out[4] as usize, 3);
+        }
     }
 
     /// V = 1000: the vocabulary reductions split in 125 chunks of 8.
