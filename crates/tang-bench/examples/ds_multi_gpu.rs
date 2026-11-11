@@ -84,6 +84,10 @@ fn real_case() -> (Case, HashMap<TensorId, String>) {
     (Case { st, ins, outs, want, weights, caches }, wnames)
 }
 
+fn use_nccl_env() -> bool {
+    std::env::var("MGPU_COMM").as_deref() == Ok("nccl")
+}
+
 fn main() {
     let model = std::env::var("MGPU_MODEL").unwrap_or_else(|_| "ds-tiny".into());
     let world: usize = std::env::var("MGPU_WORLD").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
@@ -106,18 +110,24 @@ fn main() {
         s.experts, s.splits, s.all_reduce, s.all_gather
     );
     let comm = HostComm::new(world);
+    // one rank per process (multi-host NCCL): MGPU_RANK, on MGPU_DEVICE (0)
+    let only: Option<usize> = std::env::var("MGPU_RANK").ok().map(|v| v.parse().expect("MGPU_RANK"));
+    let device: Option<usize> = std::env::var("MGPU_DEVICE").ok().map(|v| v.parse().expect("MGPU_DEVICE"));
+    assert!(only.is_none() || use_nccl_env(), "MGPU_RANK needs MGPU_COMM=nccl");
     let use_nccl = std::env::var("MGPU_COMM").as_deref() == Ok("nccl");
     #[cfg(feature = "nccl")]
-    let nccl_id = use_nccl.then(|| tang_moe::nccl::unique_id().expect("libnccl"));
+    let nccl_id = use_nccl.then(|| nccl::shared_id(only));
     #[cfg(not(feature = "nccl"))]
     assert!(!use_nccl, "MGPU_COMM=nccl needs --features nccl");
     let shapes = input_shapes(&c.st.graph);
-    let results: Vec<(Vec<Vec<f64>>, f64)> = std::thread::scope(|sc| {
+    let results: Vec<(Vec<Vec<f64>>, f64, f64)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..world)
+            .filter(|r| only.is_none_or(|o| o == *r))
             .map(|r| {
                 let (c, an, comm, shapes) = (&c, &an, comm.clone(), &shapes);
                 sc.spawn(move || {
-                    let rt = Runtime::cuda_on(r).unwrap_or_else(|| panic!("no CUDA device {r}"));
+                    let ord = device.unwrap_or(if only.is_some() { 0 } else { r });
+                    let rt = Runtime::cuda_on(ord).unwrap_or_else(|| panic!("no CUDA device {ord}"));
                     let p = rank_program(&c.st.graph, &c.outs, an, &c.weights, r, comm.clone());
                     let ins = p.local_inputs(&c.ins, shapes);
                     let sg = segments(&p);
@@ -173,15 +183,17 @@ fn main() {
                     };
                     #[cfg(feature = "nccl")]
                     if let Some(id) = nccl_id {
-                        let dev = nccl::Rank::new(r, world, id);
+                        let dev = nccl::Rank::new(ord, r, world, id);
                         let dstep = || dev.step(&rt, &sg, &progs, &ins);
                         let out = dstep();
+                        dev.comm_ms.set(0.0);
                         let t = Instant::now();
                         let iters = 20;
                         for _ in 0..iters {
                             dstep();
                         }
-                        return (out, t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                        let n = iters as f64;
+                        return (out, t.elapsed().as_secs_f64() * 1e3 / n, dev.comm_ms.get() / n);
                     }
                     let out = step();
                     let t = Instant::now();
@@ -189,20 +201,44 @@ fn main() {
                     for _ in 0..iters {
                         step();
                     }
-                    (out, t.elapsed().as_secs_f64() * 1e3 / iters as f64)
+                    (out, t.elapsed().as_secs_f64() * 1e3 / iters as f64, f64::NAN)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let ranks: Vec<Vec<Vec<f64>>> = results.iter().map(|r| r.0.clone()).collect();
-    let got = assemble(&c.st.graph, &c.outs, &an, &ranks);
-    let worst = got.iter().zip(&c.want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+    let worst = match only {
+        // this rank alone: replicated outputs whole, split ones against its slice
+        Some(r) => c
+            .outs
+            .iter()
+            .enumerate()
+            .map(|(o, t)| match an.out_local[o] {
+                None => rel(&results[0].0[o], &c.want[o]),
+                Some(d) => {
+                    let full: Vec<usize> = c.st.graph.shape(*t).iter().map(|x| x.n()).collect();
+                    let outer: usize = full[..d].iter().product();
+                    let row = c.want[o].len() / outer / world;
+                    let mine: Vec<f64> = (0..outer)
+                        .flat_map(|i| c.want[o][(i * world + r) * row..(i * world + r + 1) * row].to_vec())
+                        .collect();
+                    rel(&results[0].0[o], &mine)
+                }
+            })
+            .fold(0.0, f64::max),
+        None => {
+            let ranks: Vec<Vec<Vec<f64>>> = results.iter().map(|r| r.0.clone()).collect();
+            let got = assemble(&c.st.graph, &c.outs, &an, &ranks);
+            got.iter().zip(&c.want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max)
+        }
+    };
     let ok = worst < 1e-3;
     println!(
-        "{model} on {world} GPUs: rank 0 vs unsharded interpreter rel err {worst:.2e}, {:.2} ms a step \
-         ({} collectives, f32 weights): {}",
+        "{model} on {world} GPUs{}: vs unsharded interpreter rel err {worst:.2e}, {:.2} ms a step, {:.2} ms of it \
+         in collectives ({} collectives, f32 weights): {}",
+        only.map_or(String::new(), |r| format!(" (rank {r} of this process)")),
         results[0].1,
+        results[0].2,
         if use_nccl { "NCCL device" } else { "host" },
         if ok { "PASS" } else { "FAIL" }
     );
@@ -231,6 +267,33 @@ mod nccl {
         world: usize,
         // staging per collective (by its rank-program node): (send, recv, result)
         bufs: std::cell::RefCell<HashMap<usize, (DevBuf, DevBuf, DevBuf)>>,
+        /// Wall time in collectives (each bracketed by stream syncs).
+        pub comm_ms: std::cell::Cell<f64>,
+    }
+
+    /// The NCCL id every rank joins with. One process: made here. One rank a
+    /// process: rank 0 makes it and writes it (hex) to `MGPU_NCCL_ID_FILE`;
+    /// other ranks wait for that file (copied over by the launcher).
+    pub fn shared_id(only: Option<usize>) -> UniqueId {
+        let Some(r) = only else { return tang_moe::nccl::unique_id().expect("libnccl") };
+        let path = std::env::var("MGPU_NCCL_ID_FILE").expect("MGPU_NCCL_ID_FILE");
+        if r == 0 {
+            let id = tang_moe::nccl::unique_id().expect("libnccl");
+            let hex: String = id.0.internal.iter().map(|b| format!("{:02x}", *b as u8)).collect();
+            std::fs::write(&path, hex).expect("write NCCL id");
+            return id;
+        }
+        let hex = loop {
+            match std::fs::read_to_string(&path) {
+                Ok(h) if h.len() >= 256 => break h,
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        };
+        let mut id = tang_moe::nccl::unique_id().expect("libnccl");
+        for (k, b) in id.0.internal.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap() as _;
+        }
+        id
     }
 
     /// Where a rank-program node's value lives on the device.
@@ -241,10 +304,10 @@ mod nccl {
     }
 
     impl Rank {
-        pub fn new(rank: usize, world: usize, id: UniqueId) -> Self {
-            Gpu::at(rank).and_then(|g| g.bind()).expect("bind device");
+        pub fn new(ordinal: usize, rank: usize, world: usize, id: UniqueId) -> Self {
+            Gpu::at(ordinal).and_then(|g| g.bind()).expect("bind device");
             let comm = Comm::new(rank, world, id).expect("ncclCommInitRank");
-            Rank { comm, world, bufs: Default::default() }
+            Rank { comm, world, bufs: Default::default(), comm_ms: Default::default() }
         }
 
         pub fn step(
@@ -266,6 +329,8 @@ mod nccl {
             let mut bufs = self.bufs.borrow_mut();
             for (si, seg) in sg.segments.iter().enumerate() {
                 for b in &sg.before[si] {
+                    rt.sync();
+                    let tc = std::time::Instant::now();
                     let (src, n) = ptr(loc[&b.src]);
                     let full = match b.kind {
                         CollKind::AllReduce => n,
@@ -288,6 +353,8 @@ mod nccl {
                         }
                     }
                     loc.insert(b.dst, Loc::Buf(res.ptr, full));
+                    rt.sync();
+                    self.comm_ms.set(self.comm_ms.get() + tc.elapsed().as_secs_f64() * 1e3);
                 }
                 let Some((prog, outs)) = &progs[si] else { continue };
                 for (k, f) in seg.feeds.iter().enumerate() {
