@@ -100,12 +100,12 @@ fn main() {
                     c.args.iter().filter(|a| a.view.is_gather()).count(),
                     nd.int_mma.is_some()
                 ),
-                None => format!("{:?}", nd.shape),
+                None => format!("{:?} (not a comp) gathers 0", nd.shape),
             };
             (what, nat, k.source.lines().next().unwrap_or("").to_string())
         })
         .collect();
-    let prog = Program::with_plan(&rt, program.program, &empty, &plan);
+    let mut prog = Program::with_plan(&rt, program.program, &empty, &plan);
 
     // weights, streamed from the mapping one tensor at a time
     let t1 = Instant::now();
@@ -125,6 +125,8 @@ fn main() {
         bytes_up as f64 / 1e9,
         t1.elapsed().as_secs_f64()
     );
+    // one CUDA graph a step (writes and cache copies stay outside it)
+    prog.capture(&rt);
     let pos_in = st.inputs.iter().position(|s| *s == StepInput::Pos).unwrap();
     let tok_in = st
         .inputs

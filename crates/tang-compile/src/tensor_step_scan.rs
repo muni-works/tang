@@ -217,10 +217,15 @@ impl Deriver<'_> {
                     },
                 )?;
                 // (the chunked schedule's DeltaForm no longer describes U')
-                let out = self.sg.linear_scan(a, u0, dim, false, false)?;
+                // one new row: its state is U'_0 itself (the scan of one
+                // element from zero), so no scan kernel
+                let out = if k == 1 {
+                    u0
+                } else {
+                    self.sg.linear_scan(a, u0, dim, false, false)?
+                };
                 let updated = self.last_row(out, dim, false)?;
                 self.state_slot(n, dim, input, updated);
-                let _ = k;
                 Ok(out)
             }
             _ => err(format!(
