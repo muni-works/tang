@@ -357,6 +357,7 @@ pub fn dims_from_config(
         engram_head_dim: u("engram_head_dim"),
         // a real run binds the rows its hashes hit (see `engram_tables`)
         engram_rows: 0,
+        vision: false,
         dspark_targets: at(&list("dspark_target_layer_ids")),
         n_mtp: u("n_mtp_layers"),
         dspark_block: u("dspark_block_size"),
@@ -767,7 +768,7 @@ impl RealRun {
         use tang_compile::tensor::step::StepInput;
         let mut experts: HashMap<String, Vec<u8>> = HashMap::new();
         for (l, u) in used.iter().enumerate() {
-            if ns.storage.iter().any(|s| *s == Some(Format::Mxfp4)) {
+            if ns.storage.contains(&Some(Format::Mxfp4)) {
                 experts.extend(self.native_expert_tables(l, u, rows)?);
             }
         }

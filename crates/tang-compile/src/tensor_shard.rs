@@ -170,7 +170,7 @@ fn split_coord(view: &View, d: usize, n: usize, space: &[usize], world: usize) -
     let f = &view.forms[d];
     (0..space.len()).find(|&j| {
         let s = f.coefs[j];
-        if s <= 0 || space[j] % world != 0 || space[j] as i64 * s != n as i64 {
+        if s <= 0 || !space[j].is_multiple_of(world) || space[j] as i64 * s != n as i64 {
             return false;
         }
         let mut rest = f.clone();
@@ -474,7 +474,7 @@ fn reshape_split(src: &[usize], d: usize, dst: &[usize], world: usize) -> Option
     let chunk: usize = src[d..].iter().product::<usize>() / world;
     (0..dst.len()).find(|&e| {
         dst[..e].iter().product::<usize>() == pre
-            && dst[e] % world == 0
+            && dst[e].is_multiple_of(world)
             && dst[e..].iter().product::<usize>() / world == chunk
     })
 }
@@ -1241,7 +1241,8 @@ pub fn expert_inputs(g: &TensorGraph, outputs: &[TensorId], world: usize) -> Has
     }
     ok.into_iter()
         .filter(|&(t, good)| {
-            good && g.nodes[t].shape[0].n() % world == 0 && g.nodes[t].shape[0].n() >= world
+            good && g.nodes[t].shape[0].n().is_multiple_of(world)
+                && g.nodes[t].shape[0].n() >= world
         })
         .map(|(t, _)| TensorId(t as u32))
         .collect()
@@ -1374,7 +1375,7 @@ pub fn plan_auto(
     let dims = |t: TensorId| -> Vec<usize> {
         let shape = fixed(&g.nodes[t.n()].shape);
         (0..shape.len())
-            .filter(|&d| shape[d] % world == 0 && shape[d] >= world)
+            .filter(|&d| shape[d].is_multiple_of(world) && shape[d] >= world)
             .collect()
     };
     let failed = greedy_splits(&cost, &dims, &mut plan, &mut best, &cands, threads);
@@ -1436,7 +1437,7 @@ pub fn plan_auto(
         }
         let mut adopt: Option<(f64, Vec<(TensorId, usize)>)> = None;
         for d in 0..shape.len() {
-            if shape[d] % world != 0 || shape[d] < world {
+            if !shape[d].is_multiple_of(world) || shape[d] < world {
                 continue;
             }
             let mut trial = plan.clone();

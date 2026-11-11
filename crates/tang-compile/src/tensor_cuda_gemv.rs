@@ -442,7 +442,7 @@ impl TensorGraph {
                 None => (target == DecodeTarget::Cuda)
                     .then(|| lw.topk_select(root).or_else(|| lw.topk_warp(root)))
                     .flatten()
-                    .or_else(|| mma())
+                    .or_else(mma)
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
@@ -2213,6 +2213,56 @@ impl Lowering<'_> {
                         })
                         .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
                         .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                    // then the token and row tiles together, by the bytes
+                    // all groups load per reduce element (L2 traffic):
+                    // each group loads every leaf once per register point
+                    // it depends on; a 4-bit row re-read by k/t1 groups
+                    // vs k f32 activations re-read by rows/t2 groups.
+                    // 8×4 at k=8 is 8.5 B per weight element, 2×16 is 4
+                    // (H200: window time tracks it). TANG_WIN_JOINT=0 off
+                    // (only past 4 tokens: on the H200 2×16 took window-8
+                    // from 17.9 to 13.4 ms but window-4 from 6.9 to 9.0)
+                    if let Some((d2, _)) = reg2.filter(|_| pts[d1] > 4) {
+                        if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
+                            let bytes = |l: &Leaf| match l.pack {
+                                Some(Packing::U4) => 0.5,
+                                Some(Packing::Bf16 | Packing::F16) => 2.0,
+                                None => 4.0,
+                            };
+                            let traffic = |a: usize, b: usize| -> f64 {
+                                let groups = (pts[d1] / a * (pts[d2] / b)) as f64;
+                                groups
+                                    * leaves
+                                        .iter()
+                                        // (per-group scales, constant along
+                                        // the innermost reduce dim, amortize)
+                                        .filter(|l| l.addr.coefs[rank - 1] != 0)
+                                        .map(|l| {
+                                            let mut n = bytes(l);
+                                            if l.addr.coefs[d1] != 0 {
+                                                n *= a as f64;
+                                            }
+                                            if l.addr.coefs[d2] != 0 {
+                                                n *= b as f64;
+                                            }
+                                            n
+                                        })
+                                        .sum::<f64>()
+                            };
+                            let best = [8usize, 4, 2]
+                                .into_iter()
+                                .filter(|&a| pts[d1].is_multiple_of(a))
+                                .flat_map(|a| {
+                                    [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b))
+                                })
+                                .filter(|&(a, b)| pts[d2].is_multiple_of(b) && a * b <= cap)
+                                .min_by(|x, y| traffic(x.0, x.1).total_cmp(&traffic(y.0, y.1)));
+                            if let Some((a, b)) = best {
+                                reg = Some((d1, a));
+                                reg2 = Some((d2, b));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4001,8 +4051,8 @@ impl TensorGraph {
 }
 
 impl Lowering<'_> {
-    /// A small reduction (at most 64 elements a point, Sum or Max, width
-    /// 1) as one thread per point looping over its reduce space: for a
+    /// A small reduction (at most 64 elements a point, Sum or Max, of
+    /// width 1) as one thread per point looping over its reduce space: for a
     /// kernel that hosts inlined nodes or side jobs (`TNode::host`) and
     /// has no warp lowering (a depthwise conv over a short window).
     fn thread_reduction(&self, root: usize) -> Option<Kernel> {
@@ -4117,7 +4167,7 @@ impl Lowering<'_> {
             || c.tuple != 0
             || g.nodes[u].precision.storage != super::Format::F32
             || self.packed.contains_key(&u)
-            || threads % 32 != 0
+            || !threads.is_multiple_of(32)
         {
             return None;
         }

@@ -6,6 +6,8 @@
 //! with HKDF-SHA256, the client proves the code with `/pair/finish`, and the node answers with
 //! its own confirmation and the new API key sealed with AES-256-GCM. Five wrong finishes close
 //! the window; one exchange runs at a time.
+// handlers return a ready axum `Response` as their error (large, by design)
+#![allow(clippy::result_large_err)]
 
 use crate::auth::{random_bytes, sha256_hex, unauthorized, Auth, Identity, KeyEntry};
 use aes_gcm::aead::{Aead, KeyInit, Payload};

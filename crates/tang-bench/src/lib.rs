@@ -268,6 +268,7 @@ pub mod ir_coder_prefill;
 pub mod ir_ds_prefill;
 pub mod ir_ds_real;
 pub mod ir_ds_spark;
+pub mod ir_ds_vision;
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]
