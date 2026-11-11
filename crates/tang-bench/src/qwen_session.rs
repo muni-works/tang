@@ -514,6 +514,9 @@ pub fn dims_for(dir: &str, ctx: usize) -> QwenDims {
     if let Some(x) = c["rope_theta"].as_f64() {
         d.theta = x;
     }
+    // bench/lowbit's `export`: GPTQ 3-bit decoder blocks
+    d.g3 = c["quantization"]["tang_bits"].as_u64() == Some(3);
+    d.hadamard = c["quantization"]["tang_hadamard"].as_u64().unwrap_or(0) as usize;
     d
 }
 
@@ -521,6 +524,21 @@ pub fn dims_for(dir: &str, ctx: usize) -> QwenDims {
 /// iterator is drawn (empty for state, which starts zeroed).
 /// Device inputs for a step graph from an MLX checkpoint, converted as the
 /// iterator is drawn (empty for state, which starts zeroed).
+/// The normalized Sylvester Hadamard matrix `[n, n]` (f32), as
+/// bench/lowbit's `hadamard`: `H[i][j] = (-1)^popcount(i & j) / √n`.
+pub fn hadamard_matrix(n: usize) -> Vec<f32> {
+    let s = 1.0 / (n as f32).sqrt();
+    (0..n * n)
+        .map(|e| {
+            if (e / n & e % n).count_ones() % 2 == 0 {
+                s
+            } else {
+                -s
+            }
+        })
+        .collect()
+}
+
 pub fn load_inputs<'a>(
     st: &'a St,
     dims: &'a QwenDims,
@@ -555,6 +573,9 @@ pub fn load_inputs<'a>(
         }
         if name == "rope" {
             return rope_table(dims);
+        }
+        if name == "hadamard" {
+            return hadamard_matrix(dims.hadamard);
         }
         if name == "model.norm" {
             return st.bf16("model.norm.weight");
@@ -593,6 +614,10 @@ pub fn load_inputs<'a>(
             "k_norm" => st.bf16(&format!("{pre}self_attn.k_norm.weight")),
             _ => {
                 let (p, part) = what.split_once('.').unwrap();
+                if part == "had" {
+                    // one rotation per input: q/k/v (gate/up) share signs
+                    return st.words(&format!("{pre}{}.had", proj(p)[0]));
+                }
                 // row-major [rows, …]: concatenating rows is
                 // concatenating the word arrays
                 let mut v = Vec::new();

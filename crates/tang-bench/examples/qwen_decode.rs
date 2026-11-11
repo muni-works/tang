@@ -157,6 +157,8 @@ fn tiny_dims() -> QwenDims {
         // QWEN_VOCAB_CHUNKS=2 exercises the split embedding and LM head
         vocab_chunks: env("QWEN_VOCAB_CHUNKS").max(1),
         prefill_q4: false,
+        g3: false,
+        hadamard: 0,
     }
 }
 
@@ -196,6 +198,7 @@ fn tiny_logical(dims: &QwenDims, dg: &DecodeGraph, seed: u64) -> Vec<Vec<f32>> {
                     vec![0.0; n]
                 }
                 Some(Packing::F16) => unreachable!("only the caches are f16"),
+                Some(Packing::U3) => unreachable!("the tiny model is 4-bit"),
                 None => (0..n).map(|_| 1.0 + 0.2 * rng.f32()).collect(),
             }
         })
@@ -210,6 +213,7 @@ fn device_words(dg: &DecodeGraph, logical: &[Vec<f32>]) -> Vec<Vec<f32>> {
             Some(Packing::U4) => pack_u4(v),
             Some(Packing::Bf16) => pack_bf16(v),
             Some(Packing::F16) => vec![0.0; Packing::F16.words(v.len())],
+            Some(Packing::U3) => unreachable!("the tiny model is 4-bit"),
             None => v.clone(),
         })
         .collect()

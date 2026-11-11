@@ -78,6 +78,16 @@ pub struct QwenDims {
     /// register-block kernel over packed weights
     /// (`opencl_mma_kernel_q4`). Off: the f32 maps (every other backend).
     pub prefill_q4: bool,
+    /// The decoder-block projections are GPTQ 3-bit (bench/lowbit's
+    /// `export`: `Packing::U3` codes, f16 scales and biases per 64; the
+    /// embedding and LM head stay MLX 4-bit). Set from `config.json`'s
+    /// `quantization.tang_bits == 3`.
+    pub g3: bool,
+    /// [`QwenDims::g3`] codes in a rotated basis: each projection input
+    /// is first rotated, `x' = H·(x ⊙ s)` per block of this many columns
+    /// (`hadamard` input: the normalized Sylvester H; `{site}.had`: the
+    /// site's ±1 signs). 0: none. From `quantization.tang_hadamard`.
+    pub hadamard: usize,
 }
 
 impl QwenDims {
@@ -97,6 +107,8 @@ impl QwenDims {
             kv_f16: true,
             vocab_chunks: 1,
             prefill_q4: false,
+            g3: false,
+            hadamard: 0,
         }
     }
 
@@ -248,6 +260,39 @@ struct Builder {
     inputs: Vec<InputSpec>,
     /// [`QwenDims::prefill_q4`]
     q4: bool,
+    /// [`QwenDims::g3`]
+    g3: bool,
+}
+
+/// `x' = H·(x ⊙ s)` per `hb`-column block of a `[seq, n]` (or `[T, n]`)
+/// tensor: the rotation [`QwenDims::hadamard`] codes expect at a
+/// projection's input. `s`: `[n]` signs; `h`: `[hb, hb]`.
+pub(crate) fn hadamard_rows(
+    g: &mut TensorGraph,
+    x: TensorId,
+    t: tang_compile::tensor::Dim,
+    n: usize,
+    s: TensorId,
+    h: TensorId,
+    hb: usize,
+) -> TensorId {
+    use tang_compile::tensor::Dim;
+    // space (t, block, j), reduce (i)
+    let col = form(4, &[(1, hb as i64), (3, 1)], 0);
+    let r = g
+        .comp(
+            &[t, Dim::Fixed(n / hb), Dim::Fixed(hb)],
+            &[Dim::Fixed(hb)],
+            vec![
+                arg(x, vec![unit(4, 0), col.clone()]),
+                arg(s, vec![col]),
+                arg(h, vec![unit(4, 3), unit(4, 2)]),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1] * v[2]],
+        )
+        .unwrap();
+    g.reshape(r, &[t, Dim::Fixed(n)]).unwrap()
 }
 
 impl Builder {
@@ -294,16 +339,19 @@ impl Builder {
             .collect()
     }
 
+    /// A projection's codes, scales, biases: MLX 4-bit, or (`g3`, the
+    /// decoder blocks) GPTQ 3-bit with f16 scales and biases.
     fn q4(&mut self, name: &str, rows: usize, cols: usize) -> [TensorId; 3] {
         let groups = cols / GROUP;
+        let (q, sb) = if self.g3 && !name.starts_with("embed") && !name.starts_with("lm_head") {
+            (Packing::U3, Packing::F16)
+        } else {
+            (Packing::U4, Packing::Bf16)
+        };
         [
-            self.input(
-                format!("{name}.q"),
-                &[rows, groups, GROUP],
-                Some(Packing::U4),
-            ),
-            self.input(format!("{name}.s"), &[rows, groups], Some(Packing::Bf16)),
-            self.input(format!("{name}.b"), &[rows, groups], Some(Packing::Bf16)),
+            self.input(format!("{name}.q"), &[rows, groups, GROUP], Some(q)),
+            self.input(format!("{name}.s"), &[rows, groups], Some(sb)),
+            self.input(format!("{name}.b"), &[rows, groups], Some(sb)),
         ]
     }
 
@@ -449,6 +497,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         g: TensorGraph::new(),
         inputs: Vec::new(),
         q4: prefill_q4,
+        g3: dims.g3,
     };
     let state = b.input("state".into(), &[2], None);
     let chunk = (seq > 1).then(|| b.input("chunk".into(), &[seq + 1], None));
@@ -557,6 +606,24 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
     if vocab_chunks > 1 {
         keep.extend(&parts);
     }
+    // [`QwenDims::hadamard`]: rotate a projection input (identity when 0)
+    let had = (dims.hadamard > 0).then(|| {
+        let hb = dims.hadamard;
+        b.input("hadamard".into(), &[hb, hb], None)
+    });
+    let rot = |b: &mut Builder, x: TensorId, n: usize, site: &str, p: &dyn Fn(&str) -> String| {
+        let Some(h) = had else { return x };
+        let s = b.input(p(&format!("{site}.had")), &[n], Some(Packing::F16));
+        hadamard_rows(
+            &mut b.g,
+            x,
+            tang_compile::tensor::Dim::Fixed(seq),
+            n,
+            s,
+            h,
+            dims.hadamard,
+        )
+    };
     let mut x = Rows {
         src: x0,
         off: 0,
@@ -585,6 +652,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         let v_cache = b.input(p("v_cache"), &vc_shape, kv);
 
         let normed = b.rms_norm(x, seq, 0, d, ln1, eps);
+        let normed = rot(&mut b, normed, d, "qkv", &p);
         let normed = Rows {
             src: normed,
             off: 0,
@@ -967,6 +1035,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
             attn
         };
         let attn = b.g.reshape(attn, &[seq, q_rows]).unwrap();
+        let attn = rot(&mut b, attn, q_rows, "o", &p);
         let attn = Rows {
             src: attn,
             off: 0,
@@ -980,6 +1049,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
             stride: d as i64,
         };
         let normed2 = b.rms_norm(res1_rows, seq, 0, d, ln2, eps);
+        let normed2 = rot(&mut b, normed2, d, "gate", &p);
         let normed2 = Rows {
             src: normed2,
             off: 0,
@@ -992,6 +1062,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
+        let act = rot(&mut b, act, ff, "down", &p);
         let act = Rows {
             src: act,
             off: 0,
@@ -1121,7 +1192,7 @@ pub fn split_gemvs(
         .inputs
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.packing == Some(Packing::U4))
+        .filter(|(_, s)| matches!(s.packing, Some(Packing::U4 | Packing::U3)))
         .map(|(k, _)| k)
         .collect();
     // (node, parts) of the next GEMV to split; the graph is dead-code
@@ -1331,7 +1402,7 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .inputs
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.packing == Some(Packing::U4))
+        .filter(|(_, s)| matches!(s.packing, Some(Packing::U4 | Packing::U3)))
         .map(|(k, _)| k)
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
@@ -1810,6 +1881,8 @@ mod tests {
             kv_f16: false,
             vocab_chunks: 1,
             prefill_q4: false,
+            g3: false,
+            hadamard: 0,
         }
     }
 
@@ -1842,6 +1915,7 @@ mod tests {
                     _ if s.name.ends_with("cache") => (0..n).map(|_| rnd() - 0.5).collect(),
                     _ => match s.packing {
                         Some(Packing::U4) => (0..n).map(|_| (rnd() * 15.999).floor()).collect(),
+                        Some(Packing::U3) => (0..n).map(|_| (rnd() * 7.999).floor()).collect(),
                         Some(_) => (0..n).map(|_| 0.01 + 0.02 * rnd()).collect(),
                         None => (0..n).map(|_| 1.0 + 0.2 * rnd()).collect(),
                     },
@@ -1974,6 +2048,8 @@ mod tests {
         // past `tiled_reduction`'s cap (Qwen3-1.7B's are [96, 64])
         let dims = QwenDims {
             prefill_q4: true,
+            g3: false,
+            hadamard: 0,
             ff: 40 * GROUP,
             ..tiny()
         };
@@ -1994,6 +2070,8 @@ mod tests {
     fn opencl_prefill_staged_kernel_covers_projections() {
         let dims = QwenDims {
             prefill_q4: true,
+            g3: false,
+            hadamard: 0,
             ff: 40 * GROUP,
             ..tiny()
         };

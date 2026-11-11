@@ -47,6 +47,9 @@ FORMATS = {
     # GPTQ (Hessian-aware, error feedback; `calib` builds the Hessians)
     "g3g64h": ("affine", dict(bits=3, g=64, had=True, gptq=True), 3.5),
     "g3g64": ("affine", dict(bits=3, g=64, gptq=True), 3.5),
+    # rotation seeded per projection *input* (q/k/v share one, gate/up one):
+    # what a graph can apply once to the activation
+    "g3g64hs": ("affine", dict(bits=3, g=64, had=True, shared=True, gptq=True), 3.5),
     "g3g128h": ("affine", dict(bits=3, g=128, had=True, gptq=True), 3.25),
     "g4g128h": ("affine", dict(bits=4, g=128, had=True, gptq=True), 4.25),
     "gvq4d2048h": ("vq", dict(d=4, k=2048, g=128, had=True, gptq=True), 2.875),
@@ -148,22 +151,29 @@ def gptq_inv(h, damp=0.01):
     h = h.clone()
     dead = torch.diag(h) == 0
     h[dead, dead] = 1
-    h += damp * torch.diag(h).mean() * torch.eye(h.shape[0], dtype=h.dtype)
+    h += damp * torch.diag(h).mean() * torch.eye(h.shape[0], dtype=h.dtype, device=h.device)
     l = torch.linalg.cholesky(h)
     return torch.linalg.cholesky(torch.cholesky_inverse(l), upper=True).float()
 
 
-def gptq_affine(w, h, bits, g, blk=128):
+def gptq_affine(w, h, bits, g, blk=128, codes=False):
     """GPTQ (Frantar et al.) with per-group min/max affine params, fixed
-    when the sweep enters each group (from the error-updated weights)."""
-    w = w.clone()
-    u = gptq_inv(h)
+    when the sweep enters each group (from the error-updated weights).
+    codes=True: (integer codes, f16 scales, f16 biases) instead of the
+    dequantized weights. Runs on the GPU when there is one (same math)."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    w = w.clone().to(dev)
+    u = gptq_inv(h.to(dev))
     q = torch.zeros_like(w)
-    qmax = 2 ** bits - 1
     o, n = w.shape
+    if codes:
+        qi = torch.zeros(o, n, dtype=torch.uint8, device=dev)
+        scs = torch.zeros(o, n // g, dtype=torch.float16, device=dev)
+        los = torch.zeros(o, n // g, dtype=torch.float16, device=dev)
+    qmax = 2 ** bits - 1
     for b0 in range(0, n, blk):
         b1 = min(b0 + blk, n)
-        wb, eb = w[:, b0:b1].clone(), torch.zeros(o, b1 - b0)
+        wb, eb = w[:, b0:b1].clone(), torch.zeros(o, b1 - b0, device=dev)
         for j in range(b1 - b0):
             c = b0 + j
             if c % g == 0:
@@ -171,14 +181,78 @@ def gptq_affine(w, h, bits, g, blk=128):
                 lo, hi = grp.amin(1), grp.amax(1)
                 sc = ((hi - lo) / qmax).clamp_min(1e-8).half().float()
                 lo = lo.half().float()
+                if codes:
+                    scs[:, c // g], los[:, c // g] = sc.half(), lo.half()
             x = wb[:, j]
-            qc = ((x - lo) / sc).round().clamp(0, qmax) * sc + lo
+            ci = ((x - lo) / sc).round().clamp(0, qmax)
+            qc = ci * sc + lo
             q[:, c] = qc
+            if codes:
+                qi[:, c] = ci.to(torch.uint8)
             e = (x - qc) / u[c, c]
             wb[:, j:] -= e.unsqueeze(1) * u[c, c:b1].unsqueeze(0)
             eb[:, j] = e
         w[:, b1:] -= eb @ u[b0:b1, b1:]
-    return q
+    return (qi.cpu(), scs.cpu(), los.cpu()) if codes else q.cpu()
+
+
+def pack_bits(q, bits):
+    """Codes (uint8, row-major) as one little-endian bit stream in u32 words,
+    code i at bit bits·i (tang's Packing::U3 for bits=3): int32 tensor."""
+    import numpy as np
+    v = q.reshape(-1).numpy().astype(np.uint64)
+    assert v.size * bits % 32 == 0
+    out = np.zeros(v.size * bits // 32 + 1, dtype=np.uint64)
+    pos = np.arange(v.size, dtype=np.uint64) * bits
+    np.bitwise_or.at(out, (pos >> 5).astype(np.int64), (v << (pos & 31)) & 0xFFFFFFFF)
+    np.bitwise_or.at(out, (pos >> 5).astype(np.int64) + 1, v << (pos & 31) >> 32)
+    return torch.from_numpy(out[:-1].astype(np.uint32).view(np.int32))
+
+
+def export(fmt, outdir):
+    """The MLX 4-bit model with every decoder-block projection replaced by
+    GPTQ codes of `fmt` (affine, no rotation): `.weight` the bit stream as
+    U32 [rows, cols·bits/32], `.scales` / `.biases` F16 [rows, cols/g].
+    Everything else (embeddings, LM head, norms) is MLX's. tang reads it
+    with TANG_QWEN_G3=1."""
+    import shutil
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    kind, p, _ = FORMATS[fmt]
+    assert kind == "affine" and p.get("gptq"), "export: GPTQ affine"
+    assert not p.get("had") or p.get("shared"), "export: a rotation must be per input (shared)"
+    os.makedirs(outdir, exist_ok=True)
+    for f in os.listdir(MLX[0]):
+        if f != "model.safetensors" and not f.startswith("."):
+            shutil.copyfile(f"{MLX[0]}/{f}", f"{outdir}/{f}")  # no chmod: network volumes refuse it
+    cfg = json.load(open(f"{outdir}/config.json"))
+    cfg["quantization"] = dict(cfg.get("quantization", {}), tang_lowbit=fmt, tang_bits=p["bits"],
+                               tang_hadamard=HB if p.get("had") else 0)
+    json.dump(cfg, open(f"{outdir}/config.json", "w"), indent=2)
+    out = {}
+    with safe_open(f"{MLX[0]}/model.safetensors", "pt") as f:
+        for k in f.keys():
+            out[k] = f.get_tensor(k)
+    t = time.time()
+    for k in list(out):
+        base = k[:-len(".weight")] if k.endswith(".weight") else None
+        if not base or not any(base.endswith(pr) for pr in PROJ) or ".layers." not in base:
+            continue
+        name = f"{base}.weight"
+        w = bf16_tensor(name).float()
+        had = p.get("had", False)
+        seed = seed_of(name, fmt)
+        if had:
+            # codes in the rotated basis; the graph rotates the activation
+            # by the same signs (`.had` [cols], ±1 as f16) and block Hadamard
+            w = rotate(w, seed)
+            out[f"{base}.had"] = signs_of(w.shape[1], seed).half()
+        qi, sc, lo = gptq_affine(w, hessian(name, seed, had), p["bits"], p["g"], codes=True)
+        out[name] = pack_bits(qi, p["bits"]).reshape(w.shape[0], -1)
+        out[f"{base}.scales"], out[f"{base}.biases"] = sc.contiguous(), lo.contiguous()
+        print("export", name, round(time.time() - t), flush=True)
+    save_file(out, f"{outdir}/model.safetensors", metadata={"format": "mlx"})
+    print("saved", outdir, flush=True)
 
 
 def gptq_vq(w, h, d, k, g, blk=128):
@@ -252,6 +326,21 @@ def mlx_file():
     return safe_open(f"{MLX[0]}/model.safetensors", "pt")
 
 
+def seed_of(name, fmt):
+    """The rotation seed of a projection: per matrix, or (`shared`) per
+    projection input — `layer.q` for q/k/v, `layer.gate` for gate/up."""
+    if FORMATS[fmt][1].get("shared"):
+        layer, proj = name.split(".")[2], ".".join(name.split(".")[3:5])
+        name = f"{layer}.{HIN[proj]}"
+    return zlib.crc32(name.encode()) & 0xFFFF
+
+
+def signs_of(cols, seed):
+    """The ±1 vector `rotate` multiplies by (same generator)."""
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randint(0, 2, (cols,), generator=g) * 2 - 1).float()
+
+
 def cached(name, fmt, layer):
     """Quantized weight for one projection. VQ results (minutes per matrix on
     CPU) are cached on disk as bf16; the rest is recomputed."""
@@ -262,7 +351,7 @@ def cached(name, fmt, layer):
     path = f"{CACHE}/{fmt}/{name}.pt"
     if os.path.exists(path):
         return torch.load(path)
-    q = quantize(bf16_tensor(name), fmt, seed=zlib.crc32(name.encode()) & 0xFFFF, name=name)
+    q = quantize(bf16_tensor(name), fmt, seed=seed_of(name, fmt), name=name)
     if FORMATS[fmt][0] == "vq" or FORMATS[fmt][1].get("gptq"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(q, path)
@@ -402,6 +491,8 @@ def main():
     if cmd == "calib":  # Hessians for GPTQ: calib <calib.txt> [nseq] [seqlen]
         a = sys.argv + [None] * 6
         return calib(a[2], int(a[3] or 128), int(a[4] or 256), int(a[5] or 0), int(a[6] or 99))
+    if cmd == "export":  # export <fmt> <outdir>
+        return export(sys.argv[2], sys.argv[3])
     if cmd == "cache":  # fill the VQ cache: cache <fmt> <first> <last>
         for l in range(int(sys.argv[3]), int(sys.argv[4])):
             for p in PROJ:

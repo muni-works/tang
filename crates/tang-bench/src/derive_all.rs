@@ -52,6 +52,8 @@ pub fn qwen_ctx(ctx: usize, cap: usize) -> Model {
         kv_f16: false,
         vocab_chunks: 1,
         prefill_q4: false,
+        g3: false,
+        hadamard: 0,
     };
     let pg = prefill_graph(&dims);
     let named =

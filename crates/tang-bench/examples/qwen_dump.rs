@@ -117,6 +117,8 @@ fn main() {
         kv_f16: true,
         vocab_chunks: 1,
         prefill_q4: false,
+        g3: false,
+        hadamard: 0,
     };
     let dg = step_graph(&dims, seq, dims.ctx);
     let (g, outs) = compiled_decode(&dg, !msl);
