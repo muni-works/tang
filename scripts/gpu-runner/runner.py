@@ -99,7 +99,7 @@ def model_dir(name, log):
 
 
 def board_rows(out, model, ref, log):
-    parser = os.path.join(HERE, "bench_board.py")
+    parser = os.path.join(HERE, "..", "bench_board.py")
     p = subprocess.run([sys.executable, parser, "parse", out, "--model", model, "--branch", ref,
                         "--source", "gpu-runner"], capture_output=True, text=True)
     if p.returncode or not p.stdout.strip():
