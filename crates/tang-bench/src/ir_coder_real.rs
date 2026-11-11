@@ -189,10 +189,12 @@ pub fn lower_real_step(
         ..Default::default()
     };
     // norms' and gates' statistics recomputed inside their maps (one
-    // kernel a norm, Q8x32 stores included); TANG_STAGED_MAP=0: off
+    // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
+    // evaluated in their readers; TANG_STAGED_MAP=0: off
     if std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
+        graph.schedule_small_maps(&outs, &inplace);
     }
     let program = graph.to_cuda_decode(&outs, &opts);
     RealStep {
@@ -451,10 +453,29 @@ mod tests {
         let low = lower_real_step(&pg, &st, &tys);
         if std::env::var("LIST").is_ok() {
             let g = &low.graph;
-            for (k, nat) in low.program.program.kernels.iter().zip(&low.program.native).take(60) {
+            for (k, nat) in low
+                .program
+                .program
+                .kernels
+                .iter()
+                .zip(&low.program.native)
+                .take(60)
+            {
                 let i = k.node.index();
-                let what = g.comp_at(i).map_or("-".to_string(), |c| format!("red {:?} args {:?} st {:?}", c.red, c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(), g.nodes()[i].precision.storage));
-                eprintln!("K n{i} {:?} nat {nat} int8 {} {what} | {}", g.nodes()[i].shape, g.nodes()[i].int_mma.is_some(), k.source.lines().next().unwrap_or(""));
+                let what = g.comp_at(i).map_or("-".to_string(), |c| {
+                    format!(
+                        "red {:?} args {:?} st {:?}",
+                        c.red,
+                        c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(),
+                        g.nodes()[i].precision.storage
+                    )
+                });
+                eprintln!(
+                    "K n{i} {:?} nat {nat} int8 {} {what} | {}",
+                    g.nodes()[i].shape,
+                    g.nodes()[i].int_mma.is_some(),
+                    k.source.lines().next().unwrap_or("")
+                );
             }
         }
         eprintln!(

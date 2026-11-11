@@ -348,6 +348,8 @@ mod tests {
         if staged {
             let k = g.schedule_staged_stats(&outs, &[]);
             assert!(k > 0, "no statistic staged");
+            let m = g.schedule_small_maps(&outs, &[]);
+            assert!(m > 0, "no small map inlined");
         }
         let dp = g.to_cuda_decode(&outs, opts);
         let nk = dp.program.kernels.len();

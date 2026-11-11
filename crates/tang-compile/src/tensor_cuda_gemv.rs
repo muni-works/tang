@@ -689,6 +689,85 @@ impl TensorGraph {
     }
 }
 
+impl TensorGraph {
+    /// Schedule (decode): a small materialized map (≤ 1024 points; a GDN
+    /// layer's per-head gates `α = exp(softplus(·)·A)`, `β = σ(·)`) read
+    /// only by comps is evaluated inside each reader instead of launched
+    /// on its own, when the readers' spaces total at most 2²² points (a
+    /// few transcendentals per point are free next to the reader's loads).
+    /// Not outputs, in-place updates' operands, maps read through
+    /// reshapes or by non-comps, or maps over inlined reductions. Returns
+    /// how many maps it inlined.
+    pub fn schedule_small_maps(&mut self, outputs: &[TensorId], inplace: &[TensorId]) -> usize {
+        let n = self.nodes.len();
+        let live = self.live(outputs);
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            match &self.nodes[i].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if !readers[a.src.n()].contains(&i) {
+                            readers[a.src.n()].push(i);
+                        }
+                    }
+                }
+                Op::Reshape(t) => readers[t.n()].push(usize::MAX),
+                Op::Scan(sc) => sc
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                Op::Operator(o) => o
+                    .inputs
+                    .iter()
+                    .for_each(|t| readers[t.n()].push(usize::MAX)),
+                _ => {}
+            }
+        }
+        let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
+        let mut count = 0;
+        for i in (0..n).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            if c.monoid.is_some()
+                || c.tuple != 0
+                || c.width() != 1
+                || self.nodes[i].inline
+                || is_output(i)
+                || numel(&c.out) > 1024
+                || self.nodes[i].precision.storage != super::Format::F32
+                || readers[i].is_empty()
+                || c.args.iter().any(|a| a.view.guard || a.view.gather.is_some())
+                // over an inlined reduction (a staged statistic): stays
+                || c.args.iter().any(|a| {
+                    let p = a.src.n();
+                    self.nodes[p].inline || self.comp_at(p).is_some_and(|pc| pc.monoid.is_some() && self.nodes[p].inline)
+                })
+            {
+                continue;
+            }
+            let ok = readers[i].iter().all(|&r| {
+                r != usize::MAX
+                    && !inplace.iter().any(|t| t.n() == r)
+                    && self.comp_at(r).is_some_and(|rc| {
+                        rc.args
+                            .iter()
+                            .all(|a| a.src.n() != i || !(a.view.guard || a.view.gather.is_some()))
+                    })
+                    && self.nodes[r].int_mma.is_none()
+            });
+            let work: usize = readers[i]
+                .iter()
+                .filter(|&&r| r != usize::MAX)
+                .map(|&r| self.comp_at(r).map_or(0, |rc| numel(&rc.space())))
+                .sum();
+            if ok && work <= 1 << 22 {
+                self.nodes[i].inline = true;
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 impl super::TNode {
     fn op_input(&self) -> Option<usize> {
         match self.op {
