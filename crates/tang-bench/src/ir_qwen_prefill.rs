@@ -553,10 +553,8 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
     if seq > 1 {
         // a window reads every weight `seq` times: its dequantization is
         // materialized (stored f16 by `compiled_decode`), as `step_graph`
-        // writes it for seq > 1. (The projections still are not
-        // tensor-core tiles: `merge_reduce_dims` cannot merge their
-        // `(groups, 64)` reduce dims, the activation being read through
-        // one dim at `64·g + j`; the hand graph builds a flat `k` instead.)
+        // writes it for seq > 1, and `merge_reduce_dims_scaled` reads it
+        // as a flat `k`: each projection a tensor-core tile
         let g = &step.graph;
         let u4: Vec<usize> = step
             .inputs
@@ -581,11 +579,7 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
         seq,
         kctx: dims.ctx,
         outputs,
-        keep: pg
-            .keep
-            .iter()
-            .filter_map(|t| step.rows.get(t).copied())
-            .collect(),
+        keep,
         logit_chunks: Vec::new(),
         inputs,
         q4: false,
@@ -1005,6 +999,27 @@ mod tests {
             if k == 1 {
                 // decode: every kernel has the native decode lowering
                 assert_eq!(native, p.native.len(), "transpiled decode kernels");
+            } else {
+                // a window: every projection a tensor-core tile, as the hand
+                // prefill's, plus the LM head (logits of all k rows, which a
+                // draft verify needs; the hand step computes the last row's)
+                let shapes: Vec<_> = p
+                    .program
+                    .kernels
+                    .iter()
+                    .filter(|kn| kn.source.contains("mma"))
+                    .map(|kn| g.nodes()[kn.node.index()].shape.clone())
+                    .collect();
+                let hshapes: Vec<_> = hp
+                    .program
+                    .kernels
+                    .iter()
+                    .filter(|kn| kn.source.contains("mma"))
+                    .map(|kn| hg.nodes()[kn.node.index()].shape.clone())
+                    .collect();
+                let mut want = hshapes.clone();
+                want.push(vec![Dim::Fixed(k), Dim::Fixed(dims.vocab)]);
+                assert_eq!(shapes, want, "mma tiles");
             }
         }
     }
@@ -1098,6 +1113,45 @@ mod tests {
                 "{layers} layers, k={k}: {} kernels ({} distinct sources) compiled to {arch} PTX",
                 p.program.kernels.len(),
                 distinct.len()
+            );
+        }
+    }
+
+    /// A fingerprint of the hand graphs' CUDA sources (tiny and Qwen3-8B
+    /// shapes; decode, 6- and 512-token prefill, OpenCL q4 prefill), to
+    /// show a pass change leaves them byte-identical.
+    #[test]
+    #[ignore]
+    fn hand_sources_fingerprint() {
+        use std::hash::{Hash, Hasher};
+        let q4 = QwenDims {
+            prefill_q4: true,
+            ff: 40 * GROUP,
+            ..tiny()
+        };
+        for (name, dims, seq) in [
+            ("tiny decode", tiny(), 1),
+            ("tiny prefill 6", tiny(), 6),
+            ("8b decode", QwenDims::qwen3_8b(4352), 1),
+            ("8b prefill 512", QwenDims::qwen3_8b(4352), 512),
+            ("tiny q4 prefill 6 (opencl)", q4, 6),
+        ] {
+            let dg = step_graph(&dims, seq, dims.ctx);
+            let (g, outs) = compiled_decode(&dg, !dims.prefill_q4);
+            let opts = decode_opts(&dg, &outs);
+            let p = if dims.prefill_q4 {
+                g.to_opencl_decode(&outs, &opts)
+            } else {
+                g.to_cuda_decode(&outs, &opts)
+            };
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in &p.program.kernels {
+                k.source.hash(&mut h);
+            }
+            eprintln!(
+                "fingerprint {name}: {} kernels, {:016x}",
+                p.program.kernels.len(),
+                h.finish()
             );
         }
     }

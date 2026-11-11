@@ -99,14 +99,14 @@ pub mod scan;
 pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
 #[path = "tensor_space.rs"]
 pub mod space;
-/// Decode as the finite difference of prefill: the `T → T + k` step and
-/// its KV cache, derived from the full-sequence graph.
-#[path = "tensor_step.rs"]
-pub mod step;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
+/// Decode as the finite difference of prefill: the `T → T + k` step and
+/// its KV cache, derived from the full-sequence graph.
+#[path = "tensor_step.rs"]
+pub mod step;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
@@ -860,9 +860,18 @@ pub(crate) fn tile_axes(pts: &[usize]) -> (Option<usize>, Option<usize>) {
     (x, x.and_then(|dx| tile::largest_other(pts, dx)))
 }
 
-/// How `merge_reduce_dims` rewrites one arg: `None` leaves it, `Some((d0,
-/// shape))` reads a reshape of its source with dims `d0, d0 + 1` merged.
-type MergePlan = Option<(usize, Vec<Dim>)>;
+/// How `merge_reduce_dims` rewrites one arg.
+#[derive(Clone)]
+enum MergePlan {
+    /// It reads neither dim: left as is.
+    Neither,
+    /// It reads a reshape of its source with dims `d0, d0 + 1` merged.
+    Reshape(usize, Vec<Dim>),
+    /// Source dim `d0` already reads `s·(n_inner·outer + inner)`: the
+    /// same source, read at `s·merged`
+    /// ([`TensorGraph::merge_reduce_dims_scaled`] only).
+    Scaled(usize),
+}
 
 /// `(split, tile, reg)` — one thread mapping for a comp.
 pub type ScheduleCandidate = (u32, (u32, u32, u32), (u32, u32));
@@ -3422,6 +3431,26 @@ impl TensorGraph {
     /// which is what the matmul schedules and the tensor-core lowerings
     /// look for. Repeated until nothing merges.
     pub fn merge_reduce_dims(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        self.merge_reduce_dims_with(outputs, false)
+    }
+
+    /// [`merge_reduce_dims`](Self::merge_reduce_dims) that also merges
+    /// through an arg reading both dims in one source dim as
+    /// `s·(n_inner·outer + inner)` — an activation `x[t, 64·g + j]` against
+    /// a grouped weight `w[n, g, j]`, the 4-bit projections of a graph
+    /// written once for decode and prefill. Opt-in: it reshapes the other
+    /// operand (the grouped weight) to a flat `k`, which pins it to
+    /// memory, so a lowering that evaluates that operand where it loads
+    /// it (OpenCL's 4-bit prefill) keeps the plain pass.
+    pub fn merge_reduce_dims_scaled(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        self.merge_reduce_dims_with(outputs, true)
+    }
+
+    fn merge_reduce_dims_with(
+        &self,
+        outputs: &[TensorId],
+        scaled: bool,
+    ) -> (TensorGraph, Vec<TensorId>) {
         let mut g = self.clone();
         let live = self.live(outputs);
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
@@ -3444,10 +3473,13 @@ impl TensorGraph {
                             // exp(S − m)) is recomputed by its readers,
                             // the contraction nested in their tiles; a
                             // reshape would pin it to memory
-                            if reads && g.maps_contraction(a.src.n()) {
+                            let plan = g.merge_plan(a, outer, inner, n_inner, scaled)?;
+                            // (a scaled read reshapes nothing)
+                            let reshapes = matches!(plan, MergePlan::Reshape(..));
+                            if reads && reshapes && g.maps_contraction(a.src.n()) {
                                 return None;
                             }
-                            g.merge_plan(a, outer, inner, n_inner)
+                            Some(plan)
                         })
                         .collect();
                     plan.map(|p| (d, p))
@@ -3458,8 +3490,13 @@ impl TensorGraph {
                 let mut args = Vec::with_capacity(c.args.len());
                 for (a, p) in c.args.iter().zip(plan) {
                     let (src, forms) = match p {
-                        None => (a.src, a.view.forms.clone()),
-                        Some((d0, shape)) => {
+                        MergePlan::Neither => (a.src, a.view.forms.clone()),
+                        MergePlan::Scaled(d0) => {
+                            let mut forms = a.view.forms.clone();
+                            forms[d0].coefs[outer] = forms[d0].coefs[inner];
+                            (a.src, forms)
+                        }
+                        MergePlan::Reshape(d0, shape) => {
                             let src = g.reshape(a.src, &shape).unwrap();
                             let mut forms = a.view.forms.clone();
                             // dims d0, d0+1 become one dim picking `outer`
@@ -3513,24 +3550,31 @@ impl TensorGraph {
             })
     }
 
-    /// How `a` would read with space dims `outer`/`inner` merged: `None`
-    /// if it cannot; `Some(None)` if it reads neither; `Some((d0, shape))`
-    /// if source dims `d0`, `d0+1` pick `outer`, `inner` and `shape` is
-    /// the source's shape with the two merged.
-    #[allow(clippy::type_complexity)]
+    /// How `a` would read with space dims `outer`/`inner` merged, `None`
+    /// if it cannot (see [`MergePlan`]; `Scaled` only when `scaled`).
     fn merge_plan(
         &self,
         a: &Arg,
         outer: usize,
         inner: usize,
         n_inner: usize,
-    ) -> Option<Option<(usize, Vec<Dim>)>> {
+        scaled: bool,
+    ) -> Option<MergePlan> {
         let forms = &a.view.forms;
         let touches: Vec<usize> = (0..forms.len())
             .filter(|&d| forms[d].coefs[outer] != 0 || forms[d].coefs[inner] != 0)
             .collect();
         if touches.is_empty() {
-            return Some(None);
+            return Some(MergePlan::Neither);
+        }
+        if scaled && touches.len() == 1 {
+            let d0 = touches[0];
+            let f = &forms[d0];
+            let s = f.coefs[inner];
+            if s != 0 && f.coefs[outer] == s * n_inner as i64 {
+                return Some(MergePlan::Scaled(d0));
+            }
+            return None;
         }
         let [d0, d1] = touches[..] else { return None };
         if d1 != d0 + 1 {
@@ -3547,7 +3591,7 @@ impl TensorGraph {
         let mut merged = shape.clone();
         merged[d0] = Dim::Fixed(shape[d0].fixed()? * n_inner);
         merged.remove(d1);
-        Some(Some((d0, merged)))
+        Some(MergePlan::Reshape(d0, merged))
     }
 
     /// Whether node `a` reads `b`, directly or transitively.
@@ -5367,6 +5411,56 @@ mod tests {
         let c = mg.comp_at(outs[0].n()).unwrap();
         assert_eq!(c.red, vec![Dim::Fixed(groups * per * hd)]);
         assert_eq!(c.args[0].view.rank(), 3);
+        close(&mg.eval(&inputs, &outs)[0], &want);
+    }
+
+    /// `y[t, n] = Σ_{g,j} x[t, 64·g + j] · w[n, g, j]`: the plain pass
+    /// keeps the two reduce dims (the activation reads both through one
+    /// dim); the scaled one makes it one flat `k`, same values.
+    #[test]
+    fn merge_reduce_dims_scaled_flattens_a_grouped_read() {
+        let (t, n, groups, gs) = (3, 5, 2, 8);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[t, groups * gs]);
+        let w = g.input(&[n, groups, gs]);
+        let r = 4; // (t, n, g, j)
+        let xf = Form {
+            coefs: vec![0, 0, gs as i64, 1],
+            offset: 0,
+        };
+        let y = g
+            .comp(
+                &[t, n],
+                &[groups, gs],
+                vec![
+                    Arg {
+                        src: x,
+                        view: View {
+                            forms: vec![Form::unit(r, 0), xf],
+                            guard: false,
+                            gather: None,
+                        },
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(r, &[Some(1), Some(2), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let inputs = [
+            ramp(t * groups * gs, 0.01, -0.3),
+            ramp(n * groups * gs, 0.02, 0.1),
+        ];
+        let want = g.eval(&inputs, &[y]).remove(0);
+        let (pg, pouts) = g.merge_reduce_dims(&[y]);
+        assert_eq!(pg.comp_at(pouts[0].n()).unwrap().red.len(), 2);
+        let (mg, outs) = g.merge_reduce_dims_scaled(&[y]);
+        let c = mg.comp_at(outs[0].n()).unwrap();
+        assert_eq!(c.red, vec![Dim::Fixed(groups * gs)]);
+        assert_eq!(c.args[0].view.forms[1], Form::unit(3, 2));
         close(&mg.eval(&inputs, &outs)[0], &want);
     }
 

@@ -1167,7 +1167,12 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         g.merge_siblings(&outs)
     };
-    let (mut g, mut outs) = if dg.seq > 1 {
+    // (scaled: a derived window's projections read `x[t, 64·g + j]`; the
+    // OpenCL 4-bit prefill evaluates the grouped weight where it loads it,
+    // so its reduce dims stay apart)
+    let (mut g, mut outs) = if dg.seq > 1 && !dg.q4 {
+        g.merge_reduce_dims_scaled(&outs)
+    } else if dg.seq > 1 {
         g.merge_reduce_dims(&outs)
     } else {
         (g, outs)
