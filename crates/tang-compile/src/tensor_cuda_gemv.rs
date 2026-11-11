@@ -214,6 +214,27 @@ impl TensorGraph {
     /// kernels, packed inputs decoded at load, runtime bounds and
     /// in-place updates (see the module docs); everything else WGSL
     /// transpiled. Buffers of packed inputs are sized in words.
+    /// The tuning cache's key for the kernel rooted at `root`: what it
+    /// computes, not where it sits (layers with the same shapes share it).
+    pub fn kernel_sig(&self, root: usize, reads: &[usize]) -> String {
+        let n = &self.nodes[root];
+        let red = self
+            .comp_at(root)
+            .map(|c| format!("{:?}", c.red))
+            .unwrap_or_default();
+        let rd: Vec<String> = reads
+            .iter()
+            .map(|&r| format!("{:?}/{:?}", self.nodes[r].shape, self.nodes[r].precision.storage))
+            .collect();
+        super::tune::hash_hex(&format!(
+            "{:?}|{:?}|{red}|{:?}|{}",
+            n.shape,
+            n.precision.storage,
+            n.int_mma,
+            rd.join(";")
+        ))
+    }
+
     pub fn to_cuda_decode(&self, outputs: &[TensorId], opts: &DecodeOpts) -> DecodeProgram {
         self.to_decode(outputs, opts, DecodeTarget::Cuda)
     }
@@ -299,9 +320,10 @@ impl TensorGraph {
             }
         }
         let mut native = Vec::with_capacity(program.kernels.len());
-        for k in &mut program.kernels {
+        for (ki, k) in program.kernels.iter_mut().enumerate() {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            super::tune::set_kernel(ki, Some(self.kernel_sig(root, &reads)));
             if any_block {
                 if let Some(s) = self.nodes[root].int_mma {
                     let (src, threads, blocks) = self
@@ -516,6 +538,7 @@ impl TensorGraph {
                 b.len = p.words(b.len);
             }
         }
+        super::tune::set_kernel(0, None);
         DecodeProgram {
             program: program.canonical(),
             native,
@@ -1836,7 +1859,7 @@ impl Lowering<'_> {
     /// otherwise. Taken when the schedule inlines the partial
     /// (`TANG_SPLIT_FUSE=1` in the Qwen decode schedule).
     fn split_fused(&self, root: usize) -> Option<Kernel> {
-        if std::env::var("TANG_SPLIT_FUSE").as_deref() == Ok("0") {
+        if super::tune::knob("TANG_SPLIT_FUSE").as_deref() == Some("0") {
             return None;
         }
         let g = self.g;
@@ -2129,7 +2152,7 @@ impl Lowering<'_> {
         // `TANG_REG2=0` disables it
         let mut reg2: Option<(usize, usize)> = None;
         if let Some((d1, t1)) = reg {
-            if std::env::var("TANG_REG2").as_deref() != Ok("0")
+            if super::tune::knob("TANG_REG2").as_deref() != Some("0")
                 && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
             {
                 let bytes = |l: &Leaf| match l.pack {
@@ -2162,7 +2185,7 @@ impl Lowering<'_> {
                     .filter(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= 16)
                     .min_by(|a, b| cost(Some(*a)).total_cmp(&cost(Some(*b))))
                     .filter(|&c| cost(Some(c)) < 0.75 * base);
-            } else if std::env::var("TANG_REG2").as_deref() != Ok("0") {
+            } else if super::tune::knob("TANG_REG2").as_deref() != Some("0") {
                 // a 4-bit GEMV whose register dim the weight ignores (the
                 // rows of a short window, `[k, rows]`): tile the weight
                 // rows too, so each lane's activation loads serve several
@@ -2170,9 +2193,7 @@ impl Lowering<'_> {
                 // lane loads k·32 f32 activations per 16 bytes of weight
                 // and a window is bound by those loads, not by DRAM. Up
                 // to `TANG_WIN_TILE` (32) points a lane
-                let cap: usize = std::env::var("TANG_WIN_TILE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
+                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE")
                     .unwrap_or(32);
                 let w4: Vec<&Leaf> = leaves
                     .iter()
@@ -2244,7 +2265,7 @@ impl Lowering<'_> {
         // lanes stream the weight rows)
         let lpg = if ks == 1
             && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
-            && std::env::var("TANG_SUBWARP").as_deref() != Ok("0")
+            && super::tune::knob("TANG_SUBWARP").as_deref() != Some("0")
         {
             n_chunks.div_ceil(4).next_power_of_two().clamp(1, 32)
         } else {
@@ -2526,7 +2547,7 @@ impl Lowering<'_> {
         // activations, one copy per token) stream a float4 at a time inside
         // the chunk instead of all `vec` up front: k·vec registers spill
         let stream = vec % 4 == 0
-            && std::env::var("TANG_WIN_STREAM").as_deref() != Ok("0")
+            && super::tune::knob("TANG_WIN_STREAM").as_deref() != Some("0")
             && leaves.iter().any(|l| l.pack == Some(Packing::U4))
             && leaves
                 .iter()
@@ -3325,7 +3346,7 @@ impl Lowering<'_> {
     /// Coder-next schedules them only with `TANG_STAGED_MAP=1`;
     /// `TANG_STAGED_MAP=0` disables it everywhere.
     fn staged_map(&self, root: usize) -> Option<Kernel> {
-        if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("0") {
+        if super::tune::knob("TANG_STAGED_MAP").as_deref() == Some("0") {
             return None;
         }
         let g = self.g;

@@ -50,6 +50,9 @@ pub mod cuda_gemv;
 mod cuda_int8;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
+/// Measured schedule choices (the tuning cache) behind the lowering knobs.
+#[path = "tensor_tune.rs"]
+pub mod tune;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;

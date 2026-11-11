@@ -1,0 +1,12 @@
+# tang tuning cache for NVIDIA H200 (CUDA sm_90a): sig<TAB>knobs<TAB>tuned ms<TAB>default ms<TAB>note
+# written by the autotuner (crates/tang-bench/src/autotune.rs); TANG_TUNE=0 ignores it
+1f81124a9bceed12	TANG_GEMV_UNROLL=1,TANG_GEMV_WARPS=4	0.00626	0.00715	coder-next x47
+289d5fcb1b1d9236	TANG_GEMV_UNROLL=1,TANG_GEMV_WARPS=2	0.00850	0.00934	coder-next x47
+29e4810cdeae1c71	TANG_GEMV_WARPS=2	0.01000	0.01193	coder-next x94
+48d9610983d4add8	TANG_GEMV_WARPS=2	0.00706	0.00852	coder-next x36
+852f87bf667b5540	TANG_GEMV_WARPS=2	0.01034	0.01229	coder-next x2
+9e6e445cf761e077	TANG_STAGED_MAP=0	0.00555	0.00595	coder-next x48
+a1e2d93ba7d49f37	TANG_STAGED_MAP=0	0.00582	0.00613	coder-next x12
+c91b5275daa3ac08	TANG_GEMV_WARPS=2	0.13413	0.14032	coder-next x1
+e8b6c7709b725053	TANG_STAGED_MAP=0	0.00539	0.00574	coder-next x49
+eb72a37cba9b1e18	TANG_GEMV_WARPS=2	0.00660	0.00759	coder-next x118
