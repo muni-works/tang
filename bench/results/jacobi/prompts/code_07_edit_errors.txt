@@ -1,0 +1,35 @@
+<|im_start|>user
+Add error handling to this Rust function so it returns `Result<Config, String>` instead of panicking. Output only the full updated code.
+
+```rust
+use std::fs;
+
+pub struct Config {
+    pub host: String,
+    pub port: u16,
+    pub workers: usize,
+}
+
+pub fn load(path: &str) -> Config {
+    let text = fs::read_to_string(path).unwrap();
+    let mut host = String::from("localhost");
+    let mut port = 8080;
+    let mut workers = 4;
+    for line in text.lines() {
+        let (k, v) = line.split_once('=').unwrap();
+        match k.trim() {
+            "host" => host = v.trim().to_string(),
+            "port" => port = v.trim().parse().unwrap(),
+            "workers" => workers = v.trim().parse().unwrap(),
+            _ => {}
+        }
+    }
+    Config { host, port, workers }
+}
+```
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

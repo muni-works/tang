@@ -233,6 +233,7 @@ fn clone_prog(p: &WgslProgram) -> WgslProgram {
                 points: k.points,
                 count: k.count,
                 workgroup_size: k.workgroup_size,
+                writes: Vec::new(),
             })
             .collect(),
         buffers: p

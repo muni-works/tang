@@ -25,8 +25,8 @@
 //!   affine [`TensorGraph::linear_scan`], the readout, and the gated RMSNorm.
 //! - **FFN**: dense clamped SwiGLU, or the MoE: sigmoid router, selection on
 //!   score + bias (top-k by rank, ties to the lower id), weights the unbiased
-//!   scores normalized × scale, every routed expert evaluated and weighted
-//!   (zero weight off the top-k), plus the ungated shared expert.
+//!   scores normalized × scale, the `top_k` picked experts' rows gathered by
+//!   id (only the picks are evaluated), plus the ungated shared expert.
 //! - **Head**: unweighted stream mean, RMSNorm, lm head.
 //!
 //! Weights are plain f32 matrices (no GGUF quant formats; see the gap list
@@ -96,6 +96,11 @@ pub struct GlmDims {
     pub route_scale: f64,
     /// SwiGLU clamp (routed, shared and dense alike, as in the real GGUF).
     pub limit: f64,
+    /// Rows of the bound expert tensors when they hold only some experts
+    /// (a CPU check at real size can't hold 288 in f64): each MoE layer
+    /// then reads `ffn_expert_slot[n_expert]`, expert id → row. 0: the
+    /// tensors hold every expert, no slot map.
+    pub expert_rows: usize,
 }
 
 impl GlmDims {
@@ -136,6 +141,7 @@ impl GlmDims {
             ff_sh: 6,
             route_scale: 2.5,
             limit: 1.0,
+            expert_rows: 0,
         }
     }
 }
@@ -962,16 +968,20 @@ fn kda(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
     b.linear(y, o_proj)
 }
 
-/// The MoE FFN: sigmoid router with selection bias, top-k by rank, every
-/// expert weighted (zero off the top-k), plus the shared expert.
+/// The MoE FFN: sigmoid router with selection bias, top-k by rank (slot
+/// `s` holds the expert of rank `s`), each pick's expert rows gathered by
+/// id (or by `ffn_expert_slot[id]` when the tensors hold only
+/// [`GlmDims::expert_rows`] experts), weighted, plus the shared expert.
 fn moe(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
     let p = format!("blk.{l}");
-    let (n, e, ff, ffs) = (d.n, d.n_expert, d.ff_exp, d.ff_sh);
+    let (n, e, ff, ffs, ka) = (d.n, d.n_expert, d.ff_exp, d.ff_sh, d.top_k);
+    let rows = if d.expert_rows > 0 { d.expert_rows } else { e };
     let router = b.w(format!("{p}.ffn_gate_inp"), &[e, n]);
     let bias = b.w(format!("{p}.exp_probs_b"), &[e]);
-    let gate = b.w(format!("{p}.ffn_gate_exps"), &[e, ff, n]);
-    let up = b.w(format!("{p}.ffn_up_exps"), &[e, ff, n]);
-    let down = b.w(format!("{p}.ffn_down_exps"), &[e, n, ff]);
+    let gate = b.w(format!("{p}.ffn_gate_exps"), &[rows, ff, n]);
+    let up = b.w(format!("{p}.ffn_up_exps"), &[rows, ff, n]);
+    let down = b.w(format!("{p}.ffn_down_exps"), &[rows, n, ff]);
+    let slot_map = (d.expert_rows > 0).then(|| b.w(format!("{p}.ffn_expert_slot"), &[e]));
     let sg = b.w(format!("{p}.ffn_gate_shexp"), &[ffs, n]);
     let su = b.w(format!("{p}.ffn_up_shexp"), &[ffs, n]);
     let sd = b.w(format!("{p}.ffn_down_shexp"), &[n, ffs]);
@@ -992,45 +1002,86 @@ fn moe(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
         ],
         |v| above(v[0] + v[1], v[2] + v[3], v[4], v[5]),
     );
-    let k = d.top_k as f64;
-    let ws = b.map(&[T, fx(e)], vec![a(s, id(2)), a(rank, id(2))], move |v| {
-        select(lit(k) - v[1] - lit(0.5), v[0], lit(0.0))
-    });
-    let wsum = b.sum(&[T], &[fx(e)], vec![a(ws, id(2))], |v| v[0]);
+    b.name(format!("{p}.expert_rank"), rank);
+    // slot s: the expert of rank s (its id) and its unbiased score
+    let kp = [T, fx(ka), fx(e)];
+    let (ks, ke) = (b.g.iota(&kp, 1), b.g.iota(&kp, 2));
+    let ids = b.sum(
+        &[T, fx(ka)],
+        &[fx(e)],
+        vec![a(rank, vec![u(3, 0), u(3, 2)]), a(ks, id(3)), a(ke, id(3))],
+        |v| pick(v[0], v[1], v[2]),
+    );
+    b.name(format!("{p}.expert_ids"), ids);
+    let wsel = b.sum(
+        &[T, fx(ka)],
+        &[fx(e)],
+        vec![
+            a(rank, vec![u(3, 0), u(3, 2)]),
+            a(ks, id(3)),
+            a(s, vec![u(3, 0), u(3, 2)]),
+        ],
+        |v| pick(v[0], v[1], v[2]),
+    );
+    let wsum = b.sum(&[T], &[fx(ka)], vec![a(wsel, id(2))], |v| v[0]);
     let scale = d.route_scale;
     let wt = b.map(
-        &[T, fx(e)],
-        vec![a(ws, id(2)), a(wsum, vec![u(2, 0)])],
+        &[T, fx(ka)],
+        vec![a(wsel, id(2)), a(wsum, vec![u(2, 0)])],
         move |v| v[0] / (v[1] + lit(1e-20)) * lit(scale),
     );
+    // the row of the expert tensors slot s reads
+    let erow = slot_map.map(|m| {
+        b.map(
+            &[T, fx(ka)],
+            vec![
+                a(ids, id(2)),
+                Arg {
+                    src: m,
+                    view: View::pick(2, &[None]).gather(0, 0, 1),
+                },
+            ],
+            |v| v[1],
+        )
+    });
+    let row_ix = |rank: usize| a(erow.unwrap_or(ids), vec![u(rank, 0), u(rank, 1)]);
+    let gathered = |w: TensorId| Arg {
+        src: w,
+        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+    };
+    // each pick's gate/up rows: space (t, slot, f, n)
     let proj = |b: &mut B, w: TensorId| {
         b.sum(
-            &[T, fx(e), fx(ff)],
+            &[T, fx(ka), fx(ff)],
             &[fx(n)],
-            vec![
-                a(w, vec![u(4, 1), u(4, 2), u(4, 3)]),
-                a(x, vec![u(4, 0), u(4, 3)]),
-            ],
-            |v| v[0] * v[1],
+            vec![row_ix(4), a(x, vec![u(4, 0), u(4, 3)]), gathered(w)],
+            |v| v[1] * v[2],
         )
     };
     let eg = proj(b, gate);
     let eu = proj(b, up);
     let lim = d.limit;
     let hidden = b.map(
-        &[T, fx(e), fx(ff)],
-        vec![a(eg, id(3)), a(eu, id(3))],
-        move |v| silu(v[0].min(lit(lim))) * v[1].max(lit(-lim)).min(lit(lim)),
+        &[T, fx(ka), fx(ff)],
+        vec![a(eg, id(3)), a(eu, id(3)), a(wt, vec![u(3, 0), u(3, 1)])],
+        move |v| v[2] * (silu(v[0].min(lit(lim))) * v[1].max(lit(-lim)).min(lit(lim))),
+    );
+    // each pick's down projection: space (t, slot, n, f)
+    let dn = b.sum(
+        &[T, fx(ka), fx(n)],
+        &[fx(ff)],
+        vec![
+            row_ix(4),
+            a(hidden, vec![u(4, 0), u(4, 1), u(4, 3)]),
+            gathered(down),
+        ],
+        |v| v[1] * v[2],
     );
     let routed = b.sum(
         &[T, fx(n)],
-        &[fx(e), fx(ff)],
-        vec![
-            a(wt, vec![u(4, 0), u(4, 2)]),
-            a(down, vec![u(4, 2), u(4, 1), u(4, 3)]),
-            a(hidden, vec![u(4, 0), u(4, 2), u(4, 3)]),
-        ],
-        |v| v[0] * v[1] * v[2],
+        &[fx(ka)],
+        vec![a(dn, vec![u(3, 0), u(3, 2), u(3, 1)])],
+        |v| v[0],
     );
     let shared = b.mlp(x, sg, su, sd, lim);
     b.add(routed, shared)
@@ -1120,6 +1171,72 @@ pub fn try_step(pg: &PrefillGraph, k: usize, capacity: usize) -> Result<StepGrap
         },
     )
     .map_err(|e| e.0)
+}
+
+/// [`crate::ir_sample::append_sampler`] on `pg`'s logits: adds the
+/// `sample.params` input and returns the token ids `[T]`.
+pub fn add_sampler(pg: &mut PrefillGraph, spec: crate::ir_sample::SampleSpec) -> TensorId {
+    let s = crate::ir_sample::append_sampler(&mut pg.g, pg.logits, spec);
+    pg.inputs.push(PrefillInput {
+        name: "sample.params".into(),
+        shape: vec![fx(4)],
+    });
+    pg.named.push(("sample.token".into(), s.token));
+    s.token
+}
+
+/// [`derive_step`] on the logits and the sampled token ids (outputs 0, 1).
+pub fn try_step_sampled(
+    pg: &PrefillGraph,
+    token: TensorId,
+    k: usize,
+    capacity: usize,
+) -> Result<StepGraph, String> {
+    derive_step(
+        &pg.g,
+        &[pg.logits, token],
+        &StepSpec {
+            seq: SEQ,
+            new: k,
+            capacity,
+        },
+    )
+    .map_err(|e| e.0)
+}
+
+/// The step's cache inputs from a prefill of `p0` rows: `vals[c]` is the
+/// prefill's value of `st.caches[c].node`. A scan's state keeps row
+/// `p0 − 1` along its axis; row caches and rings go through `seed_cache`.
+pub fn seed_caches(
+    pg: &PrefillGraph,
+    st: &StepGraph,
+    vals: &[Vec<f64>],
+    p0: usize,
+    cap: usize,
+) -> Vec<Vec<f64>> {
+    st.caches
+        .iter()
+        .zip(vals)
+        .map(|(c, v)| {
+            let shape: Vec<usize> =
+                pg.g.shape(c.node)
+                    .iter()
+                    .map(|&x| if x == T { p0 } else { x.n() })
+                    .collect();
+            if c.state {
+                let outer: usize = shape[..c.axis].iter().product();
+                let inner: usize = shape[c.axis + 1..].iter().product();
+                (0..outer)
+                    .flat_map(|o| {
+                        let b = (o * shape[c.axis] + p0 - 1) * inner;
+                        v[b..b + inner].to_vec()
+                    })
+                    .collect()
+            } else {
+                tang_compile::tensor::step::seed_cache(c, &shape, v, p0, cap)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

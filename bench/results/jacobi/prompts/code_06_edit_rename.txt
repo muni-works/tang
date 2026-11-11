@@ -1,0 +1,42 @@
+<|im_start|>user
+Rename the function `fetch_items` to `load_items` and the variable `res` to `response` everywhere in this file. Output only the full updated file.
+
+```python
+import requests
+
+BASE = "https://api.example.com"
+
+
+def fetch_items(session, page):
+    res = session.get(f"{BASE}/items", params={"page": page})
+    res.raise_for_status()
+    return res.json()["items"]
+
+
+def fetch_all(session):
+    items = []
+    page = 1
+    while True:
+        batch = fetch_items(session, page)
+        if not batch:
+            break
+        items.extend(batch)
+        page += 1
+    return items
+
+
+def main():
+    with requests.Session() as s:
+        for item in fetch_all(s):
+            print(item["id"], item["name"])
+
+
+if __name__ == "__main__":
+    main()
+```
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

@@ -160,6 +160,21 @@ impl CudaDevice {
         let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal).ok())
             .ok()
             .flatten()?;
+        let stream = ctx.default_stream();
+        Self::from_stream(ctx, stream)
+    }
+
+    /// Borrow an existing cudarc context and stream (e.g. phyz-gpu's or
+    /// the host application's) so tang programs run on the same context,
+    /// in order with the caller's work on `stream`, and can read and write
+    /// the caller's `CudaSlice`s without copies. `stream` must belong to
+    /// `ctx`. `None` if the device attributes cannot be queried.
+    ///
+    /// For [`Program::capture`](crate::program::Program::capture) the
+    /// stream must not be the legacy default stream and the context must
+    /// have event tracking disabled (see [`Self::capturable`]); that is
+    /// the caller's choice, since it affects their allocations too.
+    pub fn from_stream(ctx: Arc<CudaContext>, stream: Arc<CudaStream>) -> Option<Self> {
         use cudarc::driver::sys::CUdevice_attribute as A;
         let major = ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -171,7 +186,6 @@ impl CudaDevice {
         let suffix = if major == 9 { "a" } else { "" };
         let arch: &'static str = Box::leak(format!("sm_{major}{minor}{suffix}").into_boxed_str());
         let name = format!("{} (CUDA {arch})", ctx.name().ok()?);
-        let stream = ctx.default_stream();
         Some(Self {
             ctx,
             stream,
@@ -179,6 +193,12 @@ impl CudaDevice {
             arch,
             functions: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// [`Self::from_stream`] on `ctx`'s default stream.
+    pub fn from_context(ctx: Arc<CudaContext>) -> Option<Self> {
+        let stream = ctx.default_stream();
+        Self::from_stream(ctx, stream)
     }
 
     /// Device `ordinal` set up for CUDA Graph capture

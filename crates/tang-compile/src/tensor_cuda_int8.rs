@@ -57,6 +57,12 @@ fn blk(f: Format) -> Option<Blk> {
     }
 }
 
+/// DeepSeek's weight formats ([`Format::Fp8B32`], [`Format::Mxfp4`]): no
+/// GGUF block, the Gemv stage only ([`gemv_kernel_ds`]).
+fn ds_format(f: Format) -> bool {
+    matches!(f, Format::Fp8B32 | Format::Mxfp4)
+}
+
 /// `Σ_d stride_d · (form_d(coords) + gather_d · idx)` as C, over source
 /// `shape`, with iteration coordinates named `names` (empty name: that
 /// coordinate is 0 here) and the gather index expression `idx`.
@@ -142,7 +148,18 @@ pub(super) fn q8x32_writer(src: &str, points: usize, f32_scale: bool) -> Option<
     }
     let src = src.replace(store, "tang_q8x32_store(out, g, v[0], params.count);");
     let at = src.find("extern \"C\"")?;
-    let helper = if f32_scale {
+    Some(format!(
+        "{}{}{}",
+        &src[..at],
+        q8x32_store(f32_scale),
+        &src[at..]
+    ))
+}
+
+/// The `tang_q8x32_store` helper (`f32_scale`: the scale alone, one f32 a
+/// 32, as `Format::Q8x32F` stores it).
+pub(super) fn q8x32_store(f32_scale: bool) -> String {
+    if f32_scale {
         // the scale alone, one f32 a 32
         Q8X32_STORE.replace(
             "    int s = q;\n    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);\n    if ((g & 31u) == 0u) ((float2*)((unsigned char*)out + n))[g >> 5] = make_float2(d, d * (float)s);",
@@ -150,8 +167,7 @@ pub(super) fn q8x32_writer(src: &str, points: usize, f32_scale: bool) -> Option<
         )
     } else {
         Q8X32_STORE.to_string()
-    };
-    Some(format!("{}{helper}{}", &src[..at], &src[at..]))
+    }
 }
 
 impl TensorGraph {
@@ -184,16 +200,27 @@ impl TensorGraph {
             ));
         }
         let storage = |t: TensorId| self.nodes[t.n()].precision.storage;
+        let is_w = |f: Format| blk(f).is_some() || ds_format(f);
         let wi = (0..c.args.len())
-            .find(|&a| blk(storage(c.args[a].src)).is_some())
-            .ok_or("no Q4K / Q5K / Q8_0 operand")?;
+            .find(|&a| is_w(storage(c.args[a].src)))
+            .ok_or("no Q4K / Q5K / Q8_0 / Fp8B32 / Mxfp4 operand")?;
         let xi = (0..c.args.len())
             .find(|&a| storage(c.args[a].src) == Format::Q8x32)
             .ok_or("no Q8x32 operand")?;
         if !matches!(self.nodes[c.args[wi].src.n()].op, Op::Input(_)) {
             return Err("the block-format weight must be a graph input".into());
         }
-        let b = blk(storage(c.args[wi].src)).unwrap();
+        let wfmt = storage(c.args[wi].src);
+        if ds_format(wfmt) && s.stage != Stage::Gemv {
+            return Err(format!("{wfmt:?} weights run only on the Gemv stage"));
+        }
+        // DS formats have no GGUF block; their kernel reads `wfmt`
+        let b = blk(wfmt).unwrap_or(Blk {
+            bytes: 0,
+            per: 32,
+            qs: 0,
+            five: false,
+        });
         // the body must be the product of the two operands
         let nv = c.args.len();
         let probe = |w: f64, x: f64| {
@@ -211,16 +238,21 @@ impl TensorGraph {
         let (ws, xs) = (shape(wa.src), shape(xa.src));
         let unit = |f: &super::Form, d: usize| f.as_unit() == Some(d);
         let free_of = |f: &super::Form, d: usize| f.coefs[d] == 0;
-        // W: [.., rows, k] with r and k as unit forms, nothing else on them
+        // `d` with coefficient 1 plus position terms (not r or k)
+        let on = |f: &super::Form, d: usize| {
+            f.coefs[d] == 1 && (rd..=kd).all(|j| j == d || f.coefs[j] == 0)
+        };
+        // W: [.., rows, k] with k a unit form, r one plus position terms (a
+        // block-diagonal weight's group picks its rows), nothing else on them
         let wl = ws.len();
         if wl < 2
             || !unit(&wa.view.forms[wl - 1], kd)
-            || !unit(&wa.view.forms[wl - 2], rd)
+            || !on(&wa.view.forms[wl - 2], rd)
             || wa.view.forms[..wl - 2]
                 .iter()
                 .any(|f| !free_of(f, kd) || !free_of(f, rd))
             || ws[wl - 1] != k
-            || ws[wl - 2] != rows
+            || ws[wl - 2] < rows
             || wa.view.guard
             || xa.view.guard
         {
@@ -231,12 +263,20 @@ impl TensorGraph {
                 return Err("W's gather must index its leading dims".into());
             }
         }
-        // X: [.., k], k a unit form, no form on r
+        // X: [.., k], k one plus position terms that keep a slice on a
+        // 32-boundary (a group's slice of a wider row), no form on r
         let xl = xs.len();
-        if !unit(&xa.view.forms[xl - 1], kd)
+        let xf = &xa.view.forms[xl - 1];
+        if !on(xf, kd)
+            || xf.offset % 32 != 0
+            || xf
+                .coefs
+                .iter()
+                .enumerate()
+                .any(|(j, &q)| j != kd && q % 32 != 0)
             || xa.view.forms[..xl - 1].iter().any(|f| !free_of(f, kd))
             || xa.view.forms.iter().any(|f| !free_of(f, rd))
-            || xs[xl - 1] != k
+            || xs[xl - 1] % 32 != 0
         {
             return Err("X must be read [.., k] independent of r".into());
         }
@@ -305,6 +345,9 @@ impl TensorGraph {
         // recomputes and quantizes a position's row in shared memory
         let xn = xa.src.n();
         let fused = if self.nodes[xn].inline {
+            if !unit(xf, kd) {
+                return Err("an inlined Q8x32 producer needs X read [.., k]".into());
+            }
             if s.stage != Stage::Gemv {
                 return Err("an inlined Q8x32 producer needs the Gemv stage".into());
             }
@@ -313,6 +356,9 @@ impl TensorGraph {
             None
         };
         if s.stage == Stage::Gemv {
+            if ds_format(wfmt) && s.pos_tile > 1 {
+                return Err("pos_tile > 1 is not lowered for DS formats".into());
+            }
             if s.pos_tile > 1 && wa.view.gather.is_some() {
                 return Err("pos_tile > 1 needs an ungathered weight".into());
             }
@@ -338,6 +384,8 @@ impl TensorGraph {
                 xp: &xp,
                 fused: fused.as_deref(),
                 ptile: (s.pos_tile.max(1) as usize).min(npos),
+                fmt: wfmt,
+                w_total: ws.iter().product(),
             }));
         }
         let ksplit = s.ksplit as usize;
@@ -857,6 +905,10 @@ struct GemvShape<'a> {
     fused: Option<&'a str>,
     /// positions a block (one weight read for all of them)
     ptile: usize,
+    /// the weight's storage format
+    fmt: Format,
+    /// elements of the whole weight tensor (where a DS format's scales start)
+    w_total: usize,
 }
 
 /// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
@@ -869,7 +921,7 @@ struct GemvShape<'a> {
 /// (`TANG_GEMV_UNROLL=1`: every load of a lane issued before its math). A fused activation
 /// prologue quantizes with the whole block, so it keeps 8 warps.
 fn gemv_knobs(g: &GemvShape) -> (usize, bool) {
-    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let env = |k: &str| super::tune::knob_parse::<usize>(k);
     let warps = if g.fused.is_some() {
         8
     } else {
@@ -891,6 +943,9 @@ fn uloop(units: usize, lanes: usize, unroll: bool) -> String {
 }
 
 fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
+    if ds_format(g.fmt) {
+        return gemv_kernel_ds(g);
+    }
     if g.b.per == 32 && g.ptile > 1 {
         return gemv_kernel_q8_0_tiled(g);
     }
@@ -899,10 +954,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     }
     let units = g.k / 128;
     // half-super-blocks a lane (more loads in flight a lane), then lanes a row
-    let upl: usize = std::env::var("TANG_GEMV_UPL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL").unwrap_or(2);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1025,10 +1077,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
 fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     let units = g.k / 128;
     // units a lane (`TANG_GEMV_Q8_UPL`, default 1): more independent loads in flight a thread
-    let upl: usize = std::env::var("TANG_GEMV_Q8_UPL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_Q8_UPL").unwrap_or(1);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1265,4 +1314,183 @@ fn stage_kquant_tiles(src: &str, bb: usize, row_bytes: usize) -> String {
         ),
         None => src.to_string(),
     }
+}
+
+/// Decoders of DeepSeek's weight bytes. `tang_fp4x4`: four e2m1 codes (the
+/// low nibble of each byte of `n`) as four int8 lanes holding twice their
+/// value (`{0, ±1, ±2, ±3, ±4, ±6, ±8, ±12}`: exact, so the dot of a block
+/// is one integer `dp4a` chain). `tang_e4m3`: an OCP e4m3 byte's value
+/// (subnormals exact, without f32 subnormals: no flush to zero).
+/// `tang_e8m0`: a bare exponent's power of two.
+const DS_HELPERS: &str = r#"
+__device__ __forceinline__ int tang_fp4x4(unsigned n) {
+    const unsigned x = n & 0x07070707u, t = x | (x >> 4);
+    const unsigned s = (t & 0xFFu) | ((t >> 8) & 0xFF00u);
+    const unsigned pos = __byte_perm(0x03020100u, 0x0C080604u, s);
+    const unsigned neg = __byte_perm(0xFDFEFF00u, 0xF4F8FAFCu, s);
+    const unsigned m = ((n >> 3) & 0x01010101u) * 0xFFu;
+    return (int)((pos & ~m) | (neg & m));
+}
+__device__ __forceinline__ float tang_e4m3(unsigned b) {
+    const unsigned v = b & 0x7Fu;
+    const float f = v >= 8u ? __uint_as_float((v << 20) + (120u << 23)) : (float)v * 0.001953125f;
+    return (b & 0x80u) ? -f : f;
+}
+__device__ __forceinline__ float tang_e8m0(unsigned s) {
+    return __uint_as_float(s ? (s << 23) : 0x00400000u);
+}
+"#;
+
+/// [`Stage::Gemv`] on DeepSeek's weights: [`Format::Mxfp4`] (routed
+/// experts) or [`Format::Fp8B32`] (dense), dequantized in registers against
+/// Q8x32 activations. A lane takes 128 columns (four 32-column scale blocks)
+/// at a time, `lanes` lanes a row, as [`gemv_kernel_q8_0`].
+///
+/// - Mxfp4: 64 code bytes (four 16-byte loads) and the four e8m0 scales
+///   (one 4-byte load) a unit; a block's 32 codes become int8 lanes of twice
+///   their value ([`DS_HELPERS`]), re-interleaved to element order with
+///   `__byte_perm`, `dot` on `dp4a`, then `acc += ½·2^(s−127)·dₓ·dot`.
+/// - Fp8B32: 128 code bytes (eight 16-byte loads) and the scales of the
+///   row's 32-row band (one 4-byte load); each code decoded to f32 and
+///   multiplied by its int8 activation code, `acc += 2^(s−127)·dₓ·Σ`.
+fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
+    let fp4 = g.fmt == Format::Mxfp4;
+    let units = g.k / 128;
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_DS_UPL").unwrap_or(1);
+    let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
+    let (warps, unroll) = gemv_knobs(g);
+    let rpw = 32 / lanes;
+    let row_blocks = g.rows.div_ceil(warps * rpw);
+    let k = g.k;
+    let params: Vec<String> = (0..g.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    let xkey_decl = match g.xkey {
+        Some(e) => format!("      const long long XKEY = {e};\n"),
+        None => String::new(),
+    };
+    let xsrc = match g.fused {
+        Some(pro) => format!(
+            "    __shared__ __align__(16) signed char tang_sx[{k}];\n    __shared__ float2 tang_ss[{kb}];\n    {{ const long long P = pos;\n{decode}{xkey_decl}{pro}    }}\n    __syncthreads();\n    (void)xr;\n    const signed char* xc = tang_sx;\n    const float2* xs = tang_ss;\n",
+            kb = k / 32,
+            decode = g.decode,
+        ),
+        None => format!(
+            "    const signed char* xc = (const signed char*)({xp}) + xr;\n    const float2* xs = (const float2*)((const unsigned char*)({xp}) + {x_total}) + xr / 32;\n",
+            xp = g.xp,
+            x_total = g.x_total,
+        ),
+    };
+    let xld = if g.fused.is_some() { "*" } else { "__ldg" };
+    // the row's codes and scales, from the slice's element offset `woff`
+    let (wdecl, body) = if fp4 {
+        (
+            format!(
+                "    const unsigned char* wc = (const unsigned char*)({wp}) + (woff + (long long)rr * {k}) / 2;\n    const unsigned char* wsc = (const unsigned char*)({wp}) + {codes} + (woff + (long long)rr * {k}) / 32;\n",
+                wp = g.wp,
+                codes = g.w_total / 2,
+            ),
+            format!(
+                r#"            const uint4* cv = (const uint4*)(wc + (size_t)u * 64);
+            const uint4 c4[4] = {{__ldg(cv), __ldg(cv + 1), __ldg(cv + 2), __ldg(cv + 3)}};
+            const unsigned sc4 = __ldg((const unsigned*)(wsc + (size_t)u * 4));
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {{
+                const int blk = 4 * u + b;
+                const int4* xv = (const int4*)(xc + blk * 32);
+                const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
+                int dot = 0;
+                #pragma unroll
+                for (int w = 0; w < 4; w++) {{
+                    const unsigned q = (&c4[b].x)[w];
+                    const unsigned lo = (unsigned)tang_fp4x4(q), hi = (unsigned)tang_fp4x4(q >> 4);
+                    const int x0 = w & 2 ? (&x4[1].x)[2 * (w & 1)] : (&x4[0].x)[2 * (w & 1)];
+                    const int x1 = w & 2 ? (&x4[1].x)[2 * (w & 1) + 1] : (&x4[0].x)[2 * (w & 1) + 1];
+                    dot = __dp4a((int)__byte_perm(lo, hi, 0x5140u), x0, dot);
+                    dot = __dp4a((int)__byte_perm(lo, hi, 0x7362u), x1, dot);
+                }}
+                const float2 xd = {xld}(xs + blk);
+                acc = fmaf(0.5f * tang_e8m0((sc4 >> (8 * b)) & 0xFFu) * xd.x, (float)dot, acc);
+            }}
+"#
+            ),
+        )
+    } else {
+        (
+            format!(
+                "    const long long grow = woff / {k} + rr;\n    const unsigned char* wc = (const unsigned char*)({wp}) + grow * {k};\n    const unsigned char* wsc = (const unsigned char*)({wp}) + {codes} + (grow / 32) * {kb};\n",
+                wp = g.wp,
+                codes = g.w_total,
+                kb = k / 32,
+            ),
+            format!(
+                r#"            const uint4* cv = (const uint4*)(wc + (size_t)u * 128);
+            uint4 c8[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) c8[i] = __ldg(cv + i);
+            const unsigned sc4 = __ldg((const unsigned*)(wsc + (size_t)u * 4));
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {{
+                const int blk = 4 * u + b;
+                const int4* xv = (const int4*)(xc + blk * 32);
+                const int4 x4[2] = {{{xld}(xv), {xld}(xv + 1)}};
+                float dot = 0.f;
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {{
+                    const unsigned q = w & 4 ? (&c8[2 * b + 1].x)[w & 3] : (&c8[2 * b].x)[w & 3];
+                    const int xw = w & 4 ? (&x4[1].x)[w & 3] : (&x4[0].x)[w & 3];
+                    #pragma unroll
+                    for (int e = 0; e < 4; e++)
+                        dot = fmaf(tang_e4m3((q >> (8 * e)) & 0xFFu), (float)(signed char)(xw >> (8 * e)), dot);
+                }}
+                const float2 xd = {xld}(xs + blk);
+                acc = fmaf(tang_e8m0((sc4 >> (8 * b)) & 0xFFu) * xd.x, dot, acc);
+            }}
+"#
+            ),
+        )
+    };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    src.push_str(DS_HELPERS);
+    if g.fused.is_some() {
+        src.push_str(
+            "__device__ __forceinline__ float tang_select(float f, float t, bool c) { return c ? t : f; }\n",
+        );
+    }
+    write!(
+        src,
+        r#"extern "C" __global__ void __launch_bounds__({threads}) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos = blockIdx.x / {row_blocks}, rb = blockIdx.x % {row_blocks};
+    const int r = (rb * {warps} + warp) * {rpw} + lane / {lanes}, u0 = lane % {lanes};
+    if (pos >= {npos}) return;
+    const bool live = r < {rows};
+    const int rr = live ? r : 0;
+    long long KEY, xr, woff;
+    {{ const long long P = pos;
+{decode}      KEY = {wkey};
+{xkey_decl}      xr = ({x_off});
+      woff = ({w_off}); }}
+{wdecl}{xsrc}    float acc = 0.f;
+    if (live) {{
+{uloop}{body}        }}
+    }}
+    #pragma unroll
+    for (int o = {lanes} / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (live && u0 == 0) out[(long long)pos * {rows} + r] = acc;
+}}
+"#,
+        params = params.join(", "),
+        threads = warps * 32,
+        uloop = uloop(units, lanes, unroll),
+        npos = g.npos,
+        rows = g.rows,
+        decode = g.decode,
+        wkey = g.wkey,
+        x_off = g.x_off,
+        w_off = g.w_off,
+    )
+    .unwrap();
+    (src, warps * 32, g.npos * row_blocks)
 }

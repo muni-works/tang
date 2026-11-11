@@ -117,6 +117,24 @@ impl Runtime {
         CudaDevice::new(0).map(Self::Cuda)
     }
 
+    /// CUDA device `ordinal` (one rank of a multi-GPU program).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_on(ordinal: usize) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::new(ordinal).map(Self::Cuda)
+    }
+
+    /// The CUDA stream every launch and copy of this runtime goes on.
+    #[cfg(feature = "cuda")]
+    pub fn cu_stream(&self) -> cudarc::driver::sys::CUstream {
+        match self {
+            Self::Cuda(d) => d.stream.cu_stream(),
+            _ => panic!("cu_stream: not CUDA"),
+        }
+    }
+
     /// CUDA device 0 set up for [`Program::capture`]
     /// ([`CudaDevice::new_capturable`]).
     #[cfg(feature = "cuda")]
@@ -125,6 +143,19 @@ impl Runtime {
             return None;
         }
         CudaDevice::new_capturable(0).map(Self::Cuda)
+    }
+
+    /// A runtime on an existing cudarc context and stream, shared with the
+    /// caller ([`CudaDevice::from_stream`]). `None` without nvrtc.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_from_stream(
+        ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::from_stream(ctx, stream).map(Self::Cuda)
     }
 
     /// The first OpenCL GPU, if a driver and a device are present.
@@ -275,8 +306,9 @@ impl From<&MemoryPlan> for BufferPlan {
 /// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
 /// buffers share the layout).
 ///
-/// Block formats (Q4K, Q5K, Q8x32) are passed in and read back as their
-/// raw device words, except that reading a Q8x32 buffer dequantizes it.
+/// Block formats (GGUF Q4K / Q5K / Q6K / Q8_0, DeepSeek Fp8B32 / Mxfp4,
+/// Q8x32) are passed in and read back as their raw device words, except
+/// that reading a Q8x32 buffer dequantizes it.
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     b.format.words(b.len).max(1)
 }
@@ -340,6 +372,9 @@ enum Storage {
         /// The program as launches of kernels and persistent segments
         /// ([`Program::megakernel`]): `run` launches these instead.
         fused: Option<Vec<Item>>,
+        /// Slots kept in host-pinned, device-mapped memory
+        /// ([`Program::with_host`]): kernels read them zero-copy.
+        host: Vec<Option<HostMapped>>,
     },
     #[cfg(feature = "opencl")]
     OpenCl {
@@ -348,6 +383,53 @@ enum Storage {
         /// One kernel object per kernel, arguments bound at construction.
         kernels: ClKernels,
     },
+}
+
+/// A buffer in page-locked host memory mapped into the device's address
+/// space (`cuMemHostAlloc(DEVICEMAP)`): kernels read it over the bus, at
+/// the addresses they touch, with no device copy — a table too large for
+/// device memory (DeepSeek's Engram) that a step only gathers from.
+#[cfg(feature = "cuda")]
+pub struct HostMapped {
+    host: *mut f32,
+    dev: u64,
+    len: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl HostMapped {
+    fn new(d: &CudaDevice, words: &[f32]) -> Self {
+        use cudarc::driver::sys;
+        d.stream.context().bind_to_thread().expect("bind context");
+        let bytes = words.len().max(1) * 4;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut dev: sys::CUdeviceptr = 0;
+        unsafe {
+            let r = sys::cuMemHostAlloc(&mut p, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP);
+            assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemHostAlloc");
+            std::ptr::copy_nonoverlapping(words.as_ptr(), p as *mut f32, words.len());
+            let r = sys::cuMemHostGetDevicePointer_v2(&mut dev, p, 0);
+            assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuMemHostGetDevicePointer");
+        }
+        HostMapped {
+            host: p as *mut f32,
+            dev,
+            len: words.len(),
+        }
+    }
+
+    fn read(&self) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(self.host, self.len).to_vec() }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for HostMapped {
+    fn drop(&mut self) {
+        unsafe {
+            cudarc::driver::sys::cuMemFreeHost(self.host as *mut std::ffi::c_void);
+        }
+    }
 }
 
 /// One launch of a fused program ([`Program::megakernel`]).
@@ -399,6 +481,62 @@ impl Program {
     /// Lower `g` for `rt` and allocate it; `inputs` in graph input order.
     pub fn compile(rt: &Runtime, g: &TensorGraph, outputs: &[TensorId], inputs: &[&[f32]]) -> Self {
         Self::new(rt, rt.lower(g, outputs), inputs)
+    }
+
+    /// [`new`](Self::new) with graph inputs `host` kept in host-pinned,
+    /// device-mapped memory instead of device memory (CUDA): the kernels
+    /// read them zero-copy, so a step that gathers a few rows of a huge
+    /// table moves only those rows over the bus.
+    #[cfg(feature = "cuda")]
+    pub fn with_host(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        host: &[usize],
+    ) -> Self {
+        let Runtime::Cuda(d) = rt else {
+            panic!("host-mapped inputs need the CUDA runtime")
+        };
+        let empty: Vec<&[f32]> = inputs
+            .iter()
+            .enumerate()
+            .map(|(k, v)| if host.contains(&k) { &[][..] } else { *v })
+            .collect();
+        let mut p = Self::new(rt, program, &empty);
+        let mapped: Vec<(usize, HostMapped)> = p
+            .program
+            .buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let k = b.input.filter(|k| host.contains(k))?;
+                Some((
+                    p.slot[i],
+                    HostMapped::new(d, &pack_words(b.format, inputs[k])),
+                ))
+            })
+            .collect();
+        let Storage::Cuda {
+            slots, host: hs, ..
+        } = &mut p.storage
+        else {
+            unreachable!()
+        };
+        for (s, h) in mapped {
+            // the device slot shrinks to a word: nothing of it is read
+            slots[s] = std::rc::Rc::new(d.stream.alloc_zeros::<f32>(1).expect("alloc"));
+            hs[s] = Some(h);
+        }
+        p
+    }
+
+    /// Bytes held in host-mapped buffers.
+    #[cfg(feature = "cuda")]
+    pub fn host_bytes(&self) -> usize {
+        match &self.storage {
+            Storage::Cuda { host, .. } => host.iter().flatten().map(|h| h.len * 4).sum(),
+            _ => 0,
+        }
     }
 
     /// Allocate every buffer (one per tensor) and upload the inputs.
@@ -488,11 +626,13 @@ impl Program {
                     .iter()
                     .map(|k| d.function(&k.source))
                     .collect();
+                let host = (0..plan.slot_len.len()).map(|_| None).collect();
                 let storage = Storage::Cuda {
                     slots,
                     functions,
                     graph: None,
                     fused: None,
+                    host,
                 };
                 Self::assemble(program, storage, plan)
             }
@@ -597,6 +737,10 @@ impl Program {
                 write_wgpu(device, &slots[s], b.format, inputs[k]);
             }
         }
+        assert!(
+            program.kernels.iter().all(|k| k.writes.is_empty()),
+            "multi-output kernels run on CUDA only"
+        );
         let p = Self::assemble(program, Storage::Wgpu(slots), plan);
         for (i, a) in p.args.iter().enumerate() {
             let (out, reads) = a.split_last().unwrap();
@@ -623,14 +767,27 @@ impl Program {
             .kernels
             .iter()
             .map(|k| {
+                // reads, `out`, then a multi-output kernel's further outputs
                 k.reads
                     .iter()
-                    .chain(std::iter::once(&k.node))
-                    .map(|&t| p.slot_of(t))
+                    .copied()
+                    .chain(k.outputs())
+                    .map(|t| p.slot_of(t))
                     .collect()
             })
             .collect();
         p
+    }
+
+    /// Whether `t` has a device buffer (an unused input or a folded value doesn't).
+    pub fn has_buffer(&self, t: TensorId) -> bool {
+        let t = self.program.storage(t);
+        self.program.buffers.iter().any(|b| b.node == t)
+    }
+
+    /// Whether input `k` is bound to a buffer (an input no kernel reads isn't).
+    pub fn has_input(&self, k: usize) -> bool {
+        self.program.buffers.iter().any(|b| b.input == Some(k))
     }
 
     fn buffer_index(&self, t: TensorId) -> usize {
@@ -666,6 +823,19 @@ impl Program {
         match &self.storage {
             Storage::Wgpu(s) => Some(&s[self.slot_of(t)]),
             #[cfg(any(feature = "cuda", feature = "opencl"))]
+            _ => None,
+        }
+    }
+
+    /// The CUDA buffer holding `t` (packed words of [`Self::format`]; f32
+    /// for the default format), so a caller sharing the context
+    /// ([`Runtime::cuda_from_stream`]) can copy device-to-device into or
+    /// out of the program on its stream instead of round-tripping the host.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_slice(&self, t: TensorId) -> Option<&cudarc::driver::CudaSlice<f32>> {
+        match &self.storage {
+            Storage::Cuda { slots, .. } => Some(&slots[self.slot_of(t)]),
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
@@ -868,6 +1038,8 @@ impl Program {
                 && threads.is_multiple_of(k.workgroup_size)
                 && threads / k.workgroup_size <= 15
                 && crate::cuda::dynamic_smem(&k.source) == 0
+                // the megakernel's stages write one buffer (the last arg)
+                && k.writes.is_empty()
         };
         let mut runs: Vec<Vec<usize>> = Vec::new();
         for &i in &self.order {
@@ -899,11 +1071,16 @@ impl Program {
             slots,
             fused,
             graph,
+            host,
             ..
         } = &mut self.storage
         else {
             unreachable!()
         };
+        assert!(
+            host.iter().all(Option::is_none),
+            "megakernel over host-mapped buffers"
+        );
         let mut items = Vec::new();
         let (mut phases, mut grid) = (0, 0);
         for (r, m) in runs.iter().zip(megas) {
@@ -925,7 +1102,7 @@ impl Program {
                     p
                 })
                 .collect();
-            let table = d.stream.memcpy_stod(&ptrs).expect("pointer table");
+            let table = d.stream.clone_htod(&ptrs).expect("pointer table");
             let sync = d
                 .stream
                 .alloc_zeros::<u32>(2 + 2 * (mega.phases.len() + 1))
@@ -971,7 +1148,7 @@ impl Program {
         }) else {
             return Vec::new();
         };
-        let words = d.stream.memcpy_dtov(&m.sync).expect("read trace");
+        let words = d.stream.clone_dtoh(&m.sync).expect("read trace");
         let t: Vec<u64> = words[2..]
             .chunks(2)
             .map(|c| c[0] as u64 | (c[1] as u64) << 32)
@@ -1001,7 +1178,20 @@ impl Program {
             d.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .expect("begin capture");
-            self.launch_all(d);
+            // independent kernels on side streams (a DAG graph, not a
+            // chain; TANG_GRAPH_DAG=0: the chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
+            let dag = !std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "0");
+            let fused = matches!(&self.storage, Storage::Cuda { fused: Some(_), .. });
+            if dag && !fused {
+                let n = std::env::var("TANG_GRAPH_STREAMS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2usize)
+                    .max(1);
+                self.launch_dag(d, n);
+            } else {
+                self.launch_all(d);
+            }
             let g = d
                 .stream
                 .end_capture(
@@ -1076,6 +1266,112 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn run_cuda(&self, d: &CudaDevice, i: usize) {
+        self.run_cuda_on(&d.stream, i)
+    }
+
+    /// Kernel dependencies in launch order, from slot hazards: the last
+    /// writer of every slot it reads (RAW), and of every slot it writes
+    /// (WAW), and every reader of those since (WAR). Indices into `order`.
+    #[cfg(feature = "cuda")]
+    fn hazard_deps(&self) -> Vec<Vec<usize>> {
+        let mut last_w: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut readers: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut deps = Vec::with_capacity(self.order.len());
+        for (n, &i) in self.order.iter().enumerate() {
+            let outs = 1 + self.program.kernels[i].writes.len();
+            let a = &self.args[i];
+            let (rd, wr) = a.split_at(a.len() - outs.min(a.len()));
+            let mut dv: Vec<usize> = Vec::new();
+            for s in rd {
+                dv.extend(last_w.get(s));
+            }
+            for s in wr {
+                dv.extend(last_w.get(s));
+                dv.extend(readers.get(s).into_iter().flatten());
+            }
+            dv.retain(|&j| j != n);
+            dv.sort_unstable();
+            dv.dedup();
+            for s in rd {
+                readers.entry(*s).or_default().push(n);
+            }
+            for s in wr {
+                last_w.insert(*s, n);
+                readers.remove(s);
+            }
+            deps.push(dv);
+        }
+        deps
+    }
+
+    /// [`launch_all`](Self::launch_all) over `streams` streams (the
+    /// device's plus side streams forked from it) for graph capture: a
+    /// kernel continues the stream whose tail it depends on, else takes
+    /// the stream with the oldest tail; a dependency on another stream is
+    /// an event recorded right after it. All streams join the device's
+    /// stream at the end, so the capture closes.
+    #[cfg(feature = "cuda")]
+    fn launch_dag(&self, d: &CudaDevice, streams: usize) {
+        let deps = self.hazard_deps();
+        let n = self.order.len();
+        // pass 1: a stream per kernel
+        let mut on = vec![0usize; n];
+        let mut tail: Vec<Option<usize>> = vec![None; streams];
+        for k in 0..n {
+            let cont = (0..streams)
+                .filter(|&s| tail[s].is_some_and(|t| deps[k].binary_search(&t).is_ok()))
+                .max_by_key(|&s| tail[s]);
+            let s = cont.unwrap_or_else(|| {
+                (0..streams)
+                    .min_by_key(|&s| tail[s].map_or(-1, |t| t as i64))
+                    .unwrap()
+            });
+            on[k] = s;
+            tail[s] = Some(k);
+        }
+        // the latest dependency per other stream needs an event after it
+        let mut waits: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut evented = vec![false; n];
+        for k in 0..n {
+            let mut per: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &j in &deps[k] {
+                if on[j] != on[k] {
+                    let e = per.entry(on[j]).or_insert(j);
+                    *e = (*e).max(j);
+                }
+            }
+            for (_, j) in per {
+                waits[k].push(j);
+                evented[j] = true;
+            }
+        }
+        // pass 2: launches, events, joins
+        let mut ss = vec![d.stream.clone()];
+        for _ in 1..streams {
+            let s = d.ctx.new_stream().expect("side stream");
+            s.join(&d.stream).expect("fork into capture");
+            ss.push(s);
+        }
+        let mut ev: Vec<Option<cudarc::driver::CudaEvent>> = (0..n).map(|_| None).collect();
+        for k in 0..n {
+            let st = &ss[on[k]];
+            for &j in &waits[k] {
+                st.wait(ev[j].as_ref().expect("event before its waiter"))
+                    .expect("wait");
+            }
+            self.run_cuda_on(st, self.order[k]);
+            if evented[k] {
+                ev[k] = Some(st.record_event(None).expect("event"));
+            }
+        }
+        for s in &ss[1..] {
+            d.stream.join(s).expect("join");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_cuda_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>, i: usize) {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let Storage::Cuda {
             slots, functions, ..
@@ -1089,9 +1385,15 @@ impl Program {
             block_dim: (k.workgroup_size, 1, 1),
             shared_mem_bytes: crate::cuda::dynamic_smem(&k.source),
         };
-        let mut launch = d.stream.launch_builder(&functions[i]);
+        let Storage::Cuda { host, .. } = &self.storage else {
+            unreachable!()
+        };
+        let mut launch = stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
-            launch.arg(&*slots[s]);
+            match &host[s] {
+                Some(h) => launch.arg(&h.dev),
+                None => launch.arg(&*slots[s]),
+            };
         }
         launch.arg(&k.points);
         unsafe { launch.launch(cfg) }.expect("launch");
@@ -1105,9 +1407,13 @@ impl Program {
                 self.read_wgpu(device, t)
             }
             #[cfg(feature = "cuda")]
-            (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
+            (Runtime::Cuda(d), Storage::Cuda { slots, host, .. }) => {
                 let b = &self.program.buffers[self.buffer_index(t)];
                 let n = words(b);
+                if let Some(h) = &host[self.slot_of(t)] {
+                    d.sync();
+                    return h.read()[..n].to_vec();
+                }
                 let mut out = vec![0.0f32; n];
                 d.stream
                     .memcpy_dtoh(&slots[self.slot_of(t)].slice(0..n), &mut out)
@@ -1137,6 +1443,23 @@ impl Program {
         match b.format {
             Format::F16 => unpack_f16(&raw, b.len),
             _ => raw[..b.len].to_vec(),
+        }
+    }
+
+    /// The raw device address and f32 length of `t`'s buffer, for code that
+    /// works on it in place outside the program (NCCL collectives). Valid
+    /// while the program lives; work on it must go on [`Runtime::cu_stream`].
+    #[cfg(feature = "cuda")]
+    pub fn cuda_buffer(&self, rt: &Runtime, t: TensorId) -> (u64, usize) {
+        use cudarc::driver::DevicePtr;
+        let b = &self.program.buffers[self.buffer_index(t)];
+        assert!(b.format == Format::F32, "cuda_buffer: an f32 buffer only");
+        match (rt, &self.storage) {
+            (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
+                let (p, _sync) = slots[self.slot_of(t)].device_ptr(&d.stream);
+                (p, b.len)
+            }
+            _ => panic!("cuda_buffer: not a CUDA program"),
         }
     }
 
@@ -1854,7 +2177,9 @@ fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
                 .map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2])
                 .collect()
         }
-        Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
+        Format::Q4K | Format::Q5K | Format::Fp8B32 | Format::Mxfp4 => {
+            words[..format.words(n)].to_vec()
+        }
         Format::F16 => unpack_f16(words, n),
         f if f.is_fp8() => {
             let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();
@@ -1994,6 +2319,44 @@ mod tests {
     /// runs (the barrier state resets itself).
     #[cfg(feature = "cuda")]
     #[test]
+    fn cuda_shared_context_runs_on_callers_stream() {
+        use cudarc::driver::CudaContext;
+        if !CudaDevice::has_nvrtc() {
+            return;
+        }
+        let Ok(ctx) = std::panic::catch_unwind(|| CudaContext::new(0)).map(|r| r.ok()) else {
+            return;
+        };
+        let Some(ctx) = ctx else { return };
+        // the caller's context and stream, as phyz-gpu would own them
+        let stream = ctx.new_stream().unwrap();
+        let rt = Runtime::cuda_from_stream(ctx.clone(), stream.clone()).unwrap();
+        let d = rt.cuda_device().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&d.ctx, &ctx));
+        assert!(std::sync::Arc::ptr_eq(&d.stream, &stream));
+        let mut g = TensorGraph::new();
+        let a = g.input(&[16, 8]);
+        let b = g.input(&[8, 4]);
+        let out = g.matmul(a, b).unwrap();
+        let va: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
+        let vb: Vec<f32> = (0..32).map(|i| 1.0 - i as f32 * 0.03).collect();
+        let p = Program::compile(&rt, &g, &[out], &[&va, &vb]);
+        p.run(&rt);
+        // the caller takes the result device-to-device on its own stream
+        let res = p.cuda_slice(out).unwrap();
+        let copy = stream.clone_dtod(&res.slice(0..64)).unwrap();
+        let got = stream.clone_dtoh(&copy).unwrap();
+        assert_eq!(got, p.read(&rt, out));
+        for i in 0..16 {
+            for j in 0..4 {
+                let want: f32 = (0..8).map(|k| va[i * 8 + k] * vb[k * 4 + j]).sum();
+                assert!((got[i * 4 + j] - want).abs() < 1e-4, "{i},{j}");
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn cuda_megakernel_matches_launches() {
         use tang_compile::tensor::cuda_mega::MegaOpts;
         let Some(rt) = Runtime::cuda() else { return };
@@ -2029,9 +2392,25 @@ mod tests {
             p.run(&rt);
             p.read(&rt, outs[0])
         };
-        // all fused; then only the 640-block kernel is small enough, so
-        // nothing fuses (a run of one stays a launch)
-        for (max_blocks, fused) in [(0, 1), (700, 3)] {
+        // all fused; then cap at the smallest grid, so only that kernel is
+        // small enough and nothing fuses (a run of one stays a launch). The
+        // cap comes from the lowering, so grid changes there don't break it.
+        let grids: Vec<u32> = {
+            let p = lower();
+            p.program
+                .kernels
+                .iter()
+                .map(|k| k.count.div_ceil(k.workgroup_size))
+                .collect()
+        };
+        let smallest = *grids.iter().min().unwrap();
+        assert!(grids.len() >= 2, "grids {grids:?}");
+        assert_eq!(
+            grids.iter().filter(|&&b| b == smallest).count(),
+            1,
+            "grids {grids:?}"
+        );
+        for (max_blocks, fused) in [(0, 1), (smallest, grids.len())] {
             let mut p = lower();
             let (launches, phases, _) = p.megakernel(&rt, &MegaOpts::default(), 0, max_blocks);
             assert_eq!(launches, fused, "max_blocks {max_blocks}");

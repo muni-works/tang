@@ -1,0 +1,56 @@
+# tang-llm for Linux (x86_64 + aarch64, CPU + CUDA 12.8), attached to a GitHub release.
+# These are the tarballs frog's node installer (`curl -fsSL https://frog.toys/node | sh`) downloads;
+# names and layout must match frog's site/node.sh and docs/tang-linux-release.md.
+# Runs on a `v*` tag push, or by hand (workflow_dispatch) with an existing tag.
+# Without GitHub runners, scripts/release-linux.sh builds the same tarballs on mew or a pod.
+name: linux release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and attach to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  tang-llm-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, variant: cpu, container: "" }
+          - { runner: ubuntu-22.04, variant: cuda, container: "nvidia/cuda:12.8.1-devel-ubuntu22.04" }
+          - { runner: ubuntu-22.04-arm, variant: cpu, container: "" }
+          - { runner: ubuntu-22.04-arm, variant: cuda, container: "nvidia/cuda:12.8.1-devel-ubuntu22.04" }
+    runs-on: ${{ matrix.runner }}
+    # ubuntu 22.04 everywhere: glibc 2.35 is the floor for users. CUDA builds need no GPU.
+    container: ${{ matrix.container }}
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Container deps
+        if: matrix.container != ''
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates build-essential pkg-config git
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/gh.gpg
+          echo "deb [signed-by=/usr/share/keyrings/gh.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/gh.list
+          apt-get update -qq && apt-get install -y -qq gh
+          curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build, package and attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: scripts/release-linux.sh --native --variant ${{ matrix.variant }} --upload "$TAG"

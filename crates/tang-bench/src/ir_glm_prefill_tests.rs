@@ -729,3 +729,81 @@ fn glm_dsa_sparse_step_matches_prefill() {
         }
     }
 }
+
+/// The sampler appended to the tiny GLM graph, derived with it: the step's
+/// greedy token is the first argmax of the step's own logits (bit for bit:
+/// no arithmetic on the greedy path) and the prefill's token at that
+/// position; sampled tokens (temperature, top-k, top-p, seed) agree between
+/// the prefill graph and the derived step over a run of k = 1 steps.
+#[test]
+fn glm_sampler_rides_the_derived_step() {
+    use crate::ir_sample::{sample_host, SampleSpec};
+    let d = GlmDims::tiny();
+    let mut pg = prefill_graph(&d);
+    let token = add_sampler(&mut pg, SampleSpec::default());
+    let w = weights(&pg);
+    let cap = 9;
+    let all = tokens(cap, d.vocab);
+    for params in [
+        [0.0, 1.0, 0.0, 0.0],
+        [0.8, 0.9, 6.0, 1234.0],
+        [1.3, 1.0, 0.0, 7.0],
+    ] {
+        let ins = |toks: &[usize]| -> Vec<Vec<f64>> {
+            pg.inputs
+                .iter()
+                .map(|s| match s.name.as_str() {
+                    "tokens" => toks.iter().map(|&t| t as f64).collect(),
+                    "sample.params" => params.to_vec(),
+                    n => w[n].iter().map(|&x| x as f64).collect(),
+                })
+                .collect()
+        };
+        // prefill over all positions: tokens per row
+        let full = pg.g.bind(&[(SEQ, cap)]).unwrap();
+        let out = full.eval(&ins(&all), &[pg.logits, token]);
+        for t in 0..cap {
+            let row = &out[0][t * d.vocab..(t + 1) * d.vocab];
+            let (want, _) = sample_host(row, params, t as u64, 64.0);
+            assert_eq!(out[1][t] as usize, want, "prefill row {t} {params:?}");
+        }
+        // derived steps from p0 = 4: k = 1 each, caches carried
+        let st = try_step_sampled(&pg, token, 1, cap).unwrap();
+        let p0 = 4;
+        let pre = pg.g.bind(&[(SEQ, p0)]).unwrap();
+        let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+        let vals = pre.eval(&ins(&all[..p0]), &nodes);
+        let mut caches = seed_caches(&pg, &st, &vals, p0, cap);
+        let pw = ins(&all);
+        for p in p0..cap {
+            let sins: Vec<Vec<f64>> = st
+                .inputs
+                .iter()
+                .map(|&si| match si {
+                    StepInput::Pos => vec![p as f64],
+                    StepInput::New(_) => vec![all[p] as f64],
+                    StepInput::Same(i) => pw[i].clone(),
+                    StepInput::Cache(c) => caches[c].clone(),
+                })
+                .collect();
+            let mut ids = st.outputs.clone();
+            ids.extend(st.caches.iter().map(|c| c.updated));
+            let got = st.graph.eval(&sins, &ids);
+            let (sl, stok) = (&got[0], got[1][0] as usize);
+            if params[0] <= 0.0 {
+                let am = (0..d.vocab)
+                    .max_by(|&a, &b| sl[a].total_cmp(&sl[b]).then(b.cmp(&a)))
+                    .unwrap();
+                assert_eq!(stok, am, "greedy step token is the step logits' argmax");
+            }
+            assert_eq!(stok, out[1][p] as usize, "step {p} vs prefill {params:?}");
+            for (c, v) in got[2..].iter().enumerate() {
+                caches[c] = v.clone();
+            }
+        }
+        eprintln!(
+            "params {params:?}: prefill tokens {:?}",
+            out[1].iter().map(|&x| x as usize).collect::<Vec<_>>()
+        );
+    }
+}
