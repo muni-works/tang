@@ -427,6 +427,44 @@ mod tests {
         (worst, nks)
     }
 
+    /// The many-row contraction split (`split_bilinear`) on the tiny coder
+    /// chunk step, thresholds at 1: the interpreter gives the same logits
+    /// and caches before and after.
+    #[test]
+    fn split_bilinear_keeps_the_step() {
+        let m = coder();
+        let w = weights(&m);
+        let k = 8;
+        let st = derive(&m, k, Rows::All).unwrap();
+        let toks: Vec<f64> = (0..k).map(|i| ((37 * i + 5) % vocab(&m)) as f64).collect();
+        let ins: Vec<Vec<f64>> = st
+            .inputs
+            .iter()
+            .map(|&x| match x {
+                StepInput::Pos => vec![3.0],
+                StepInput::New(_) => toks.clone(),
+                StepInput::Same(i) => w[&m.inputs[i].0].clone(),
+                StepInput::Cache(c) => {
+                    let n: usize = concrete(st.graph.shape(st.caches[c].input), 1).iter().product();
+                    (0..n).map(|j| ((j * 13 % 7) as f64 - 3.0) * 0.05).collect()
+                }
+            })
+            .collect();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let g = st.graph.split_bilinear_min(&ids, 1, 1).expect("something splits");
+        let a = st.graph.eval(&ins, &ids);
+        // (the factors come after their readers: evaluate in dependency order)
+        let (g, gids) = g.eliminate_dead(&ids);
+        let b = g.eval(&ins, &gids);
+        let mut worst = 0.0f64;
+        for (x, y) in a.iter().zip(&b) {
+            worst = worst.max(rel(y, x));
+        }
+        eprintln!("split_bilinear on the tiny coder k = {k} step: rel err {worst:.2e}");
+        assert!(worst < 1e-9, "{worst}");
+    }
+
     #[test]
     fn chunked_prefill_then_decode_on_the_cpu() {
         for m in [qwen(), coder()] {

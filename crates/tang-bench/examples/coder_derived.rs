@@ -118,8 +118,18 @@ fn main() {
     );
     let rt = runtime();
     eprintln!("runtime: {}", rt.name());
-    let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
+    // (dumped residual buffers stay live to the end, out of slot reuse)
+    let mut plan_outs = low.outs.clone();
+    if opt("--dump-resid").is_some() {
+        plan_outs.extend(residual_stream(&low.graph, &pg));
+    }
+    let plan = slot_plan(&low.program.program, &plan_outs, &low.inplace);
     let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
+    // --dump-resid FILE: every residual-stream buffer after the prompt
+    // (chunk mode) or after each prompt step (decode mode), f32 LE
+    let resid = residual_stream(&low.graph, &pg);
+    let dump = opt("--dump-resid");
+    let mut dumped: Vec<f32> = Vec::new();
     let RealStep {
         program,
         outs,
@@ -133,7 +143,11 @@ fn main() {
         .iter()
         .zip(&program.native)
         .map(|(k, &nat)| {
-            let nd = &graph.nodes()[k.node.index()];
+            let head = k.source.lines().next().unwrap_or("").to_string();
+            // nodes the lowering added (a split factor) have no entry here
+            let Some(nd) = graph.nodes().get(k.node.index()) else {
+                return ("(lowering node) gathers 0".to_string(), nat, head);
+            };
             let what = match graph.comp_at(k.node.index()) {
                 Some(c) => format!(
                     "{:?} red {:?} gathers {} int8 {}",
@@ -144,7 +158,7 @@ fn main() {
                 ),
                 None => format!("{:?} (not a comp) gathers 0", nd.shape),
             };
-            (what, nat, k.source.lines().next().unwrap_or("").to_string())
+            (what, nat, head)
         })
         .collect();
     let mut prog = Program::with_plan(&rt, program.program, &empty, &plan);
@@ -214,11 +228,10 @@ fn main() {
     if chunk > 1 {
         let n = ids.len() / chunk * chunk;
         let toks: Vec<f32> = ids[..n].iter().map(|&t| t as f32).collect();
-        // one warm chunk, then the real run from an empty cache
-        prog.write(&rt, prog.input(pos_in), &[0.0]);
-        prog.write(&rt, prog.input(tok_in), &toks[..chunk]);
-        prog.run(&rt);
-        let _ = prog.read(&rt, outs[0]);
+        // no warm-up chunk: a run updates caches in place, and the timed
+        // run must start from the empty session
+        let check_from: Option<usize> = opt("--check").map(|v| v.parse().unwrap());
+        let (mut agree, mut total) = (0usize, 0usize);
         let t = Instant::now();
         for c in 0..n / chunk {
             prog.write(&rt, prog.input(pos_in), &[(c * chunk) as f32]);
@@ -227,9 +240,35 @@ fn main() {
             for &(k, upd) in &swaps {
                 prog.copy(&rt, prog.input(k), &prog, upd);
             }
+            // --check: each row's argmax against the next prompt token
+            // (teacher-forced; the prompt a greedy k = 1 continuation)
+            if check_from.is_some() {
+                let l = prog.read(&rt, outs[0]);
+                for r in 0..chunk {
+                    let p = c * chunk + r;
+                    if p + 1 < n && p + 1 >= check_from.unwrap() {
+                        let row = &l[r * vocab..(r + 1) * vocab];
+                        let am = (0..vocab).fold(0, |b, i| if row[i] > row[b] { i } else { b });
+                        agree += usize::from(am == ids[p + 1]);
+                        total += 1;
+                    }
+                }
+            }
         }
-        let _ = prog.read(&rt, outs[0]);
+        if total > 0 {
+            println!("teacher-forced argmax = next token: {agree}/{total}");
+        }
+        let l = prog.read(&rt, outs[0]);
         let s = t.elapsed().as_secs_f64();
+        if let Some(p) = &dump {
+            for &r in &resid {
+                dumped.extend(prog.read(&rt, r));
+            }
+            let b: Vec<u8> = dumped.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(p, b).unwrap();
+            eprintln!("dumped {} residual buffers", resid.len());
+        }
+        println!("last row top: {:?}", logprobs(&l[l.len() - vocab..]));
         println!(
             "chunked prefill: {n} tokens in chunks of {chunk}: {:.1} ms = {:.1} tok/s ({:.2} ms a chunk)",
             s * 1e3,
@@ -245,6 +284,16 @@ fn main() {
     let t2 = Instant::now();
     for (p, &tok) in ids.iter().enumerate() {
         step(tok, p);
+        if dump.is_some() {
+            for &r in &resid {
+                dumped.extend(prog.read(&rt, r));
+            }
+        }
+    }
+    if let Some(p) = &dump {
+        let b: Vec<u8> = dumped.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(p, b).unwrap();
+        eprintln!("dumped {} residual buffers a step", resid.len());
     }
     let prompt_s = t2.elapsed().as_secs_f64();
     let mut out = Vec::new();

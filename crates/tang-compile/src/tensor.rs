@@ -45,6 +45,8 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_delta.rs"]
 mod cuda_delta;
+#[path = "tensor_cuda_split.rs"]
+mod cuda_split;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.

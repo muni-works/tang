@@ -2291,7 +2291,7 @@ impl TensorGraph {
     }
 }
 
-fn src_define(src: &str, name: &str) -> usize {
+pub(super) fn src_define(src: &str, name: &str) -> usize {
     src.lines()
         .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
         .and_then(|v| v.trim().parse().ok())
