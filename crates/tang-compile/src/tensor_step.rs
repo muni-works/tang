@@ -45,9 +45,12 @@
 //! last new row only; [`StepOptions::batch`] names a batch dim of
 //! independent sessions, each with its own `p0`.
 //!
-//! Not handled (an error, not a wrong graph): shifted or strided reads
-//! along `T` (convolutions over time would need a ring of the last few
-//! rows), position tables indexed by `T` through a fixed axis (write the
+//! **Rings** (`tensor_step_ring.rs`): a reduction masked to a window
+//! `t − W < j ≤ t`, and a guarded read a bounded way back along `T` (a
+//! causal conv), keep the last few positions instead of `capacity` rows.
+//!
+//! Not handled (an error, not a wrong graph): unguarded shifted or strided
+//! reads along `T`, position tables indexed by `T` through a fixed axis (write the
 //! lookup as a masked sum over the table, as `ir_qwen` does), gathers
 //! and guards over `T`, reshapes that move `T` off the outer dim,
 //! operator nodes, exclusive/reverse/log/max-plus/banded scans along `T`,
@@ -64,6 +67,10 @@ use super::{err, Arg, Comp, Dim, Form, Op, ShapeError, TensorGraph, TensorId, Vi
 /// sequence axis (the cache is the monoid / scan state).
 #[path = "tensor_step_scan.rs"]
 mod scan;
+
+#[path = "tensor_step_ring.rs"]
+mod ring;
+pub use ring::seed_cache;
 #[cfg(test)]
 #[path = "tensor_step_state_tests.rs"]
 mod state_tests;
@@ -132,6 +139,10 @@ pub struct CacheSlot {
     /// last position (`node`'s shape without its scan dim `axis`). Empty
     /// sequence: the monoid identity (zero for an affine scan).
     pub state: bool,
+    /// A ring cache (`tensor_step_ring.rs`): only the last `S` positions,
+    /// row `s` holding position `p0 − S + s` (NaN before position 0),
+    /// instead of `capacity` rows. `None`: rows by absolute position.
+    pub ring: Option<usize>,
 }
 
 /// The derived step.
@@ -153,6 +164,9 @@ enum Mode {
     Full,
     /// The last new row only (extent 1, position `p0 + k − 1`).
     Last,
+    /// Ring caches: the last `S` old positions then the new ones (extent
+    /// `S + k`, row `s` at position `p0 − S + s`); see `tensor_step_ring.rs`.
+    Win(usize),
 }
 
 type Modes = Vec<Option<Mode>>;
@@ -211,6 +225,7 @@ pub fn derive_step_with(
         inputs_memo: HashMap::new(),
         caches: Vec::new(),
         cache_of: HashMap::new(),
+        ring_of: HashMap::new(),
     };
     d.pos = match opts.batch {
         Some(b) => d.sg.input(&[Dim::Sym(b)]),
@@ -275,6 +290,8 @@ struct Deriver<'a> {
     inputs_memo: HashMap<(usize, Modes), TensorId>,
     caches: Vec<CacheSlot>,
     cache_of: HashMap<usize, usize>,
+    /// Ring caches by (node, `S`).
+    ring_of: HashMap<(usize, usize), usize>,
 }
 
 impl Deriver<'_> {
@@ -300,6 +317,7 @@ impl Deriver<'_> {
             Mode::New => self.spec.new,
             Mode::Full => self.spec.capacity,
             Mode::Last => 1,
+            Mode::Win(s) => s + self.spec.new,
         })
     }
 
@@ -333,6 +351,15 @@ impl Deriver<'_> {
         let t = match &node.op {
             Op::Iota(dim) => self.iota(n, *dim, &modes)?,
             Op::Input(_) | Op::Comp(_) if full_single => self.cache(n, tax[0])?,
+            // ring caches (tensor_step_ring.rs)
+            Op::Input(_) | Op::Comp(_)
+                if tax.len() == 1 && matches!(modes[tax[0]], Some(Mode::Win(_))) =>
+            {
+                let Some(Mode::Win(s)) = modes[tax[0]] else {
+                    unreachable!()
+                };
+                self.ring(n, tax[0], s)?
+            }
             // the last row of the new rows (one input, read once)
             Op::Input(_) if tax.len() == 1 && modes[tax[0]] == Some(Mode::Last) => {
                 let new = self.get(n, self.modes_with(n, Mode::New))?;
@@ -391,6 +418,8 @@ impl Deriver<'_> {
         let off = match modes[dim] {
             Some(Mode::New) => 0.0,
             Some(Mode::Last) => (self.spec.new - 1) as f64,
+            // ring caches (tensor_step_ring.rs)
+            Some(Mode::Win(s)) => return self.win_iota(it, &shape, s),
             _ => return Ok(it),
         };
         if self.opts.batch.is_some() {
@@ -548,6 +577,7 @@ impl Deriver<'_> {
             input,
             updated,
             state: false,
+            ring: None,
         });
         self.cache_of.insert(n, slot);
         Ok(updated)
@@ -575,6 +605,8 @@ impl Deriver<'_> {
                     ));
                 }
             }
+            // ring caches (tensor_step_ring.rs): window-masked reduce coords
+            self.windowed(c, &mut coord, pts);
         }
         let mut args = Vec::with_capacity(c.args.len());
         for (ai, a) in c.args.iter().enumerate() {
@@ -590,9 +622,15 @@ impl Deriver<'_> {
                 return err(format!("step: node {n} arg {ai} gathers over the sequence"));
             }
             if a.view.guard && src_seq {
-                return err(format!(
-                    "step: node {n} arg {ai} is a guarded read over the sequence"
-                ));
+                // ring caches (tensor_step_ring.rs): a read a bounded way back
+                let Some((smodes, view)) = self.shifted(c, a, &coord) else {
+                    return err(format!(
+                        "step: node {n} arg {ai} is a guarded read over the sequence"
+                    ));
+                };
+                let src = self.get(a.src.n(), smodes)?;
+                args.push(Arg { src, view });
+                continue;
             }
             let mut smodes = Modes::with_capacity(src_shape.len());
             for (sa, f) in a.view.forms.iter().enumerate() {
@@ -673,12 +711,10 @@ impl Deriver<'_> {
         let red: Vec<Dim> = c
             .red
             .iter()
-            .map(|&d| {
-                if self.is_seq(d) {
-                    self.extent(red_mode)
-                } else {
-                    d
-                }
+            .enumerate()
+            .map(|(r, &d)| match coord[pts + r] {
+                Some(m) => self.extent(m),
+                None => d,
             })
             .collect();
         let t = self.sg.push_comp(Comp {
