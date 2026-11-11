@@ -7,6 +7,10 @@
 //! 2. Time: the full encoder for the image (`argv[1]`, default the repo's
 //!    hurricane webp), `VISION_ITERS` timed runs (default 10): ms per image.
 //!
+//! Both run twice: the plain lowering, then with `DecodeOpts::mma` (the
+//! tensor-core tile for matmul-shaped kernels, TF32; `VISION_MMA_SHAPE`
+//! picks the block shape). The MMA check passes under 1e-2 (TF32).
+//!
 //! ```text
 //! DS41_DIR=/models/ds41-flash-links ds_vision_gpu [image]
 //! ```
@@ -94,22 +98,35 @@ fn main() {
         weight(n).into_iter().map(|v| v as f64).collect()
     });
     let want = eg.g.eval(&ins64, &[eg.out]).remove(0);
+    let optss = [
+        ("f32", DecodeOpts::default(), 1e-3),
+        (
+            "mma",
+            DecodeOpts {
+                mma: true,
+                mma_shape: env("VISION_MMA_SHAPE", 0),
+                ..Default::default()
+            },
+            1e-2,
+        ),
+    ];
     let (g, outs) = eg.g.eliminate_common(&[eg.out]);
-    let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
     let words: Vec<Vec<f32>> = ins64.iter().map(|v| v.iter().map(|&x| x as f32).collect()).collect();
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
-    let prog = Program::new(&rt, dp.program, &refs);
-    prog.run(&rt);
-    let got: Vec<f64> = prog.read(&rt, outs[0]).iter().map(|&x| x as f64).collect();
-    let err = rel(&got, &want);
-    let ok = err < 1e-3;
-    println!(
-        "check: {sh} x {sw} patches, {check_layers} blocks, device vs f64 interpreter rel err {err:.2e}: {}",
-        if ok { "PASS" } else { "FAIL" }
-    );
-    drop(prog);
-    if !ok {
-        std::process::exit(1);
+    for (name, opts, tol) in &optss {
+        let dp = lower(&rt, &g, &outs, opts);
+        let prog = Program::new(&rt, dp.program, &refs);
+        prog.run(&rt);
+        let got: Vec<f64> = prog.read(&rt, outs[0]).iter().map(|&x| x as f64).collect();
+        let err = rel(&got, &want);
+        let ok = err < *tol;
+        println!(
+            "check [{name}]: {sh} x {sw} patches, {check_layers} blocks, device vs f64 interpreter rel err {err:.2e}: {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            std::process::exit(1);
+        }
     }
 
     // 2. the full encoder for the image
@@ -132,29 +149,41 @@ fn main() {
         words.iter().map(|w| w.len()).sum::<usize>() as f64 / 1e9,
         t0.elapsed()
     );
-    let t0 = Instant::now();
     let (g, outs) = eg.g.eliminate_common(&[eg.out]);
-    let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
-    let nk = dp.program.kernels.len();
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
-    let prog = Program::new(&rt, dp.program, &refs);
-    eprintln!("{}: {nk} kernels, lowered + uploaded in {:.1?}", rt.name(), t0.elapsed());
-    prog.run(&rt);
-    let out = prog.read(&rt, outs[0]);
-    let finite = out.iter().all(|v| v.is_finite());
-    let iters = env("VISION_ITERS", 10);
-    let ms = prog.time(&rt, iters);
     let n = pl.patches();
-    // FLOPs: per block qkv + wo + mlp (2·N·C·(3C + C + 3·I)) + attention 4·N²·C
+    // FLOPs: per block qkv + wo + mlp (2·N·C·(4C + 3I)) + attention 4·N²·C
     let (c, i) = (vd.dim as f64, vd.inter as f64);
     let nf = n as f64;
     let flops = vd.n_layers as f64 * (2.0 * nf * c * (4.0 * c + 3.0 * i) + 4.0 * nf * nf * c)
         + 2.0 * pl.rows() as f64 * vd.llm_dim as f64 * (9.0 * c + vd.llm_dim as f64);
-    println!(
-        "ds41 vision encoder: {n} patches → {} rows x {}, {nk} kernels, {ms:.2} ms per image \
-         ({:.1} TFLOP/s f32), output finite: {finite}",
-        pl.rows(),
-        vd.llm_dim,
-        flops / ms / 1e9
-    );
+    let mut first: Option<Vec<f32>> = None;
+    for (name, opts, _) in &optss {
+        let t0 = Instant::now();
+        let dp = lower(&rt, &g, &outs, opts);
+        let nk = dp.program.kernels.len();
+        let prog = Program::new(&rt, dp.program, &refs);
+        eprintln!("{} [{name}]: {nk} kernels, lowered + uploaded in {:.1?}", rt.name(), t0.elapsed());
+        prog.run(&rt);
+        let out = prog.read(&rt, outs[0]);
+        let finite = out.iter().all(|v| v.is_finite());
+        let vs = match &first {
+            None => String::new(),
+            Some(f) => {
+                let a: Vec<f64> = out.iter().map(|&v| v as f64).collect();
+                let b: Vec<f64> = f.iter().map(|&v| v as f64).collect();
+                format!(", vs f32 lowering rel {:.2e}", rel(&a, &b))
+            }
+        };
+        let iters = env("VISION_ITERS", 10);
+        let ms = prog.time(&rt, iters);
+        println!(
+            "ds41 vision encoder [{name}]: {n} patches → {} rows x {}, {nk} kernels, {ms:.2} ms per image \
+             ({:.1} TFLOP/s), finite: {finite}{vs}",
+            pl.rows(),
+            vd.llm_dim,
+            flops / ms / 1e9
+        );
+        first.get_or_insert(out);
+    }
 }

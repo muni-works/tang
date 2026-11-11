@@ -1525,7 +1525,8 @@ pub(crate) mod tests {
     }
 
     /// Image spliced into the real DS prefill: the real image planned at an
-    /// 8-position budget (2 × 2 tokens, so the f64 expert tables fit), its
+    /// 4-position budget (`VISION_SPAN`; 1 × 1 token, so the f64 expert
+    /// tables fit), its
     /// real encoder rows and delimiters in the span, `DS_REAL_LAYERS` (0,2)
     /// real layers; graph prefill logits against the reference with the
     /// image present, then the derived step for the next text token.
@@ -1538,7 +1539,7 @@ pub(crate) mod tests {
         use tang_compile::tensor::step::{seed_cache, StepInput};
         let Some(mut run) = RealRun::from_env() else { return eprintln!("no checkpoint") };
         let vd0 = VisionDims::from_config(&run.cfg).unwrap();
-        let budget: usize = std::env::var("VISION_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let budget: usize = std::env::var("VISION_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
         let vd = VisionDims { max_tokens: budget, min_pixels: 0, ..vd0.clone() };
         run.vocab_ids.push(vd.image_token_id);
         run.vocab_ids.sort_unstable();
@@ -1555,8 +1556,9 @@ pub(crate) mod tests {
         eprintln!("encoder: plan {pl:?}, span {}, rel {e_enc:.2e}", pl.span());
         assert!(e_enc < 1e-12);
 
-        // prompt: two text tokens, the image, two text tokens (+1 decoded)
-        let text = [PROMPT[0], PROMPT[1], vd.image_token_id, PROMPT[2], PROMPT[3], PROMPT[4]];
+        // prompt: a text token, the image, a text token, then one decoded
+        // (short: the f64 graph holds every routed expert of the run)
+        let text = [PROMPT[0], vd.image_token_id, PROMPT[1], PROMPT[2]];
         let pr = expand_prompt(&text, &[pl], vd.image_token_id).unwrap();
         let dl = Delims {
             start: run.st.f64("image_start").unwrap(),
