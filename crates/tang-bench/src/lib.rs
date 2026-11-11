@@ -296,6 +296,9 @@ mod gpu_ds;
 /// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_coder_real;
+/// Qwen3-Coder-Next served from its derived step (`TANG_CODER_ENGINE=derived`).
+#[cfg(feature = "coder-serve")]
+pub mod coder_serve;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]

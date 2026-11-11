@@ -559,91 +559,10 @@ fn run<D: ComputeDevice>(
     Ok(())
 }
 
-/// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
-/// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR] [--batch N]`: the Flash engine (`flash::serve`):
-/// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
-/// drafts are on unless `--no-suffix`.
+/// `tang-llm serve <first shard.gguf> ...`: [`tang_llm::flash::serve::serve_cli`].
 #[cfg(feature = "cuda")]
 fn serve_flash(args: &[String]) -> Result<()> {
-    use tang_llm::flash::serve::{default_disk, FlashServe, Settings};
-    let gguf = PathBuf::from(&args[0]);
-    let mut s = Settings {
-        sampling: tang_llm::flash::serve::SamplingMode::Greedy,
-        disk: default_disk(&gguf),
-        gguf,
-        mtp: None,
-        ctx: 32_768,
-        temp: 0.0,
-        snapshots: 6,
-        warm: Vec::new(),
-        profile: None,
-        suffix: true,
-        warm_dir: None,
-        batch: 0,
-        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(12e9, |g| g * 1e9) as usize,
-        dump: None,
-    };
-    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
-    let mut key = std::env::var("TANG_API_KEY").ok();
-    let mut it = args[1..].iter();
-    while let Some(a) = it.next() {
-        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
-        match a.as_str() {
-            "--host" => host = val()?.clone(),
-            // live OTLP/HTTP export (otel builds); the default is the local file only
-            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
-            "--port" => port = val()?.parse()?,
-            "--ctx" => s.ctx = val()?.parse()?,
-            "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
-            "--temp" => s.temp = val()?.parse()?,
-            "--sampling" => {
-                s.sampling = match val()?.as_str() {
-                    "greedy" => tang_llm::flash::serve::SamplingMode::Greedy,
-                    "model-card" => tang_llm::flash::serve::SamplingMode::ModelCard,
-                    m => bail!("--sampling greedy|model-card, not {m}"),
-                }
-            }
-            "--snapshots" => s.snapshots = val()?.parse()?,
-            "--warm-request" => s.warm.push(PathBuf::from(val()?)),
-            "--profile" => s.profile = Some(PathBuf::from(val()?)),
-            "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
-            "--no-suffix" => s.suffix = false,
-            "--warm-dir" => s.warm_dir = Some(PathBuf::from(val()?)),
-            "--batch" => s.batch = val()?.parse()?,
-            "--api-key-file" => {
-                let path = val()?;
-                key =
-                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
-            }
-            other => bail!("unknown option {other}"),
-        }
-    }
-    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
-    }
-    let name = s
-        .gguf
-        .file_name()
-        .map(|n| {
-            n.to_string_lossy()
-                .split("-0000")
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let opts = tang_llm::server::Options {
-        addr: format!("{host}:{port}"),
-        model: Some(name),
-        key,
-        dtype: Dtype::Q4,
-        hardware: probe(Backend::Cuda),
-    };
-    tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+    tang_llm::flash::serve::serve_cli(args, probe(Backend::Cuda))
 }
 
 /// Where a DeepSeek step's time goes: prefill + N decode/verify forwards with the step
