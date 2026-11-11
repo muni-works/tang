@@ -154,7 +154,7 @@ impl DsDims {
             window: 4,
             compress_ratios: vec![0, 2, 2],
             kv_source_layers: vec![1],
-            index_source_layers: vec![1],
+            index_source_layers: vec![1, 2],
             index_n_heads: 2,
             index_head_dim: 8,
             index_topk: 2,
@@ -597,6 +597,8 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
     // per layer: (compressed kv [T, hd], top-k [T, 2k]) of the sources
     let mut ckv_of: Vec<Option<TensorId>> = vec![None; dm.n_layers];
     let mut top_of: Vec<Option<TensorId>> = vec![None; dm.n_layers];
+    // the KV sources' pooled latents before RoPE (the indexer keys' input)
+    let mut lat_of: Vec<Option<TensorId>> = vec![None; dm.n_layers];
     for l in 0..dm.n_layers {
         let p = format!("layers.{l}");
         let r = dm.compress_ratios[l];
@@ -672,8 +674,11 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
                 let ckv = b.rope(lat, 1, hd, fr, -(r as i64 - 1), false);
                 b.name(format!("{p}.compressed_kv"), ckv);
                 ckv_of[l] = Some(ckv);
-
+                lat_of[l] = Some(lat);
+            }
                 if dm.index_source_layers.contains(&l) {
+                    // an index-only layer keys its own indexer off its KV source's latent
+                    let lat = lat_of[dm.source(&dm.kv_source_layers, l)].unwrap();
                     let fri = b.w(format!("{p}.attn.indexer.freqs"), &[ihd / 2]);
                     let wk = b.w(format!("{p}.attn.indexer.wk.weight"), &[ihd, hd]);
                     let knorm = b.w(format!("{p}.attn.indexer.k_norm.weight"), &[ihd]);
@@ -742,7 +747,6 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
                     b.name(format!("{p}.topk"), top);
                     top_of[l] = Some(top);
                 }
-            }
         }
 
         // scores [T, H, T] (window keys, then compressed rows)
@@ -1251,6 +1255,8 @@ pub(crate) mod tests {
         pub(crate) w: &'a Weights,
         pub(crate) bugs: Bugs,
         pub(crate) load: Option<LoadExpert<'a>>,
+        /// KV sources' pooled latents before RoPE, for the indexers keyed off them.
+        pub(crate) lat: std::cell::RefCell<HashMap<usize, Vec<f64>>>,
     }
 
     fn mm(x: &[f64], t: usize, w: &[f64], n: usize, k: usize) -> Vec<f64> {
@@ -1481,16 +1487,19 @@ pub(crate) mod tests {
                         }
                     }
                     self.rms(&mut lat, &format!("{p}.attn.compressor.norm.weight"));
-                    if dm.index_source_layers.contains(&l) {
-                        let sel = if ng == 0 {
-                            vec![Vec::new(); t]
-                        } else {
-                            self.indexer(l, x, &qr, &lat)
-                        };
-                        topk.insert(l, sel);
-                    }
+                    self.lat.borrow_mut().insert(l, lat.clone());
                     rope(&mut lat, hd, rd, 1, &fr, |j| (j * r) as f64, false);
                     ckv.insert(l, lat);
+                }
+                if dm.index_source_layers.contains(&l) {
+                    // an index-only layer keys its own indexer off its KV source's latent
+                    let lat = self.lat.borrow()[&dm.source(&dm.kv_source_layers, l)].clone();
+                    let sel = if t / r == 0 {
+                        vec![Vec::new(); t]
+                    } else {
+                        self.indexer(l, x, &qr, &lat)
+                    };
+                    topk.insert(l, sel);
                 }
                 let c = &ckv[&dm.source(&dm.kv_source_layers, l)];
                 kv.extend_from_slice(c);
@@ -1764,6 +1773,7 @@ pub(crate) mod tests {
                 w: &w,
                 bugs: Bugs::default(),
                 load: None,
+                lat: Default::default(),
             }
             .forward(&all[..t]);
             let e = rel(&got[0], &want);
@@ -1811,6 +1821,7 @@ pub(crate) mod tests {
                 w: &w,
                 bugs,
                 load: None,
+                lat: Default::default(),
             }
             .forward(&all);
             let e = rel(&got[0], &want);

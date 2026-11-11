@@ -610,6 +610,7 @@ mod tests {
             w: &w,
             bugs: Bugs::default(),
             load: Some(&load),
+            lat: Default::default(),
         }
         .forward(&toks);
         let used: Vec<Vec<usize>> = used

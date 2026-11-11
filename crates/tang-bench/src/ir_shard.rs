@@ -117,6 +117,8 @@ pub struct Case {
     pub outs: Vec<TensorId>,
     pub want: Vec<Vec<f64>>,
     pub weights: HashSet<TensorId>,
+    /// `(cache input, index into outs of its update)`.
+    pub caches: Vec<(TensorId, usize)>,
 }
 
 pub fn case(m: &Model, k: usize, p0: usize) -> Case {
@@ -149,7 +151,13 @@ pub fn case(m: &Model, k: usize, p0: usize) -> Case {
     outs.extend(st.caches.iter().map(|c| c.updated));
     let want = st.graph.eval(&ins, &outs);
     let weights: HashSet<TensorId> = weight_inputs(m, &st).into_iter().map(|(t, _)| t).collect();
-    Case { st, ins, outs, want, weights }
+    let caches = cache_pairs(&st);
+    Case { st, ins, outs, want, weights, caches }
+}
+
+/// Each cache's input and the index of its update in `outputs ++ updated`.
+pub fn cache_pairs(st: &StepGraph) -> Vec<(TensorId, usize)> {
+    st.caches.iter().enumerate().map(|(c, s)| (s.input, st.outputs.len() + c)).collect()
 }
 
 /// Worst `|a − b| / max|b|` over the finite reference entries (unwritten
@@ -177,7 +185,7 @@ mod tests {
     /// eager plan (every split the rules take) and the 8×H200 plan, whole
     /// and cut into segments at the collectives.
     fn check(m: &Model, k: usize, worlds: &[usize]) {
-        let Case { st, ins, outs, want, weights: ws } = case(m, k, 5);
+        let Case { st, ins, outs, want, weights: ws, caches } = case(m, k, 5);
         assert!(want[0].iter().all(|x| x.is_finite()));
         let one = |_: TensorId| 1.0;
         let dense = |n: usize| {
@@ -186,7 +194,7 @@ mod tests {
         };
         for &n in worlds {
             for (label, cm) in [("eager", CostModel::eager()), ("8xH200", CostModel::h200())] {
-                let plan = plan_auto(&st.graph, &outs, &ws, n, &one, &cm);
+                let plan = plan_auto(&st.graph, &outs, &ws, &caches, n, &one, &cm);
                 let an = analyze(&st.graph, &outs, &plan);
                 let got = simulate(&st.graph, &outs, &an, &ws, &ins);
                 let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
@@ -229,13 +237,44 @@ mod tests {
         check(&m, 2, &[8]);
     }
 
+    /// GDN under TP (joint moves in `plan_auto`): the scans run split by head and their state caches
+    /// stay split per rank (no gather of the state each step).
+    #[test]
+    fn coder_gdn_scans_split_by_head() {
+        use tang_compile::tensor::shard::Place;
+        use tang_compile::tensor::Op;
+        let m = coder_model(coder_wide());
+        // two rows: the step keeps a real scan (one row lowers to plain comps)
+        let Case { st, ins, outs, want, weights: ws, caches } = case(&m, 2, 5);
+        for n in [2usize, 4, 8] {
+            let plan = plan_auto(&st.graph, &outs, &ws, &caches, n, &|_| 1.0, &CostModel::eager());
+            let an = analyze(&st.graph, &outs, &plan);
+            let scans: Vec<bool> = st
+                .graph
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, nd)| matches!(nd.op, Op::Scan(_)))
+                .map(|(i, _)| matches!(an.place[i], Place::S(_)))
+                .collect();
+            let local = an.out_local.iter().filter(|l| l.is_some()).count();
+            eprintln!("coder N={n}: {}/{} scans split, {local} caches kept split", scans.iter().filter(|&&b| b).count(), scans.len());
+            assert!(!scans.is_empty() && scans.iter().any(|&b| b), "N={n}: no scan split");
+            assert!(local > 0, "N={n}: no cache kept split");
+            let got = simulate(&st.graph, &outs, &an, &ws, &ins);
+            let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+            eprintln!("  rel err {err:.2e}");
+            assert!(err < 1e-9, "N={n}: sharded GDN diverges");
+        }
+    }
+
     /// The check notices a wrong program: the same plan with every
     /// all-reduce dropped (partial sums left per rank) diverges.
     #[test]
     fn negative_control_dropped_all_reduce_fails() {
         for m in [ds_model(ds_wide()), coder_model(coder_wide())] {
-            let Case { st, ins, outs, want, weights: ws } = case(&m, 1, 5);
-            let plan = plan_auto(&st.graph, &outs, &ws, 4, &|_| 1.0, &CostModel::eager());
+            let Case { st, ins, outs, want, weights: ws, caches } = case(&m, 1, 5);
+            let plan = plan_auto(&st.graph, &outs, &ws, &caches, 4, &|_| 1.0, &CostModel::eager());
             let mut an = analyze(&st.graph, &outs, &plan);
             for c in an.conv.iter_mut().flatten().chain(an.out_conv.iter_mut()) {
                 if *c == Some(CollKind::AllReduce) {
@@ -260,11 +299,10 @@ mod tests {
         let cfg = crate::ir_ds_real::load_config(std::path::Path::new(&dir)).expect("DS41_DIR config");
         let layers: Vec<usize> = (0..cfg["n_layers"].as_u64().unwrap() as usize).collect();
         let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
-        let mut dm = crate::ir_ds_real::dims_from_config(&cfg, &layers, vocab, 0, 4096);
-        // the prefill builder makes an indexer only at layers that also
-        // compress KV (2, 8, 14, 20); 24..36 then reuse layer 20's top-k
-        // (their own indexer weights are ~6 MB fp8 a layer, replicated)
-        dm.index_source_layers.retain(|l| dm.kv_source_layers.contains(l));
+        let dm = crate::ir_ds_real::dims_from_config(&cfg, &layers, vocab, 0, 4096);
+        // every index source has its own indexer (24..36 keyed off layer
+        // 20's compressed latent); ~6 MB fp8 a layer, replicated
+        eprintln!("index sources {:?}, KV sources {:?}", dm.index_source_layers, dm.kv_source_layers);
         let (l, inter, d) = (dm.n_layers, dm.moe_inter, dm.dim);
         let t0 = std::time::Instant::now();
         let m = Model { cap: 4096, ..ds_model(dm.clone()) };
@@ -279,7 +317,7 @@ mod tests {
         for (n, bw, label) in [(8usize, 4.8e12, "8xH200"), (4, 4.8e12, "4xH200")] {
             let t0 = std::time::Instant::now();
             let cm = CostModel::h200();
-            let plan = plan_auto(&st.graph, &outs, &ws, n, &elem, &cm);
+            let plan = plan_auto(&st.graph, &outs, &ws, &crate::ir_shard::cache_pairs(&st), n, &elem, &cm);
             let an = analyze(&st.graph, &outs, &plan);
             let c = step_cost(&st.graph, &outs, &an, &ws, &elem, &cm);
             let s = summary(&plan, &an);

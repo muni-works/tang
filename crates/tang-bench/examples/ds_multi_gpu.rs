@@ -21,7 +21,7 @@ use tang_bench::ir_shard::{case, coder_model, coder_wide, ds_model, ds_wide, nat
 use tang_bench::qwen_session::lower;
 use tang_compile::tensor::cuda_gemv::DecodeOpts;
 use tang_compile::tensor::shard::{
-    analyze, input_shapes, plan_auto, rank_program, segments, CollKind, Comm, CostModel, Feed, HostComm,
+    analyze, assemble, input_shapes, plan_auto, rank_program, segments, CollKind, Comm, CostModel, Feed, HostComm,
 };
 use tang_compile::tensor::TensorId;
 use tang_gpu::program::{Program, Runtime};
@@ -80,7 +80,8 @@ fn real_case() -> (Case, HashMap<TensorId, String>) {
     outs.extend(st.caches.iter().map(|c| c.updated));
     let want = st.graph.eval(&ins, &outs);
     let weights: HashSet<TensorId> = wnames.keys().copied().collect();
-    (Case { st, ins, outs, want, weights }, wnames)
+    let caches = tang_bench::ir_shard::cache_pairs(&st);
+    (Case { st, ins, outs, want, weights, caches }, wnames)
 }
 
 fn main() {
@@ -97,7 +98,7 @@ fn main() {
     eprintln!("{model}: step + interpreter reference in {:.1?}", t0.elapsed());
     let elem = |t: TensorId| names.get(&t).map_or(1.0, |n| native_bytes(n));
     let cm = if eager { CostModel::eager() } else { CostModel::h200() };
-    let plan = plan_auto(&c.st.graph, &c.outs, &c.weights, world, &elem, &cm);
+    let plan = plan_auto(&c.st.graph, &c.outs, &c.weights, &c.caches, world, &elem, &cm);
     let an = analyze(&c.st.graph, &c.outs, &plan);
     let s = summary(&plan, &an);
     eprintln!(
@@ -105,6 +106,11 @@ fn main() {
         s.experts, s.splits, s.all_reduce, s.all_gather
     );
     let comm = HostComm::new(world);
+    let use_nccl = std::env::var("MGPU_COMM").as_deref() == Ok("nccl");
+    #[cfg(feature = "nccl")]
+    let nccl_id = use_nccl.then(|| tang_moe::nccl::unique_id().expect("libnccl"));
+    #[cfg(not(feature = "nccl"))]
+    assert!(!use_nccl, "MGPU_COMM=nccl needs --features nccl");
     let shapes = input_shapes(&c.st.graph);
     let results: Vec<(Vec<Vec<f64>>, f64)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..world)
@@ -165,6 +171,18 @@ fn main() {
                         }
                         sg.outputs.iter().map(|o| vals[o].clone()).collect()
                     };
+                    #[cfg(feature = "nccl")]
+                    if let Some(id) = nccl_id {
+                        let dev = nccl::Rank::new(r, world, id);
+                        let dstep = || dev.step(&rt, &sg, &progs, &ins);
+                        let out = dstep();
+                        let t = Instant::now();
+                        let iters = 20;
+                        for _ in 0..iters {
+                            dstep();
+                        }
+                        return (out, t.elapsed().as_secs_f64() * 1e3 / iters as f64);
+                    }
                     let out = step();
                     let t = Instant::now();
                     let iters = 5;
@@ -177,15 +195,125 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let worst = results[0].0.iter().zip(&c.want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+    let ranks: Vec<Vec<Vec<f64>>> = results.iter().map(|r| r.0.clone()).collect();
+    let got = assemble(&c.st.graph, &c.outs, &an, &ranks);
+    let worst = got.iter().zip(&c.want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
     let ok = worst < 1e-3;
     println!(
         "{model} on {world} GPUs: rank 0 vs unsharded interpreter rel err {worst:.2e}, {:.2} ms a step \
-         (host collectives, f32 weights): {}",
+         ({} collectives, f32 weights): {}",
         results[0].1,
+        if use_nccl { "NCCL device" } else { "host" },
         if ok { "PASS" } else { "FAIL" }
     );
     if !ok {
         std::process::exit(1);
+    }
+}
+
+/// Collectives on the device: segment outputs stay in their programs'
+/// buffers, a collective reads one in place into a staging buffer and NCCL
+/// reduces / gathers it on the runtime's own stream, and fed inputs are
+/// device-to-device copies. Nothing crosses to the host until the outputs.
+#[cfg(feature = "nccl")]
+mod nccl {
+    use std::collections::HashMap;
+    use std::mem::ManuallyDrop;
+
+    use tang_compile::tensor::shard::{gather_copies, CollKind, Feed, Segmented};
+    use tang_compile::tensor::TensorId;
+    use tang_gpu::program::{Program, Runtime};
+    use tang_moe::gpu::{copy_d2d_async, DevBuf, Gpu, Stream};
+    use tang_moe::nccl::{Comm, UniqueId};
+
+    pub struct Rank {
+        comm: Comm,
+        world: usize,
+        // staging per collective (by its rank-program node): (send, recv, result)
+        bufs: std::cell::RefCell<HashMap<usize, (DevBuf, DevBuf, DevBuf)>>,
+    }
+
+    /// Where a rank-program node's value lives on the device.
+    #[derive(Clone, Copy)]
+    enum Loc {
+        Prog(usize, TensorId),
+        Buf(u64, usize),
+    }
+
+    impl Rank {
+        pub fn new(rank: usize, world: usize, id: UniqueId) -> Self {
+            Gpu::at(rank).and_then(|g| g.bind()).expect("bind device");
+            let comm = Comm::new(rank, world, id).expect("ncclCommInitRank");
+            Rank { comm, world, bufs: Default::default() }
+        }
+
+        pub fn step(
+            &self,
+            rt: &Runtime,
+            sg: &Segmented,
+            progs: &[Option<(Program, Vec<TensorId>)>],
+            ins: &[Vec<f64>],
+        ) -> Vec<Vec<f64>> {
+            // the runtime's stream, not owned here
+            let s = ManuallyDrop::new(Stream(rt.cu_stream()));
+            let mut loc: HashMap<usize, Loc> = HashMap::new();
+            let ptr = |l: Loc| -> (u64, usize) {
+                match l {
+                    Loc::Prog(si, t) => progs[si].as_ref().unwrap().0.cuda_buffer(rt, t),
+                    Loc::Buf(p, n) => (p, n),
+                }
+            };
+            let mut bufs = self.bufs.borrow_mut();
+            for (si, seg) in sg.segments.iter().enumerate() {
+                for b in &sg.before[si] {
+                    let (src, n) = ptr(loc[&b.src]);
+                    let full = match b.kind {
+                        CollKind::AllReduce => n,
+                        CollKind::AllGather(_) => n * self.world,
+                    };
+                    let (send, recv, res) = bufs.entry(b.dst).or_insert_with(|| {
+                        (DevBuf::zeroed(n * 4).unwrap(), DevBuf::zeroed(full * 4).unwrap(), DevBuf::zeroed(full * 4).unwrap())
+                    });
+                    match b.kind {
+                        CollKind::AllReduce => {
+                            copy_d2d_async(res.ptr, src, n * 4, &s).unwrap();
+                            self.comm.all_reduce_sum_f32(res, n, &s).unwrap();
+                        }
+                        CollKind::AllGather(_) => {
+                            copy_d2d_async(send.ptr, src, n * 4, &s).unwrap();
+                            self.comm.all_gather_f32(send, recv, n, &s).unwrap();
+                            for (a, d, len) in gather_copies(self.world, b.outer, n) {
+                                copy_d2d_async(res.ptr + 4 * d as u64, recv.ptr + 4 * a as u64, len * 4, &s).unwrap();
+                            }
+                        }
+                    }
+                    loc.insert(b.dst, Loc::Buf(res.ptr, full));
+                }
+                let Some((prog, outs)) = &progs[si] else { continue };
+                for (k, f) in seg.feeds.iter().enumerate() {
+                    if let Feed::Value(n) = f {
+                        let (dst, dn) = prog.cuda_buffer(rt, prog.input(k));
+                        let (src, sn) = ptr(loc[n]);
+                        assert_eq!(dn, sn, "fed value length");
+                        copy_d2d_async(dst, src, dn * 4, &s).unwrap();
+                    }
+                }
+                prog.run(rt);
+                for (d, o) in seg.defines.iter().zip(outs) {
+                    loc.insert(*d, Loc::Prog(si, *o));
+                }
+            }
+            let _ = ins;
+            sg.outputs
+                .iter()
+                .map(|o| match loc[o] {
+                    Loc::Prog(si, t) => progs[si].as_ref().unwrap().0.read(rt, t).iter().map(|&x| x as f64).collect(),
+                    Loc::Buf(p, n) => {
+                        rt.sync();
+                        ManuallyDrop::new(DevBuf { ptr: p, len: n * 4 }).read::<f32>(0, n).unwrap().iter().map(|&x| x as f64).collect()
+                    }
+                })
+                .collect()
+        }
     }
 }

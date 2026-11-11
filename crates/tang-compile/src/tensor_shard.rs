@@ -63,6 +63,10 @@ pub struct ShardPlan {
     pub world: usize,
     /// Input node → placement (absent: replicated).
     pub inputs: HashMap<TensorId, WeightPlace>,
+    /// Caches: `(input node, index into outputs of its updated value)`. A
+    /// cache whose update comes out split is kept split per rank (its
+    /// input takes the same split): the GDN state and KV split by head.
+    pub caches: Vec<(TensorId, usize)>,
 }
 
 /// A masked partial's owner test: rank `r` holds point `p` iff
@@ -125,6 +129,8 @@ pub struct Analysis {
     pub conv: Vec<Vec<Option<CollKind>>>,
     /// The step outputs' collectives (an output not `R`).
     pub out_conv: Vec<Option<CollKind>>,
+    /// Outputs left split across ranks (sharded caches): the dim.
+    pub out_local: Vec<Option<usize>>,
     pub collectives: Vec<Collective>,
 }
 
@@ -270,10 +276,11 @@ fn linear_in(c: &Comp, lin: &[usize]) -> bool {
 }
 
 /// Propagate placements through `g` (topologically ordered, as built).
-pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analysis {
+type Sweep = (Vec<Place>, Vec<Option<usize>>, Vec<Vec<Option<CollKind>>>);
+
+fn sweep(g: &TensorGraph, live: &[bool], plan: &ShardPlan, cache_place: &HashMap<TensorId, Place>) -> Sweep {
     let n = g.nodes.len();
     let world = plan.world;
-    let live = g.live(outputs);
     let mut place = vec![Place::R; n];
     let mut split = vec![None; n];
     let mut conv: Vec<Vec<Option<CollKind>>> = (0..n).map(|i| vec![None; dep_srcs(g, i).len()]).collect();
@@ -281,10 +288,11 @@ pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analy
         let shape = fixed(&g.nodes[i].shape);
         match &g.nodes[i].op {
             Op::Input(_) => {
-                place[i] = match plan.inputs.get(&TensorId(i as u32)) {
+                let t = TensorId(i as u32);
+                place[i] = match plan.inputs.get(&t) {
                     Some(WeightPlace::Split(d)) => Place::S(*d),
                     Some(WeightPlace::Experts) => Place::Ep,
-                    _ => Place::R,
+                    _ => cache_place.get(&t).cloned().unwrap_or(Place::R),
                 }
             }
             Op::Iota(_) => {}
@@ -307,7 +315,10 @@ pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analy
                     }
                 }
             }
-            Op::Operator(_) | Op::Scan(_) => {
+            Op::Scan(sc) => {
+                place[i] = scan_rule(g, sc, &place, &mut conv[i], &shape);
+            }
+            Op::Operator(_) => {
                 for (k, s) in dep_srcs(g, i).iter().enumerate() {
                     conv[i][k] = to_r(&place[s.n()]);
                 }
@@ -319,7 +330,76 @@ pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analy
             }
         }
     }
-    let out_conv: Vec<Option<CollKind>> = outputs.iter().map(|o| to_r(&place[o.n()])).collect();
+    (place, split, conv)
+}
+
+/// A scan is independent along its leading (non-matrix, non-scan) dims:
+/// inputs all split on the same such dim give an output split on it.
+fn scan_rule(g: &TensorGraph, sc: &Scan, place: &[Place], conv: &mut [Option<CollKind>], out: &[usize]) -> Place {
+    let lead = match &sc.kind {
+        ScanKind::Monoid(m) => out.len() - usize::from(m.width > 1),
+        ScanKind::Affine { .. } => out.len() - 2,
+    };
+    let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
+    if let Some(Place::S(d)) = ps.first() {
+        let d = *d;
+        let ok = d < lead
+            && d != sc.dim
+            && ps.iter().zip(&sc.inputs).all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
+        if ok {
+            return Place::S(d);
+        }
+    }
+    for (k, p) in ps.iter().enumerate() {
+        conv[k] = to_r(p);
+    }
+    Place::R
+}
+
+/// Propagate placements through `g` (topologically ordered, as built).
+pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analysis {
+    let n = g.nodes.len();
+    let world = plan.world;
+    let live = g.live(outputs);
+    // caches follow their updates: shard a cache whose update comes out
+    // split, drop it again if the split doesn't hold (each tried once)
+    let mut cache_place: HashMap<TensorId, Place> = HashMap::new();
+    let mut tried: HashSet<TensorId> = HashSet::new();
+    let (place, split, conv) = loop {
+        let (place, split, conv) = sweep(g, &live, plan, &cache_place);
+        let mut changed = false;
+        for &(inp, oi) in &plan.caches {
+            let po = &place[outputs[oi].n()];
+            let cur = cache_place.get(&inp).cloned().unwrap_or(Place::R);
+            match po {
+                Place::S(_) if cur == Place::R && tried.insert(inp) => {
+                    cache_place.insert(inp, po.clone());
+                    changed = true;
+                }
+                _ if cur != Place::R && *po != cur => {
+                    cache_place.remove(&inp);
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break (place, split, conv);
+        }
+    };
+    let mut out_local: Vec<Option<usize>> = vec![None; outputs.len()];
+    for &(inp, oi) in &plan.caches {
+        if let (Some(Place::S(d)), Place::S(e)) = (cache_place.get(&inp), &place[outputs[oi].n()]) {
+            if d == e {
+                out_local[oi] = Some(*d);
+            }
+        }
+    }
+    let out_conv: Vec<Option<CollKind>> = outputs
+        .iter()
+        .zip(&out_local)
+        .map(|(o, l)| if l.is_some() { None } else { to_r(&place[o.n()]) })
+        .collect();
     // one collective per (source, kind)
     let mut seen = HashSet::new();
     let mut collectives = Vec::new();
@@ -350,6 +430,7 @@ pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analy
         split,
         conv,
         out_conv,
+        out_local,
         collectives,
     }
 }
@@ -722,6 +803,8 @@ pub fn rank_program(
                         None => remap[s].unwrap(),
                     };
                 }
+                // split by a leading (independent) dim: each rank scans its slice
+                node.shape = local_shape(&full, p).into_iter().map(Dim::Fixed).collect();
             }
             Op::Comp(c) => {
                 let space: Vec<usize> = c.space().iter().map(|d| d.n()).collect();
@@ -853,7 +936,7 @@ pub fn simulate(
     let progs: Vec<RankProgram> = (0..an.world)
         .map(|r| rank_program(g, outputs, an, weights, r, comm.clone()))
         .collect();
-    let mut res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
+    let res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
         let hs: Vec<_> = progs
             .iter()
             .map(|p| {
@@ -864,12 +947,34 @@ pub fn simulate(
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     for r in 1..res.len() {
-        let same = res[r].iter().zip(&res[0]).all(|(a, b)| {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        let same = res[r].iter().zip(&res[0]).zip(&an.out_local).all(|((a, b), l)| {
+            l.is_some() || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
         });
         assert!(same, "rank {r} disagrees with rank 0");
     }
-    res.swap_remove(0)
+    assemble(g, outputs, an, &res)
+}
+
+/// The step's outputs from every rank's: replicated outputs from rank 0,
+/// outputs left split ([`Analysis::out_local`]) concatenated along their dim.
+pub fn assemble(g: &TensorGraph, outputs: &[TensorId], an: &Analysis, ranks: &[Vec<Vec<f64>>]) -> Vec<Vec<f64>> {
+    (0..outputs.len())
+        .map(|o| match an.out_local[o] {
+            None => ranks[0][o].clone(),
+            Some(d) => {
+                let full = fixed(&g.nodes[outputs[o].n()].shape);
+                let outer: usize = full[..d].iter().product();
+                let row = ranks[0][o].len() / outer;
+                let mut v = Vec::with_capacity(row * outer * an.world);
+                for i in 0..outer {
+                    for r in ranks {
+                        v.extend_from_slice(&r[o][i * row..(i + 1) * row]);
+                    }
+                }
+                v
+            }
+        })
+        .collect()
 }
 
 /// Full shapes of the graph inputs by input index.
@@ -1016,11 +1121,12 @@ pub fn plan_auto(
     g: &TensorGraph,
     outputs: &[TensorId],
     weights: &HashSet<TensorId>,
+    caches: &[(TensorId, usize)],
     world: usize,
     elem: &dyn Fn(TensorId) -> f64,
     cm: &CostModel,
 ) -> ShardPlan {
-    let mut plan = ShardPlan { world, inputs: HashMap::new() };
+    let mut plan = ShardPlan { world, inputs: HashMap::new(), caches: caches.to_vec() };
     if world == 1 {
         return plan;
     }
@@ -1042,6 +1148,7 @@ pub fn plan_auto(
         .filter(|t| numel(&g.nodes[t.n()].shape) as f64 * elem(*t) / cm.hbm >= 0.05 * cm.latency)
         .collect();
     cands.sort_by_key(|t| (std::cmp::Reverse(numel(&g.nodes[t.n()].shape)), t.n()));
+    let mut failed = Vec::new();
     for t in cands {
         let shape = fixed(&g.nodes[t.n()].shape);
         let mut pick = None;
@@ -1060,9 +1167,79 @@ pub fn plan_auto(
             Some(d) => plan.inputs.insert(t, WeightPlace::Split(d)),
             None => plan.inputs.remove(&t),
         };
+        if pick.is_none() {
+            failed.push(t);
+        }
+    }
+    // Joint moves: a block split by head (GDN: in-projections, conv, decay
+    // and output projection) only pays once every weight in it is split; one
+    // alone just adds gathers. For each split that lost on its own, keep it
+    // tentatively and greedily co-split the weights built next to it (input
+    // order follows the builder, so neighbours are the same layer, 1-D ones
+    // included); adopt the group if the step got cheaper.
+    let mut near: Vec<TensorId> = weights.iter().copied().filter(|t| !plan.inputs.contains_key(t)).collect();
+    near.sort_by_key(|t| t.n());
+    for t in failed {
+        if plan.inputs.contains_key(&t) {
+            continue;
+        }
+        let at = near.iter().position(|u| *u == t).unwrap();
+        let hood: Vec<TensorId> = near[at.saturating_sub(JOINT_REACH)..(at + JOINT_REACH + 1).min(near.len())]
+            .iter()
+            .copied()
+            .filter(|u| *u != t && !plan.inputs.contains_key(u))
+            .collect();
+        let shape = fixed(&g.nodes[t.n()].shape);
+        let mut adopt: Option<(f64, Vec<(TensorId, usize)>)> = None;
+        for d in 0..shape.len() {
+            if shape[d] % world != 0 || shape[d] < world {
+                continue;
+            }
+            let mut trial = plan.clone();
+            trial.inputs.insert(t, WeightPlace::Split(d));
+            let mut group = vec![(t, d)];
+            let mut cur = cost(&trial);
+            for &u in &hood {
+                let us = fixed(&g.nodes[u.n()].shape);
+                let mut upick = None;
+                for e in 0..us.len() {
+                    if us[e] % world != 0 || us[e] < world {
+                        continue;
+                    }
+                    trial.inputs.insert(u, WeightPlace::Split(e));
+                    let c = cost(&trial);
+                    if c < cur * (1.0 - 1e-9) {
+                        cur = c;
+                        upick = Some(e);
+                    }
+                }
+                match upick {
+                    Some(e) => {
+                        trial.inputs.insert(u, WeightPlace::Split(e));
+                        group.push((u, e));
+                    }
+                    None => {
+                        trial.inputs.remove(&u);
+                    }
+                }
+            }
+            let bar = adopt.as_ref().map_or(best, |a| a.0);
+            if cur < bar * (1.0 - 1e-9) {
+                adopt = Some((cur, group));
+            }
+        }
+        if let Some((c, group)) = adopt {
+            best = c;
+            for (u, e) in group {
+                plan.inputs.insert(u, WeightPlace::Split(e));
+            }
+        }
     }
     plan
 }
+
+/// How many weights on each side (in input order) a joint move tries.
+const JOINT_REACH: usize = 12;
 
 /// One line about node `t`: its op, args and views (debugging plans).
 pub fn describe(g: &TensorGraph, t: TensorId) -> String {
@@ -1293,7 +1470,7 @@ pub fn simulate_segmented(
     let shapes = input_shapes(g);
     let progs: Vec<RankProgram> =
         (0..an.world).map(|r| rank_program(g, outputs, an, weights, r, comm.clone())).collect();
-    let mut res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
+    let res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
         let hs: Vec<_> = progs
             .iter()
             .enumerate()
@@ -1305,5 +1482,50 @@ pub fn simulate_segmented(
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    res.swap_remove(0)
+    assemble(g, outputs, an, &res)
+}
+
+/// An all-gather done by a collective that concatenates rank-major (NCCL:
+/// rank `r`'s whole chunk at `r · len`) laid out as [`Comm::all_gather`]
+/// wants it (`[outer, world · inner]`): the copies `(src, dst, len)` in
+/// elements from the rank-major buffer to the result. One copy when
+/// `outer == 1`.
+pub fn gather_copies(world: usize, outer: usize, local: usize) -> Vec<(usize, usize, usize)> {
+    let row = local / outer;
+    if outer == 1 {
+        return vec![(0, 0, local * world)];
+    }
+    (0..outer)
+        .flat_map(|o| (0..world).map(move |r| (r * local + o * row, (o * world + r) * row, row)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gather_copies_match_host_all_gather() {
+        for (world, outer, row) in [(2usize, 1usize, 3usize), (4, 3, 2), (8, 5, 1)] {
+            let local = outer * row;
+            let chunks: Vec<Vec<f64>> =
+                (0..world).map(|r| (0..local).map(|i| (r * 1000 + i) as f64).collect()).collect();
+            let comm = HostComm::new(world);
+            let want: Vec<Vec<f64>> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..world)
+                    .map(|r| {
+                        let (c, x) = (comm.clone(), chunks[r].clone());
+                        s.spawn(move || c.all_gather(r, &x, outer))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let rank_major: Vec<f64> = chunks.concat();
+            let mut got = vec![f64::NAN; local * world];
+            for (src, dst, len) in gather_copies(world, outer, local) {
+                got[dst..dst + len].copy_from_slice(&rank_major[src..src + len]);
+            }
+            assert_eq!(got, want[0], "world {world} outer {outer}");
+        }
+    }
 }
