@@ -99,6 +99,10 @@ pub mod scan;
 pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
 #[path = "tensor_space.rs"]
 pub mod space;
+/// Decode as the finite difference of prefill: the `T → T + k` step and
+/// its KV cache, derived from the full-sequence graph.
+#[path = "tensor_step.rs"]
+pub mod step;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
