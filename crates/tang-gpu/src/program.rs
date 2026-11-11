@@ -1167,9 +1167,9 @@ impl Program {
             d.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .expect("begin capture");
-            // TANG_GRAPH_DAG=1: independent kernels on side streams (a DAG
-            // graph, not a chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
-            let dag = std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "1");
+            // independent kernels on side streams (a DAG graph, not a
+            // chain; TANG_GRAPH_DAG=0: the chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
+            let dag = !std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "0");
             let fused = matches!(&self.storage, Storage::Cuda { fused: Some(_), .. });
             if dag && !fused {
                 let n = std::env::var("TANG_GRAPH_STREAMS")
