@@ -153,6 +153,7 @@ impl FusionPlanner {
                 | Node::Recip(_)
                 | Node::Sqrt(_)
                 | Node::Sin(_)
+                | Node::Floor(_)
                 | Node::Exp2(_)
                 | Node::Log2(_)
                 | Node::Atan2(_, _)
@@ -175,6 +176,7 @@ impl FusionPlanner {
             | Node::Recip(a)
             | Node::Sqrt(a)
             | Node::Sin(a)
+            | Node::Floor(a)
             | Node::Exp2(a)
             | Node::Log2(a) => {
                 f(a.index() as usize);

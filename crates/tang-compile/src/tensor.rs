@@ -4461,6 +4461,7 @@ enum POp {
     Recip(u32),
     Sqrt(u32),
     Sin(u32),
+    Floor(u32),
     Atan2(u32, u32),
     Exp2(u32),
     Log2(u32),
@@ -4488,6 +4489,7 @@ impl Prog {
                 | Node::Recip(a)
                 | Node::Sqrt(a)
                 | Node::Sin(a)
+                | Node::Floor(a)
                 | Node::Exp2(a)
                 | Node::Log2(a) => std::slice::from_ref(a),
                 Node::Select(c, a, b) => &[*c, *a, *b],
@@ -4507,6 +4509,7 @@ impl Prog {
                 Node::Recip(a) => POp::Recip(m(a)),
                 Node::Sqrt(a) => POp::Sqrt(m(a)),
                 Node::Sin(a) => POp::Sin(m(a)),
+                Node::Floor(a) => POp::Floor(m(a)),
                 Node::Atan2(y, x) => POp::Atan2(m(y), m(x)),
                 Node::Exp2(a) => POp::Exp2(m(a)),
                 Node::Log2(a) => POp::Log2(m(a)),
@@ -4534,6 +4537,7 @@ impl Prog {
                 POp::Recip(a) => 1.0 / v[a as usize],
                 POp::Sqrt(a) => v[a as usize].sqrt(),
                 POp::Sin(a) => v[a as usize].sin(),
+                POp::Floor(a) => v[a as usize].floor(),
                 POp::Atan2(y, x) => v[y as usize].atan2(v[x as usize]),
                 POp::Exp2(a) => v[a as usize].exp2(),
                 POp::Log2(a) => v[a as usize].log2(),
@@ -4907,6 +4911,7 @@ pub(super) fn replay(
             Node::Recip(a) => dst.recip(m(a)),
             Node::Sqrt(a) => dst.sqrt(m(a)),
             Node::Sin(a) => dst.sin(m(a)),
+            Node::Floor(a) => dst.floor(m(a)),
             Node::Atan2(a, b) => dst.atan2(m(a), m(b)),
             Node::Exp2(a) => dst.exp2(m(a)),
             Node::Log2(a) => dst.log2(m(a)),

@@ -32,6 +32,7 @@ impl ExprGraph {
             Node::Recip(a) => format!("(1 / {})", self.fmt_expr(a)),
             Node::Sqrt(a) => format!("sqrt({})", self.fmt_expr(a)),
             Node::Sin(a) => format!("sin({})", self.fmt_expr(a)),
+            Node::Floor(a) => format!("floor({})", self.fmt_expr(a)),
             Node::Atan2(y, x) => {
                 format!("atan2({}, {})", self.fmt_expr(y), self.fmt_expr(x))
             }

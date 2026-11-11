@@ -90,6 +90,7 @@ fn op(node: &Node) -> (String, Vec<ExprId>) {
         Node::Recip(a) => ("1/".into(), vec![a]),
         Node::Sqrt(a) => ("√".into(), vec![a]),
         Node::Sin(a) => ("sin".into(), vec![a]),
+        Node::Floor(a) => ("⌊⌋".into(), vec![a]),
         Node::Atan2(a, b) => ("atan2".into(), vec![a, b]),
         Node::Exp2(a) => ("2^".into(), vec![a]),
         Node::Log2(a) => ("log₂".into(), vec![a]),

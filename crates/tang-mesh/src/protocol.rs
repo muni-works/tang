@@ -29,6 +29,8 @@ pub enum WireNode {
     Exp2(u32),
     Log2(u32),
     Select(u32, u32, u32),
+    /// Appended last so existing variant tags stay put on the wire.
+    Floor(u32),
 }
 
 impl WireNode {
@@ -43,6 +45,7 @@ impl WireNode {
             Node::Recip(a) => WireNode::Recip(a.index()),
             Node::Sqrt(a) => WireNode::Sqrt(a.index()),
             Node::Sin(a) => WireNode::Sin(a.index()),
+            Node::Floor(a) => WireNode::Floor(a.index()),
             Node::Atan2(y, x) => WireNode::Atan2(y.index(), x.index()),
             Node::Exp2(a) => WireNode::Exp2(a.index()),
             Node::Log2(a) => WireNode::Log2(a.index()),
@@ -61,6 +64,7 @@ impl WireNode {
             WireNode::Recip(a) => Node::Recip(ExprId::from_index(a)),
             WireNode::Sqrt(a) => Node::Sqrt(ExprId::from_index(a)),
             WireNode::Sin(a) => Node::Sin(ExprId::from_index(a)),
+            WireNode::Floor(a) => Node::Floor(ExprId::from_index(a)),
             WireNode::Atan2(y, x) => Node::Atan2(ExprId::from_index(y), ExprId::from_index(x)),
             WireNode::Exp2(a) => Node::Exp2(ExprId::from_index(a)),
             WireNode::Log2(a) => Node::Log2(ExprId::from_index(a)),
@@ -127,6 +131,7 @@ impl WireGraph {
                 WireNode::Recip(a) => graph.recip(id_map[a as usize]),
                 WireNode::Sqrt(a) => graph.sqrt(id_map[a as usize]),
                 WireNode::Sin(a) => graph.sin(id_map[a as usize]),
+                WireNode::Floor(a) => graph.floor(id_map[a as usize]),
                 WireNode::Atan2(y, x) => graph.atan2(id_map[y as usize], id_map[x as usize]),
                 WireNode::Exp2(a) => graph.exp2(id_map[a as usize]),
                 WireNode::Log2(a) => graph.log2(id_map[a as usize]),

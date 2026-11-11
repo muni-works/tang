@@ -1384,6 +1384,7 @@ pub fn lean_trace_stabilize_softmax() -> String {
             | Node::Recip(a)
             | Node::Sqrt(a)
             | Node::Sin(a)
+            | Node::Floor(a)
             | Node::Exp2(a)
             | Node::Log2(a) => vec![a],
             Node::Select(c, a, b) => vec![c, a, b],

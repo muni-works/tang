@@ -85,6 +85,9 @@ impl ExprGraph {
                 self.mul(cos_a, da)
             }
 
+            // floor is piecewise constant: d(floor(a)) = 0.
+            Node::Floor(_) => ExprId::ZERO,
+
             Node::Atan2(y, x) => {
                 // d(atan2(y, x)) = (x*dy - y*dx) / (x^2 + y^2)
                 let dy = self.diff_inner(y, var, memo);
