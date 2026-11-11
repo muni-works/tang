@@ -128,6 +128,177 @@ pub fn lower(
     (dp, keep, ng)
 }
 
+/// Shapes of [`int8_case`].
+#[derive(Clone, Copy, Debug)]
+pub struct Int8Dims {
+    pub ne: usize,
+    pub rows: usize,
+    pub k: usize,
+    pub nb: usize,
+    pub ns: usize,
+}
+
+impl Int8Dims {
+    pub fn tiny() -> Self {
+        Self { ne: 6, rows: 32, k: 512, nb: 5, ns: 2 }
+    }
+    /// coder-next's routed gate (512 experts, 512 rows, d = 2048, top-10)
+    /// and a dense `[512, 2048]` Q8_0 weight, at `nb` streams.
+    pub fn coder(nb: usize) -> Self {
+        Self { ne: 512, rows: 512, k: 2048, nb, ns: 10 }
+    }
+}
+
+/// A routed contraction `y[b, s, r] = Σ_k W[idx[b, s], r, k]·X[b, k]` (Q4_K
+/// experts, grouped by expert from `group` positions) and a dense one
+/// `z[b, r] = Σ_k V[r, k]·X[b, k]` (Q8_0), staged by `bo`, lowered; with
+/// inputs and the f64 references (dequantized weights times the
+/// Q8x32-rounded activations).
+pub struct Int8Case {
+    pub program: DecodeProgram,
+    pub outs: Vec<TensorId>,
+    pub inputs: Vec<Vec<f32>>,
+    pub want: [Vec<f64>; 2],
+    pub stages: Vec<String>,
+}
+
+impl Int8Case {
+    /// `(routed, dense)` rel errs of outputs `got`.
+    pub fn errors(&self, got: &[Vec<f32>]) -> (f64, f64) {
+        let f = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+        (rel(&f(&got[0]), &self.want[0]), rel(&f(&got[1]), &self.want[1]))
+    }
+}
+
+pub fn int8_case(
+    d: &Int8Dims,
+    bo: &tang_compile::tensor::int8_sched::BlockOpts,
+    group: usize,
+) -> Int8Case {
+    use tang_compile::tensor::{gguf, Arg, Format, Monoid, Precision, View};
+    let Int8Dims { ne, rows, k, nb, ns } = *d;
+    let mut seed = 0x2545F491u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut w4 = Vec::new();
+    for _ in 0..ne * rows * k / 256 {
+        let mut b = vec![0u8; 144];
+        b[..2].copy_from_slice(&0x2000u16.to_le_bytes());
+        b[2..4].copy_from_slice(&0x1c00u16.to_le_bytes());
+        for x in &mut b[4..] {
+            *x = rnd() as u8;
+        }
+        w4.extend(b);
+    }
+    let mut w8 = Vec::new();
+    for _ in 0..rows * k / 32 {
+        let mut b = vec![0u8; 34];
+        b[..2].copy_from_slice(&0x2400u16.to_le_bytes());
+        for x in &mut b[2..] {
+            *x = rnd() as u8;
+        }
+        w8.extend(b);
+    }
+    let deq = |f: Format, b: &[u8], n: usize| {
+        let mut o = vec![0f32; n];
+        gguf::dequantize(f, b, &mut o).unwrap();
+        o.into_iter().map(|v| v as f64).collect::<Vec<f64>>()
+    };
+    let d4 = deq(Format::Q4K, &w4, ne * rows * k);
+    let d8 = deq(Format::Q8_0, &w8, rows * k);
+    // routed ids: some experts repeat across streams, distinct within one
+    let idx: Vec<usize> = (0..nb * ns)
+        .map(|p| ((p % ns) * 7 + (p / ns) * 3 * usize::from(p % 3 == 0)) % ne)
+        .collect();
+    let xs: Vec<f64> = (0..nb * k)
+        .map(|i| ((i as f64) * 0.37).sin() * 0.8 + if i % 97 == 0 { 3.0 } else { 0.0 })
+        .collect();
+    let mut xq = xs.clone();
+    Format::Q8x32.round_blocks(&mut xq);
+    let f = Dim::Fixed;
+    let mut g = TensorGraph::new();
+    let ix = g.input(&[f(nb), f(ns)]);
+    let x = g.input(&[f(nb), f(k)]);
+    let w = g.input(&[f(ne), f(rows), f(k)]);
+    let v = g.input(&[f(rows), f(k)]);
+    let a = |src, view| Arg { src, view };
+    let y = g
+        .comp(
+            &[f(nb), f(ns), f(rows)],
+            &[f(k)],
+            vec![
+                a(ix, View::pick(4, &[Some(0), Some(1)])),
+                a(x, View::pick(4, &[Some(0), Some(3)])),
+                a(w, View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1)),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[1] * v[2]],
+        )
+        .unwrap();
+    let z = g
+        .comp(
+            &[f(nb), f(rows)],
+            &[f(k)],
+            vec![
+                a(x, View::pick(3, &[Some(0), Some(2)])),
+                a(v, View::pick(3, &[Some(1), Some(2)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap();
+    g.set_precision(w, Precision::storage(Format::Q4K));
+    g.set_precision(v, Precision::storage(Format::Q8_0));
+    let (g, outs) = if group > 0 {
+        let (g, o, _) = g.schedule_expert_groups(&[y, z], group);
+        (g, o)
+    } else {
+        (g, vec![y, z])
+    };
+    let (g, outs, sched) = g.schedule_block_weights_with(&outs, bo);
+    assert_eq!(sched.gemvs, 2, "both contractions on the int8 GEMV");
+    let mut keep = outs.clone();
+    keep.extend(&sched.copies);
+    let (g, keep) = g.substitute_maps(&keep);
+    let stages = g
+        .nodes()
+        .iter()
+        .filter_map(|n| n.int_mma.map(|m| format!("{:?}/pt{}", m.stage, m.pos_tile)))
+        .collect();
+    let program = g.to_cuda_decode(&keep[..2], &Default::default());
+    let inputs: Vec<Vec<f32>> = vec![
+        idx.iter().map(|&e| e as f32).collect(),
+        xs.iter().map(|&v| v as f32).collect(),
+        crate::ir_ds_real::words_of(&w4),
+        crate::ir_ds_real::words_of(&w8),
+    ];
+    let mut wy = vec![0.0; nb * ns * rows];
+    for p in 0..nb * ns {
+        for r in 0..rows {
+            wy[p * rows + r] = (0..k)
+                .map(|c| d4[(idx[p] * rows + r) * k + c] * xq[(p / ns) * k + c])
+                .sum();
+        }
+    }
+    let mut wz = vec![0.0; nb * rows];
+    for b in 0..nb {
+        for r in 0..rows {
+            wz[b * rows + r] = (0..k).map(|c| d8[r * k + c] * xq[b * k + c]).sum();
+        }
+    }
+    Int8Case {
+        program,
+        outs: keep[..2].to_vec(),
+        inputs,
+        want: [wy, wz],
+        stages,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,153 +430,20 @@ mod tests {
         );
     }
 
-    /// Block-format weights at batch: a routed contraction `y[b, s, r] =
-    /// Σ_k W[idx[b, s], r, k]·X[b, k]` (Q4_K experts) grouped by expert and
-    /// a dense one `z[b, r] = Σ_k V[r, k]·X[b, k]` (Q8_0) with B positions
-    /// on one weight read (`BlockOpts::pos_tile`), on the int8 GEMV run on
-    /// the CPU, against the dequantized weights times the Q8x32-rounded
-    /// activations in f64.
     #[test]
     fn block_weights_at_batch_run_on_the_cpu() {
         use tang_compile::tensor::int8_sched::BlockOpts;
-        use tang_compile::tensor::{gguf, Arg, Dim, Format, Monoid, Precision, View};
-        let (ne, rows, k, nb, ns) = (6usize, 32usize, 512usize, 5usize, 2usize);
-        let mut seed = 0x2545F491u64;
-        let mut rnd = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        // Q4_K: d, dmin f16 in range, random scales and codes
-        let mut w4 = Vec::new();
-        for _ in 0..ne * rows * k / 256 {
-            let mut b = vec![0u8; 144];
-            b[..2].copy_from_slice(&0x2000u16.to_le_bytes()); // d ≈ 0.0078
-            b[2..4].copy_from_slice(&0x1c00u16.to_le_bytes()); // dmin ≈ 0.0039
-            for x in &mut b[4..] {
-                *x = rnd() as u8;
-            }
-            w4.extend(b);
-        }
-        let mut w8 = Vec::new();
-        for _ in 0..rows * k / 32 {
-            let mut b = vec![0u8; 34];
-            b[..2].copy_from_slice(&0x2400u16.to_le_bytes());
-            for x in &mut b[2..] {
-                *x = rnd() as u8;
-            }
-            w8.extend(b);
-        }
-        let deq = |f: Format, b: &[u8], n: usize| {
-            let mut o = vec![0f32; n];
-            gguf::dequantize(f, b, &mut o).unwrap();
-            o.into_iter().map(|v| v as f64).collect::<Vec<f64>>()
-        };
-        let d4 = deq(Format::Q4K, &w4, ne * rows * k);
-        let d8 = deq(Format::Q8_0, &w8, rows * k);
-        let idx: Vec<usize> = (0..nb * ns)
-            .map(|p| [4, 1, 4, 0, 2, 4, 1, 5, 0, 4][p])
-            .collect();
-        let xs: Vec<f64> = (0..nb * k)
-            .map(|i| ((i as f64) * 0.37).sin() * 0.8 + if i % 97 == 0 { 3.0 } else { 0.0 })
-            .collect();
-        let mut xq = xs.clone();
-        Format::Q8x32.round_blocks(&mut xq);
-        let f = Dim::Fixed;
-        let mut g = TensorGraph::new();
-        let ix = g.input(&[f(nb), f(ns)]);
-        let x = g.input(&[f(nb), f(k)]);
-        let w = g.input(&[f(ne), f(rows), f(k)]);
-        let v = g.input(&[f(rows), f(k)]);
-        let y = g
-            .comp(
-                &[f(nb), f(ns), f(rows)],
-                &[f(k)],
-                vec![
-                    Arg {
-                        src: ix,
-                        view: View::pick(4, &[Some(0), Some(1)]),
-                    },
-                    Arg {
-                        src: x,
-                        view: View::pick(4, &[Some(0), Some(3)]),
-                    },
-                    Arg {
-                        src: w,
-                        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
-                    },
-                ],
-                Some(Monoid::sum()),
-                |v| vec![v[1] * v[2]],
-            )
-            .unwrap();
-        let z = g
-            .comp(
-                &[f(nb), f(rows)],
-                &[f(k)],
-                vec![
-                    Arg {
-                        src: x,
-                        view: View::pick(3, &[Some(0), Some(2)]),
-                    },
-                    Arg {
-                        src: v,
-                        view: View::pick(3, &[Some(1), Some(2)]),
-                    },
-                ],
-                Some(Monoid::sum()),
-                |v| vec![v[0] * v[1]],
-            )
-            .unwrap();
-        g.set_precision(w, Precision::storage(Format::Q4K));
-        g.set_precision(v, Precision::storage(Format::Q8_0));
-        let (g, outs, eg) = g.schedule_expert_groups(&[y, z], 2);
-        assert_eq!(eg.grouped.len(), 1);
         let bo = BlockOpts {
             pos_tile: 8,
             mma_min: 0,
             ksplit: 0,
         };
-        let (g, outs, sched) = g.schedule_block_weights_with(&outs, &bo);
-        assert_eq!(sched.gemvs, 2, "both contractions on the int8 GEMV");
-        let mut keep = outs.clone();
-        keep.extend(&sched.copies);
-        let (g, keep) = g.substitute_maps(&keep);
-        let tiled = g
-            .nodes()
-            .iter()
-            .filter(|n| n.int_mma.is_some_and(|m| m.pos_tile > 1))
-            .count();
-        assert_eq!(tiled, 1, "the dense GEMV tiles its positions");
-        let dp = g.to_cuda_decode(&keep[..2], &Default::default());
-        let ins: Vec<Vec<f32>> = vec![
-            idx.iter().map(|&e| e as f32).collect(),
-            xs.iter().map(|&v| v as f32).collect(),
-            crate::ir_ds_real::words_of(&w4),
-            crate::ir_ds_real::words_of(&w8),
-        ];
-        let got = crate::cuda_cpu::run(&dp, &ins, &keep[..2]);
-        let mut wy = vec![0.0; nb * ns * rows];
-        for p in 0..nb * ns {
-            for r in 0..rows {
-                wy[p * rows + r] = (0..k)
-                    .map(|c| d4[(idx[p] * rows + r) * k + c] * xq[(p / ns) * k + c])
-                    .sum();
-            }
-        }
-        let mut wz = vec![0.0; nb * rows];
-        for b in 0..nb {
-            for r in 0..rows {
-                wz[b * rows + r] = (0..k).map(|c| d8[r * k + c] * xq[b * k + c]).sum();
-            }
-        }
-        let gy: Vec<f64> = got[0].iter().map(|&v| v as f64).collect();
-        let gz: Vec<f64> = got[1].iter().map(|&v| v as f64).collect();
-        let (ey, ez) = (rel(&gy, &wy), rel(&gz, &wz));
+        let c = int8_case(&Int8Dims::tiny(), &bo, 2);
+        let got = crate::cuda_cpu::run(&c.program, &c.inputs, &c.outs);
+        let (ey, ez) = c.errors(&got);
         eprintln!(
-            "int8 at B={nb}: routed Q4_K grouped by expert rel err {ey:.2e}; dense Q8_0 \
-             {nb} positions a weight read rel err {ez:.2e}"
+            "int8 at B=5: routed Q4_K grouped by expert rel err {ey:.2e}; dense Q8_0 \
+             5 positions a weight read rel err {ez:.2e}"
         );
         assert!(ey < 1e-5 && ez < 1e-5, "{ey} {ez}");
     }

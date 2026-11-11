@@ -79,6 +79,10 @@ name = "coder_derived"
 required-features = ["cuda", "gguf"]
 
 [[example]]
+name = "int8_batch_gpu"
+required-features = ["cuda"]
+
+[[example]]
 name = "coder_batched"
 required-features = ["cuda", "gguf"]
 
