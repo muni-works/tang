@@ -43,9 +43,16 @@ writes these files to `~/runner/jobs/<id>/`:
   `total_s`, `ok`, `commit`, `summary` and board rows
 - `DONE`, written last
 
-Check and race jobs append rows to `~/runner/bench/results/board.jsonl`. The
-rows come from `bench_board.py parse` (from #225) and are tagged
-`source: gpu-runner`.
+Every job with a model (check, race and cmd) gets board rows from
+`bench_board.py parse`, which reads `out/` or, failing that, the log. The job's
+`TANG_*` env becomes the row's `config`, so a `TANG_COKERNEL=1` run doesn't
+plot as the default. Rows are tagged `source: gpu-runner`, appended to
+`~/runner/bench/results/board.jsonl` and returned in `result.json`.
+`gpu-run.sh` then appends them to `bench/results/board.jsonl` on main and
+pushes, through `scripts/board-push.sh`. That push happens on the machine that
+ran `gpu-run.sh`, because the pods hold no GitHub credentials. Set
+`BOARD_PUSH=0` to skip it. `install` copies `bench_board.py` next to
+`runner.py`.
 
 Several sessions share each pod, and other GPU work (in `~/F` and the other
 session dirs) is not queued here. The runner serializes only its own jobs.
