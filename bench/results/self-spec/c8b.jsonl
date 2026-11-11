@@ -1,0 +1,12 @@
+{"drafter":"full-sanity","layers":36,"bits":4,"own_kv":false,"cost":1.0000}
+{"drafter":"exit-L33","layers":33,"bits":4,"own_kv":false,"cost":0.9235}
+{"drafter":"skip-every4th","layers":27,"bits":4,"own_kv":false,"cost":0.7706}
+{"drafter":"q3-all","layers":36,"bits":3,"own_kv":false,"cost":0.7961}
+{"prompt":0,"drafter":"full-sanity","p":39,"n":87,"match":[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]}
+{"prompt":0,"drafter":"exit-L33","p":39,"n":87,"match":[8, 8, 8, 7, 5, 3, 1, 1, 0, 3, 1, 1, 0, 1, 1, 1, 0, 7, 5, 3, 1, 3, 1, 1]}
+{"prompt":0,"drafter":"skip-every4th","p":39,"n":87,"match":[8, 8, 8, 8, 7, 5, 3, 1, 5, 3, 1, 0, 8, 8, 7, 5, 3, 1, 1, 3, 1, 5, 3, 1]}
+{"prompt":0,"drafter":"q3-all","p":39,"n":87,"match":[8, 8, 8, 8, 8, 8, 8, 7, 5, 3, 1, 2, 0, 7, 5, 8, 8, 6, 4, 2, 7, 5, 3, 1]}
+{"prompt":1,"drafter":"full-sanity","p":37,"n":85,"match":[]}
+{"prompt":1,"drafter":"exit-L33","p":37,"n":85,"match":[2, 0, 0, 0, 1, 0, 0, 4, 2, 0, 0, 8, 6, 4, 2, 0, 0, 2, 0, 0, 0, 0, 2, 0]}
+{"prompt":1,"drafter":"skip-every4th","p":37,"n":85,"match":[5, 3, 1, 4, 1, 0, 7, 5, 4, 8, 0, 8, 8, 8, 8, 6, 4, 2, 0, 2, 0, 1, 1, 1]}
+{"prompt":1,"drafter":"q3-all","p":37,"n":85,"match":[5, 3, 1, 8, 8, 8, 7, 5, 3, 1, 0, 8, 8, 8, 8, 8, 8, 8, 6, 4, 2, 5, 3, 1]}

@@ -934,7 +934,7 @@ fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Monoid;
+    use super::super::{Monoid, ScanKind};
     use super::*;
 
     const T: Dim = Dim::Sym("T");
@@ -1581,6 +1581,87 @@ mod tests {
         let e = check_steps_with(&g, &outs, 5, &[1], (0, 1), Rows::All);
         eprintln!("hybrid, stale states: max rel err {e:.2e}");
         assert!(e > 1e-3, "{e}");
+    }
+
+    /// The delta-rule step without `A`: the hybrid's step (whose
+    /// gated-delta scan carries a [`DeltaForm`](super::super::DeltaForm))
+    /// against the same step derived with the form stripped (the dense
+    /// `Σ_j A[i, j]·S[j, c]`), on the same inputs: equal outputs and
+    /// states, and at k = 1 no reduction left whose output is a whole
+    /// `[n, m]` state.
+    #[test]
+    fn delta_step_factors_out_the_dense_product() {
+        let (g, outs) = hybrid();
+        let mut dense = g.clone();
+        let mut forms = 0;
+        for nd in &mut dense.nodes {
+            if let Op::Scan(sc) = &mut nd.op {
+                if let ScanKind::Affine { form, .. } = &mut sc.kind {
+                    forms += usize::from(form.take().is_some());
+                }
+            }
+        }
+        assert_eq!(forms, 2, "linear attention and the delta rule");
+        // reductions with an [n, m] = [4, 4] output: the dense AS
+        let state_reductions = |st: &StepGraph| {
+            (0..st.graph.nodes().len())
+                .filter(|&i| {
+                    st.graph.comp_at(i).is_some_and(|c| {
+                        !c.red.is_empty() && c.points().ends_with(&[Dim::Fixed(4), Dim::Fixed(4)])
+                    })
+                })
+                .count()
+        };
+        for k in [1usize, 4] {
+            let fs = derive_step(&g, &outs, &spec(k)).unwrap();
+            let ds = derive_step(&dense, &outs, &spec(k)).unwrap();
+            assert_eq!(fs.inputs, ds.inputs);
+            let shapes: Vec<Vec<usize>> = (0..fs.inputs.len())
+                .map(|j| {
+                    let nd = fs
+                        .graph
+                        .nodes()
+                        .iter()
+                        .find(|nd| matches!(nd.op, Op::Input(i) if i == j))
+                        .unwrap();
+                    nd.shape.iter().map(|d| d.n()).collect()
+                })
+                .collect();
+            let inputs: Vec<Vec<f64>> = fs
+                .inputs
+                .iter()
+                .zip(&shapes)
+                .enumerate()
+                .map(|(j, (si, sh))| match si {
+                    StepInput::Pos => vec![5.0],
+                    _ => rand(sh.iter().product(), 101 + j as u64, 0.8),
+                })
+                .collect();
+            let ids = |st: &StepGraph| {
+                let mut v = st.outputs.clone();
+                v.extend(st.caches.iter().map(|c| c.updated));
+                v
+            };
+            let a = fs.graph.eval(&inputs, &ids(&fs));
+            let b = ds.graph.eval(&inputs, &ids(&ds));
+            let worst = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| max_err(x, y))
+                .fold(0.0, f64::max);
+            let (nf, nd) = (state_reductions(&fs), state_reductions(&ds));
+            eprintln!(
+                "k={k}: factored vs dense delta step max rel err {worst:.2e}; \
+                 [n, m] reductions {nf} vs {nd}"
+            );
+            assert!(worst < 1e-12, "k={k}: {worst}");
+            // (k > 1 scans its rows with `linear_scan`, which has its own
+            // [n, m] products; the decode step k = 1 has none)
+            if k == 1 {
+                assert_eq!(nf, 0);
+                assert!(nd >= 2, "{nd}");
+            }
+        }
     }
 
     /// A reverse scan reads the future; a cached row computed from a
