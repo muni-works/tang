@@ -1,7 +1,10 @@
 # Node API
 
 Status: implemented (milestone N0 of frog node). What frog's scheduler reads and drives on each
-machine that runs `tang-llm serve`. All of it sits behind the same API key as `/v1/*`.
+machine that runs `tang-llm serve`. All of it sits behind the same gate as `/v1/*`: beyond
+loopback a paired client's key (or the static `TANG_API_KEY`) is required, and an unpaired node
+answers `401 {"error": "not paired"}`. Pairing, the node identity and the auth rules are frog's
+`docs/node-protocol.md` (sections 1–6); here: `src/auth.rs`, `src/pair.rs`, `src/model_id.rs`.
 
 - `GET /node`: the machine, its model, measured rates, the queue and the KV it holds.
 - `POST /models/load`, `POST /models/unload`: swap the model, only into free memory.
@@ -11,8 +14,10 @@ machine that runs `tang-llm serve`. All of it sits behind the same API key as `/
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "node_id": "7950c88da7b7e5bb86e3cc225258b704",
+  "identity": { "fingerprint": "3f2a91c0…", "public_key": "<base64 Ed25519 public key>" },
+  "name": "cams-mbp",
   "version": "0.1.0",
   "hardware": {
     "kind": "metal",
@@ -84,6 +89,10 @@ Fields:
 
 - `schema`: the shape's version. New fields don't bump it; a field changing meaning or going
   away does. Clients should ignore fields they don't know.
+- Schema 2 adds `identity` (the Ed25519 key in `~/.cache/tang/node-identity` and its
+  fingerprint, which clients pin), `name` (the host name), and `weights_hash` and `quant` on
+  every loaded and on-disk model (`src/model_id.rs`). `kv.prompt_cache_keys` is shown only to a
+  caller the gate let through.
 - `node_id`: 128 random bits made the first time and kept in `~/.cache/tang/node-id`
   (`TANG_CACHE_DIR` overrides the directory). It names the machine, not the process: it
   survives restarts and model swaps.
