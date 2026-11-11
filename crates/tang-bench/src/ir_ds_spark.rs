@@ -246,6 +246,7 @@ pub fn spark_graph(dm: &DsDims) -> SparkGraph {
         named: Vec::new(),
         eps: dm.eps,
         ws: Default::default(),
+        image_mask: None,
     };
     let mains = b.input("mains".into(), &[T, fx(nt * d)]);
     let next = b.input("next".into(), &[T]);
