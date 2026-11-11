@@ -74,7 +74,9 @@ static inline unsigned max(unsigned a, unsigned b) { return a > b ? a : b; }
 static inline float min(float a, float b) { return std::fmin(a, b); }
 static inline float max(float a, float b) { return std::fmax(a, b); }
 static inline float __fdividef(float a, float b) { return a / b; }
-static inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+// glibc 2.40+ declares rsqrtf (extern): ours under another name
+static inline float tang_rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+#define rsqrtf tang_rsqrtf
 static inline float __frcp_rn(float x) { return 1.0f / x; }
 static inline float tang_sw_h2f(unsigned short h) {
     unsigned s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
@@ -468,6 +470,15 @@ mod tests {
                     .collect()
             })
             .collect();
+        // the router's top-k is the warp select (not the generic combine)
+        assert!(
+            dp.program
+                .kernels
+                .iter()
+                .any(|k| k.source.contains("warp select"))
+                || std::env::var("TANG_TOPK_SELECT").is_ok_and(|v| v == "0"),
+            "no top-k warp select"
+        );
         let got = super::run(&dp, &words, &outs);
         let mut worst = 0.0f64;
         for (oi, (gv, wv)) in got.iter().zip(&want).enumerate() {

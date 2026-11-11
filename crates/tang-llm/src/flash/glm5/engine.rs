@@ -2868,9 +2868,17 @@ fn slots_bench(
             }
         } else {
             let rows: Vec<(usize, u32)> = (0..slots).map(|s| (s, cur[s])).collect();
-            let lg = e.window_batch(&rows)?;
-            for s in 0..slots {
-                cur[s] = argmax(&lg[s * nv..(s + 1) * nv]);
+            #[cfg(feature = "cuda")]
+            let res = e.window_rows_resident(&rows)?;
+            #[cfg(not(feature = "cuda"))]
+            let res: Option<Vec<u32>> = None;
+            if let Some(ids) = res {
+                cur.copy_from_slice(&ids);
+            } else {
+                let lg = e.window_batch(&rows)?;
+                for s in 0..slots {
+                    cur[s] = argmax(&lg[s * nv..(s + 1) * nv]);
+                }
             }
         }
         for s in 0..slots {
@@ -3736,6 +3744,97 @@ mod tests {
             }
         }
         assert!(e.slot_tokens(0).is_empty(), "slot 0 untouched");
+    }
+
+    /// The device-resident rows window (`TANG_GLM5_RES_ROWS=1`) gives the greedy ids of the
+    /// host-staged `window_batch` over the same slots, step after step: three slots with
+    /// different prompts, both the in-order (one launch pair) and a permuted (per-row
+    /// core) slot order, and a host window after it still agrees (mirrors refreshed).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn engine_gpu_rows_resident_matches_window_batch() {
+        let _env = crate::flash::glm5::env_write();
+        let (Some(ids), true) = (seq1(), Path::new(TINY).exists()) else {
+            skip_or_fail("tiny fixture absent");
+            return;
+        };
+        if tang_moe::gpu::Gpu::for_test().is_none() {
+            skip_or_fail("no CUDA device");
+            return;
+        }
+        let knobs = [
+            ("TANG_GLM5_MOE", "fast"),
+            ("TANG_GLM5_KDA_PF2", "1"),
+            ("TANG_GLM5_KDA_GRAPH", "1"),
+            ("TANG_GLM5_GEMV8", "1"),
+        ];
+        for (k, v) in knobs {
+            std::env::set_var(k, v);
+        }
+        let mk = || {
+            let mut e = Glm5Engine::open(Path::new(TINY)).unwrap();
+            assert!(e.use_gpu_slots(3).unwrap(), "GPU did not load");
+            let (m, hp) = (&e.m, e.m.hp.clone());
+            let gf = e.gpu.as_mut().unwrap();
+            gf.enable_mla_resident(&m.g, &|l| m.mla_weights(l)).unwrap();
+            if gf.mhc_f.is_none() {
+                gf.enable_mhc_fused(&m.g, &hp).unwrap();
+            }
+            e
+        };
+        let prompts = [&ids[..9], &ids[3..15], &ids[1..6]];
+        let steps = 5;
+        let nv;
+        let mut a = mk();
+        let mut b = mk();
+        nv = a.m.hp.n_vocab;
+        let mut cur = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            let la = a.window_slot(k, p).unwrap();
+            let lb = b.window_slot(k, p).unwrap();
+            let (ta, tb) = (
+                argmax(&la[(p.len() - 1) * nv..]),
+                argmax(&lb[(p.len() - 1) * nv..]),
+            );
+            assert_eq!(ta, tb, "prefill slot {k}");
+            cur.push(ta);
+        }
+        let orders: [[usize; 3]; 2] = [[0, 1, 2], [2, 0, 1]];
+        let mut flips = 0;
+        for step in 0..steps {
+            let order = orders[step % 2];
+            let rows: Vec<(usize, u32)> = order.iter().map(|&s| (s, cur[s])).collect();
+            let la = a.window_batch(&rows).unwrap();
+            let want: Vec<u32> = (0..3).map(|i| argmax(&la[i * nv..(i + 1) * nv])).collect();
+            std::env::set_var("TANG_GLM5_RES_ROWS", "1");
+            let got = b.window_rows_resident(&rows).unwrap();
+            std::env::remove_var("TANG_GLM5_RES_ROWS");
+            let got = got.expect("resident rows did not run");
+            eprintln!("rows step {step} order {order:?}: batch {want:?} resident {got:?}");
+            flips += want.iter().zip(&got).filter(|(x, y)| x != y).count();
+            for (i, &s) in order.iter().enumerate() {
+                cur[s] = want[i];
+            }
+        }
+        // a host window per slot after the resident rows still agrees
+        let mut tail_flips = 0;
+        for k in 0..3 {
+            std::env::set_var("TANG_GLM5_RESIDENT", "0");
+            let la = a.window_slot(k, &ids[2..5]).unwrap();
+            let lb = b.window_slot(k, &ids[2..5]).unwrap();
+            std::env::remove_var("TANG_GLM5_RESIDENT");
+            tail_flips += (0..3)
+                .filter(|&p| argmax(&la[p * nv..(p + 1) * nv]) != argmax(&lb[p * nv..(p + 1) * nv]))
+                .count();
+        }
+        for (k, _) in knobs {
+            std::env::remove_var(k);
+        }
+        assert_eq!(flips, 0, "resident rows ids != window_batch ids");
+        assert_eq!(tail_flips, 0, "host windows after resident rows disagree");
+        for k in 0..3 {
+            assert_eq!(a.slot_tokens(k), b.slot_tokens(k), "slot {k} tokens");
+        }
     }
 
     /// KDA_WIN_STEP: with the window-step threshold >= t, one t-token window over the

@@ -127,7 +127,11 @@ impl RealRun {
             .split(',')
             .map(|s| s.parse().unwrap())
             .collect();
-        assert_eq!(layer_ids.len(), hp.n_layer, "GLM_REAL_LAYERS vs block_count");
+        assert_eq!(
+            layer_ids.len(),
+            hp.n_layer,
+            "GLM_REAL_LAYERS vs block_count"
+        );
         let mut vocab_ids: Vec<usize> = (0..2048).collect();
         vocab_ids.extend(PROMPT);
         vocab_ids.sort_unstable();
@@ -206,7 +210,10 @@ impl RealRun {
 
     /// Every graph input but `tokens`, `sample.params` and the MoE expert
     /// tensors / slot maps, checked against the graph's shapes.
-    pub fn dense_inputs(&self, inputs: &[PrefillInput]) -> Result<HashMap<String, Vec<f64>>, String> {
+    pub fn dense_inputs(
+        &self,
+        inputs: &[PrefillInput],
+    ) -> Result<HashMap<String, Vec<f64>>, String> {
         let mut out = HashMap::new();
         for i in inputs {
             let n = i.name.as_str();
@@ -241,7 +248,11 @@ impl RealRun {
         let (n, ff) = (d.n, d.ff_exp);
         let per = n * ff;
         let mut slot = vec![0.0; d.n_expert];
-        for (name, k) in [("ffn_gate_exps", 0), ("ffn_up_exps", 1), ("ffn_down_exps", 2)] {
+        for (name, k) in [
+            ("ffn_gate_exps", 0),
+            ("ffn_up_exps", 1),
+            ("ffn_down_exps", 2),
+        ] {
             let t = self
                 .g
                 .info(&format!("blk.{l}.{name}.weight"))
@@ -306,7 +317,10 @@ impl RealRun {
                     }
                 })
                 .collect();
-            let e = pg.g.bind(&[(SEQ, toks.len())]).unwrap().eval(&base, &[node]);
+            let e =
+                pg.g.bind(&[(SEQ, toks.len())])
+                    .unwrap()
+                    .eval(&base, &[node]);
             let mut u: Vec<usize> = e[0].iter().map(|&x| x as usize).collect();
             u.sort_unstable();
             u.dedup();
@@ -333,9 +347,7 @@ impl RealRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir_glm_prefill::{
-        add_sampler, prefill_graph, seed_caches, try_step_sampled, SEQ,
-    };
+    use crate::ir_glm_prefill::{add_sampler, prefill_graph, seed_caches, try_step_sampled, SEQ};
     use crate::ir_sample::{sample_host, SampleSpec};
     use std::time::Instant;
     use tang_compile::tensor::step::StepInput;
@@ -468,7 +480,11 @@ mod tests {
             base.iter().map(|x| x.len()).sum::<usize>() as f64 / 1e9,
             t0.elapsed()
         );
-        let argmax = |r: &[f64]| (0..r.len()).max_by(|&a, &b| r[a].total_cmp(&r[b]).then(b.cmp(&a))).unwrap();
+        let argmax = |r: &[f64]| {
+            (0..r.len())
+                .max_by(|&a, &b| r[a].total_cmp(&r[b]).then(b.cmp(&a)))
+                .unwrap()
+        };
         let agree = |got: &[f64], want: &[f64]| {
             got.chunks(v)
                 .zip(want.chunks(v))
@@ -502,7 +518,11 @@ mod tests {
             st.caches.len(),
             st.caches
                 .iter()
-                .map(|c| format!("{}{:?}", if c.state { "state" } else { "rows" }, st.graph.shape(c.input)))
+                .map(|c| format!(
+                    "{}{:?}",
+                    if c.state { "state" } else { "rows" },
+                    st.graph.shape(c.input)
+                ))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
@@ -532,7 +552,11 @@ mod tests {
             t0.elapsed(),
             rss_gb()
         );
-        assert_eq!(stok, argmax(&sgot[0]), "greedy token = the step logits' argmax");
+        assert_eq!(
+            stok,
+            argmax(&sgot[0]),
+            "greedy token = the step logits' argmax"
+        );
 
         // sampled: the same step with temperature / top-k / top-p / seed
         let k_params = st
@@ -541,7 +565,11 @@ mod tests {
             .position(|&si| si == StepInput::Same(params_at))
             .unwrap();
         let mut sampled = Vec::new();
-        for params in [[0.8, 0.95, 40.0, 1.0], [1.0, 0.9, 0.0, 2.0], [0.6, 1.0, 8.0, 3.0]] {
+        for params in [
+            [0.8, 0.95, 40.0, 1.0],
+            [1.0, 0.9, 0.0, 2.0],
+            [0.6, 1.0, 8.0, 3.0],
+        ] {
             sins[k_params] = params.to_vec();
             let s = st.graph.eval(&sins, &st.outputs);
             let (want_tok, kept) = sample_host(&s[0], params, t_pre as u64, 64.0);
