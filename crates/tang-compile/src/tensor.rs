@@ -5871,6 +5871,85 @@ mod tests {
     }
 
     #[test]
+    fn guard_on_a_var_the_address_cancels_is_not_staged() {
+        // a stride-4 transposed conv's backward under a contraction:
+        // y[o, b, x] = Σ_r w[o, r] · Σ_q a[b, x + q − 2, r − 4q + 2] · h[same].
+        // The flat address 4x + r − 6 has no q, but the padding depends on
+        // it, so the tile's load loop (no q in scope) cannot apply it.
+        let mut g = TensorGraph::new();
+        let a = g.input(&[2, 16, 4]);
+        let h = g.input(&[16, 4]);
+        let w = g.input(&[9, 16]);
+        // space: (b, x, r, q)
+        let taps = |lead: Vec<Form>| View {
+            gather: None,
+            forms: lead
+                .into_iter()
+                .chain([
+                    Form {
+                        coefs: vec![0, 1, 0, 1],
+                        offset: -2,
+                    },
+                    Form {
+                        coefs: vec![0, 0, 1, -4],
+                        offset: 2,
+                    },
+                ])
+                .collect(),
+            guard: true,
+        };
+        let inner = g
+            .comp(
+                &[2, 16, 16],
+                &[5],
+                vec![
+                    Arg {
+                        src: a,
+                        view: taps(vec![Form::unit(4, 0)]),
+                    },
+                    Arg {
+                        src: h,
+                        view: taps(vec![]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        // space: (o, b, x, r)
+        let y = g
+            .comp(
+                &[9, 2, 16],
+                &[16],
+                vec![
+                    Arg {
+                        src: inner,
+                        view: View::pick(4, &[Some(1), Some(2), Some(3)]),
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(4, &[Some(0), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        g.set_inline(inner, true);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let src = &g.to_wgsl(&[y]).kernels[0].source;
+        assert!(src.contains("var<workgroup> stage_"), "not tiled:\n{src}");
+        let loads: Vec<&str> = src
+            .lines()
+            .filter(|l| l.trim_start().starts_with("stage_"))
+            .collect();
+        assert!(!loads.is_empty());
+        for l in loads {
+            assert!(!l.contains("i32(q"), "load reads a reduce var:\n{l}");
+        }
+    }
+
+    #[test]
     fn guarded_read_of_a_map_stays_materialized() {
         // y = conv(snake(x)): snake(0) ≠ 0 in general, so the map is not
         // spliced through the guarded read (it would pad with f(0))

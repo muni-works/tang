@@ -1224,6 +1224,44 @@ impl Program {
         }
     }
 
+    /// Exchange the buffers behind `a` and `b` (same length and format,
+    /// neither sharing its slot with another tensor): a step's `p′`
+    /// becomes the next step's `p` with no copy. Drops a
+    /// [`capture`](Self::capture); not available once
+    /// [`megakernel`](Self::megakernel) has baked the buffers in, nor on
+    /// OpenCL, whose kernel arguments are bound at construction (use
+    /// [`copy`](Self::copy)).
+    pub fn swap(&mut self, a: TensorId, b: TensorId) {
+        let (ia, ib) = (self.buffer_index(a), self.buffer_index(b));
+        if ia == ib {
+            return;
+        }
+        let (ba, bb) = (&self.program.buffers[ia], &self.program.buffers[ib]);
+        assert_eq!((ba.len, ba.format), (bb.len, bb.format), "swap shape");
+        let (sa, sb) = (self.slot[ia], self.slot[ib]);
+        let tenants = |s: usize| self.slot.iter().filter(|&&x| x == s).count();
+        assert_eq!((tenants(sa), tenants(sb)), (1, 1), "swap of a shared slot");
+        match &mut self.storage {
+            Storage::Wgpu(slots) => {
+                slots.swap(sa, sb);
+                self.recording = None;
+            }
+            #[cfg(feature = "cuda")]
+            Storage::Cuda {
+                slots,
+                graph,
+                fused,
+                ..
+            } => {
+                assert!(fused.is_none(), "swap after megakernel");
+                slots.swap(sa, sb);
+                *graph = None;
+            }
+            #[cfg(feature = "opencl")]
+            Storage::OpenCl { .. } => unimplemented!("swap on OpenCL"),
+        }
+    }
+
     /// Milliseconds per run of the whole program: the minimum over five
     /// batches of `iters` (a shared GPU only ever adds time).
     pub fn time(&self, rt: &Runtime, iters: usize) -> f64 {
@@ -1922,6 +1960,30 @@ mod tests {
         q.copy(&rt, q.input(0), &p, p.input(0));
         q.run(&rt);
         assert_eq!(q.read(&rt, c), first);
+    }
+
+    #[test]
+    fn swap_ping_pongs_an_input_and_an_output() {
+        let Ok(rt) = Runtime::select() else { return };
+        let mut g = TensorGraph::new();
+        let p = g.input(&[8]);
+        let x = g.input(&[8]);
+        let y = g.map(&[p, x], |v| v[0] * v[1]).unwrap();
+        let p0: Vec<f32> = (0..8).map(|i| i as f32 * 0.5 - 1.0).collect();
+        let x0: Vec<f32> = (0..8).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let mut prog = Program::compile(&rt, &g, &[y], &[&p0, &x0]);
+        // a recorded run holds the old bindings: the swap drops it
+        if rt.wgpu_parts().is_some() {
+            prog.capture(&rt);
+        }
+        prog.run(&rt);
+        prog.swap(prog.input(0), y);
+        let want: Vec<f32> = p0.iter().zip(&x0).map(|(p, x)| p * x).collect();
+        assert_eq!(prog.read(&rt, prog.input(0)), want);
+        assert_eq!(prog.read(&rt, y), p0);
+        prog.run(&rt);
+        let want: Vec<f32> = want.iter().zip(&x0).map(|(p, x)| p * x).collect();
+        assert_eq!(prog.read(&rt, y), want);
     }
 
     /// CUDA: a chain of kernels fused into persistent segments
