@@ -68,6 +68,8 @@ mod gather_tests;
 #[path = "tensor_gguf.rs"]
 pub mod gguf;
 /// Vulkan decode lowering: the decode kernels as GLSL (SPIR-V passthrough).
+#[path = "tensor_expert_group.rs"]
+pub mod expert_group;
 #[path = "tensor_glsl_gemv.rs"]
 pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]

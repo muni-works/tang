@@ -88,6 +88,18 @@ name = "coder_serve"
 required-features = ["coder-serve"]
 
 [[example]]
+name = "int8_batch_gpu"
+required-features = ["cuda"]
+
+[[example]]
+name = "coder_batched_diff"
+required-features = ["cuda", "gguf"]
+
+[[example]]
+name = "coder_batched"
+required-features = ["cuda", "gguf"]
+
+[[example]]
 name = "glm_real_gpu"
 required-features = ["cuda", "gguf"]
 

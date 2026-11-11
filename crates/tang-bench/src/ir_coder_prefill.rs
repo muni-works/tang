@@ -570,6 +570,25 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
         .unwrap();
     // attn[t, g, r, c] = Σ_j p·v / l: space (t, g, r, c, j)
     let sp = [T, Dim::Fixed(kvh), Dim::Fixed(per), Dim::Fixed(hd), T];
+    // `TANG_CODER_VT=1`: V read through a transposed copy `[kvh·hd, T]`, so
+    // the derived step caches it with positions innermost and P·V streams
+    // each head dim's cached values contiguously (batched decode at long
+    // context: P·V was ~half the step, its V loads strided by kvh·hd)
+    let vt_arg = if std::env::var("TANG_CODER_VT").as_deref() == Ok("1") {
+        let vt = b
+            .g
+            .comp(
+                &[Dim::Fixed(kvh * hd), T],
+                &[],
+                vec![arg(v, vec![unit(2, 1), unit(2, 0)])],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        arg(vt, vec![form(5, &[(1, hd as i64), (3, 1)], 0), unit(5, 4)])
+    } else {
+        arg(v, vec![unit(5, 4), form(5, &[(1, hd as i64), (3, 1)], 0)])
+    };
     let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
     let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
     let attn =
@@ -580,7 +599,7 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
                 arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
                 arg(m, mlv.clone()),
                 arg(lsum, mlv),
-                arg(v, vec![unit(5, 4), form(5, &[(1, hd as i64), (3, 1)], 0)]),
+                vt_arg.clone(),
                 arg(to, ident(5)),
                 arg(jo, ident(5)),
             ],
@@ -861,6 +880,30 @@ pub fn derived_step(pg: &CoderPrefill, k: usize, capacity: usize) -> Result<Step
             seq: SEQ,
             new: k,
             capacity,
+        },
+    )
+    .map_err(|e| e.0)
+}
+
+/// The batched `T → T + 1` step: [`batch_graph`] adds a leading dim `B` of
+/// independent streams, each at its own length (its `p0` an element of the
+/// `[B]` position input).
+///
+/// [`batch_graph`]: tang_compile::tensor::step::batch_graph
+pub fn derived_step_batched(pg: &CoderPrefill, capacity: usize) -> Result<StepGraph, String> {
+    use tang_compile::tensor::step::{batch_graph, derive_step_with, Rows, StepOptions};
+    let (bg, outs) = batch_graph(&pg.g, &[pg.logits], SEQ, "B").map_err(|e| e.0)?;
+    derive_step_with(
+        &bg,
+        &outs,
+        &StepSpec {
+            seq: SEQ,
+            new: 1,
+            capacity,
+        },
+        &StepOptions {
+            rows: Rows::All,
+            batch: Some("B"),
         },
     )
     .map_err(|e| e.0)
