@@ -202,7 +202,7 @@ pub fn lower_real_step(
 
 /// The residual adds of shape `[k, d_model]` (`a + b` of two plain reads)
 /// read by more than one comp: the residual stream of the step.
-fn residual_stream(
+pub(crate) fn residual_stream(
     g: &tang_compile::tensor::TensorGraph,
     pg: &CoderPrefill,
 ) -> Vec<tang_compile::tensor::TensorId> {
@@ -253,6 +253,46 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    /// The tiny coder step through the real-size lowering's map passes
+    /// (residual stream kept), every kernel listed (`--nocapture`).
+    #[test]
+    fn tiny_step_kernels() {
+        use crate::ir_coder_prefill::*;
+        let pg = prefill_graph(&CoderDims::tiny());
+        let st = derived_step(&pg, 1, 21).unwrap();
+        let mut outs = st.outputs.clone();
+        outs.extend(st.caches.iter().map(|c| c.updated));
+        let n = outs.len();
+        let mut keep = outs.clone();
+        keep.extend(residual_stream(&st.graph, &pg));
+        let (g, keep) = st.graph.substitute_maps(&keep);
+        let (g, keep) = g.eliminate_common(&keep);
+        let dp = g.to_cuda_decode(&keep[..n], &Default::default());
+        for (k, nat) in dp.program.kernels.iter().zip(&dp.native) {
+            let i = k.node.index();
+            let what = match g.comp_at(i) {
+                Some(c) => format!(
+                    "red {:?} args {:?}",
+                    c.red,
+                    c.args
+                        .iter()
+                        .map(|a| (a.src.index(), g.nodes()[a.src.index()].shape.clone()))
+                        .collect::<Vec<_>>()
+                ),
+                None => "not a comp".into(),
+            };
+            eprintln!(
+                "K n{i} {:?} nat {nat} {what} | {}",
+                g.nodes()[i].shape,
+                k.source
+                    .lines()
+                    .find(|l| l.contains("tang-") || l.starts_with("//"))
+                    .unwrap_or("")
+            );
+        }
+        eprintln!("{} kernels", dp.program.kernels.len());
+    }
 
     fn open() -> Option<Gguf> {
         let p = gguf_path();
