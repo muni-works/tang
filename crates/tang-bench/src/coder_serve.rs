@@ -257,15 +257,30 @@ impl DerivedCoder {
             .write(&self.rt, sl.prog.input(self.params_in), &sl.params);
     }
 
-    /// Zero a slot's running state (rings and states); its K/V rows are read only below its
-    /// position, so they need no clearing.
+    /// Zero a slot's running state (rings and states) and the K/V rows its sequence wrote:
+    /// a reused slot must look like a fresh one (stale rows past the position changed
+    /// greedy output on the H200).
     fn clear_slot(&mut self, s: usize) {
         let p = &self.slots[s].prog;
         for &k in &self.running {
             let t = p.input(k);
             p.write(&self.rt, t, &self.zeros[..p.words_of(t)]);
         }
+        let n = self.slots[s].tokens.len();
+        self.zero_rows(s, 0, n);
         self.slots[s].tokens.clear();
+    }
+
+    /// Zero rows `from..to` of slot `s`'s K/V caches.
+    fn zero_rows(&self, s: usize, from: usize, to: usize) {
+        if to <= from {
+            return;
+        }
+        let p = &self.slots[s].prog;
+        for &(k, w) in &self.rows {
+            let z = vec![0.0f32; (to - from) * w];
+            p.write_words(&self.rt, p.input(k), from * w, &z);
+        }
     }
 
     /// Queue one step of slot `s`: token `tok` at position `pos`.
@@ -475,6 +490,8 @@ impl ServeEngine for DerivedCoder {
             ensure!(part.len() == p.words_of(t), "state part size");
             p.write_words(&self.rt, t, 0, part);
         }
+        let old = self.slots[slot].tokens.len();
+        self.zero_rows(slot, prefix.len(), old);
         self.slots[slot].tokens = prefix.to_vec();
         Ok(())
     }
