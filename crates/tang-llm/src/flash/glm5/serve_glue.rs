@@ -313,6 +313,22 @@ impl ServeEngine for Glm5Serve {
             return Ok(out);
         }
         let t0 = Instant::now();
+        // TANG_GLM5_RES_ROWS=1: the device-resident rows window (greedy ids on the
+        // device; serving is greedy-only, so no logits come back)
+        #[cfg(feature = "cuda")]
+        if let Some(ids) = self.e.window_rows_resident(rows)? {
+            let secs = t0.elapsed().as_secs_f64();
+            self.last_window = WinStats {
+                t: rows.len(),
+                wall_ms: secs * 1e3,
+                ..WinStats::default()
+            };
+            crate::telemetry::glm5_window(rows.len(), secs);
+            for &(slot, _) in rows {
+                self.last_logits[slot].clear();
+            }
+            return Ok(ids);
+        }
         let lg = self.e.window_batch(rows)?;
         let secs = t0.elapsed().as_secs_f64();
         self.last_window = WinStats {

@@ -760,10 +760,8 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     if args.first().is_some_and(|a| a.ends_with(".gguf")) {
         return serve_flash(args);
     }
-    let spec = args
-        .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS] [--otel-live]")?
-        .clone();
+    // No model starts empty; load one later with `POST /models/load` (frog nodes do this).
+    let (spec, flags) = split_model(args);
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
     let mut image_pipeline = None;
@@ -779,7 +777,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let mut draft_model = std::env::var("TANG_DRAFT_MODEL")
         .ok()
         .filter(|m| !m.is_empty());
-    let mut it = args[1..].iter();
+    let mut it = flags.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host = it.next().context("--host H")?.clone(),
@@ -813,7 +811,9 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         _ => true,
     };
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    tang_llm::resolve_model(&spec)?;
+    if let Some(m) = &spec {
+        tang_llm::resolve_model(m)?;
+    }
     if let Some(m) = &draft_model {
         tang_llm::resolve_model(m)?;
     }
@@ -824,7 +824,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let opts = tang_llm::server::Options {
         addr,
         key,
-        model: Some(spec),
+        model: spec,
         dtype,
         hardware: probe(backend),
     };
@@ -841,6 +841,14 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             image_pipeline
         )
     )
+}
+
+/// `serve [<model>] [flags]`: the model, if the first argument isn't a flag, and the flags.
+fn split_model(args: &[String]) -> (Option<String>, &[String]) {
+    match args.first() {
+        Some(m) if !m.starts_with('-') => (Some(m.clone()), &args[1..]),
+        _ => (None, args),
+    }
 }
 
 /// Reads the device and its free memory, for `/node` and the fit check before a load.
@@ -1530,4 +1538,22 @@ fn calibrate_image_preview<D: ComputeDevice, F: Fn() -> Result<D>>(
         record.constant_baseline_mse
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_model;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn serve_model_is_optional() {
+        let a = v(&["--host", "0.0.0.0", "--port", "8911"]);
+        assert_eq!(split_model(&a), (None, &a[..]));
+        let a = v(&["Qwen/Qwen3-0.6B", "--port", "8911"]);
+        assert_eq!(split_model(&a), (Some("Qwen/Qwen3-0.6B".into()), &a[1..]));
+        assert_eq!(split_model(&[]), (None, &[][..]));
+    }
 }

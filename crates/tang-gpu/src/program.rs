@@ -488,7 +488,12 @@ impl Program {
     /// read them zero-copy, so a step that gathers a few rows of a huge
     /// table moves only those rows over the bus.
     #[cfg(feature = "cuda")]
-    pub fn with_host(rt: &Runtime, program: WgslProgram, inputs: &[&[f32]], host: &[usize]) -> Self {
+    pub fn with_host(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        host: &[usize],
+    ) -> Self {
         let Runtime::Cuda(d) = rt else {
             panic!("host-mapped inputs need the CUDA runtime")
         };
@@ -505,10 +510,16 @@ impl Program {
             .enumerate()
             .filter_map(|(i, b)| {
                 let k = b.input.filter(|k| host.contains(k))?;
-                Some((p.slot[i], HostMapped::new(d, &pack_words(b.format, inputs[k]))))
+                Some((
+                    p.slot[i],
+                    HostMapped::new(d, &pack_words(b.format, inputs[k])),
+                ))
             })
             .collect();
-        let Storage::Cuda { slots, host: hs, .. } = &mut p.storage else {
+        let Storage::Cuda {
+            slots, host: hs, ..
+        } = &mut p.storage
+        else {
             unreachable!()
         };
         for (s, h) in mapped {
@@ -1167,7 +1178,20 @@ impl Program {
             d.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .expect("begin capture");
-            self.launch_all(d);
+            // independent kernels on side streams (a DAG graph, not a
+            // chain; TANG_GRAPH_DAG=0: the chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
+            let dag = !std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "0");
+            let fused = matches!(&self.storage, Storage::Cuda { fused: Some(_), .. });
+            if dag && !fused {
+                let n = std::env::var("TANG_GRAPH_STREAMS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2usize)
+                    .max(1);
+                self.launch_dag(d, n);
+            } else {
+                self.launch_all(d);
+            }
             let g = d
                 .stream
                 .end_capture(
@@ -1242,6 +1266,112 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn run_cuda(&self, d: &CudaDevice, i: usize) {
+        self.run_cuda_on(&d.stream, i)
+    }
+
+    /// Kernel dependencies in launch order, from slot hazards: the last
+    /// writer of every slot it reads (RAW), and of every slot it writes
+    /// (WAW), and every reader of those since (WAR). Indices into `order`.
+    #[cfg(feature = "cuda")]
+    fn hazard_deps(&self) -> Vec<Vec<usize>> {
+        let mut last_w: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut readers: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut deps = Vec::with_capacity(self.order.len());
+        for (n, &i) in self.order.iter().enumerate() {
+            let outs = 1 + self.program.kernels[i].writes.len();
+            let a = &self.args[i];
+            let (rd, wr) = a.split_at(a.len() - outs.min(a.len()));
+            let mut dv: Vec<usize> = Vec::new();
+            for s in rd {
+                dv.extend(last_w.get(s));
+            }
+            for s in wr {
+                dv.extend(last_w.get(s));
+                dv.extend(readers.get(s).into_iter().flatten());
+            }
+            dv.retain(|&j| j != n);
+            dv.sort_unstable();
+            dv.dedup();
+            for s in rd {
+                readers.entry(*s).or_default().push(n);
+            }
+            for s in wr {
+                last_w.insert(*s, n);
+                readers.remove(s);
+            }
+            deps.push(dv);
+        }
+        deps
+    }
+
+    /// [`launch_all`](Self::launch_all) over `streams` streams (the
+    /// device's plus side streams forked from it) for graph capture: a
+    /// kernel continues the stream whose tail it depends on, else takes
+    /// the stream with the oldest tail; a dependency on another stream is
+    /// an event recorded right after it. All streams join the device's
+    /// stream at the end, so the capture closes.
+    #[cfg(feature = "cuda")]
+    fn launch_dag(&self, d: &CudaDevice, streams: usize) {
+        let deps = self.hazard_deps();
+        let n = self.order.len();
+        // pass 1: a stream per kernel
+        let mut on = vec![0usize; n];
+        let mut tail: Vec<Option<usize>> = vec![None; streams];
+        for k in 0..n {
+            let cont = (0..streams)
+                .filter(|&s| tail[s].is_some_and(|t| deps[k].binary_search(&t).is_ok()))
+                .max_by_key(|&s| tail[s]);
+            let s = cont.unwrap_or_else(|| {
+                (0..streams)
+                    .min_by_key(|&s| tail[s].map_or(-1, |t| t as i64))
+                    .unwrap()
+            });
+            on[k] = s;
+            tail[s] = Some(k);
+        }
+        // the latest dependency per other stream needs an event after it
+        let mut waits: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut evented = vec![false; n];
+        for k in 0..n {
+            let mut per: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &j in &deps[k] {
+                if on[j] != on[k] {
+                    let e = per.entry(on[j]).or_insert(j);
+                    *e = (*e).max(j);
+                }
+            }
+            for (_, j) in per {
+                waits[k].push(j);
+                evented[j] = true;
+            }
+        }
+        // pass 2: launches, events, joins
+        let mut ss = vec![d.stream.clone()];
+        for _ in 1..streams {
+            let s = d.ctx.new_stream().expect("side stream");
+            s.join(&d.stream).expect("fork into capture");
+            ss.push(s);
+        }
+        let mut ev: Vec<Option<cudarc::driver::CudaEvent>> = (0..n).map(|_| None).collect();
+        for k in 0..n {
+            let st = &ss[on[k]];
+            for &j in &waits[k] {
+                st.wait(ev[j].as_ref().expect("event before its waiter"))
+                    .expect("wait");
+            }
+            self.run_cuda_on(st, self.order[k]);
+            if evented[k] {
+                ev[k] = Some(st.record_event(None).expect("event"));
+            }
+        }
+        for s in &ss[1..] {
+            d.stream.join(s).expect("join");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_cuda_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>, i: usize) {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let Storage::Cuda {
             slots, functions, ..
@@ -1258,7 +1388,7 @@ impl Program {
         let Storage::Cuda { host, .. } = &self.storage else {
             unreachable!()
         };
-        let mut launch = d.stream.launch_builder(&functions[i]);
+        let mut launch = stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
             match &host[s] {
                 Some(h) => launch.arg(&h.dev),
