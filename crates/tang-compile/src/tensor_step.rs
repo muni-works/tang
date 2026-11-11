@@ -195,12 +195,35 @@ pub fn derive_step_with(
     spec: &StepSpec,
     opts: &StepOptions,
 ) -> Result<StepGraph, ShapeError> {
+    // The derivation recurses once per node along the longest dependency
+    // chain (GLM tiny overflowed a 2 MB test thread). It runs on its own
+    // thread with a stack sized for any model: an explicit worklist would
+    // repeat every op's demand rules (which modes each arg is read in) in
+    // a second place.
+    const STACK: usize = 1 << 30; // reserved, not committed, until used
+    std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .name("derive_step".into())
+            .stack_size(STACK)
+            .spawn_scoped(sc, || derive_on_this_thread(g, outputs, spec, opts))
+            .expect("spawn the derive_step thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
+}
+
+fn derive_on_this_thread(
+    g: &TensorGraph,
+    outputs: &[TensorId],
+    spec: &StepSpec,
+    opts: &StepOptions,
+) -> Result<StepGraph, ShapeError> {
     // last-row outputs: a node whose new rows feed a cache anyway is
     // sliced from them rather than computed again for the last row
     let need_new = match opts.rows {
         Rows::All => None,
         Rows::Last => {
-            let all = derive_step_with(
+            let all = derive_on_this_thread(
                 g,
                 outputs,
                 spec,

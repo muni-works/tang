@@ -510,17 +510,13 @@ fn step_matches_prefill(d: &GlmDims, p0: usize, ks: &[usize], cap: usize) -> f64
         let vals = g.eval(&inputs(&pg, &w, &all[..p0]), &nodes);
         for (c, v) in first.caches.iter().zip(vals) {
             let shape = shape_at(c.node, p0);
-            let ax = c.axis;
-            let outer: usize = shape[..ax].iter().product();
-            let inner: usize = shape[ax + 1..].iter().product();
-            let mut buf = vec![f64::NAN; outer * cap * inner];
-            for o in 0..outer {
-                for r in 0..p0 {
-                    let s = (o * p0 + r) * inner;
-                    let dd = (o * cap + r) * inner;
-                    buf[dd..dd + inner].copy_from_slice(&v[s..s + inner]);
-                }
-            }
+            let buf = if c.state {
+                // a scan's state: row p0 − 1 along its axis
+                rows_of(&v, &shape, c.axis, p0 - 1, p0)
+            } else {
+                // rows (NaN past the filled ones) or a ring of the last rows
+                tang_compile::tensor::step::seed_cache(c, &shape, &v, p0, cap)
+            };
             caches.insert(c.node, buf);
         }
     }
@@ -553,15 +549,28 @@ fn step_matches_prefill(d: &GlmDims, p0: usize, ks: &[usize], cap: usize) -> f64
         let lw = rows_of(&want[0], &shape_at(pg.logits, grown), 0, p0, grown);
         worst = worst.max(rel(&got[0], &lw));
         for (c, slot) in step.caches.iter().enumerate() {
-            let gr = rows_of(&got[1 + c], &shape_at(slot.node, cap), slot.axis, 0, grown);
-            let wr = rows_of(
-                &want[1 + c],
-                &shape_at(slot.node, grown),
-                slot.axis,
-                0,
-                grown,
-            );
-            worst = worst.max(rel(&gr, &wr));
+            let wshape = shape_at(slot.node, grown);
+            if slot.state {
+                let wr = rows_of(&want[1 + c], &wshape, slot.axis, grown - 1, grown);
+                worst = worst.max(rel(&got[1 + c], &wr));
+            } else {
+                // every written buffer row against the position it holds
+                let ax = slot.axis;
+                let outer: usize = wshape[..ax].iter().product();
+                let inner: usize = wshape[ax + 1..].iter().product();
+                let n = slot.rows(cap);
+                let (mut gr, mut wr) = (Vec::new(), Vec::new());
+                for o in 0..outer {
+                    for r in 0..n {
+                        if let Some(p) = slot.position(r, grown) {
+                            let (gb, wb) = ((o * n + r) * inner, (o * grown + p) * inner);
+                            gr.extend_from_slice(&got[1 + c][gb..gb + inner]);
+                            wr.extend_from_slice(&want[1 + c][wb..wb + inner]);
+                        }
+                    }
+                }
+                worst = worst.max(rel(&gr, &wr));
+            }
             caches.insert(slot.node, got[1 + c].clone());
         }
         p0 = grown;

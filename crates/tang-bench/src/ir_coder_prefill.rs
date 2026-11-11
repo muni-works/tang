@@ -24,10 +24,9 @@
 //! - **Attention**: q and its gate interleaved per head (`[q | gate]`),
 //!   QK rmsnorm, NeoX rope on the first `n_rot` dims of each head (partial
 //!   rotary), GQA, causal softmax, output × `sigmoid(gate)`, `attn_output`.
-//!   Rope is written as what it is, a position-dependent rotation matrix
-//!   `R(t)` applied to each normalized head (a masked sum over the head
-//!   dim), so no read is shifted or guarded and position comes from an
-//!   iota (the derived step's `iota + p0`).
+//!   The rotation partner is a guarded read at `i ± n_rot/2` on the head
+//!   axis (a plain read along `T`); position comes from an iota (the
+//!   derived step's `iota + p0`).
 //! - **MoE**: router softmax over all experts, top-k by one
 //!   [`Monoid::topk`] reduction, weights renormalized with the `2⁻¹⁴`
 //!   clamp, each picked expert's SwiGLU read through a gathered view of
@@ -172,12 +171,6 @@ fn select(c: ExprId, t: ExprId, f: ExprId) -> ExprId {
 
 fn lit(v: f64) -> ExprId {
     ExprId::from_f64(v)
-}
-
-/// `x` where `a == b` (integers as floats), else 0.
-fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
-    let z = lit(0.0);
-    select(a - b + lit(0.5), select(b - a + lit(0.5), x, z), z)
 }
 
 fn sigmoid(x: ExprId) -> ExprId {
@@ -626,10 +619,10 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
 }
 
 /// `[T, heads, hd]`: each head of `src` (head `h` at `h·stride`) rmsnormed
-/// with `w`, then rotated by `R(t)`: NeoX rope on dims `0..n_rot` (pairs
-/// `i`, `i + n_rot/2`, angle `t·base^(−2i/n_rot)`), identity above. `R(t)`
-/// is applied as a sum over the head dim with its entries built from
-/// iotas, so every read is a plain unit read and position is an iota.
+/// with `w`, then NeoX rope on dims `0..n_rot` (pairs `i`, `i + n_rot/2`,
+/// angle `t·base^(−2i/n_rot)`), identity above. The partner of dim `i` is a
+/// guarded read of the normed head at `i ± n_rot/2` (a shift on the head
+/// axis, a plain read along `T`); position is an iota.
 fn rope_normed(
     b: &mut B,
     dims: &CoderDims,
@@ -640,40 +633,54 @@ fn rope_normed(
     stride: usize,
 ) -> TensorId {
     let hd = dims.head_dim;
-    let (n_rot, half) = (dims.n_rot as f64, (dims.n_rot / 2) as f64);
+    let (n_rot, half) = (dims.n_rot as f64, dims.n_rot / 2);
     let (eps, ln_base) = (dims.eps, dims.rope_base.ln());
-    // space (t, h, i, j): out[t, h, i] = Σ_j R(t)[i, j]·xn[t, h, j]
-    let sp = [T, Dim::Fixed(heads), Dim::Fixed(hd), Dim::Fixed(hd)];
-    let (ti, ii, ji) = (b.g.iota(&sp, 0), b.g.iota(&sp, 2), b.g.iota(&sp, 3));
+    let sp = [T, Dim::Fixed(heads), Dim::Fixed(hd)];
+    let xn =
+        b.g.comp(
+            &sp,
+            &[],
+            vec![
+                arg(
+                    src,
+                    vec![unit(3, 0), form(3, &[(1, stride as i64), (2, 1)], 0)],
+                ),
+                arg(ss, vec![unit(3, 0), unit(3, 1)]),
+                arg(w, vec![unit(3, 2)]),
+            ],
+            None,
+            move |v| {
+                let inv = lit(1.0) / (v[1] / lit(hd as f64) + lit(eps)).sqrt();
+                vec![v[0] * inv * v[2]]
+            },
+        )
+        .unwrap();
+    let shifted = |o: i64| {
+        let mut a = arg(xn, vec![unit(3, 0), unit(3, 1), form(3, &[(2, 1)], o)]);
+        a.view.guard = true;
+        a
+    };
+    let (ti, ii) = (b.g.iota(&sp, 0), b.g.iota(&sp, 2));
+    let h = half as f64;
     b.g.comp(
-        &sp[..3],
-        &sp[3..],
+        &sp,
+        &[],
         vec![
-            arg(
-                src,
-                vec![unit(4, 0), form(4, &[(1, stride as i64), (3, 1)], 0)],
-            ),
-            arg(ss, vec![unit(4, 0), unit(4, 1)]),
-            arg(w, vec![unit(4, 3)]),
-            arg(ti, ident(4)),
-            arg(ii, ident(4)),
-            arg(ji, ident(4)),
+            arg(xn, ident(3)),
+            shifted(half as i64),
+            shifted(-(half as i64)),
+            arg(ti, ident(3)),
+            arg(ii, ident(3)),
         ],
-        Some(Monoid::sum()),
-        |v| {
-            let inv = lit(1.0) / (v[1] / lit(hd as f64) + lit(eps)).sqrt();
-            let xn = v[0] * inv * v[2];
-            let (t, i, j) = (v[3], v[4], v[5]);
-            // frequency index: i in the first half, i − half in the second
-            let upper = i - lit(half) + lit(0.5);
-            let f = select(upper, i - lit(half), i);
+        None,
+        move |v| {
+            let (x, up, dn, t, i) = (v[0], v[1], v[2], v[3], v[4]);
+            let lower = lit(h - 0.5) - i; // i < half
+            let f = select(lower, i, i - lit(h));
             let theta = t * (lit(-2.0 * ln_base / n_rot) * f).exp();
             let (c, s) = (theta.cos(), theta.sin());
-            let lower = pick(j, i, c) - pick(j, i + lit(half), s);
-            let higher = pick(j, i, c) + pick(j, i - lit(half), s);
-            let rot = select(upper, higher, lower);
-            let r = select(lit(n_rot - 0.5) - i, rot, pick(j, i, lit(1.0)));
-            vec![xn * r]
+            let rot = select(lower, x * c - up * s, x * c + dn * s);
+            vec![select(lit(n_rot - 0.5) - i, rot, x)]
         },
     )
     .unwrap()
@@ -1166,22 +1173,16 @@ mod tests {
         }
     }
 
-    /// The full graph is refused by `derive_step` at the GDN state scan;
-    /// the GDN conv alone (its guarded shifted read over `T`) is refused
-    /// too.
+    /// The full graph derives: the GDN state scan is a carried state and
+    /// the GDN conv's guarded read back along `T` a ring cache (values:
+    /// `derive_all::tests::coder_next_derives`). The conv alone too.
     #[test]
-    fn derive_step_refuses_gdn() {
+    fn derive_step_takes_gdn() {
         let pg = prefill_graph(&CoderDims::tiny());
-        let e = derived_step(&pg, 1, 16).err().expect("refused");
-        eprintln!("derive_step on coder tiny (GDN, attn, GDN): {e}");
-        assert!(e.contains("scan"), "{e}");
-        // the conv's guarded shift removed (one tap): the scan still refuses
-        let mut dims = CoderDims::tiny();
-        dims.ssm_d_conv = 1;
-        let pg = prefill_graph(&dims);
-        let e = derived_step(&pg, 1, 16).err().expect("refused");
-        eprintln!("derive_step with d_conv = 1 (no shift): {e}");
-        assert!(e.contains("scan"), "{e}");
+        let st = derived_step(&pg, 1, 16).expect("derives");
+        eprintln!("derive_step on coder tiny: {} caches", st.caches.len());
+        assert!(st.caches.iter().any(|c| c.state));
+        assert!(st.caches.iter().any(|c| c.ring.is_some()));
         // the conv by itself, written as in `gdn`
         let (ch, dc) = (6usize, 4usize);
         let mut g = TensorGraph::new();
@@ -1209,9 +1210,9 @@ mod tests {
             new: 1,
             capacity: 16,
         };
-        let e = derive_step(&g, &[acc], &spec).err().expect("refused").0;
-        eprintln!("derive_step on the GDN conv alone: {e}");
-        assert!(e.contains("guarded"), "{e}");
+        let st = derive_step(&g, &[acc], &spec).expect("derives");
+        assert_eq!(st.caches.len(), 1);
+        assert_eq!(st.caches[0].ring, Some(dc - 1), "a ring of d_conv − 1 rows");
     }
 
     /// With attention layers only, the same builder derives: gated
