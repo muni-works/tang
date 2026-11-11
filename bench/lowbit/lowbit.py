@@ -46,6 +46,7 @@ FORMATS = {
     "vq4d8192h": ("vq", dict(d=4, k=8192, g=128, had=True), 3.375),
     # GPTQ (Hessian-aware, error feedback; `calib` builds the Hessians)
     "g3g64h": ("affine", dict(bits=3, g=64, had=True, gptq=True), 3.5),
+    "g3g64": ("affine", dict(bits=3, g=64, gptq=True), 3.5),
     "g3g128h": ("affine", dict(bits=3, g=128, had=True, gptq=True), 3.25),
     "g4g128h": ("affine", dict(bits=4, g=128, had=True, gptq=True), 4.25),
     "gvq4d2048h": ("vq", dict(d=4, k=2048, g=128, had=True, gptq=True), 2.875),
