@@ -41,21 +41,21 @@ use tang_expr::ExprId;
 
 /// The symbolic sequence dim.
 pub const SEQ: &str = "T";
-const T: Dim = Dim::Sym(SEQ);
+pub(crate) const T: Dim = Dim::Sym(SEQ);
 
-fn fx(n: usize) -> Dim {
+pub(crate) fn fx(n: usize) -> Dim {
     Dim::Fixed(n)
 }
 
-fn unit(rank: usize, d: usize) -> Form {
+pub(crate) fn unit(rank: usize, d: usize) -> Form {
     Form::unit(rank, d)
 }
 
-fn konst(rank: usize, c: i64) -> Form {
+pub(crate) fn konst(rank: usize, c: i64) -> Form {
     Form::constant(rank, c)
 }
 
-fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
+pub(crate) fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
     let mut f = Form::constant(rank, offset);
     for &(d, c) in terms {
         f.coefs[d] += c;
@@ -63,11 +63,11 @@ fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
     f
 }
 
-fn ident(rank: usize) -> Vec<Form> {
+pub(crate) fn ident(rank: usize) -> Vec<Form> {
     (0..rank).map(|d| unit(rank, d)).collect()
 }
 
-fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
+pub(crate) fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
         view: View {
@@ -78,26 +78,26 @@ fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
     }
 }
 
-fn select(c: ExprId, t: ExprId, f: ExprId) -> ExprId {
+pub(crate) fn select(c: ExprId, t: ExprId, f: ExprId) -> ExprId {
     tang_expr::with_graph(|g| g.select(c, t, f))
 }
 
-fn lit(v: f64) -> ExprId {
+pub(crate) fn lit(v: f64) -> ExprId {
     ExprId::from_f64(v)
 }
 
 /// `x` where `a == b` (integers as floats), else 0.
-fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
+pub(crate) fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
     let z = lit(0.0);
     select(a - b + lit(0.5), select(b - a + lit(0.5), x, z), z)
 }
 
-fn sigmoid(x: ExprId) -> ExprId {
+pub(crate) fn sigmoid(x: ExprId) -> ExprId {
     lit(1.0) / (lit(1.0) + (-x).exp())
 }
 
 /// The masked-out value of a max (absorbed by the always-visible diagonal).
-const NEG: f64 = -1e30;
+pub(crate) const NEG: f64 = -1e30;
 
 /// The tiny config: the real attention form, a few experts.
 #[derive(Clone, Debug)]
@@ -152,6 +152,15 @@ pub struct DsDims {
     /// Layers whose input stream (mean over the `hc` streams) is a DSpark
     /// target hidden: the graph's `mains` output `[T, n · dim]`.
     pub dspark_targets: Vec<usize>,
+    /// The DSpark drafter ([`crate::ir_ds_spark`]): its stages (the
+    /// checkpoint's MTP layers), draft block, noise token, Markov rank and
+    /// MoE size.
+    pub n_mtp: usize,
+    pub dspark_block: usize,
+    pub dspark_noise: usize,
+    pub dspark_rank: usize,
+    pub dspark_experts: usize,
+    pub dspark_active: usize,
 }
 
 impl DsDims {
@@ -195,6 +204,12 @@ impl DsDims {
             engram_head_dim: 0,
             engram_rows: 0,
             dspark_targets: Vec::new(),
+            n_mtp: 0,
+            dspark_block: 0,
+            dspark_noise: 0,
+            dspark_rank: 0,
+            dspark_experts: 0,
+            dspark_active: 0,
         }
     }
 
@@ -218,6 +233,12 @@ impl DsDims {
             engram_head_dim: 8,
             engram_rows: 97,
             dspark_targets: vec![3, 4, 5],
+            n_mtp: 3,
+            dspark_block: 4,
+            dspark_noise: 47,
+            dspark_rank: 8,
+            dspark_experts: 4,
+            dspark_active: 2,
             ..Self::tiny()
         }
     }
@@ -262,15 +283,17 @@ impl PrefillGraph {
     }
 }
 
-struct B {
-    g: TensorGraph,
-    inputs: Vec<PrefillInput>,
-    named: Vec<(String, TensorId)>,
-    eps: f64,
+pub(crate) struct B {
+    pub(crate) g: TensorGraph,
+    pub(crate) inputs: Vec<PrefillInput>,
+    pub(crate) named: Vec<(String, TensorId)>,
+    pub(crate) eps: f64,
+    /// Weights by name: a weight asked for twice is one input.
+    pub(crate) ws: std::collections::HashMap<String, TensorId>,
 }
 
 impl B {
-    fn input(&mut self, name: String, shape: &[Dim]) -> TensorId {
+    pub(crate) fn input(&mut self, name: String, shape: &[Dim]) -> TensorId {
         self.inputs.push(PrefillInput {
             name,
             shape: shape.to_vec(),
@@ -278,21 +301,28 @@ impl B {
         self.g.input(shape)
     }
 
-    fn w(&mut self, name: String, shape: &[usize]) -> TensorId {
+    pub(crate) fn w(&mut self, name: String, shape: &[usize]) -> TensorId {
+        if let Some(&t) = self.ws.get(&name) {
+            let have: Vec<usize> = self.g.shape(t).iter().map(|d| d.n()).collect();
+            assert_eq!(have, shape, "{name}: asked for with two shapes");
+            return t;
+        }
         let s: Vec<Dim> = shape.iter().map(|&n| fx(n)).collect();
-        self.input(name, &s)
+        let t = self.input(name.clone(), &s);
+        self.ws.insert(name, t);
+        t
     }
 
-    fn name(&mut self, s: String, t: TensorId) {
+    pub(crate) fn name(&mut self, s: String, t: TensorId) {
         self.named.push((s, t));
     }
 
-    fn n(&self, t: TensorId, d: usize) -> usize {
+    pub(crate) fn n(&self, t: TensorId, d: usize) -> usize {
         self.g.shape(t)[d].n()
     }
 
     /// `y[t, n] = Σ_k x[t, k]·w[n, k]`.
-    fn linear(&mut self, x: TensorId, w: TensorId) -> TensorId {
+    pub(crate) fn linear(&mut self, x: TensorId, w: TensorId) -> TensorId {
         let (n, k) = (self.n(w, 0), self.n(w, 1));
         self.g
             .comp(
@@ -308,7 +338,7 @@ impl B {
             .unwrap()
     }
 
-    fn rms(&mut self, x: TensorId, w: TensorId) -> TensorId {
+    pub(crate) fn rms(&mut self, x: TensorId, w: TensorId) -> TensorId {
         let n = self.n(w, 0);
         let eps = self.eps;
         let ss = self
@@ -338,7 +368,7 @@ impl B {
 
     /// Interleaved-pair RoPE of every `hd`-wide head of `x` (`[T, heads·hd]`)
     /// at position `t + off`; `fr` (`[hd/2]`) is zero on the no-rope pairs.
-    fn rope(
+    pub(crate) fn rope(
         &mut self,
         x: TensorId,
         heads: usize,
@@ -378,7 +408,7 @@ impl B {
 
     /// `[T, a, b]` reduced over axis 2 (`row`) or 1 (`col`) with `m`, then
     /// `f(x, r)` elementwise: one Sinkhorn half-step or a softmax piece.
-    fn hc_norm(
+    pub(crate) fn hc_norm(
         &mut self,
         c: TensorId,
         hc: usize,
@@ -419,7 +449,13 @@ impl B {
 
     /// The mHC coefficients of stream `x` (`[T, hc·d]`): pre `[T, hc]`,
     /// post `[T, hc]`, comb `[T, hc(j), hc(k)]`.
-    fn hc_mixes(&mut self, p: &str, kind: &str, x: TensorId, dm: &DsDims) -> [TensorId; 3] {
+    pub(crate) fn hc_mixes(
+        &mut self,
+        p: &str,
+        kind: &str,
+        x: TensorId,
+        dm: &DsDims,
+    ) -> [TensorId; 3] {
         let (hc, d, mix) = (dm.hc, dm.dim, dm.mix());
         let (eps, he) = (dm.eps, dm.hc_eps);
         let f = self.w(format!("{p}.hc_{kind}_fn"), &[mix, hc * d]);
@@ -521,7 +557,7 @@ impl B {
     }
 
     /// `out[t, i] = Σ_c pre[t, c]·x[t, c·d + i]`.
-    fn hc_pre(&mut self, x: TensorId, pre: TensorId, hc: usize, d: usize) -> TensorId {
+    pub(crate) fn hc_pre(&mut self, x: TensorId, pre: TensorId, hc: usize, d: usize) -> TensorId {
         self.g
             .comp(
                 &[T, fx(d)],
@@ -537,7 +573,7 @@ impl B {
     }
 
     /// `out[t, k, i] = post[t, k]·h[t, i] + Σ_j comb[t, j, k]·res[t, j·d + i]`.
-    fn hc_post(
+    pub(crate) fn hc_post(
         &mut self,
         h: TensorId,
         res: TensorId,
@@ -579,7 +615,7 @@ impl B {
     /// Masked reduction over keys `j` of a `[T, H, T]` score node: `f(s, extra…)`
     /// where `vis(t, j, extra…) > 0`, the monoid identity elsewhere.
     #[allow(clippy::too_many_arguments)]
-    fn attn_reduce(
+    pub(crate) fn attn_reduce(
         &mut self,
         out: &[Dim],
         red_j: usize,
@@ -616,7 +652,7 @@ impl B {
     /// token ids, done on the host as the hand engine does) gathered from
     /// the host-resident table, projected to `hc` keys and one value, and
     /// each stream gated by its key: `h + σ(signed √|q·k|)·v`.
-    fn engram(&mut self, p: &str, x: TensorId, dm: &DsDims) -> TensorId {
+    pub(crate) fn engram(&mut self, p: &str, x: TensorId, dm: &DsDims) -> TensorId {
         let (d, hc, ec, ehd) = (dm.dim, dm.hc, dm.engram_cols, dm.engram_head_dim);
         let eps = self.eps;
         let hs = self.input(format!("{p}.engram.hash"), &[T, fx(ec)]);
@@ -695,7 +731,7 @@ impl B {
     /// in; `[T, T]`, 1 where row j is in a kept block. Membership is read
     /// off the k-th best block `(i_k, v_k)`: kept iff its value beats `v_k`,
     /// or ties it at a block index ≤ `i_k` (the stable order).
-    fn candidates(&mut self, score: TensorId, dm: &DsDims) -> TensorId {
+    pub(crate) fn candidates(&mut self, score: TensorId, dm: &DsDims) -> TensorId {
         let (bs, kb) = (dm.candidate_block_size, dm.candidate_topk_blocks);
         let bsf = bs as f64;
         let blk = move |j: ExprId| ((j + lit(0.5)) * lit(1.0 / bsf)).floor();
@@ -789,6 +825,203 @@ impl B {
     }
 }
 
+/// The MoE of `xn` (`[T, d]`, normed): `ne` routed experts, top `ka`,
+/// plus the shared expert; weights under `{p}.ffn`. `expert_rows > 0`:
+/// the expert tensors hold that many rows and `{p}.ffn.expert_slot` maps
+/// an expert id to its row.
+pub(crate) fn moe_graph(
+    b: &mut B,
+    p: &str,
+    xn: TensorId,
+    dm: &DsDims,
+    ne: usize,
+    ka: usize,
+    expert_rows: usize,
+) -> TensorId {
+    let (d, inter) = (dm.dim, dm.moe_inter);
+    let gate = b.w(format!("{p}.ffn.gate.weight"), &[ne, d]);
+    let bias = b.w(format!("{p}.ffn.gate.bias"), &[ne]);
+    let rows = if expert_rows > 0 { expert_rows } else { ne };
+    let w1 = b.w(format!("{p}.ffn.experts.w1"), &[rows, inter, d]);
+    let w3 = b.w(format!("{p}.ffn.experts.w3"), &[rows, inter, d]);
+    let w2 = b.w(format!("{p}.ffn.experts.w2"), &[rows, d, inter]);
+    let slot_map = (expert_rows > 0).then(|| b.w(format!("{p}.ffn.expert_slot"), &[ne]));
+    let s1 = b.w(format!("{p}.ffn.shared_experts.w1.weight"), &[inter, d]);
+    let s3w = b.w(format!("{p}.ffn.shared_experts.w3.weight"), &[inter, d]);
+    let s2 = b.w(format!("{p}.ffn.shared_experts.w2.weight"), &[d, inter]);
+    let lg = b.linear(xn, gate);
+    let sc =
+        b.g.map(&[lg], |v| {
+            let sp = select(v[0] - lit(20.0), v[0], (lit(1.0) + v[0].exp()).ln());
+            sp.sqrt()
+        })
+        .unwrap();
+    let ei = b.g.iota(&[T, fx(ne)], 1);
+    let fmax = -(f32::MAX as f64);
+    let etop =
+        b.g.comp_tuple(
+            &[T, fx(2 * ka)],
+            &[fx(ne)],
+            vec![
+                arg(sc, ident(2)),
+                arg(bias, vec![unit(2, 1)]),
+                arg(ei, ident(2)),
+            ],
+            Some(Monoid::topk(ka)),
+            |v| {
+                let mut o = vec![v[2], v[0] + v[1]];
+                for _ in 1..ka {
+                    o.push(lit(0.0));
+                    o.push(lit(fmax));
+                }
+                o
+            },
+        )
+        .unwrap();
+    b.name(format!("{p}.expert_topk"), etop);
+    // the picked expert ids `[T, ka]` (slot s at etop[t, 2s])
+    let ids = |rank: usize, sd: usize| arg(etop, vec![unit(rank, 0), form(rank, &[(sd, 2)], 0)]);
+    // the row of the expert tensors slot s reads
+    let erow = slot_map.map(|m| {
+        b.g.comp(
+            &[T, fx(ka)],
+            &[],
+            vec![
+                ids(2, 1),
+                Arg {
+                    src: m,
+                    view: View::pick(2, &[None]).gather(0, 0, 1),
+                },
+            ],
+            None,
+            |v| vec![v[1]],
+        )
+        .unwrap()
+    });
+    let row_ix = |rank: usize, sd: usize| match erow {
+        Some(e) => arg(e, vec![unit(rank, 0), unit(rank, sd)]),
+        None => ids(rank, sd),
+    };
+    // routing weights: the unbiased score of each pick (a one-hot sum
+    // over the experts: a gather of the `[T, ne]` scores would be a
+    // gather of a sequence-bearing tensor), renormalized, scaled
+    let ei3 = b.g.iota(&[T, fx(ka), fx(ne)], 2);
+    let wpick =
+        b.g.comp(
+            &[T, fx(ka)],
+            &[fx(ne)],
+            vec![
+                ids(3, 1),
+                arg(sc, vec![unit(3, 0), unit(3, 2)]),
+                arg(ei3, ident(3)),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![pick(v[0], v[2], v[1])],
+        )
+        .unwrap();
+    let (norm, rs) = (dm.norm_topk_prob && ka > 1, dm.route_scale);
+    let wsum =
+        b.g.comp(
+            &[T],
+            &[fx(ka)],
+            vec![arg(wpick, ident(2))],
+            Some(Monoid::sum()),
+            |v| vec![v[0]],
+        )
+        .unwrap();
+    let wt =
+        b.g.comp(
+            &[T, fx(ka)],
+            &[],
+            vec![arg(wpick, ident(2)), arg(wsum, vec![unit(2, 0)])],
+            None,
+            |v| {
+                vec![
+                    if norm {
+                        v[0] / (v[1] + lit(1e-20))
+                    } else {
+                        v[0]
+                    } * lit(rs),
+                ]
+            },
+        )
+        .unwrap();
+    let lim = dm.swiglu_limit;
+    let swiglu = move |g: ExprId, u: ExprId| -> ExprId {
+        let (g, u) = if lim > 0.0 {
+            let gl = select(g - lit(lim), lit(lim), g);
+            let ul = select(u - lit(lim), lit(lim), select(-u - lit(lim), lit(-lim), u));
+            (gl, ul)
+        } else {
+            (g, u)
+        };
+        g * sigmoid(g) * u
+    };
+    // each picked expert's gate/up rows, gathered by its row: space (t, slot, f, n)
+    let up = |b: &mut B, w: TensorId| {
+        b.g.comp(
+            &[T, fx(ka), fx(inter)],
+            &[fx(d)],
+            vec![
+                row_ix(4, 1),
+                arg(xn, vec![unit(4, 0), unit(4, 3)]),
+                Arg {
+                    src: w,
+                    view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[1] * v[2]],
+        )
+        .unwrap()
+    };
+    let (eg, eu) = (up(&mut *b, w1), up(&mut *b, w3));
+    let eh =
+        b.g.comp(
+            &[T, fx(ka), fx(inter)],
+            &[],
+            vec![
+                arg(eg, ident(3)),
+                arg(eu, ident(3)),
+                arg(wt, vec![unit(3, 0), unit(3, 1)]),
+            ],
+            None,
+            |v| vec![v[2] * swiglu(v[0], v[1])],
+        )
+        .unwrap();
+    // each pick's down projection: space (t, slot, n, f)
+    let dn =
+        b.g.comp(
+            &[T, fx(ka), fx(d)],
+            &[fx(inter)],
+            vec![
+                row_ix(4, 1),
+                arg(eh, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
+                Arg {
+                    src: w2,
+                    view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[1] * v[2]],
+        )
+        .unwrap();
+    let routed =
+        b.g.comp(
+            &[T, fx(d)],
+            &[fx(ka)],
+            vec![arg(dn, vec![unit(3, 0), unit(3, 2), unit(3, 1)])],
+            Some(Monoid::sum()),
+            |v| vec![v[0]],
+        )
+        .unwrap();
+    let sg = b.linear(xn, s1);
+    let su = b.linear(xn, s3w);
+    let sh = b.g.map(&[sg, su], |v| swiglu(v[0], v[1])).unwrap();
+    let shared = b.linear(sh, s2);
+    b.g.map(&[routed, shared], |v| v[0] + v[1]).unwrap()
+}
+
 /// The full-sequence graph.
 pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
     let (d, h, hd, hc) = (dm.dim, dm.n_heads, dm.head_dim, dm.hc);
@@ -801,6 +1034,7 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         inputs: Vec::new(),
         named: Vec::new(),
         eps: dm.eps,
+        ws: Default::default(),
     };
     let tokens = b.input("tokens".into(), &[T]);
     let emb = b.w("embed.weight".into(), &[dm.vocab, d]);
@@ -1205,192 +1439,7 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         let hx = b.hc_pre(x, apre, hc, d);
         let fnw = b.w(format!("{p}.ffn_norm.weight"), &[d]);
         let xn = b.rms(hx, fnw);
-        let gate = b.w(format!("{p}.ffn.gate.weight"), &[ne, d]);
-        let bias = b.w(format!("{p}.ffn.gate.bias"), &[ne]);
-        let rows = if dm.expert_rows > 0 {
-            dm.expert_rows
-        } else {
-            ne
-        };
-        let w1 = b.w(format!("{p}.ffn.experts.w1"), &[rows, inter, d]);
-        let w3 = b.w(format!("{p}.ffn.experts.w3"), &[rows, inter, d]);
-        let w2 = b.w(format!("{p}.ffn.experts.w2"), &[rows, d, inter]);
-        let slot_map = (dm.expert_rows > 0).then(|| b.w(format!("{p}.ffn.expert_slot"), &[ne]));
-        let s1 = b.w(format!("{p}.ffn.shared_experts.w1.weight"), &[inter, d]);
-        let s3w = b.w(format!("{p}.ffn.shared_experts.w3.weight"), &[inter, d]);
-        let s2 = b.w(format!("{p}.ffn.shared_experts.w2.weight"), &[d, inter]);
-        let lg = b.linear(xn, gate);
-        let sc =
-            b.g.map(&[lg], |v| {
-                let sp = select(v[0] - lit(20.0), v[0], (lit(1.0) + v[0].exp()).ln());
-                sp.sqrt()
-            })
-            .unwrap();
-        let ei = b.g.iota(&[T, fx(ne)], 1);
-        let fmax = -(f32::MAX as f64);
-        let etop =
-            b.g.comp_tuple(
-                &[T, fx(2 * ka)],
-                &[fx(ne)],
-                vec![
-                    arg(sc, ident(2)),
-                    arg(bias, vec![unit(2, 1)]),
-                    arg(ei, ident(2)),
-                ],
-                Some(Monoid::topk(ka)),
-                |v| {
-                    let mut o = vec![v[2], v[0] + v[1]];
-                    for _ in 1..ka {
-                        o.push(lit(0.0));
-                        o.push(lit(fmax));
-                    }
-                    o
-                },
-            )
-            .unwrap();
-        b.name(format!("{p}.expert_topk"), etop);
-        // the picked expert ids `[T, ka]` (slot s at etop[t, 2s])
-        let ids =
-            |rank: usize, sd: usize| arg(etop, vec![unit(rank, 0), form(rank, &[(sd, 2)], 0)]);
-        // the row of the expert tensors slot s reads
-        let erow = slot_map.map(|m| {
-            b.g.comp(
-                &[T, fx(ka)],
-                &[],
-                vec![
-                    ids(2, 1),
-                    Arg {
-                        src: m,
-                        view: View::pick(2, &[None]).gather(0, 0, 1),
-                    },
-                ],
-                None,
-                |v| vec![v[1]],
-            )
-            .unwrap()
-        });
-        let row_ix = |rank: usize, sd: usize| match erow {
-            Some(e) => arg(e, vec![unit(rank, 0), unit(rank, sd)]),
-            None => ids(rank, sd),
-        };
-        // routing weights: the unbiased score of each pick (a one-hot sum
-        // over the experts: a gather of the `[T, ne]` scores would be a
-        // gather of a sequence-bearing tensor), renormalized, scaled
-        let ei3 = b.g.iota(&[T, fx(ka), fx(ne)], 2);
-        let wpick =
-            b.g.comp(
-                &[T, fx(ka)],
-                &[fx(ne)],
-                vec![
-                    ids(3, 1),
-                    arg(sc, vec![unit(3, 0), unit(3, 2)]),
-                    arg(ei3, ident(3)),
-                ],
-                Some(Monoid::sum()),
-                |v| vec![pick(v[0], v[2], v[1])],
-            )
-            .unwrap();
-        let (norm, rs) = (dm.norm_topk_prob && ka > 1, dm.route_scale);
-        let wsum =
-            b.g.comp(
-                &[T],
-                &[fx(ka)],
-                vec![arg(wpick, ident(2))],
-                Some(Monoid::sum()),
-                |v| vec![v[0]],
-            )
-            .unwrap();
-        let wt =
-            b.g.comp(
-                &[T, fx(ka)],
-                &[],
-                vec![arg(wpick, ident(2)), arg(wsum, vec![unit(2, 0)])],
-                None,
-                |v| {
-                    vec![
-                        if norm {
-                            v[0] / (v[1] + lit(1e-20))
-                        } else {
-                            v[0]
-                        } * lit(rs),
-                    ]
-                },
-            )
-            .unwrap();
-        let lim = dm.swiglu_limit;
-        let swiglu = move |g: ExprId, u: ExprId| -> ExprId {
-            let (g, u) = if lim > 0.0 {
-                let gl = select(g - lit(lim), lit(lim), g);
-                let ul = select(u - lit(lim), lit(lim), select(-u - lit(lim), lit(-lim), u));
-                (gl, ul)
-            } else {
-                (g, u)
-            };
-            g * sigmoid(g) * u
-        };
-        // each picked expert's gate/up rows, gathered by its row: space (t, slot, f, n)
-        let up = |b: &mut B, w: TensorId| {
-            b.g.comp(
-                &[T, fx(ka), fx(inter)],
-                &[fx(d)],
-                vec![
-                    row_ix(4, 1),
-                    arg(xn, vec![unit(4, 0), unit(4, 3)]),
-                    Arg {
-                        src: w,
-                        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
-                    },
-                ],
-                Some(Monoid::sum()),
-                |v| vec![v[1] * v[2]],
-            )
-            .unwrap()
-        };
-        let (eg, eu) = (up(&mut b, w1), up(&mut b, w3));
-        let eh =
-            b.g.comp(
-                &[T, fx(ka), fx(inter)],
-                &[],
-                vec![
-                    arg(eg, ident(3)),
-                    arg(eu, ident(3)),
-                    arg(wt, vec![unit(3, 0), unit(3, 1)]),
-                ],
-                None,
-                |v| vec![v[2] * swiglu(v[0], v[1])],
-            )
-            .unwrap();
-        // each pick's down projection: space (t, slot, n, f)
-        let dn =
-            b.g.comp(
-                &[T, fx(ka), fx(d)],
-                &[fx(inter)],
-                vec![
-                    row_ix(4, 1),
-                    arg(eh, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
-                    Arg {
-                        src: w2,
-                        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
-                    },
-                ],
-                Some(Monoid::sum()),
-                |v| vec![v[1] * v[2]],
-            )
-            .unwrap();
-        let routed =
-            b.g.comp(
-                &[T, fx(d)],
-                &[fx(ka)],
-                vec![arg(dn, vec![unit(3, 0), unit(3, 2), unit(3, 1)])],
-                Some(Monoid::sum()),
-                |v| vec![v[0]],
-            )
-            .unwrap();
-        let sg = b.linear(xn, s1);
-        let su = b.linear(xn, s3w);
-        let sh = b.g.map(&[sg, su], |v| swiglu(v[0], v[1])).unwrap();
-        let shared = b.linear(sh, s2);
-        let moe = b.g.map(&[routed, shared], |v| v[0] + v[1]).unwrap();
+        let moe = moe_graph(&mut b, &p, xn, dm, ne, ka, dm.expert_rows);
         x = b.hc_post(moe, x, fpost, fcomb, hc, d);
         b.name(format!("{p}.stream"), x);
         // the next block's attention collapses with this block's ffn pre-mix
@@ -1565,11 +1614,16 @@ pub(crate) mod tests {
 
     pub(crate) type Weights = HashMap<String, Vec<f64>>;
 
-    fn weights(pg: &PrefillGraph, dm: &DsDims) -> Weights {
+    pub(crate) fn weights(pg: &PrefillGraph, dm: &DsDims) -> Weights {
+        weights_of(&pg.inputs, dm)
+    }
+
+    /// Seeded random weights for graph inputs (sensible scales by name).
+    pub(crate) fn weights_of(inputs: &[PrefillInput], dm: &DsDims) -> Weights {
         let rd = dm.rope_head_dim;
-        pg.inputs
+        inputs
             .iter()
-            .filter(|s| s.name != "tokens" && !s.name.ends_with(".engram.hash"))
+            .filter(|s| s.shape.iter().all(|d| d.fixed().is_some()))
             .map(|s| {
                 let shape: Vec<usize> = s.shape.iter().map(|d| d.n()).collect();
                 let n: usize = shape.iter().product();
@@ -1613,7 +1667,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn tokens(n: usize, vocab: usize) -> Vec<f64> {
+    pub(crate) fn tokens(n: usize, vocab: usize) -> Vec<f64> {
         (0..n).map(|i| ((37 * i + 5) % vocab) as f64).collect()
     }
 
@@ -1754,7 +1808,7 @@ pub(crate) mod tests {
         pub(crate) load: Option<LoadExpert<'a>>,
     }
 
-    fn mm(x: &[f64], t: usize, w: &[f64], n: usize, k: usize) -> Vec<f64> {
+    pub(crate) fn mm(x: &[f64], t: usize, w: &[f64], n: usize, k: usize) -> Vec<f64> {
         assert_eq!(x.len(), t * k);
         let mut y = vec![0.0; t * n];
         for ti in 0..t {
@@ -1765,11 +1819,11 @@ pub(crate) mod tests {
         y
     }
 
-    fn sig(x: f64) -> f64 {
+    pub(crate) fn sig(x: f64) -> f64 {
         1.0 / (1.0 + (-x).exp())
     }
 
-    fn topk_stable(v: &[f64], k: usize) -> Vec<usize> {
+    pub(crate) fn topk_stable(v: &[f64], k: usize) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..v.len()).collect();
         idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap().then(a.cmp(&b)));
         idx.truncate(k);
@@ -1777,7 +1831,7 @@ pub(crate) mod tests {
     }
 
     /// forward.rs `rope`: the last `rd` of every `d`-wide vector, adjacent pairs.
-    fn rope(
+    pub(crate) fn rope(
         v: &mut [f64],
         d: usize,
         rd: usize,
@@ -1802,11 +1856,11 @@ pub(crate) mod tests {
     }
 
     impl Ref<'_> {
-        fn w(&self, n: &str) -> &[f64] {
+        pub(crate) fn w(&self, n: &str) -> &[f64] {
             self.w.get(n).unwrap_or_else(|| panic!("no weight {n}"))
         }
 
-        fn linear(&self, x: &[f64], t: usize, n: &str, rows: usize) -> Vec<f64> {
+        pub(crate) fn linear(&self, x: &[f64], t: usize, n: &str, rows: usize) -> Vec<f64> {
             if t == 0 {
                 return Vec::new();
             }
@@ -1814,7 +1868,7 @@ pub(crate) mod tests {
             mm(x, t, self.w(n), rows, k)
         }
 
-        fn rms(&self, x: &mut [f64], n: &str) {
+        pub(crate) fn rms(&self, x: &mut [f64], n: &str) {
             let g = self.w(n);
             let k = g.len();
             for row in x.chunks_mut(k) {
@@ -1875,7 +1929,12 @@ pub(crate) mod tests {
         }
 
         #[allow(clippy::type_complexity)]
-        fn hc_mixes(&self, p: &str, kind: &str, x: &[f64]) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+        pub(crate) fn hc_mixes(
+            &self,
+            p: &str,
+            kind: &str,
+            x: &[f64],
+        ) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
             let (hc, d, mix) = (self.dm.hc, self.dm.dim, self.dm.mix());
             let t = x.len() / (hc * d);
             let mixes = self.linear(x, t, &format!("{p}.hc_{kind}_fn"), mix);
@@ -1898,7 +1957,7 @@ pub(crate) mod tests {
                 .collect()
         }
 
-        fn hc_pre(&self, x: &[f64], pre: &[Vec<f64>]) -> Vec<f64> {
+        pub(crate) fn hc_pre(&self, x: &[f64], pre: &[Vec<f64>]) -> Vec<f64> {
             let (hc, d) = (self.dm.hc, self.dm.dim);
             let mut out = vec![0.0; pre.len() * d];
             for (ti, pm) in pre.iter().enumerate() {
@@ -1912,7 +1971,7 @@ pub(crate) mod tests {
         }
 
         #[allow(clippy::type_complexity)]
-        fn hc_post(
+        pub(crate) fn hc_post(
             &self,
             h: &[f64],
             res: &[f64],
@@ -2187,7 +2246,7 @@ pub(crate) mod tests {
             out
         }
 
-        fn expert(
+        pub(crate) fn expert(
             &self,
             x: &[f64],
             t: usize,
@@ -2221,8 +2280,14 @@ pub(crate) mod tests {
 
         fn moe(&self, l: usize, x: &[f64]) -> Vec<f64> {
             let dm = self.dm;
-            let p = format!("layers.{l}");
-            let (ne, k, d, inter) = (dm.n_experts, dm.n_active, dm.dim, dm.moe_inter);
+            self.moe_at(&format!("layers.{l}"), l, x, dm.n_experts, dm.n_active)
+        }
+
+        /// The MoE under `p` (`ne` experts, top `k`); `l` names the layer
+        /// for `load`.
+        pub(crate) fn moe_at(&self, p: &str, l: usize, x: &[f64], ne: usize, k: usize) -> Vec<f64> {
+            let dm = self.dm;
+            let (d, inter) = (dm.dim, dm.moe_inter);
             let t = x.len() / d;
             let sc: Vec<f64> = self
                 .linear(x, t, &format!("{p}.ffn.gate.weight"), ne)
@@ -2433,7 +2498,7 @@ pub(crate) mod tests {
         via.map_or_else(|| format!("{n:?}"), |(s, _)| s.clone())
     }
 
-    fn shape_at(pg: &PrefillGraph, t: TensorId, rows: usize) -> Vec<usize> {
+    pub(crate) fn shape_at(pg: &PrefillGraph, t: TensorId, rows: usize) -> Vec<usize> {
         pg.g.shape(t)
             .iter()
             .map(|&d| if d == T { rows } else { d.n() })

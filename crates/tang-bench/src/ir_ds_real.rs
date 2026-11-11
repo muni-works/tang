@@ -289,6 +289,12 @@ pub fn dims_from_config(
         // a real run binds the rows its hashes hit (see `engram_tables`)
         engram_rows: 0,
         dspark_targets: at(&list("dspark_target_layer_ids")),
+        n_mtp: u("n_mtp_layers"),
+        dspark_block: u("dspark_block_size"),
+        dspark_noise: u("dspark_noise_token_id"),
+        dspark_rank: u("dspark_markov_rank"),
+        dspark_experts: u("dspark_n_routed_experts"),
+        dspark_active: u("dspark_n_activated_experts"),
     }
 }
 
