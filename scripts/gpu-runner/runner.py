@@ -82,6 +82,11 @@ def checkout(ref, log):
                           capture_output=True, text=True).stdout.strip()
 
 
+def log_line(log, msg):
+    with open(log, "a") as f:
+        f.write(msg + "\n")
+
+
 def model_dir(name, log):
     if not name:
         return None
@@ -89,12 +94,18 @@ def model_dir(name, log):
     if name in NO_COPY or not os.path.isdir(vol):
         return vol
     local = os.path.join(MODELS, name)
-    # copy once (rsync is a no-op when it's already there); write then mark
-    if not os.path.exists(os.path.join(local, ".runner-complete")):
-        os.makedirs(local, exist_ok=True)
-        rc, s = sh(f"rsync -a {vol}/ {local}/ && touch {local}/.runner-complete", log)
-        if rc:
-            return vol
+    if os.path.exists(os.path.join(local, ".runner-complete")):
+        return local  # a finished local copy: container disk, faster than the volume
+    # a complete volume copy (its .complete marker) is used in place: copying a 50 GB GGUF
+    # first held a job up for 1h43m
+    if os.path.exists(os.path.join(vol, ".complete")):
+        log_line(log, f"[runner] model {name}: {vol} (volume, no copy)")
+        return vol
+    # otherwise copy once (rsync is a no-op when it's already there); write then mark
+    os.makedirs(local, exist_ok=True)
+    rc, _ = sh(f"rsync -a {vol}/ {local}/ && touch {local}/.runner-complete", log)
+    if rc:
+        return vol
     return local
 
 
@@ -184,12 +195,27 @@ def next_job():
     return names[0] if names else None
 
 
+def compiles(path):
+    """`path` parses as Python (a half-copied runner.py doesn't take over)."""
+    try:
+        compile(open(path).read(), path, "exec")
+        return True
+    except (SyntaxError, ValueError, OSError):
+        return False
+
+
 def serve():
     os.makedirs(JOBS, exist_ok=True)
     with open(os.path.join(HOME, "runner.pid"), "w") as f:
         f.write(str(os.getpid()))
     print(f"[runner] {now()} serving {JOBS}", flush=True)
+    me = os.path.abspath(__file__)
+    born = os.path.getmtime(me)
     while True:
+        # a reinstalled runner.py takes over between jobs (never under a running one)
+        if os.path.getmtime(me) != born and compiles(me):
+            print(f"[runner] {now()} runner.py changed: re-exec", flush=True)
+            os.execv(sys.executable, [sys.executable, me, "serve"])
         name = next_job()
         if not name:
             time.sleep(2)
