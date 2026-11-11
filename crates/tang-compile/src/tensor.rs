@@ -99,6 +99,9 @@ pub mod place;
 pub use place::{Boundary, MemorySchedule, Place, Placed};
 #[path = "tensor_precision.rs"]
 pub mod precision;
+/// Sub-4-bit weight formats (affine, codebook VQ, Hadamard), emulated.
+#[path = "tensor_lowbit.rs"]
+pub mod lowbit;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
