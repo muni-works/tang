@@ -120,7 +120,13 @@ impl Step {
             // (`ir_qwen::prefill`) instead of the hand-written `step_graph`;
             // its position is the `pos` input, its tokens `tokens`
             let pg = prefill::prefill_graph(dims);
-            let step = prefill::derived_step(&pg, dims, seq);
+            // QWEN_DERIVED_ROWS=last: a window computes only its last
+            // row's logits (as the hand prefill step does)
+            let rows = match std::env::var("QWEN_DERIVED_ROWS").as_deref() {
+                Ok("last") => tang_compile::tensor::step::Rows::Last,
+                _ => tang_compile::tensor::step::Rows::All,
+            };
+            let step = prefill::derived_step_rows(&pg, dims, seq, rows);
             prefill::as_decode_graph(&pg, &step, dims)
         } else {
             step_graph(dims, seq, kctx)
@@ -332,8 +338,10 @@ impl Step {
             return self.state(rt).0;
         }
         let l = self.logits(rt);
-        let vocab = l.len() / self.dg.seq;
-        argmax(&l[(self.dg.seq - 1) * vocab..])
+        // all new rows, or (QWEN_DERIVED_ROWS=last) the last one
+        let rows = self.dg.g.shape(self.dg.outputs[0])[0].n();
+        let vocab = l.len() / rows;
+        argmax(&l[(rows - 1) * vocab..])
     }
 
     /// Prefill: `tokens` at positions `p0..`, then `state` holds the next

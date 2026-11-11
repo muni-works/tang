@@ -12,7 +12,7 @@
 #      and f32 caches
 #   3. Qwen3-8B MLX 4-bit: a 21-token prompt, 64 greedy tokens, then device
 #      time of a decode step (k = 1) and a 4-token window (k = 4) at each
-#      length in $LENS. Hand first, then derived.
+#      length in $LENS. Hand, derived, and derived with last-row windows.
 #   4. a summary: step ms and tok/s side by side, and whether the greedy
 #      ids agree
 #
@@ -85,11 +85,15 @@ log "Qwen3-8B: prompt, greedy decode, bench (k = 1 and k = $WINDOW) at $LENS"
 # a fixed 21-token prompt (any ids will do for timing; both runs use the same)
 echo "785 6722 315 9625 374 12095 13 576 6722 315 9856 374 19846 13 576 6722 315 15344 374 21718 13" \
   >"$OUT/prompt.ids"
-for kind in hand derived; do
+# derived-last: the derived window computes only its last row's logits
+# (QWEN_DERIVED_ROWS=last), as the hand prefill step does
+for kind in hand derived derived-last; do
   flag=""
-  [ "$kind" = derived ] && flag="--derived"
+  rows=all
+  [ "$kind" != hand ] && flag="--derived"
+  [ "$kind" = derived-last ] && rows=last
   # shellcheck disable=SC2086
-  "$BIN" model "$MODEL_DIR" "$OUT/prompt.ids" --gen 64 --ctx "$CTX" \
+  QWEN_DERIVED_ROWS=$rows "$BIN" model "$MODEL_DIR" "$OUT/prompt.ids" --gen 64 --ctx "$CTX" \
     --bench "$LENS" --bench-window "$WINDOW" --out "$OUT/ids-$kind.txt" $flag \
     2>&1 | tee "$OUT/model-$kind.txt"
 done
@@ -107,20 +111,22 @@ log "summary"
   done
   echo
   echo "Qwen3-8B device step time:"
-  for kind in hand derived; do
-    grep -E '^(decode step at len|window of)' "$OUT/model-$kind.txt" | sed 's/^/  /'
+  for kind in hand derived derived-last; do
+    grep -E '^(decode step at len|window of)' "$OUT/model-$kind.txt" | sed "s/^/  [$kind] /"
   done
   echo
   echo "end to end (not like for like, see the header):"
-  for kind in hand derived; do
-    printf '  %-8s %s\n' "$kind" "$(grep -E '^decode .* tok/s end to end' "$OUT/model-$kind.txt")"
+  for kind in hand derived derived-last; do
+    printf '  %-13s %s\n' "$kind" "$(grep -E '^decode .* tok/s end to end' "$OUT/model-$kind.txt")"
   done
   echo
-  if cmp -s "$OUT/ids-hand.txt" "$OUT/ids-derived.txt"; then
-    echo "greedy ids: identical (64 tokens)"
-  else
-    echo "greedy ids differ:"
-    echo "  hand:    $(cat "$OUT/ids-hand.txt")"
-    echo "  derived: $(cat "$OUT/ids-derived.txt")"
-  fi
+  for kind in derived derived-last; do
+    if cmp -s "$OUT/ids-hand.txt" "$OUT/ids-$kind.txt"; then
+      echo "greedy ids, $kind vs hand: identical (64 tokens)"
+    else
+      echo "greedy ids, $kind vs hand: differ"
+      echo "  hand:  $(cat "$OUT/ids-hand.txt")"
+      echo "  $kind: $(cat "$OUT/ids-$kind.txt")"
+    fi
+  done
 } | tee "$OUT/summary.txt"

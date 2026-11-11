@@ -12,7 +12,9 @@
 //! `[kvh, hd, T]`), so the derived step reads and writes the same buffers.
 use tang::Scalar;
 use tang_compile::tensor::cuda_gemv::Packing;
-use tang_compile::tensor::step::{derive_step, StepGraph, StepInput, StepSpec};
+use tang_compile::tensor::step::{
+    derive_step_with, Rows, StepGraph, StepInput, StepOptions, StepSpec,
+};
 use tang_compile::tensor::{Dim, Form, Monoid, Op, TensorGraph, TensorId};
 use tang_expr::ExprId;
 
@@ -469,7 +471,14 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
 /// The derived step of `pg` appending `k` tokens, against caches of
 /// `dims.ctx` positions: outputs `[logits, updated caches…]`.
 pub fn derived_step(pg: &PrefillGraph, dims: &QwenDims, k: usize) -> StepGraph {
-    derive_step(
+    derived_step_rows(pg, dims, k, Rows::All)
+}
+
+/// [`derived_step`] with only the last new row's logits ([`Rows::Last`]):
+/// the LM head and the last layer's MLP run for one row, as in the hand
+/// prefill step.
+pub fn derived_step_rows(pg: &PrefillGraph, dims: &QwenDims, k: usize, rows: Rows) -> StepGraph {
+    derive_step_with(
         &pg.g,
         &[pg.logits],
         &StepSpec {
@@ -477,6 +486,7 @@ pub fn derived_step(pg: &PrefillGraph, dims: &QwenDims, k: usize) -> StepGraph {
             new: k,
             capacity: dims.ctx,
         },
+        &StepOptions { rows, batch: None },
     )
     .expect("the Qwen prefill graph has a step")
 }
@@ -544,7 +554,19 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
     caches.sort_by_key(|(n, _)| order(n));
     let mut outputs = step.outputs.clone();
     outputs.extend(caches.iter().map(|(_, t)| *t));
-    let seq = step.graph.shape(step.outputs[0])[0].n();
+    // tokens per step (the logits may be the last row only)
+    let tokens = step
+        .inputs
+        .iter()
+        .position(|si| matches!(si, StepInput::New(i) if pg.inputs[*i].name == "tokens"))
+        .expect("a step reads its tokens");
+    let seq = step
+        .graph
+        .nodes()
+        .iter()
+        .find(|n| matches!(n.op, Op::Input(i) if i == tokens))
+        .map(|n| n.shape[0].n())
+        .unwrap();
     let mut keep: Vec<TensorId> = pg
         .keep
         .iter()
@@ -565,13 +587,24 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
             })
             .map(|(k, _)| k)
             .collect();
+        // (only a weight read by more than one row: the LM head of a
+        // last-row window is a GEMV over the packed words, as in the hand
+        // step, not a 1.2 GB f16 copy a step)
+        let wide_reader = |n: usize| {
+            (0..g.nodes().len()).any(|r| {
+                g.comp_at(r).is_some_and(|c| {
+                    c.args.iter().any(|a| a.src.index() == n)
+                        && c.out.first().and_then(|d| d.fixed()).unwrap_or(1) > 1
+                })
+            })
+        };
         keep.extend((0..g.nodes().len()).filter_map(|n| {
             let c = g.comp_at(n)?;
             let reads_u4 = c
                 .args
                 .iter()
                 .any(|a| matches!(g.nodes()[a.src.index()].op, Op::Input(i) if u4.contains(&i)));
-            (c.monoid.is_none() && reads_u4).then(|| TensorId::from_index(n))
+            (c.monoid.is_none() && reads_u4 && wide_reader(n)).then(|| TensorId::from_index(n))
         }));
     }
     DecodeGraph {
@@ -1024,6 +1057,75 @@ mod tests {
         }
     }
 
+    /// A 4-token window with only the last row's logits: equal to the
+    /// prefill's last row and to the hand prefill step's logits, with as
+    /// many kernels as the hand step and a subset of its mma tiles.
+    #[test]
+    fn last_row_window_matches_hand() {
+        let dims = tiny();
+        let pg = prefill_graph(&dims);
+        let w = weights(&pg, &dims);
+        let all = tokens(dims.ctx, dims.vocab);
+        let (p0, k) = (5, 4);
+        let caches = prefilled_caches(&pg, &dims, &w, &all[..p0]);
+        let step = derived_step_rows(&pg, &dims, k, Rows::Last);
+        assert_eq!(step.graph.shape(step.outputs[0])[0].n(), 1);
+        let inputs = step_inputs(&pg, &step, &w, &caches, &all[p0..p0 + k], p0);
+        let mut ids = step.outputs.clone();
+        ids.extend(step.caches.iter().map(|c| c.updated));
+        let got = step.graph.eval(&inputs, &ids);
+        let fg = pg.g.bind(&[(SEQ, p0 + k)]).unwrap();
+        let want = fg.eval(&prefill_inputs(&pg, &w, &all[..p0 + k]), &[pg.logits]);
+        let lw = rows(
+            &want[0],
+            &shape_at(&pg, pg.logits, p0 + k),
+            0,
+            p0 + k - 1,
+            p0 + k,
+        );
+        let e = rel(&got[0], &lw);
+        let hand = step_graph(&dims, k, dims.ctx);
+        let hin: Vec<Vec<f64>> = hand
+            .inputs
+            .iter()
+            .map(|s| match s.name.as_str() {
+                "chunk" => all[p0..p0 + k].iter().copied().chain([p0 as f64]).collect(),
+                "state" => vec![0.0, 0.0],
+                n if n.ends_with("cache") => caches[n].clone(),
+                n => w[n].clone(),
+            })
+            .collect();
+        let hres = hand.g.eval(&hin, &hand.outputs[..1]);
+        let eh = rel(&got[0], &hres[0]);
+        let dg = as_decode_graph(&pg, &step, &dims);
+        assert_eq!(dg.seq, k);
+        let (g, outs) = compiled_decode(&dg, true);
+        let p = g.to_cuda_decode(&outs, &decode_opts(&dg, &outs));
+        let (hg, houts) = compiled_decode(&hand, true);
+        let hp = hg.to_cuda_decode(&houts, &decode_opts(&hand, &houts));
+        let tiles = |p: &tang_compile::tensor::cuda_gemv::DecodeProgram, g: &TensorGraph| {
+            p.program
+                .kernels
+                .iter()
+                .filter(|kn| kn.source.contains("mma"))
+                .map(|kn| g.nodes()[kn.node.index()].shape.clone())
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "last-row window k={k}: vs prefill {e:.2e}, vs hand {eh:.2e}; kernels {} ({} mma) vs hand {} ({} mma)",
+            p.program.kernels.len(),
+            tiles(&p, &g).len(),
+            hp.program.kernels.len(),
+            tiles(&hp, &hg).len()
+        );
+        assert!(e < 1e-12 && eh < 1e-12, "{e:e} {eh:e}");
+        // the hand step's tiles, less the last layer's o, gate|up and down:
+        // those run for the last row only here (the hand step computes all
+        // k rows and keeps the last); no LM-head tile either
+        let ht = tiles(&hp, &hg);
+        assert_eq!(tiles(&p, &g), ht[..ht.len() - 3]);
+    }
+
     /// Derived kernels whose (canonical) source is one of the hand
     /// program's, counted with multiplicity.
     fn shared_sources(
@@ -1077,6 +1179,29 @@ mod tests {
             count(&hp)
         );
         assert_eq!(p.native.iter().filter(|x| !**x).count(), 0);
+        // a 4-token window, last row only, against the hand prefill step
+        let mma = |p: &tang_compile::tensor::cuda_gemv::DecodeProgram| {
+            p.program
+                .kernels
+                .iter()
+                .filter(|kn| kn.source.contains("mma"))
+                .count()
+        };
+        let step = derived_step_rows(&pg, &dims, 4, Rows::Last);
+        let dg = as_decode_graph(&pg, &step, &dims);
+        let (g, outs) = compiled_decode(&dg, true);
+        let p = g.to_cuda_decode(&outs, &decode_opts(&dg, &outs));
+        let hand = step_graph(&dims, 4, dims.ctx);
+        let (hg, houts) = compiled_decode(&hand, true);
+        let hp = hg.to_cuda_decode(&houts, &decode_opts(&hand, &houts));
+        eprintln!(
+            "qwen3-8b window 4, last row: kernels derived {} ({} mma) vs hand {} ({} mma)",
+            p.program.kernels.len(),
+            mma(&p),
+            hp.program.kernels.len(),
+            mma(&hp)
+        );
+        assert_eq!(mma(&p), mma(&hp) - 3);
     }
 
     /// Every CUDA kernel of the derived steps (tiny k = 1 and 4, Qwen3-8B
@@ -1088,20 +1213,22 @@ mod tests {
     fn derived_step_kernels_compile_with_nvrtc() {
         let arch = "sm_86";
         let mut progs = Vec::new();
-        for (dims, k) in [
-            (tiny(), 1),
-            (tiny(), 4),
-            (QwenDims::qwen3_8b(4352), 1),
-            (QwenDims::qwen3_8b(4352), 4),
+        for (dims, k, rows) in [
+            (tiny(), 1, Rows::All),
+            (tiny(), 4, Rows::All),
+            (tiny(), 4, Rows::Last),
+            (QwenDims::qwen3_8b(4352), 1, Rows::All),
+            (QwenDims::qwen3_8b(4352), 4, Rows::All),
+            (QwenDims::qwen3_8b(4352), 4, Rows::Last),
         ] {
             let pg = prefill_graph(&dims);
-            let step = derived_step(&pg, &dims, k);
+            let step = derived_step_rows(&pg, &dims, k, rows);
             let dg = as_decode_graph(&pg, &step, &dims);
             let (g, outs) = compiled_decode(&dg, true);
             let p = g.to_cuda_decode(&outs, &decode_opts(&dg, &outs));
-            progs.push((dims.layers, k, p));
+            progs.push((dims.layers, k, rows, p));
         }
-        for (layers, k, p) in &progs {
+        for (layers, k, rows, p) in &progs {
             let mut distinct: Vec<&str> = p
                 .program
                 .kernels
@@ -1121,7 +1248,7 @@ mod tests {
                 .filter(|kn| kn.source.contains("mma"))
                 .count();
             eprintln!(
-                "{layers} layers, k={k}: {} kernels ({} distinct sources, {mma} mma) compiled to {arch} PTX",
+                "{layers} layers, k={k} ({rows:?} rows): {} kernels ({} distinct sources, {mma} mma) compiled to {arch} PTX",
                 p.program.kernels.len(),
                 distinct.len()
             );

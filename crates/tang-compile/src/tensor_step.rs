@@ -50,7 +50,10 @@ use std::collections::HashMap;
 use tang::Scalar;
 use tang_expr::{ExprGraph, ExprId, Node};
 
-use super::{err, Arg, Comp, Dim, Form, Op, ShapeError, TensorGraph, TensorId, View};
+use super::{
+    err, Arg, Comp, Dim, Form, Monoid, Op, Scan, ScanKind, Semiring, ShapeError, TensorGraph,
+    TensorId, View,
+};
 
 /// What the step derivation is asked for.
 #[derive(Clone, Copy, Debug)]
@@ -63,10 +66,33 @@ pub struct StepSpec {
     pub capacity: usize,
 }
 
+/// Which rows of the outputs the step computes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rows {
+    /// All `k` new rows (a draft verify needs every row's logits).
+    #[default]
+    All,
+    /// Only the last new row: what comes after the window. Nodes that
+    /// only feed it (the LM head, the last layer's MLP) run for one row.
+    Last,
+}
+
+/// Options of [`derive_step_with`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepOptions {
+    pub rows: Rows,
+    /// A symbolic batch dim of the prefill graph (independent sessions):
+    /// the step's position input is then `[batch]`, one `p0` a session,
+    /// read through each comp's batch coordinate. Sessions at different
+    /// lengths step together.
+    pub batch: Option<&'static str>,
+}
+
 /// Where a step-graph input comes from, in the step graph's input order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepInput {
-    /// `[1]`: `p0`, the number of positions already in the caches.
+    /// `[1]` (or `[batch]`): `p0`, the number of positions already in
+    /// the caches.
     Pos,
     /// Prefill input `i`, only the `k` new rows.
     New(usize),
@@ -88,6 +114,11 @@ pub struct CacheSlot {
     /// The updated cache (rows `p0..p0+k` written): a step output, to be
     /// stored back into `input` (in place on a device).
     pub updated: TensorId,
+    /// A carried state rather than rows: the monoid state of a reduction
+    /// over the sequence (`node`'s own shape), or a scan's state at the
+    /// last position (`node`'s shape without its scan dim `axis`). Empty
+    /// sequence: the monoid identity (zero for an affine scan).
+    pub state: bool,
 }
 
 /// The derived step.
@@ -107,6 +138,8 @@ pub struct StepGraph {
 enum Mode {
     New,
     Full,
+    /// The last new row only (extent 1, position `p0 + k − 1`).
+    Last,
 }
 
 type Modes = Vec<Option<Mode>>;
@@ -119,9 +152,45 @@ pub fn derive_step(
     outputs: &[TensorId],
     spec: &StepSpec,
 ) -> Result<StepGraph, ShapeError> {
+    derive_step_with(g, outputs, spec, &StepOptions::default())
+}
+
+/// [`derive_step`] with [`StepOptions`]: last-row outputs, batched sessions.
+pub fn derive_step_with(
+    g: &TensorGraph,
+    outputs: &[TensorId],
+    spec: &StepSpec,
+    opts: &StepOptions,
+) -> Result<StepGraph, ShapeError> {
+    // last-row outputs: a node whose new rows feed a cache anyway is
+    // sliced from them rather than computed again for the last row
+    let need_new = match opts.rows {
+        Rows::All => None,
+        Rows::Last => {
+            let all = derive_step_with(
+                g,
+                outputs,
+                spec,
+                &StepOptions {
+                    rows: Rows::All,
+                    ..*opts
+                },
+            )?;
+            let mut need = vec![false; g.nodes.len()];
+            let mut stack: Vec<usize> = all.caches.iter().map(|c| c.node.n()).collect();
+            while let Some(i) = stack.pop() {
+                if !std::mem::replace(&mut need[i], true) {
+                    stack.extend(g.deps(i));
+                }
+            }
+            Some(need)
+        }
+    };
     let mut d = Deriver {
         g,
         spec: *spec,
+        opts: *opts,
+        need_new,
         sg: TensorGraph::new(),
         inputs: Vec::new(),
         pos: TensorId(0),
@@ -130,7 +199,10 @@ pub fn derive_step(
         caches: Vec::new(),
         cache_of: HashMap::new(),
     };
-    d.pos = d.sg.input(&[1usize]);
+    d.pos = match opts.batch {
+        Some(b) => d.sg.input(&[Dim::Sym(b)]),
+        None => d.sg.input(&[1usize]),
+    };
     d.inputs.push(StepInput::Pos);
     let mut outs = Vec::new();
     for &o in outputs {
@@ -141,13 +213,30 @@ pub fn derive_step(
                 tax.len()
             ));
         }
-        let modes = d.modes_with(o.n(), Mode::New);
+        let mode = match opts.rows {
+            Rows::All => Mode::New,
+            Rows::Last => Mode::Last,
+        };
+        let modes = d.modes_with(o.n(), mode);
         outs.push(d.get(o.n(), modes)?);
+    }
+    // a cached row must not depend on a carried state: the state changes
+    // with every new row, so the old rows' cached values would go stale
+    for r in d.caches.iter().filter(|c| !c.state) {
+        for st in d.caches.iter().filter(|c| c.state) {
+            if g.depends_on(r.node.n(), st.node.n()) {
+                return err(format!(
+                    "step: cached rows of {:?} depend on the running state {:?}; \
+                     old rows would change as the sequence grows",
+                    r.node, st.node
+                ));
+            }
+        }
     }
     let rows = d
         .memo
         .iter()
-        .filter(|((_, m), _)| m.iter().all(|x| *x != Some(Mode::Full)))
+        .filter(|((_, m), _)| m.iter().all(|x| x.is_none() || *x == Some(Mode::New)))
         .map(|((n, _), &t)| (TensorId(*n as u32), t))
         .collect();
     Ok(StepGraph {
@@ -163,6 +252,9 @@ pub fn derive_step(
 struct Deriver<'a> {
     g: &'a TensorGraph,
     spec: StepSpec,
+    opts: StepOptions,
+    /// [`Rows::Last`]: the nodes whose new rows a cache needs.
+    need_new: Option<Vec<bool>>,
     sg: TensorGraph,
     inputs: Vec<StepInput>,
     pos: TensorId,
@@ -194,6 +286,7 @@ impl Deriver<'_> {
         Dim::Fixed(match m {
             Mode::New => self.spec.new,
             Mode::Full => self.spec.capacity,
+            Mode::Last => 1,
         })
     }
 
@@ -214,9 +307,24 @@ impl Deriver<'_> {
         let full_single = tax.len() == 1 && modes[tax[0]] == Some(Mode::Full);
         let g = self.g;
         let node = &g.nodes[n];
+        let last_of_new = tax.len() == 1
+            && modes[tax[0]] == Some(Mode::Last)
+            && !matches!(node.op, Op::Iota(_))
+            && self.need_new.as_ref().is_some_and(|need| need[n]);
+        if last_of_new {
+            let new = self.get(n, self.modes_with(n, Mode::New))?;
+            let t = self.last_row(new, tax[0], true)?;
+            self.memo.insert((n, modes), t);
+            return Ok(t);
+        }
         let t = match &node.op {
             Op::Iota(dim) => self.iota(n, *dim, &modes)?,
             Op::Input(_) | Op::Comp(_) if full_single => self.cache(n, tax[0])?,
+            // the last row of the new rows (one input, read once)
+            Op::Input(_) if tax.len() == 1 && modes[tax[0]] == Some(Mode::Last) => {
+                let new = self.get(n, self.modes_with(n, Mode::New))?;
+                self.last_row(new, tax[0], true)?
+            }
             Op::Input(i) => {
                 let i = *i;
                 if tax.len() > 1 {
@@ -256,9 +364,8 @@ impl Deriver<'_> {
                 let shape = self.step_shape(&node.shape, &modes);
                 self.sg.reshape(s, &shape)?
             }
-            Op::Operator(_) | Op::Scan(_) => {
-                return err("step: operator and scan nodes are not derived yet")
-            }
+            Op::Scan(sc) => self.scan(n, sc, &modes)?,
+            Op::Operator(_) => return err("step: operator nodes are not derived yet"),
         };
         self.memo.insert((n, modes), t);
         Ok(t)
@@ -268,8 +375,15 @@ impl Deriver<'_> {
     fn iota(&mut self, n: usize, dim: usize, modes: &Modes) -> Result<TensorId, ShapeError> {
         let shape = self.step_shape(&self.g.nodes[n].shape, modes);
         let it = self.sg.iota(&shape, dim);
-        if modes[dim] != Some(Mode::New) {
-            return Ok(it);
+        let off = match modes[dim] {
+            Some(Mode::New) => 0.0,
+            Some(Mode::Last) => (self.spec.new - 1) as f64,
+            _ => return Ok(it),
+        };
+        if self.opts.batch.is_some() {
+            return err(
+                "step: a position read outside a comp (batched sessions need its batch coordinate)",
+            );
         }
         let r = shape.len();
         let args = vec![
@@ -282,7 +396,258 @@ impl Deriver<'_> {
                 view: View::pick(r, &[None]),
             },
         ];
-        self.sg.comp(&shape, &[], args, None, |v| vec![v[0] + v[1]])
+        self.sg.comp(&shape, &[], args, None, move |v| {
+            vec![v[0] + v[1] + ExprId::from_f64(off)]
+        })
+    }
+
+    /// How a comp over `space` reads `p0`: the one position, or (batched)
+    /// the position of the space's batch coordinate.
+    fn pos_arg(&self, space: &[Dim]) -> Result<Arg, ShapeError> {
+        let r = space.len();
+        let view = match self.opts.batch {
+            None => View::pick(r, &[None]),
+            Some(b) => match space.iter().position(|&d| d == Dim::Sym(b)) {
+                Some(bc) => View::pick(r, &[Some(bc)]),
+                None => {
+                    return err(format!(
+                        "step: a position read in a space {space:?} without the batch dim `{b}`"
+                    ))
+                }
+            },
+        };
+        Ok(Arg {
+            src: self.pos,
+            view,
+        })
+    }
+
+    /// Row `k − 1` of `src` along `axis` (kept as an extent-1 axis, or
+    /// dropped).
+    fn last_row(&mut self, src: TensorId, axis: usize, keep: bool) -> Result<TensorId, ShapeError> {
+        let shape = self.sg.shape(src).to_vec();
+        let mut out = shape.clone();
+        if keep {
+            out[axis] = Dim::Fixed(1);
+        } else {
+            out.remove(axis);
+        }
+        let r = out.len();
+        let last = (self.spec.new - 1) as i64;
+        let forms = (0..shape.len())
+            .map(|d| {
+                if d == axis {
+                    Form::constant(r, last)
+                } else {
+                    Form::unit(r, if keep || d < axis { d } else { d - 1 })
+                }
+            })
+            .collect();
+        let view = View {
+            forms,
+            guard: false,
+            gather: None,
+        };
+        self.sg
+            .comp(&out, &[], vec![Arg { src, view }], None, |v| vec![v[0]])
+    }
+
+    /// `out[p…] = m.combine(acc[…], el[p…])` over `shape` (a trailing tuple
+    /// dim when the monoid is wider than 1): `acc_picks` maps `acc`'s dims
+    /// (without the tuple dim) to point coordinates.
+    fn combine(
+        &mut self,
+        m: &Monoid,
+        shape: &[Dim],
+        acc: TensorId,
+        acc_picks: &[Option<usize>],
+        el: TensorId,
+    ) -> Result<TensorId, ShapeError> {
+        let w = m.width;
+        let tuple = usize::from(w > 1);
+        let pts = shape.len() - tuple;
+        let read = |src: TensorId, picks: &[Option<usize>], slot: usize| {
+            let mut v = View::pick(pts, picks);
+            if w > 1 {
+                v.forms.push(Form::constant(pts, slot as i64));
+            }
+            Arg { src, view: v }
+        };
+        let el_picks: Vec<Option<usize>> = (0..pts).map(Some).collect();
+        let mut args: Vec<Arg> = (0..w).map(|s| read(acc, acc_picks, s)).collect();
+        args.extend((0..w).map(|s| read(el, &el_picks, s)));
+        self.sg.push_comp(Comp {
+            out: shape.to_vec(),
+            tuple,
+            red: Vec::new(),
+            args,
+            body: m.combine.clone(),
+            body_outs: m.outs.clone(),
+            monoid: None,
+        })
+    }
+
+    fn state_slot(&mut self, n: usize, axis: usize, input: TensorId, updated: TensorId) {
+        let slot = self.caches.len();
+        self.caches.push(CacheSlot {
+            node: TensorId(n as u32),
+            axis,
+            input,
+            updated,
+            state: true,
+        });
+        self.cache_of.insert(n, slot);
+    }
+
+    /// A scan along the sequence: the scan of the new rows, started from
+    /// the cached state at `p0 − 1`; the updated state is its last row.
+    fn scan(&mut self, n: usize, sc: &Scan, modes: &Modes) -> Result<TensorId, ShapeError> {
+        let shape = self.g.nodes[n].shape.clone();
+        let tax = self.t_axes(n);
+        if tax.is_empty() {
+            // no sequence: the same scan over the same (sequence-free) inputs
+            let ins = sc
+                .inputs
+                .iter()
+                .map(|t| self.get(t.n(), vec![None; self.g.nodes[t.n()].shape.len()]))
+                .collect::<Result<Vec<_>, _>>()?;
+            return match &sc.kind {
+                ScanKind::Monoid(m) => {
+                    self.sg
+                        .scan(&ins, sc.dim, m.clone(), sc.exclusive, sc.reverse)
+                }
+                ScanKind::Affine {
+                    form: None,
+                    ring: Semiring::Real,
+                    bands: None,
+                } => self
+                    .sg
+                    .linear_scan(ins[0], ins[1], sc.dim, sc.exclusive, sc.reverse),
+                _ => err("step: this scan kind is not derived yet"),
+            };
+        }
+        if tax != [sc.dim] {
+            return err(format!(
+                "step: scan node {n} runs along dim {} but its sequence axes are {tax:?}",
+                sc.dim
+            ));
+        }
+        if sc.exclusive || sc.reverse {
+            return err(format!(
+                "step: scan node {n} is exclusive or reversed (a reverse scan reads the future)"
+            ));
+        }
+        match modes[sc.dim] {
+            Some(Mode::New) => {}
+            Some(Mode::Last) => {
+                let new = self.get(n, self.modes_with(n, Mode::New))?;
+                return self.last_row(new, sc.dim, true);
+            }
+            _ => {
+                return err(format!(
+                    "step: scan node {n} is read at old rows (cache the state, not the rows)"
+                ))
+            }
+        }
+        let dim = sc.dim;
+        let k = self.spec.new;
+        let step_shape = self.step_shape(&shape, modes);
+        // state: the output's shape without the scan dim
+        let mut st_shape = step_shape.clone();
+        st_shape.remove(dim);
+        let new_in = |d: &mut Self, t: TensorId| {
+            let m = d.modes_with(t.n(), Mode::New);
+            d.get(t.n(), m)
+        };
+        match &sc.kind {
+            ScanKind::Monoid(m) => {
+                let ins = sc
+                    .inputs
+                    .iter()
+                    .map(|&t| new_in(self, t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let part = self.sg.scan(&ins, dim, m.clone(), false, false)?;
+                let input = self.sg.input(&st_shape);
+                self.inputs.push(StepInput::Cache(self.caches.len()));
+                let pts = step_shape.len() - usize::from(m.width > 1);
+                let acc_picks: Vec<Option<usize>> =
+                    (0..pts).filter(|&d| d != dim).map(Some).collect();
+                let out = self.combine(m, &step_shape, input, &acc_picks, part)?;
+                let updated = self.last_row(out, dim, false)?;
+                self.state_slot(n, dim, input, updated);
+                Ok(out)
+            }
+            ScanKind::Affine {
+                ring: Semiring::Real,
+                bands: None,
+                ..
+            } => {
+                // S_t = A_t·S_{t−1} + U_t from S_{p0−1}: fold the cached
+                // state into the first new row, U'_0 = A_0·S + U_0
+                let a = new_in(self, sc.inputs[0])?;
+                let u = new_in(self, sc.inputs[1])?;
+                let input = self.sg.input(&st_shape);
+                self.inputs.push(StepInput::Cache(self.caches.len()));
+                let r = step_shape.len(); // [P…, n, m]
+                let nn = step_shape[r - 2];
+                // AS[P…, i, c] = Σ_j A[P…, i, j]·S[P…\dim, j, c]: space (P…, i, c, j)
+                let mut a_picks: Vec<Option<usize>> = (0..r - 1).map(Some).collect();
+                a_picks.push(Some(r));
+                let mut s_picks: Vec<Option<usize>> =
+                    (0..r - 2).filter(|&d| d != dim).map(Some).collect();
+                s_picks.extend([Some(r), Some(r - 1)]);
+                let as_ = self.sg.comp(
+                    &step_shape,
+                    &[nn],
+                    vec![
+                        Arg {
+                            src: a,
+                            view: View::pick(r + 1, &a_picks),
+                        },
+                        Arg {
+                            src: input,
+                            view: View::pick(r + 1, &s_picks),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )?;
+                let t = self.sg.iota(&step_shape, dim);
+                let u0 = self.sg.comp(
+                    &step_shape,
+                    &[],
+                    vec![
+                        Arg {
+                            src: as_,
+                            view: View::identity(r, r),
+                        },
+                        Arg {
+                            src: u,
+                            view: View::identity(r, r),
+                        },
+                        Arg {
+                            src: t,
+                            view: View::identity(r, r),
+                        },
+                    ],
+                    None,
+                    |v| {
+                        let first = ExprId::from_f64(0.5) - v[2]; // t' == 0
+                        let folded = v[0] + v[1];
+                        vec![tang_expr::with_graph(|eg| eg.select(first, folded, v[1]))]
+                    },
+                )?;
+                // (the chunked schedule's DeltaForm no longer describes U')
+                let out = self.sg.linear_scan(a, u0, dim, false, false)?;
+                let updated = self.last_row(out, dim, false)?;
+                self.state_slot(n, dim, input, updated);
+                let _ = k;
+                Ok(out)
+            }
+            _ => err(format!(
+                "step: scan node {n} is a log/max-plus or banded scan (not derived yet)"
+            )),
+        }
     }
 
     /// Node `n` (one `T`-axis, `axis`) read at old rows: its new rows
@@ -302,18 +667,15 @@ impl Deriver<'_> {
         self.inputs.push(StepInput::Cache(slot));
         let r = shape.len();
         let k = self.spec.new;
-        let pos_at = |rank: usize| Arg {
-            src: self.pos,
-            view: View::pick(rank, &[None]),
-        };
+        let mut sp = shape.clone();
+        sp.push(Dim::Fixed(k));
+        let (pos_r, pos_r1) = (self.pos_arg(&shape)?, self.pos_arg(&sp)?);
         let row = if k == 1 {
             let mut v = View::identity(r, r);
             v.forms[axis] = Form::zero(r);
             Arg { src: new, view: v }
         } else {
             // space: cache coords ++ (t)
-            let mut sp = shape.clone();
-            sp.push(Dim::Fixed(k));
             let mut v = View::identity(r + 1, r);
             v.forms[axis] = Form::unit(r + 1, r);
             let (jt, tt) = (self.sg.iota(&sp, axis), self.sg.iota(&sp, r));
@@ -330,7 +692,7 @@ impl Deriver<'_> {
                         src: tt,
                         view: View::identity(r + 1, r + 1),
                     },
-                    pos_at(r + 1),
+                    pos_r1,
                 ],
                 Some(super::Monoid::sum()),
                 // new row t lands at cache row j = p0 + t
@@ -352,7 +714,7 @@ impl Deriver<'_> {
                 src: iota,
                 view: View::identity(r, r),
             },
-            pos_at(r),
+            pos_r,
         ];
         let kf = k as f64;
         let updated = self.sg.comp(&shape, &[], args, None, |v| {
@@ -370,6 +732,7 @@ impl Deriver<'_> {
             axis,
             input,
             updated,
+            state: false,
         });
         self.cache_of.insert(n, slot);
         Ok(updated)
@@ -379,16 +742,16 @@ impl Deriver<'_> {
         let pts = c.points().len();
         // the mode of every iteration coordinate (None: not over T)
         let mut coord: Modes = modes[..pts].to_vec();
-        coord.extend(c.red.iter().map(|&d| self.is_seq(d).then_some(Mode::Full)));
+        let running =
+            !modes[..pts].iter().any(|m| m.is_some()) && c.red.iter().any(|&d| self.is_seq(d));
+        // a reduction over the sequence into no sequence axis is a running
+        // state: the step reduces the new rows only and combines them into
+        // the cached total
+        let red_mode = if running { Mode::New } else { Mode::Full };
+        coord.extend(c.red.iter().map(|&d| self.is_seq(d).then_some(red_mode)));
         let seq_red: Vec<usize> = (pts..coord.len()).filter(|&d| coord[d].is_some()).collect();
-        if !seq_red.is_empty() {
+        if !seq_red.is_empty() && !running {
             let seq_pts: Vec<usize> = (0..pts).filter(|&d| coord[d].is_some()).collect();
-            if seq_pts.is_empty() {
-                return err(format!(
-                    "step: node {n} reduces over the sequence into no sequence axis \
-                     (a running state; not derived yet)"
-                ));
-            }
             for &j in &seq_red {
                 if !seq_pts.iter().any(|&i| self.causal_mask(c, i, j)) {
                     return err(format!(
@@ -438,6 +801,45 @@ impl Deriver<'_> {
                     smodes.push(None);
                 }
             }
+            // batched: a position iota becomes a map over this comp's space,
+            // where the batch coordinate picks the session's `p0`
+            if let (Some(_), Op::Iota(dim)) = (self.opts.batch, &self.g.nodes[a.src.n()].op) {
+                let off = match smodes[*dim] {
+                    Some(Mode::New) => Some(0.0),
+                    Some(Mode::Last) => Some((self.spec.new - 1) as f64),
+                    _ => None,
+                };
+                if let Some(off) = off {
+                    let ishape = self.step_shape(&src_shape, &smodes);
+                    let it = self.sg.iota(&ishape, *dim);
+                    let space: Vec<Dim> = c
+                        .space()
+                        .iter()
+                        .zip(&coord)
+                        .map(|(&d, m)| m.map_or(d, |m| self.extent(m)))
+                        .collect();
+                    let r = space.len();
+                    let pos = self.pos_arg(&space)?;
+                    let map = self.sg.comp(
+                        &space,
+                        &[],
+                        vec![
+                            Arg {
+                                src: it,
+                                view: a.view.clone(),
+                            },
+                            pos,
+                        ],
+                        None,
+                        move |v| vec![v[0] + v[1] + ExprId::from_f64(off)],
+                    )?;
+                    args.push(Arg {
+                        src: map,
+                        view: View::identity(r, r),
+                    });
+                    continue;
+                }
+            }
             let src = self.get(a.src.n(), smodes)?;
             args.push(Arg {
                 src,
@@ -458,21 +860,32 @@ impl Deriver<'_> {
             .iter()
             .map(|&d| {
                 if self.is_seq(d) {
-                    self.extent(Mode::Full)
+                    self.extent(red_mode)
                 } else {
                     d
                 }
             })
             .collect();
-        self.sg.push_comp(Comp {
-            out,
+        let t = self.sg.push_comp(Comp {
+            out: out.clone(),
             tuple: c.tuple,
             red,
             args,
             body: c.body.clone(),
             body_outs: c.body_outs.clone(),
             monoid: c.monoid.clone(),
-        })
+        })?;
+        if !running {
+            return Ok(t);
+        }
+        // total = cached total ⊕ the new rows' partial
+        let m = c.monoid.clone().expect("a reduction has a monoid");
+        let input = self.sg.input(&out);
+        self.inputs.push(StepInput::Cache(self.caches.len()));
+        let picks: Vec<Option<usize>> = (0..pts).map(Some).collect();
+        let total = self.combine(&m, &out, input, &picks, t)?;
+        self.state_slot(n, 0, input, total);
+        Ok(total)
     }
 
     /// Whether every value `c`'s body contributes is `select(cond, x, id)`
