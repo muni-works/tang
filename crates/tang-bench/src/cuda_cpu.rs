@@ -4,8 +4,11 @@
 //! (`__syncthreads` a block barrier, warp shuffles through a per-warp
 //! exchange with a warp barrier), blocks one after the other. A check of
 //! the lowering itself (the very kernel sources a GPU would run, fused
-//! ones included) against the interpreter without a GPU. f32 buffers
-//! only; small graphs only (one OS thread per CUDA thread).
+//! ones included) against the interpreter without a GPU. Block-format
+//! buffers (GGUF / DeepSeek weights, Q8x32 activations) hold their raw
+//! words as on the device; `dp4a`, `__byte_perm` and the f16 conversion are
+//! emulated (not the int8 MMA: the int8 GEMV's `Gemv` stage only). One OS
+//! thread per CUDA thread, blocks one after the other.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -15,6 +18,7 @@ use tang_compile::tensor::cuda_gemv::DecodeProgram;
 use tang_compile::tensor::TensorId;
 
 const HEADER: &str = r#"
+#pragma once
 #include <barrier>
 #include <cmath>
 #include <cstdint>
@@ -26,8 +30,8 @@ const HEADER: &str = r#"
 using std::sqrt; using std::exp; using std::log; using std::round; using std::floor;
 using std::ceil; using std::fabs; using std::exp2; using std::log2; using std::tanh;
 struct tang_dim3 { unsigned x, y, z; };
-static thread_local tang_dim3 threadIdx;
-static tang_dim3 blockIdx, blockDim, gridDim;
+inline thread_local tang_dim3 threadIdx;
+inline tang_dim3 blockIdx, blockDim, gridDim;
 struct float4 { float x, y, z, w; };
 struct float2 { float x, y; };
 static inline float2 make_float2(float x, float y) { return {x, y}; }
@@ -44,6 +48,19 @@ struct int4 { int x, y, z, w; };
 #define __restrict__ __restrict
 #define __noinline__
 template <class T> static inline T __ldg(const T* p) { return *p; }
+static inline int __dp4a(int a, int b, int c) {
+    for (int i = 0; i < 4; i++) c += (int)(signed char)(a >> (8 * i)) * (int)(signed char)(b >> (8 * i));
+    return c;
+}
+static inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {
+    const uint64_t v = ((uint64_t)y << 32) | x;
+    unsigned r = 0;
+    for (int i = 0; i < 4; i++) r |= (unsigned)((v >> (8 * ((s >> (4 * i)) & 7))) & 0xFF) << (8 * i);
+    return r;
+}
+static inline unsigned __funnelshift_r(unsigned lo, unsigned hi, unsigned sh) {
+    sh &= 31; return sh ? (lo >> sh) | (hi << (32 - sh)) : lo;
+}
 static inline float __uint_as_float(unsigned u) { float f; std::memcpy(&f, &u, 4); return f; }
 static inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 static inline int __float_as_int(float f) { int u; std::memcpy(&u, &f, 4); return u; }
@@ -75,9 +92,9 @@ static inline unsigned short tang_sw_f2h(float f) {
     if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) r++;
     return (unsigned short)(s | r);
 }
-static std::barrier<>* tang_block;
-static std::barrier<>* tang_warp[32];
-static uint64_t tang_xch[32][32];
+inline std::barrier<>* tang_block;
+inline std::barrier<>* tang_warp[32];
+inline uint64_t tang_xch[32][32];
 static inline void __syncthreads() { tang_block->arrive_and_wait(); }
 static inline int atomicAdd(int* p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 static inline void __syncwarp(unsigned = 0xffffffffu) { tang_warp[threadIdx.x >> 5]->arrive_and_wait(); }
@@ -141,7 +158,16 @@ fn host_source(src: &str) -> String {
             r#"asm("cvt.rn.f16.f32 %0, %1;" : "=h"(s) : "f"(f));"#,
             "s = tang_sw_f2h(f);",
         )
+        .replace(
+            r#"asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));"#,
+            "f = tang_sw_h2f(h);",
+        )
         .replace("extern \"C\" ", "");
+    // the int8 MMA (not emulated: only the Gemv stage runs here)
+    if let Some(i) = s.find("asm volatile(\"mma.sync") {
+        let end = i + s[i..].find(");\n").unwrap() + 2;
+        s.replace_range(i..end, "std::abort();");
+    }
     let smem = src
         .lines()
         .find_map(|l| l.strip_prefix("#define TANG_SMEM "))
@@ -158,7 +184,8 @@ fn host_source(src: &str) -> String {
 }
 
 /// Runs `dp` on the CPU with graph input `k` holding `inputs[k]` (every
-/// other buffer zero) and returns the values of `outs`.
+/// other buffer zero; a block-format input as its raw words, f32 bits) and
+/// returns the values of `outs` (f32 outputs).
 pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Vec<f32>> {
     let p = &dp.program;
     let bi = |t: TensorId| {
@@ -168,9 +195,55 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
             .position(|b| b.node == t)
             .expect("tensor has no buffer")
     };
-    let mut cpp = String::from(HEADER);
-    for (j, k) in p.kernels.iter().enumerate() {
-        writeln!(cpp, "namespace k{j} {{\n{}\n}}", host_source(&k.source)).unwrap();
+    // kernels in translation units of `PER_TU`, compiled in parallel (one
+    // file of a few hundred kernels takes g++ more memory than a step's
+    // weights)
+    const PER_TU: usize = 8;
+    let dir: PathBuf = std::env::temp_dir().join(format!(
+        "tang-cuda-cpu-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tang_cpu.h"), HEADER).unwrap();
+    let launch = |j: usize| -> String {
+        let k = &p.kernels[j];
+        let mut args: Vec<String> = k
+            .reads
+            .iter()
+            .map(|&t| format!("B[{}].data()", bi(t)))
+            .collect();
+        for t in k.outputs() {
+            args.push(format!("B[{}].data()", bi(t)));
+        }
+        args.push(format!("{}u", k.points));
+        let blocks = k.count.div_ceil(k.workgroup_size);
+        format!(
+            "void run_k{j}(std::vector<std::vector<float>>& B) {{ tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }}); }}\n",
+            k.workgroup_size,
+            args.join(", ")
+        )
+    };
+    let nk = p.kernels.len();
+    let mut units = Vec::new();
+    for (u, j0) in (0..nk).step_by(PER_TU).enumerate() {
+        let mut cpp = String::from("#include \"tang_cpu.h\"\n");
+        for j in j0..(j0 + PER_TU).min(nk) {
+            writeln!(
+                cpp,
+                "namespace k{j} {{\n{}\n}}",
+                host_source(&p.kernels[j].source)
+            )
+            .unwrap();
+            cpp.push_str(&launch(j));
+        }
+        let f = dir.join(format!("k{u}.cpp"));
+        std::fs::write(&f, cpp).unwrap();
+        units.push(f);
+    }
+    let mut cpp = String::from("#include \"tang_cpu.h\"\n");
+    for j in 0..nk {
+        writeln!(cpp, "void run_k{j}(std::vector<std::vector<float>>& B);").unwrap();
     }
     cpp.push_str("int main(int argc, char** argv) {\n");
     writeln!(
@@ -180,13 +253,15 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
     )
     .unwrap();
     for (j, b) in p.buffers.iter().enumerate() {
-        writeln!(cpp, "    B[{j}].assign({} + 4, 0.0f);", b.len.max(1)).unwrap();
+        let words = b.format.words(b.len).max(1);
+        writeln!(cpp, "    B[{j}].assign({words} + 4, 0.0f);").unwrap();
     }
     cpp.push_str("    FILE* in = std::fopen(argv[1], \"rb\");\n");
     for (j, b) in p.buffers.iter().enumerate() {
         if let Some(k) = b.input {
             let n = inputs[k].len();
-            assert!(n <= b.len.max(1), "input {k}: {n} values, buffer {}", b.len);
+            let words = b.format.words(b.len).max(1);
+            assert!(n <= words, "input {k}: {n} words, buffer {words}");
             writeln!(
                 cpp,
                 "    if (std::fread(B[{j}].data(), 4, {n}, in) != {n}) return 2;"
@@ -195,22 +270,8 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         }
     }
     cpp.push_str("    std::fclose(in);\n");
-    for (j, k) in p.kernels.iter().enumerate() {
-        let mut args: Vec<String> = k
-            .reads
-            .iter()
-            .map(|&t| format!("B[{}].data()", bi(t)))
-            .collect();
-        args.push(format!("B[{}].data()", bi(k.node)));
-        args.push(format!("{}u", k.points));
-        let blocks = k.count.div_ceil(k.workgroup_size);
-        writeln!(
-            cpp,
-            "    tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }});",
-            k.workgroup_size,
-            args.join(", ")
-        )
-        .unwrap();
+    for j in 0..nk {
+        writeln!(cpp, "    run_k{j}(B);").unwrap();
     }
     cpp.push_str("    FILE* o = std::fopen(argv[2], \"wb\");\n");
     for &t in outs {
@@ -218,40 +279,56 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         writeln!(
             cpp,
             "    std::fwrite(B[{j}].data(), 4, {}, o);",
-            p.buffers[j].len
+            p.buffers[j].format.words(p.buffers[j].len).max(1)
         )
         .unwrap();
     }
     cpp.push_str("    std::fclose(o);\n    return 0;\n}\n");
-
-    let dir: PathBuf = std::env::temp_dir().join(format!(
-        "tang-cuda-cpu-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (src, exe, fin, fout) = (
-        dir.join("prog.cpp"),
-        dir.join("prog"),
-        dir.join("in.bin"),
-        dir.join("out.bin"),
-    );
-    std::fs::write(&src, &cpp).unwrap();
-    let cc = Command::new("g++")
-        .args(["-std=c++20", "-O1", "-w", "-pthread", "-o"])
+    let main = dir.join("main.cpp");
+    std::fs::write(&main, &cpp).unwrap();
+    units.push(main);
+    let (exe, fin, fout) = (dir.join("prog"), dir.join("in.bin"), dir.join("out.bin"));
+    let jobs = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let objs: Vec<PathBuf> = units.iter().map(|u| u.with_extension("o")).collect();
+    for chunk in units.iter().zip(&objs).collect::<Vec<_>>().chunks(jobs) {
+        let kids: Vec<_> = chunk
+            .iter()
+            .map(|(u, o)| {
+                Command::new("g++")
+                    .args(["-std=c++20", "-O1", "-w", "-pthread", "-c", "-o"])
+                    .arg(o)
+                    .arg(u)
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("g++")
+            })
+            .collect();
+        for ((u, _), kid) in chunk.iter().zip(kids) {
+            let out = kid.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "g++ failed on {}:\n{}",
+                u.display(),
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+    let ld = Command::new("g++")
+        .args(["-pthread", "-o"])
         .arg(&exe)
-        .arg(&src)
+        .args(&objs)
         .output()
         .expect("g++");
     assert!(
-        cc.status.success(),
-        "g++ failed on {}:\n{}",
-        src.display(),
-        String::from_utf8_lossy(&cc.stderr)
-            .lines()
-            .take(40)
-            .collect::<Vec<_>>()
-            .join("\n")
+        ld.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&ld.stderr)
     );
     let mut bytes = Vec::new();
     for b in &p.buffers {
@@ -269,7 +346,9 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
     let got = outs
         .iter()
         .map(|&t| {
-            let n = p.buffers[bi(t)].len;
+            let b = &p.buffers[bi(t)];
+            // a block-format output comes back as its raw words
+            let n = b.format.words(b.len).max(1);
             (&mut words).take(n).collect()
         })
         .collect();
@@ -291,6 +370,7 @@ mod tests {
         opts: &DecodeOpts,
         keep_residual: bool,
         staged: bool,
+        cokernels: bool,
     ) -> (f64, usize) {
         let m = coder();
         let w = weights(&m);
@@ -352,8 +432,30 @@ mod tests {
             let m = g.schedule_small_maps(&outs, &[]);
             assert!(m > 0, "no small map inlined");
         }
+        if cokernels {
+            let (a, b) = g.schedule_cokernels(&outs, opts);
+            eprintln!("cokernels: {a} inlined and stored, {b} side jobs");
+            assert!(a + b > 0, "no multi-output kernel");
+            if std::env::var("LIST").is_ok() {
+                for (i, nd) in g.nodes().iter().enumerate() {
+                    if let Some(h) = nd.host {
+                        eprintln!("host n{i} {:?} -> n{}", nd.shape, h.index());
+                    }
+                }
+            }
+        }
         let dp = g.to_cuda_decode(&outs, opts);
         let nk = dp.program.kernels.len();
+        if std::env::var("LIST").is_ok() {
+            for k in &dp.program.kernels {
+                eprintln!(
+                    "K n{} writes {:?} | {}",
+                    k.node.index(),
+                    k.writes.iter().map(|t| t.index()).collect::<Vec<_>>(),
+                    k.source.lines().next().unwrap_or("")
+                );
+            }
+        }
         // NaN in unwritten cache rows: zero for the run (masked anyway),
         // skipped in the comparison
         let words: Vec<Vec<f32>> = step_ins
@@ -366,28 +468,204 @@ mod tests {
             .collect();
         let got = super::run(&dp, &words, &outs);
         let mut worst = 0.0f64;
-        for (gv, wv) in got.iter().zip(&want) {
+        for (oi, (gv, wv)) in got.iter().zip(&want).enumerate() {
             let (gk, wk): (Vec<f64>, Vec<f64>) = gv
                 .iter()
                 .zip(wv)
                 .filter(|(_, w)| !w.is_nan())
                 .map(|(a, b)| (*a as f64, *b))
                 .unzip();
-            worst = worst.max(rel(&gk, &wk));
+            let e = rel(&gk, &wk);
+            if e > 1e-4 {
+                eprintln!("output {oi} (node {}): rel err {e:.2e}", outs[oi].index());
+            }
+            worst = worst.max(e);
         }
         (worst, nk)
+    }
+
+    /// The tiny coder step with multi-output kernels
+    /// (`schedule_cokernels`: residual adds folded into their norms, the
+    /// conv window into the conv, ring and state updates as side jobs)
+    /// against the interpreter, and the kernel counts with and without.
+    #[test]
+    fn coder_step_cokernels_run_on_the_cpu() {
+        let (e0, n0) = coder_step_on_cpu(&DecodeOpts::default(), true, true, false);
+        let (e1, n1) = coder_step_on_cpu(&DecodeOpts::default(), true, true, true);
+        eprintln!(
+            "tiny coder step: {n0} kernels (rel err {e0:.2e}) -> {n1} with multi-output \
+             kernels (rel err {e1:.2e} vs interpreter)"
+        );
+        assert!(e1 < 1e-4, "{e1}");
+        assert!(n1 < n0, "{n1} >= {n0}");
     }
 
     #[test]
     fn coder_step_kernels_run_on_the_cpu() {
         for staged in [false, true] {
-            let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true, staged);
+            let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true, staged, false);
             eprintln!(
                 "tiny coder step (staged stats {staged}): {nk} CUDA kernels on the CPU vs \
                  interpreter: rel err {e:.2e}"
             );
             assert!(e < 1e-4, "{e}");
         }
+    }
+
+    /// The shapes `schedule_cokernels` fuses at real size, on a small
+    /// graph: a residual add read by its RMSNorm (whose sum of squares
+    /// is staged) and by a later map, the norm read by its Q8x32 copy
+    /// and the later map; a zero-padded conv window (old ring rows, then
+    /// the new row) read by a depthwise conv and by the shifted ring;
+    /// an independent state update. Multi-output kernels against the
+    /// one-output kernels, on the CPU: the same bytes, fewer launches.
+    #[test]
+    fn cokernel_patterns_match_unfused() {
+        use tang::Scalar;
+        use tang_compile::tensor::{Arg, Dim, Form, Format, Monoid, Precision, TensorGraph, View};
+        let (d, c) = (256usize, 64usize);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[1, d]);
+        let r = g.input(&[1, d]);
+        let w = g.input(&[1, d]);
+        let ring = g.input(&[3, c]);
+        let new = g.input(&[1, c]);
+        let kw = g.input(&[c, 4]);
+        let st = g.input(&[c, 8]);
+        let a = g.map(&[x, r], |v| v[0] + v[1]).unwrap();
+        let sq = g.map(&[a], |v| v[0] * v[0]).unwrap();
+        let ss = g.reduce(sq, 1, Monoid::sum()).unwrap();
+        let ssb = g.broadcast(ss, &[Dim::Fixed(1), Dim::Fixed(d)]).unwrap();
+        let nrm = g
+            .map(&[a, ssb, w], |v| {
+                let one = tang_expr::ExprId::ONE;
+                let k = tang_expr::ExprId::from_f64(1.0 / d as f64);
+                let eps = tang_expr::ExprId::from_f64(1e-6);
+                v[0] * (one / (v[1] * k + eps).sqrt()) * v[2]
+            })
+            .unwrap();
+        let q = g.map(&[nrm], |v| v[0]).unwrap();
+        g.set_precision(q, Precision::storage(Format::Q8x32));
+        let m = g.map(&[nrm, a], |v| v[0] * v[1]).unwrap();
+        // win[t, ch] = ring[t, ch] (t < 3), new[t - 3, ch] (t = 3)
+        let f = |coefs: &[i64], offset: i64| Form {
+            coefs: coefs.to_vec(),
+            offset,
+        };
+        let pad = |forms: Vec<Form>| {
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+            .guarded()
+        };
+        let win = g
+            .comp(
+                &[4, c],
+                &[] as &[usize],
+                vec![
+                    Arg {
+                        src: ring,
+                        view: pad(vec![f(&[1, 0], 0), f(&[0, 1], 0)]),
+                    },
+                    Arg {
+                        src: new,
+                        view: pad(vec![f(&[1, 0], -3), f(&[0, 1], 0)]),
+                    },
+                ],
+                None,
+                |v| vec![v[0] + v[1]],
+            )
+            .unwrap();
+        let conv = g
+            .comp(
+                &[c],
+                &[4],
+                vec![
+                    Arg {
+                        src: win,
+                        view: View::pick(2, &[Some(1), Some(0)]),
+                    },
+                    Arg {
+                        src: kw,
+                        view: View::pick(2, &[Some(0), Some(1)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let shifted = g
+            .comp(
+                &[3, c],
+                &[] as &[usize],
+                vec![Arg {
+                    src: win,
+                    view: View {
+                        forms: vec![f(&[1, 0], 1), f(&[0, 1], 0)],
+                        guard: false,
+                        gather: None,
+                    },
+                }],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let upd = g
+            .comp(
+                &[c, 8],
+                &[] as &[usize],
+                vec![
+                    Arg {
+                        src: st,
+                        view: View::identity(2, 2),
+                    },
+                    Arg {
+                        src: new,
+                        view: View::pick(2, &[None, Some(0)]),
+                    },
+                ],
+                None,
+                |v| vec![v[0] * tang_expr::ExprId::from_f64(0.5) + v[1]],
+            )
+            .unwrap();
+        let outs0 = [a, m, q, conv, shifted, upd];
+        let mut keep = outs0.to_vec();
+        keep.extend([nrm, win]);
+        let (mut g, keep) = g.substitute_maps(&keep);
+        let outs = keep[..outs0.len()].to_vec();
+        assert!(g.schedule_staged_stats(&outs, &[]) > 0);
+        let ins: Vec<Vec<f32>> = [d, d, d, 3 * c, c, 4 * c, 8 * c]
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| {
+                (0..n)
+                    .map(|i| (((i * 37 + k * 11) % 101) as f32 - 50.0) / 23.0)
+                    .collect()
+            })
+            .collect();
+        let run = |g: &TensorGraph| {
+            let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+            (super::run(&dp, &ins, &outs), dp.program.kernels.len())
+        };
+        let (one, n1) = run(&g);
+        let mut fg = g.clone();
+        let (ai, bj) = fg.schedule_cokernels(&outs, &DecodeOpts::default());
+        let (multi, nm) = run(&fg);
+        let bits = |v: &[Vec<f32>]| {
+            v.iter()
+                .map(|o| o.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "cokernel patterns: {n1} one-output kernels -> {nm} ({ai} inlined and stored, \
+             {bj} side jobs); bytes identical: {}",
+            bits(&one) == bits(&multi)
+        );
+        assert!(one.iter().all(|o| o.iter().any(|&x| x != 0.0)));
+        assert!(nm < n1);
+        assert_eq!(bits(&one), bits(&multi));
     }
 
     /// An RMSNorm stored as Q8x32 (what an int8 GEMV reads): the sum of

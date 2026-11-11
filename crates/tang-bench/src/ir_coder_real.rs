@@ -190,11 +190,20 @@ pub fn lower_real_step(
     };
     // norms' and gates' statistics recomputed inside their maps (one
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
-    // evaluated in their readers; TANG_STAGED_MAP=0: off
-    if std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+    // evaluated in their readers; opt-in with TANG_STAGED_MAP=1 (measured
+    // slower on coder-next: 6.18 vs 5.885 ms)
+    if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("1") {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
         graph.schedule_small_maps(&outs, &inplace);
+    }
+    // multi-output kernels: residual adds folded into their norms (and
+    // norms into their Q8x32 copies), conv windows into the convs, ring
+    // and state updates as side jobs of earlier launches. Opt-in with TANG_COKERNEL=1 (measured
+    // slower on coder-next: 6.43 vs 6.18 ms); the megakernel builds on it
+    if std::env::var("TANG_COKERNEL").as_deref() == Ok("1") {
+        let (a, b) = graph.schedule_cokernels(&outs, &opts);
+        eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
     }
     let program = graph.to_cuda_decode(&outs, &opts);
     RealStep {
@@ -459,7 +468,12 @@ mod tests {
                 .kernels
                 .iter()
                 .zip(&low.program.native)
-                .take(60)
+                .take(
+                    std::env::var("LIST")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(60),
+                )
             {
                 let i = k.node.index();
                 let what = g.comp_at(i).map_or("-".to_string(), |c| {
@@ -471,9 +485,10 @@ mod tests {
                     )
                 });
                 eprintln!(
-                    "K n{i} {:?} nat {nat} int8 {} {what} | {}",
+                    "K n{i} {:?} nat {nat} int8 {} {what} writes {:?} | {}",
                     g.nodes()[i].shape,
                     g.nodes()[i].int_mma.is_some(),
+                    k.writes.iter().map(|t| t.index()).collect::<Vec<_>>(),
                     k.source.lines().next().unwrap_or("")
                 );
             }

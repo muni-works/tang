@@ -285,6 +285,7 @@ impl TensorGraph {
             int_mma: None,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             segment: None,
             sorted: false,
             detach: false,
@@ -1375,6 +1376,7 @@ impl TensorGraph {
             points: lines as u32,
             count: lines.div_ceil(64) as u32 * 64,
             workgroup_size: 64,
+            writes: Vec::new(),
         }
     }
 }

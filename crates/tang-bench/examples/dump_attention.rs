@@ -39,6 +39,8 @@ fn main() {
                 Op::Input(j) => format!("input {j}"),
                 Op::Iota(d) => format!("iota {d}"),
                 Op::Reshape(s) => format!("reshape of {}", s.index()),
+                Op::Operator(_) => "operator".to_string(),
+                Op::Scan(_) => "scan".to_string(),
                 Op::Comp(pc) => format!(
                     "comp(red {:?}, inline {}, {} args)",
                     pc.red,

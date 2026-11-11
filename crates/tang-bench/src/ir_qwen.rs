@@ -1657,7 +1657,7 @@ pub fn plan_slots(
     };
     let mut last = vec![0usize; nb];
     for (p, k) in program.kernels.iter().enumerate() {
-        for &t in k.reads.iter().chain([&k.node]) {
+        for t in k.reads.iter().copied().chain(k.outputs()) {
             last[buf_of(t)] = p;
         }
     }
@@ -1684,32 +1684,34 @@ pub fn plan_slots(
     }
     let mut free: Vec<usize> = Vec::new();
     for (p, k) in program.kernels.iter().enumerate() {
-        let b = buf_of(k.node);
-        if slot[b] == usize::MAX {
-            let w = words(b);
-            // an exact fit, else a new slot when the best fit would waste
-            // more than half of it (it is someone else's exact fit later)
-            let pick = free.iter().position(|&s| slot_words[s] == w).or_else(|| {
-                free.iter()
-                    .enumerate()
-                    .filter(|(_, &s)| slot_words[s] >= w && slot_words[s] <= 2 * w)
-                    .min_by_key(|(_, &s)| slot_words[s])
-                    .map(|(i, _)| i)
-            });
-            slot[b] = match pick {
-                Some(i) => free.swap_remove(i),
-                None => {
-                    slot_words.push(w);
-                    slot_words.len() - 1
-                }
-            };
+        for b in k.outputs().map(buf_of) {
+            if slot[b] == usize::MAX {
+                let w = words(b);
+                // an exact fit, else a new slot when the best fit would waste
+                // more than half of it (it is someone else's exact fit later)
+                let pick = free.iter().position(|&s| slot_words[s] == w).or_else(|| {
+                    free.iter()
+                        .enumerate()
+                        .filter(|(_, &s)| slot_words[s] >= w && slot_words[s] <= 2 * w)
+                        .min_by_key(|(_, &s)| slot_words[s])
+                        .map(|(i, _)| i)
+                });
+                slot[b] = match pick {
+                    Some(i) => free.swap_remove(i),
+                    None => {
+                        slot_words.push(w);
+                        slot_words.len() - 1
+                    }
+                };
+            }
         }
         // buffers whose last use is this kernel free their slots
         let mut dying: Vec<usize> = k
             .reads
             .iter()
-            .chain([&k.node])
-            .map(|&t| buf_of(t))
+            .copied()
+            .chain(k.outputs())
+            .map(buf_of)
             .filter(|&x| last[x] == p && program.buffers[x].input.is_none())
             .collect();
         dying.sort_unstable();

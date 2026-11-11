@@ -1,0 +1,282 @@
+loaded in 13s; full weight read 0.97 GB
+drafter full-sanity layers=28 bits=4 cost=1.000
+drafter exit-L14 layers=14 bits=4 cost=0.590
+drafter exit-L18 layers=18 bits=4 cost=0.707
+drafter exit-L23 layers=23 bits=4 cost=0.854
+drafter exit-L25 layers=25 bits=4 cost=0.912
+drafter skip-odd layers=14 bits=4 cost=0.590
+drafter q3-all layers=28 bits=3 cost=0.818
+prompt 0: 39 + 128 tokens in 196s (0.65 tok/s decode)
+---
+Sure! Here's a Rust function that parses a semantic version string like `"1.2.3-beta"` into a `Version` struct, returning a `Result`.
+
+```rust
+use std::str::FromStr;
+
+#[derive(Debug, PartialEq)]
+pub struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    prerelease: Option<String>,
+    buildmetadata: Option<String>,
+}
+
+impl FromStr for Version {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> =
+---
+  full-sanity : 12 windows, mean match 8.00 (114s)
+  exit-L14 : 64 windows, mean match 0.05 (43s)
+  exit-L18 : 64 windows, mean match 0.09 (55s)
+  exit-L23 : 64 windows, mean match 1.81 (181s)
+  exit-L25 : 64 windows, mean match 3.84 (350s)
+  skip-odd : 64 windows, mean match 0.33 (53s)
+  q3-all : 64 windows, mean match 3.77 (334s)
+prompt 1: 37 + 128 tokens in 65s (1.98 tok/s decode)
+---
+Implementing an **LRU (Least Recently Used)** cache using a **dictionary** and a **doubly linked list** is a common approach to achieve **O(1)** time complexity for both `get` and `put` operations.
+
+---
+
+### 🧠 Key Concepts:
+- **Dictionary** for fast access to keys.
+- **Doubly linked list** to maintain the order of access (LRU).
+- The linked list is ordered by the time of access (most recently used at the front, least recently used at the end).
+
+---
+
+### ✅ Implementation in Python
+
+```python
+class Node:
+    def
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.06 (20s)
+  exit-L18 : 64 windows, mean match 0.19 (23s)
+  exit-L23 : 64 windows, mean match 1.45 (85s)
+  exit-L25 : 64 windows, mean match 2.52 (103s)
+  skip-odd : 64 windows, mean match 0.45 (20s)
+  q3-all : 64 windows, mean match 3.09 (121s)
+prompt 2: 35 + 128 tokens in 58s (2.19 tok/s decode)
+---
+Sure! Here's a simple `useDebounce` React hook in TypeScript, and an example of how to use it in a search box.
+
+---
+
+### ✅ `useDebounce` Hook (TypeScript)
+
+```typescript
+import { useState, useEffect, useCallback } from 'react';
+
+export function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+
+  useEffect(() => {
+    const handler = () => {
+      setDebouncedValue(value);
+    };
+
+    // Delay the update by `delay` milliseconds
+   
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.09 (25s)
+  exit-L18 : 64 windows, mean match 0.17 (26s)
+  exit-L23 : 64 windows, mean match 2.11 (148s)
+  exit-L25 : 64 windows, mean match 3.91 (149s)
+  skip-odd : 64 windows, mean match 0.17 (15s)
+  q3-all : 64 windows, mean match 4.06 (122s)
+prompt 3: 32 + 128 tokens in 48s (2.68 tok/s decode)
+---
+Sure! Let's break this down.
+
+---
+
+### ✅ **Objective:**
+Implement **binary search** on a **sorted array** in **C**, and **handle the overflow** in the **midpoint**.
+
+---
+
+## 🧩 Step 1: Understand the Problem
+
+Binary search is a search algorithm that works on a sorted array. It works by repeatedly dividing the search interval in half.
+
+### Key Points:
+- The array must be **sorted**.
+- The search is **iterative**.
+- The **midpoint** is calculated using `low` and `high`.
+
+---
+
+## 🧩 Step 2:
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.03 (14s)
+  exit-L18 : 64 windows, mean match 0.11 (19s)
+  exit-L23 : 64 windows, mean match 1.88 (76s)
+  exit-L25 : 64 windows, mean match 1.80 (62s)
+  skip-odd : 64 windows, mean match 0.50 (21s)
+  q3-all : 64 windows, mean match 3.95 (126s)
+prompt 4: 34 + 128 tokens in 58s (2.21 tok/s decode)
+---
+To retrieve the **top 3 customers by total order amount per country**, using **window functions**, you can use the `ROW_NUMBER()` or `RANK()` function in SQL, depending on whether you want strict ranking (like 1st, 2nd, 3rd) or just the top 3.
+
+Here’s an example using **`ROW_NUMBER()`** to rank customers by total order amount per country, and then selecting the top 3:
+
+### ✅ SQL Query (Using `ROW_NUMBER()` and `ORDER BY`):
+
+```sql
+WITH CustomerOrders AS (
+    SELECT
+        customer_id,
+        country
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.03 (15s)
+  exit-L18 : 64 windows, mean match 0.09 (19s)
+  exit-L23 : 64 windows, mean match 1.12 (50s)
+  exit-L25 : 64 windows, mean match 2.23 (73s)
+  skip-odd : 64 windows, mean match 0.34 (19s)
+  q3-all : 64 windows, mean match 3.53 (110s)
+prompt 5: 37 + 128 tokens in 50s (2.57 tok/s decode)
+---
+Sure! Here's a simple Bash script that finds all files larger than 100MB in a given directory and prints them sorted by size.
+
+```bash
+#!/bin/bash
+
+# Define the threshold in MB
+THRESHOLD=100
+
+# Define the directory to search
+DIRECTORY="/path/to/your/directory"
+
+# Find files larger than 100MB
+find "$DIRECTORY" -type f -size +${THRESHOLD}M | sort -n -k 4,4 -k 5,5
+```
+
+### Explanation:
+- `find "$DIRECTORY" -type f -size
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.09 (14s)
+  exit-L18 : 64 windows, mean match 0.22 (20s)
+  exit-L23 : 64 windows, mean match 1.22 (44s)
+  exit-L25 : 64 windows, mean match 1.91 (64s)
+  skip-odd : 64 windows, mean match 0.30 (18s)
+  q3-all : 64 windows, mean match 3.06 (102s)
+prompt 6: 31 + 128 tokens in 53s (2.40 tok/s decode)
+---
+To implement a **thread-safe bounded queue** in Go, we need to use **sync/atomic** for atomic operations and **sync.Mutex** for mutual exclusion. The queue should support:
+
+- `Push`: Add an element to the queue.
+- `Pop`: Remove an element from the queue.
+- **Blocking** when the queue is full or empty.
+
+---
+
+### ✅ Key Concepts:
+
+- Use a `sync.Mutex` for thread-safety.
+- Use `sync/atomic` for atomic `int` operations (like `len` and `cap`).
+- Use `sync/atomic.AddInt` and `sync/atomic
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.03 (15s)
+  exit-L18 : 64 windows, mean match 0.12 (20s)
+  exit-L23 : 64 windows, mean match 1.41 (49s)
+  exit-L25 : 64 windows, mean match 2.19 (69s)
+  skip-odd : 64 windows, mean match 0.59 (23s)
+  q3-all : 64 windows, mean match 4.30 (131s)
+prompt 7: 29 + 128 tokens in 53s (2.43 tok/s decode)
+---
+Sure! Here's a Python function that merges overlapping intervals, and I'll provide a simple `pytest` test suite to verify its correctness.
+
+---
+
+### ✅ Problem: Merge Overlapping Intervals
+
+Given a list of intervals, merge all **overlapping** intervals.
+
+#### Example:
+```python
+intervals = [[1,5], [2,3], [6,9], [7,8], [4,10]]
+```
+**Merged:** `[[1,9], [4,10]]`
+
+---
+
+### ✅ Python Function: `merge_overlapping_intervals`
+
+```python
+def merge_overlapping
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.06 (15s)
+  exit-L18 : 64 windows, mean match 0.17 (21s)
+  exit-L23 : 64 windows, mean match 1.22 (46s)
+  exit-L25 : 64 windows, mean match 1.88 (59s)
+  skip-odd : 64 windows, mean match 0.30 (14s)
+  q3-all : 64 windows, mean match 3.02 (78s)
+prompt 8: 44 + 128 tokens in 42s (3.01 tok/s decode)
+---
+Sure! Here's a refactored version of your JavaScript code using `async/await`:
+
+```javascript
+async function fetchData() {
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    console.log(data);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+fetchData();
+```
+
+### Explanation:
+- `fetchData` is an `async` function.
+- `await fetch(url)` is used to handle the `fetch` promise.
+- `await response.json()` is used to handle the JSON parsing.
+- The `catch` block is now inside the `
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.06 (12s)
+  exit-L18 : 64 windows, mean match 0.25 (17s)
+  exit-L23 : 64 windows, mean match 1.89 (47s)
+  exit-L25 : 64 windows, mean match 3.42 (74s)
+  skip-odd : 64 windows, mean match 0.34 (15s)
+  q3-all : 64 windows, mean match 3.92 (103s)
+prompt 9: 37 + 128 tokens in 42s (3.07 tok/s decode)
+---
+Sure! Here's a generic Rust iterator adapter that yields **consecutive pairs** (also known as "windows of size 2") from any iterator.
+
+This is a common pattern in data processing, such as when you want to process pairs of elements from a stream.
+
+### ✅ Example Usage:
+
+```rust
+use std::iter;
+
+fn main() {
+    let data = vec![1, 2, 3, 4, 5];
+
+    // Create an iterator that yields pairs of consecutive elements
+    let pairs = data.iter().zip(data.iter().skip(1));
+
+    // Print each pair
+    for (
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L14 : 64 windows, mean match 0.06 (12s)
+  exit-L18 : 64 windows, mean match 0.16 (16s)
+  exit-L23 : 64 windows, mean match 1.55 (44s)
+  exit-L25 : 64 windows, mean match 3.45 (85s)
+  skip-odd : 64 windows, mean match 0.39 (16s)
+  q3-all : 64 windows, mean match 3.38 (85s)

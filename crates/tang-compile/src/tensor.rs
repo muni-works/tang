@@ -805,6 +805,13 @@ pub struct TNode {
     /// backend's default. Ignored unless `fragment` is set and the node
     /// has an attention plan.
     pub frag_cfg: [u8; 4],
+    /// Schedule (decode, CUDA): no kernel of its own. The kernel of node
+    /// `host` evaluates it inline wherever its own tree reads it, and
+    /// also stores it to this node's buffer (a side job of that launch),
+    /// so other readers read the buffer as usual. Set by
+    /// [`TensorGraph::schedule_cokernels`]; passes that rebuild the graph
+    /// drop it.
+    pub host: Option<TensorId>,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -1107,6 +1114,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1129,6 +1137,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1166,6 +1175,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1195,6 +1205,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1346,6 +1357,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1941,6 +1953,7 @@ impl TensorGraph {
                 detach: node.detach,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
+                host: None,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -3208,6 +3221,7 @@ impl TensorGraph {
                 detach: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
+                host: None,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3844,6 +3858,7 @@ impl TensorGraph {
                     detach: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
+                    host: None,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),

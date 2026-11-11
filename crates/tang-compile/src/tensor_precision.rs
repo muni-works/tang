@@ -66,6 +66,18 @@ pub enum Format {
     /// 4 bytes]`, no companion): the int8 activation layout hand-written kernels read. Written
     /// only (no MMA reads it).
     Q8x32F,
+    /// DeepSeek's dense fp8: OCP E4M3 bytes with one e8m0 (power-of-two)
+    /// scale per 32 × 32 block of a row-major `[.., rows, cols]` matrix
+    /// (rows and cols multiples of 32). A buffer is `[codes: n bytes]
+    /// [scales: n / 1024 bytes, row-major over (rows / 32, cols / 32)]`.
+    /// Input storage only, like [`Format::Q4K`]: the graph's values are
+    /// the dequantized weights.
+    Fp8B32,
+    /// MXFP4 (DeepSeek's routed experts): e2m1 codes two to a byte, low
+    /// nibble first, one e8m0 scale per 32 consecutive elements of the last
+    /// dim. A buffer is `[codes: n / 2 bytes][scales: n / 32 bytes]`. Input
+    /// storage only.
+    Mxfp4,
 }
 
 /// Softmax weights rounded to an 8-bit operand format are first scaled by
@@ -105,7 +117,9 @@ impl Format {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => 1,
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => 1,
         }
     }
 
@@ -114,7 +128,14 @@ impl Format {
     pub fn is_block(self) -> bool {
         matches!(
             self,
-            Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F
+            Format::Q4K
+                | Format::Q5K
+                | Format::Q6K
+                | Format::Q8_0
+                | Format::Q8x32
+                | Format::Q8x32F
+                | Format::Fp8B32
+                | Format::Mxfp4
         )
     }
 
@@ -129,6 +150,8 @@ impl Format {
             Format::Q8_0 => (len / 32 * 34).div_ceil(4),
             Format::Q8x32 => len / 4 + len / 32 * 2,
             Format::Q8x32F => len / 4 + len / 32,
+            Format::Fp8B32 => (len + len / 1024).div_ceil(4),
+            Format::Mxfp4 => (len / 2 + len / 32).div_ceil(4),
             f @ (Format::E4M3(_) | Format::E5M2(_)) => f.buffer_bytes(len).div_ceil(4),
             Format::Fp8Accum => len,
         }
@@ -161,7 +184,9 @@ impl Format {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => f32::MAX as f64,
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => f32::MAX as f64,
         }
     }
 
@@ -231,7 +256,9 @@ impl Format {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => x,
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => x,
         }
     }
 }

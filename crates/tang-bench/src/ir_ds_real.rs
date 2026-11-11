@@ -21,6 +21,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use tang_compile::tensor::Format;
+
 use crate::ir_ds_prefill::DsDims;
 
 /// The default checkpoint subset on mew (`DS41_DIR` overrides): config.json,
@@ -212,6 +214,73 @@ impl St {
             .ok_or_else(|| format!("{name}: not in the checkpoint"))?[0];
         self.rows(name, 0, n)
     }
+
+    /// The device format of a checkpoint weight: [`Format::Fp8B32`] for an
+    /// `F8_E4M3` weight (32 × 32 block scales), [`Format::Mxfp4`] for an fp4
+    /// `I8` one (row × 32 scales); `None` for anything stored unquantized.
+    pub fn native_format(&self, name: &str) -> Option<Format> {
+        match self.t.get(name)?.dtype.as_str() {
+            "F8_E4M3" => Some(Format::Fp8B32),
+            "I8" | "U8" => Some(Format::Mxfp4),
+            _ => None,
+        }
+    }
+
+    /// `(codes, scales)`: the raw bytes of a quantized weight and of its
+    /// `.scale` sibling, after checking the scale layout matches
+    /// [`St::native_format`]'s.
+    pub fn native_parts(&self, name: &str) -> Result<(Format, &[u8], &[u8]), String> {
+        let f = self
+            .native_format(name)
+            .ok_or_else(|| format!("{name}: not a quantized weight"))?;
+        let shape = self.shape(name).unwrap();
+        let (rows, cols) = (shape[0], shape[1..].iter().product::<usize>());
+        let sname = format!("{}scale", name.strip_suffix("weight").unwrap());
+        let ss = self
+            .shape(&sname)
+            .ok_or_else(|| format!("{sname}: missing"))?;
+        let want = match f {
+            Format::Fp8B32 => vec![rows / 32, cols / 32],
+            _ => vec![rows, cols / 32],
+        };
+        if ss != want || rows % 32 != 0 || cols % 32 != 0 {
+            return Err(format!("{sname}: scale {ss:?} for {f:?} weight {shape:?}"));
+        }
+        Ok((f, self.bytes(name)?, self.bytes(&sname)?))
+    }
+
+    /// A quantized weight as its device buffer: codes then scales
+    /// ([`Format::Fp8B32`] / [`Format::Mxfp4`] layout).
+    pub fn native(&self, name: &str) -> Result<(Format, Vec<u8>), String> {
+        let (f, c, s) = self.native_parts(name)?;
+        let mut v = Vec::with_capacity(c.len() + s.len());
+        v.extend_from_slice(c);
+        v.extend_from_slice(s);
+        Ok((f, v))
+    }
+}
+
+/// A byte buffer as the f32 words a device upload takes (bit patterns,
+/// zero-padded to a word).
+pub fn words_of(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            f32::from_bits(u32::from_le_bytes(w))
+        })
+        .collect()
+}
+
+/// `dm` with its indexer's top-k clamped to the context: a context of
+/// `ctx` positions has at most `ctx` compressed rows, so `index_topk ≥ ctx`
+/// picks every row either way (the reference clamps the same way), but a
+/// [`tang_compile::tensor::Monoid::topk`] of 512 lowers to a reduction
+/// whose state is 1024 wide — a 245 MB kernel source at real size. For the
+/// short-context checks.
+pub fn clamp_index_topk(dm: &mut DsDims) {
+    dm.index_topk = dm.index_topk.min(dm.ctx);
 }
 
 /// DeepSeek's `inference/config.json`.
@@ -542,6 +611,170 @@ impl RealRun {
     }
 }
 
+impl RealRun {
+    /// [`RealRun::expert_tables`]'s `w1` / `w3` / `w2` as [`Format::Mxfp4`]
+    /// device buffers (the checkpoint's own bytes: every expert's codes, then
+    /// every expert's scales; padding rows zero), keyed like the graph inputs.
+    pub fn native_expert_tables(
+        &self,
+        l: usize,
+        used: &[usize],
+        rows: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mut out = Vec::new();
+        for k in ["w1", "w3", "w2"] {
+            let name =
+                |e: usize| format!("layers.{}.ffn.experts.{e}.{k}.weight", self.layer_ids[l]);
+            let (_, c0, s0) = self.st.native_parts(&name(used[0]))?;
+            let (cn, sn) = (c0.len(), s0.len());
+            let mut v = vec![0u8; rows * (cn + sn)];
+            for (r, &e) in used.iter().enumerate() {
+                let (f, c, s) = self.st.native_parts(&name(e))?;
+                if f != Format::Mxfp4 || c.len() != cn || s.len() != sn {
+                    return Err(format!("{}: not like expert {}", name(e), used[0]));
+                }
+                v[r * cn..(r + 1) * cn].copy_from_slice(c);
+                v[rows * cn + r * sn..rows * cn + (r + 1) * sn].copy_from_slice(s);
+            }
+            out.push((format!("layers.{l}.ffn.experts.{k}"), v));
+        }
+        Ok(out)
+    }
+}
+
+/// A derived step lowered with its weights in the checkpoint's formats.
+pub struct NativeStep {
+    pub graph: tang_compile::tensor::TensorGraph,
+    /// `[step outputs…, updated caches…]` in `graph`.
+    pub outs: Vec<tang_compile::tensor::TensorId>,
+    pub program: tang_compile::tensor::cuda_gemv::DecodeProgram,
+    pub sched: tang_compile::tensor::int8_sched::BlockSchedule,
+    /// Step input index → the format its buffer holds (`None`: f32 values,
+    /// a quantized weight's dequantized when some kernel other than the int8
+    /// GEMV reads it).
+    pub storage: Vec<Option<Format>>,
+    /// Quantized weights some other kernel reads, uploaded dequantized.
+    pub demoted: Vec<String>,
+}
+
+/// The device format of prefill input `name` under [`RealRun`]'s binding:
+/// the compact expert tables are [`Format::Mxfp4`], a dense weight its
+/// checkpoint tensor's [`St::native_format`].
+pub fn native_format_of(run: &RealRun, name: &str) -> Option<Format> {
+    if name.contains(".ffn.experts.") {
+        return Some(Format::Mxfp4);
+    }
+    if name == "embed.weight" || name == "head.weight" {
+        return None;
+    }
+    run.st.native_format(&ckpt_name(name, &run.layer_ids))
+}
+
+/// The derived step with every quantized weight the int8 GEMV can read
+/// stored as the checkpoint stores it ([`tang_compile::tensor::int8_sched`]:
+/// Q8x32 activations, the GEMV dequantizing in registers), through the
+/// decode passes and `to_cuda_decode`. Caches are written to fresh buffers.
+pub fn lower_native_step(
+    pg: &crate::ir_ds_prefill::PrefillGraph,
+    st: &tang_compile::tensor::step::StepGraph,
+    format_of: &dyn Fn(&str) -> Option<Format>,
+) -> NativeStep {
+    use tang_compile::tensor::step::StepInput;
+    use tang_compile::tensor::{Op, Precision, TensorGraph, TensorId};
+    let input_node = |g: &TensorGraph, k: usize| {
+        (0..g.nodes().len())
+            .find(|&i| matches!(g.nodes()[i].op, Op::Input(j) if j == k))
+            .map(TensorId::from_index)
+            .unwrap()
+    };
+    let name_of = |k: usize| match st.inputs[k] {
+        StepInput::Same(i) => Some(pg.inputs[i].name.as_str()),
+        _ => None,
+    };
+    let mut graph = st.graph.clone();
+    for k in 0..st.inputs.len() {
+        if let Some(f) = name_of(k).and_then(format_of) {
+            graph.set_precision(input_node(&graph, k), Precision::storage(f));
+        }
+    }
+    let mut outs = st.outputs.clone();
+    outs.extend(st.caches.iter().map(|c| c.updated));
+    let (graph, outs, sched) = graph.schedule_block_weights(&outs);
+    let n = outs.len();
+    let mut keep = outs.clone();
+    keep.extend(&sched.copies);
+    let (graph, keep) = graph.substitute_maps(&keep);
+    let (graph, keep) = graph.eliminate_common(&keep);
+    let outs = keep[..n].to_vec();
+    let storage: Vec<Option<Format>> = (0..st.inputs.len())
+        .map(|k| {
+            let s = graph.nodes()[input_node(&graph, k).index()]
+                .precision
+                .storage;
+            s.is_block().then_some(s)
+        })
+        .collect();
+    let demoted = (0..st.inputs.len())
+        .filter(|&k| storage[k].is_none() && name_of(k).and_then(format_of).is_some())
+        .map(|k| name_of(k).unwrap().to_string())
+        .collect();
+    let program = graph.to_cuda_decode(&outs, &Default::default());
+    NativeStep {
+        graph,
+        outs,
+        program,
+        sched,
+        storage,
+        demoted,
+    }
+}
+
+impl RealRun {
+    /// The device words of every step input of `ns`: a native-format weight's
+    /// checkpoint bytes, anything else `vals[k]` as f32 (NaN as 0: unwritten
+    /// cache rows, masked).
+    pub fn native_words(
+        &self,
+        pg: &crate::ir_ds_prefill::PrefillGraph,
+        st: &tang_compile::tensor::step::StepGraph,
+        ns: &NativeStep,
+        used: &[Vec<usize>],
+        rows: usize,
+        vals: &[Vec<f64>],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        use tang_compile::tensor::step::StepInput;
+        let mut experts: HashMap<String, Vec<u8>> = HashMap::new();
+        for (l, u) in used.iter().enumerate() {
+            if ns.storage.iter().any(|s| *s == Some(Format::Mxfp4)) {
+                experts.extend(self.native_expert_tables(l, u, rows)?);
+            }
+        }
+        (0..st.inputs.len())
+            .map(|k| match (ns.storage[k], st.inputs[k]) {
+                (Some(f), StepInput::Same(i)) => {
+                    let name = &pg.inputs[i].name;
+                    let bytes = match experts.remove(name) {
+                        Some(b) => b,
+                        None => {
+                            let (g, b) = self.st.native(&ckpt_name(name, &self.layer_ids))?;
+                            if g != f {
+                                return Err(format!("{name}: {g:?}, scheduled {f:?}"));
+                            }
+                            b
+                        }
+                    };
+                    Ok(words_of(&bytes))
+                }
+                (Some(f), _) => Err(format!("step input {k}: {f:?} but not a weight")),
+                (None, _) => Ok(vals[k]
+                    .iter()
+                    .map(|&x| if x.is_nan() { 0.0 } else { x as f32 })
+                    .collect()),
+            })
+            .collect()
+    }
+}
+
 /// Checkpoint token ids of the check's prompt (BOS, then ids from the
 /// tokenizer's range), cycled to the length a run needs.
 pub const PROMPT: [usize; 6] = [0, 3476, 25108, 6102, 1871, 89104];
@@ -629,7 +862,8 @@ mod tests {
     use crate::ir_ds_prefill::tests::{rel, Bugs, Ref};
     use crate::ir_ds_prefill::{derived_step, prefill_graph, SEQ};
     use std::time::Instant;
-    use tang_compile::tensor::step::{seed_cache, StepInput};
+    use tang_compile::tensor::step::seed_cache;
+    use tang_compile::tensor::step::StepInput;
     use tang_compile::tensor::TensorId;
 
     fn open() -> Option<RealRun> {
@@ -1036,6 +1270,238 @@ mod tests {
         drop(got);
         bind(&mut w, &u_step);
         let mut step_ins = ins(&mut w, &mains[t_pre * nt * d..], &next[t_pre..]);
+
+    /// Rows `[0, rows)` of quantized weight `name` as a device buffer in its
+    /// native format: the codes and scales of those rows.
+    fn native_rows(run: &RealRun, name: &str, rows: usize) -> (Format, Vec<u8>) {
+        let (f, c, sc) = run.st.native_parts(name).unwrap();
+        let cols: usize = run.st.shape(name).unwrap()[1..].iter().product();
+        let (cb, sb) = match f {
+            Format::Fp8B32 => (rows * cols, rows / 32 * cols / 32),
+            _ => (rows * cols / 2, rows * cols / 32),
+        };
+        let mut v = c[..cb].to_vec();
+        v.extend_from_slice(&sc[..sb]);
+        (f, v)
+    }
+
+    /// One int8 GEMV `y[p, r] = Σ_k W[(idx[p],) r, k] · X[p, k]` over real
+    /// checkpoint rows (`experts`: the tables of those experts, gathered by
+    /// `idx`; else one dense weight), lowered by `schedule_block_weights` +
+    /// `to_cuda_decode` and run on the CPU, against the dequantized weight
+    /// times the Q8x32-rounded activation in f64: `(rel err, rel err vs the
+    /// unrounded activation)`.
+    fn gemv_on_cpu(run: &RealRun, names: &[String], rows: usize, idx: &[usize]) -> (f64, f64) {
+        use tang_compile::tensor::{Arg, Dim, Form, Monoid, Precision, TensorGraph, View};
+        let gathered = names.len() > 1 || !idx.is_empty();
+        let npos = idx.len().max(1);
+        let k: usize = run.st.shape(&names[0]).unwrap()[1..].iter().product();
+        let mut bytes = Vec::new();
+        let mut fmt = Format::F32;
+        let mut deq: Vec<Vec<f64>> = Vec::new();
+        let (mut codes, mut scales) = (Vec::new(), Vec::new());
+        for n in names {
+            let (f, b) = native_rows(run, n, rows);
+            let cb = match f {
+                Format::Fp8B32 => rows * k,
+                _ => rows * k / 2,
+            };
+            codes.extend_from_slice(&b[..cb]);
+            scales.extend_from_slice(&b[cb..]);
+            fmt = f;
+            deq.push(run.st.rows(n, 0, rows).unwrap());
+        }
+        bytes.extend(codes);
+        bytes.extend(scales);
+        let mut g = TensorGraph::new();
+        let ne = names.len();
+        let (x, w);
+        let y = if gathered {
+            let ix = g.input(&[Dim::Fixed(npos)]);
+            x = g.input(&[Dim::Fixed(npos), Dim::Fixed(k)]);
+            w = g.input(&[Dim::Fixed(ne), Dim::Fixed(rows), Dim::Fixed(k)]);
+            g.comp(
+                &[Dim::Fixed(npos), Dim::Fixed(rows)],
+                &[Dim::Fixed(k)],
+                vec![
+                    Arg {
+                        src: ix,
+                        view: View::pick(3, &[Some(0)]),
+                    },
+                    Arg {
+                        src: x,
+                        view: View::pick(3, &[Some(0), Some(2)]),
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(3, &[None, Some(1), Some(2)]).gather(0, 0, 1),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[1] * v[2]],
+            )
+            .unwrap()
+        } else {
+            x = g.input(&[Dim::Fixed(npos), Dim::Fixed(k)]);
+            w = g.input(&[Dim::Fixed(rows), Dim::Fixed(k)]);
+            g.comp(
+                &[Dim::Fixed(npos), Dim::Fixed(rows)],
+                &[Dim::Fixed(k)],
+                vec![
+                    Arg {
+                        src: x,
+                        view: View {
+                            gather: None,
+                            guard: false,
+                            forms: vec![Form::unit(3, 0), Form::unit(3, 2)],
+                        },
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(3, &[Some(1), Some(2)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap()
+        };
+        g.set_precision(w, Precision::storage(fmt));
+        let (g, outs, sched) = g.schedule_block_weights(&[y]);
+        assert_eq!(sched.gemvs, 1, "the contraction is not on the int8 GEMV");
+        let mut keep = outs.clone();
+        keep.extend(&sched.copies);
+        let (g, keep) = g.substitute_maps(&keep);
+        let dp = g.to_cuda_decode(&keep[..1], &Default::default());
+        // activations: a smooth signal with a few outliers, as hidden states
+        let xs: Vec<f64> = (0..npos * k)
+            .map(|i| {
+                let t = i as f64;
+                (t * 0.37).sin() * 0.8 + if i % 97 == 0 { 6.0 } else { 0.0 }
+            })
+            .collect();
+        let mut xq = xs.clone();
+        Format::Q8x32.round_blocks(&mut xq);
+        let mut ins: Vec<Vec<f32>> = Vec::new();
+        if gathered {
+            ins.push(idx.iter().map(|&e| e as f32).collect());
+        }
+        ins.push(xs.iter().map(|&v| v as f32).collect());
+        ins.push(words_of(&bytes));
+        let got = crate::cuda_cpu::run(&dp, &ins, &keep[..1]);
+        let got: Vec<f64> = got[0].iter().map(|&v| v as f64).collect();
+        let reference = |xv: &[f64]| -> Vec<f64> {
+            let mut out = vec![0.0; npos * rows];
+            for p in 0..npos {
+                let wm = &deq[if gathered { idx[p] } else { 0 }];
+                for r in 0..rows {
+                    out[p * rows + r] = (0..k).map(|c| wm[r * k + c] * xv[p * k + c]).sum();
+                }
+            }
+            out
+        };
+        (rel(&got, &reference(&xq)), rel(&got, &reference(&xs)))
+    }
+
+    /// The DS GEMV kernels (Fp8B32 dense, Mxfp4 gathered experts), run on
+    /// the CPU (`cuda_cpu`) over real rows of checkpoint layers 0 and 2,
+    /// against dequantize-then-f64 references.
+    #[test]
+    #[ignore]
+    fn ds_gemv_kernels_match_dequantized() {
+        let Some(run) = open() else { return };
+        let (l0, l2) = (run.layer_ids[0], run.layer_ids[1]);
+        let dense = [
+            (format!("layers.{l0}.attn.wq_a.weight"), 64),
+            (format!("layers.{l2}.ffn.shared_experts.w2.weight"), 64),
+            (format!("layers.{l2}.attn.wq_b.weight"), 96),
+        ];
+        for (n, rows) in &dense {
+            let (e, e_raw) = gemv_on_cpu(&run, std::slice::from_ref(n), *rows, &[]);
+            eprintln!("Fp8B32 {n} [{rows} rows]: rel err {e:.2e} (vs unrounded X {e_raw:.2e})");
+            assert!(e < 1e-5, "{n}: {e:e}");
+        }
+        for (l, k) in [(l0, "w1"), (l0, "w2"), (l2, "w3")] {
+            let names: Vec<String> = [48usize, 86, 98]
+                .iter()
+                .map(|e| format!("layers.{l}.ffn.experts.{e}.{k}.weight"))
+                .collect();
+            let (e, e_raw) = gemv_on_cpu(&run, &names, 64, &[2, 0, 1, 2]);
+            eprintln!(
+                "Mxfp4 layers.{l} experts 48/86/98 {k}, gathered [2, 0, 1, 2], 64 rows: rel err {e:.2e} (vs unrounded X {e_raw:.2e})"
+            );
+            assert!(e < 1e-5, "{k}: {e:e}");
+        }
+    }
+
+    /// The real-size derived step (`DS_REAL_LAYERS`, default checkpoint
+    /// layers 0 and 2) lowered with its weights in the checkpoint's formats
+    /// (`lower_native_step`: Fp8B32 dense, Mxfp4 experts, Q8x32 activations)
+    /// and run on the CPU (`cuda_cpu`), against the interpreter's step — the
+    /// step `real_layers_match_reference` checks against the f64 reference —
+    /// pure and with the scheduled Q8x32 rounding emulated. Reads the routed
+    /// experts that test recorded.
+    #[test]
+    #[ignore]
+    fn native_step_matches_interpreter() {
+        let Some(run) = open() else { return };
+        let t_pre: usize = std::env::var("DS_REAL_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let toks = run.rows_of(&prompt(t_pre + 1));
+        let used = run
+            .read_routed(toks.len())
+            .expect("run real_layers_match_reference first");
+        let rows = used.iter().map(|u| u.len()).max().unwrap();
+        let mut dm = dims_from_config(
+            &run.cfg,
+            &run.layer_ids,
+            run.vocab_ids.len(),
+            rows,
+            8.max(t_pre + 1),
+        );
+        clamp_index_topk(&mut dm);
+        let t0 = Instant::now();
+        let pg = prefill_graph(&dm);
+        let mut w = run.dense_inputs(&pg.inputs, &dm).unwrap();
+        for (l, u) in used.iter().enumerate() {
+            run.expert_tables(l, u, rows, &dm, &mut w);
+        }
+        let mut base: Vec<Vec<f64>> = pg
+            .inputs
+            .iter()
+            .map(|s| {
+                if s.name == "tokens" {
+                    toks[..t_pre].to_vec()
+                } else {
+                    w.remove(&s.name).unwrap()
+                }
+            })
+            .collect();
+        drop(w);
+        let st = derived_step(&pg, &dm, 1).unwrap();
+        let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+        let pre = pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes);
+        let caches: Vec<Vec<f64>> = nodes
+            .iter()
+            .zip(pre)
+            .zip(&st.caches)
+            .map(|((&n, v), c)| {
+                let shape: Vec<usize> =
+                    pg.g.shape(n)
+                        .iter()
+                        .map(|d| {
+                            if *d == tang_compile::tensor::Dim::Sym(SEQ) {
+                                t_pre
+                            } else {
+                                d.n()
+                            }
+                        })
+                        .collect();
+                seed_cache(c, &shape, &v, t_pre, dm.ctx)
+            })
+            .collect();
         let sins: Vec<Vec<f64>> = st
             .inputs
             .iter()
@@ -1056,5 +1522,71 @@ mod tests {
         );
         assert_eq!(sids, rids[t_pre]);
         assert!(el < 1e-9 && ec < 1e-9 && esl < 1e-9 && esc < 1e-9);
+
+                StepInput::New(_) => toks[t_pre..t_pre + 1].to_vec(),
+                StepInput::Same(i) => std::mem::take(&mut base[i]),
+                StepInput::Cache(c) => caches[c].clone(),
+            })
+            .collect();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let want = st.graph.eval(&sins, &ids);
+        eprintln!("prefill + interpreter step: {:.1?}", t0.elapsed());
+
+        let t0 = Instant::now();
+        let ns = lower_native_step(&pg, &st, &|n| native_format_of(&run, n));
+        let nk = ns.program.program.kernels.len();
+        let native = ns.program.native.iter().filter(|n| **n).count();
+        let mut fmts: std::collections::BTreeMap<String, usize> = Default::default();
+        for f in ns.storage.iter().flatten() {
+            *fmts.entry(format!("{f:?}")).or_default() += 1;
+        }
+        eprintln!(
+            "native lowering: {nk} kernels ({native} native), {} int8 GEMVs, inputs stored {fmts:?}, demoted to f32: {:?}, {:.1?}",
+            ns.sched.gemvs,
+            ns.demoted,
+            t0.elapsed()
+        );
+        let emu = ns.graph.eval_emulated(&sins, &ns.outs);
+        let words = run.native_words(&pg, &st, &ns, &used, rows, &sins).unwrap();
+        drop(sins);
+        let t0 = Instant::now();
+        let got = crate::cuda_cpu::run(&ns.program, &words, &ns.outs);
+        eprintln!("CUDA kernels on the CPU: {:.1?}", t0.elapsed());
+        let v = dm.vocab;
+        let argmax = |r: &[f64]| (0..r.len()).max_by(|&a, &b| r[a].total_cmp(&r[b])).unwrap();
+        let (mut worst_emu, mut worst_pure) = (0.0f64, 0.0f64);
+        for (j, ((g, e), p)) in got.iter().zip(&emu).zip(&want).enumerate() {
+            let keep = |x: &[f64]| -> Vec<f64> {
+                x.iter()
+                    .zip(p)
+                    .filter(|(_, w)| !w.is_nan())
+                    .map(|(a, _)| *a)
+                    .collect()
+            };
+            let g64: Vec<f64> = g.iter().map(|&x| x as f64).collect();
+            let (gk, ek, pk) = (keep(&g64), keep(e), keep(p));
+            let (a, b) = (rel(&gk, &ek), rel(&gk, &pk));
+            if j == 0 {
+                assert_eq!(argmax(&gk[..v]), argmax(&pk[..v]), "top-1");
+                eprintln!(
+                    "logits: rel err vs emulated {a:.2e}, vs pure f64 step {b:.2e}, emulated vs pure {:.2e}; argmax native {} emulated {} pure {}",
+                    rel(&ek, &pk),
+                    argmax(&gk[..v]),
+                    argmax(&ek[..v]),
+                    argmax(&pk[..v])
+                );
+            }
+            worst_emu = worst_emu.max(a);
+            worst_pure = worst_pure.max(b);
+        }
+        eprintln!(
+            "native step on the CPU: worst rel err vs emulated interpreter {worst_emu:.2e}, vs pure f64 step {worst_pure:.2e}"
+        );
+        // Q8x32 codes flip where the device's f32 activation and the
+        // interpreter's f64 one straddle a rounding boundary: noise of the
+        // quantization's own size (emulated vs pure is ~9e-3), not a kernel
+        // error (the GEMVs alone match to ~1e-7, ds_gemv_kernels_match_dequantized)
+        assert!(worst_emu < 2e-2, "{worst_emu:e}");
     }
 }
