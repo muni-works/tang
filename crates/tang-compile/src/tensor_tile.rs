@@ -817,6 +817,7 @@ pub(super) fn emit_scalar(
             Node::Recip(a) => format!("1.0 / {}", e(a)),
             Node::Sqrt(a) => format!("sqrt({})", e(a)),
             Node::Sin(a) => format!("sin({})", e(a)),
+            Node::Floor(a) => format!("floor({})", e(a)),
             Node::Atan2(a, b) => format!("atan2({}, {})", e(a), e(b)),
             Node::Exp2(a) => format!("exp2({})", e(a)),
             Node::Log2(a) => format!("log2({})", e(a)),

@@ -1,0 +1,79 @@
+# prompt	method	tokens	iters	rows	secs	exact
+code_01_rust_complete	greedy	48	48	48	95.4	1	prompt_tokens=199
+code_01_rust_complete	pld k=4	48	36	90	0	1
+code_01_rust_complete	pld k=8	48	34	142	0	1
+code_01_rust_complete	pld k=16	48	33	235	0	1
+code_01_rust_complete	jacobi k=4	48	46	184	145.3	1
+code_01_rust_complete	jacobi+pool k=4 n=3 G=2	48	41	164	147.0	1
+code_01_rust_complete	jacobi k=8	48	46	368	226.1	1
+code_01_rust_complete	jacobi+pool k=8 n=3 G=2	48	37	296	179.3	1
+code_01_rust_complete	jacobi k=16	48	46	736	287.9	1
+code_01_rust_complete	jacobi+pool k=16 n=2 G=2	48	33	528	238.1	1
+code_01_rust_complete	jacobi+pool k=16 n=3 G=2	48	35	560	205.6	1
+code_01_rust_complete	jacobi+pool k=16 n=4 G=2	48	35	560	219.1	1
+code_01_rust_complete	jacobi+pool k=16 n=3 G=4	48	33	528	220.3	1
+code_02_python_complete	greedy	48	48	48	102.7	1	prompt_tokens=222
+code_02_python_complete	pld k=4	48	32	77	0	1
+code_02_python_complete	pld k=8	48	30	121	0	1
+code_02_python_complete	pld k=16	48	29	167	0	1
+code_02_python_complete	jacobi k=4	48	46	184	129.1	1
+code_02_python_complete	jacobi+pool k=4 n=3 G=2	48	42	168	109.4	1
+code_02_python_complete	jacobi k=8	48	46	368	134.1	1
+code_02_python_complete	jacobi+pool k=8 n=3 G=2	48	33	264	80.7	1
+code_02_python_complete	jacobi k=16	48	46	736	181.2	1
+code_02_python_complete	jacobi+pool k=16 n=2 G=2	48	27	432	100.7	1
+code_02_python_complete	jacobi+pool k=16 n=3 G=2	48	29	464	103.0	1
+code_02_python_complete	jacobi+pool k=16 n=4 G=2	48	35	560	174.7	1
+code_02_python_complete	jacobi+pool k=16 n=3 G=4	48	29	464	123.3	1
+code_06_edit_rename	greedy	48	48	48	44.2	1	prompt_tokens=193
+code_06_edit_rename	pld k=4	48	17	61	0	1
+code_06_edit_rename	pld k=8	48	12	77	0	1
+code_06_edit_rename	pld k=16	48	10	117	0	1
+code_06_edit_rename	jacobi k=4	48	48	192	64.5	1
+code_06_edit_rename	jacobi+pool k=4 n=3 G=2	48	29	116	48.5	1
+code_06_edit_rename	jacobi k=8	48	48	384	89.4	1
+code_06_edit_rename	jacobi+pool k=8 n=3 G=2	48	20	160	35.8	1
+code_06_edit_rename	jacobi k=16	48	48	768	162.4	1
+code_06_edit_rename	jacobi+pool k=16 n=2 G=2	48	18	288	61.5	1
+code_06_edit_rename	jacobi+pool k=16 n=3 G=2	48	15	240	49.5	1
+code_06_edit_rename	jacobi+pool k=16 n=4 G=2	48	19	304	60.7	1
+code_06_edit_rename	jacobi+pool k=16 n=3 G=4	48	20	320	64.6	1
+code_10_write_fn	greedy	48	48	48	44.0	1	prompt_tokens=36
+code_10_write_fn	pld k=4	48	31	72	0	1
+code_10_write_fn	pld k=8	48	28	100	0	1
+code_10_write_fn	pld k=16	48	27	154	0	1
+code_10_write_fn	jacobi k=4	48	46	184	55.5	1
+code_10_write_fn	jacobi+pool k=4 n=3 G=2	48	35	140	41.9	1
+code_10_write_fn	jacobi k=8	48	46	368	81.2	1
+code_10_write_fn	jacobi+pool k=8 n=3 G=2	48	29	232	54.1	1
+code_10_write_fn	jacobi k=16	48	46	736	145.1	1
+code_10_write_fn	jacobi+pool k=16 n=2 G=2	48	26	416	81.7	1
+code_10_write_fn	jacobi+pool k=16 n=3 G=2	48	27	432	86.7	1
+code_10_write_fn	jacobi+pool k=16 n=4 G=2	48	29	464	91.1	1
+code_10_write_fn	jacobi+pool k=16 n=3 G=4	48	31	496	97.8	1
+prose_01_sky	greedy	48	48	48	46.3	1	prompt_tokens=30
+prose_01_sky	pld k=4	48	48	83	0	1
+prose_01_sky	pld k=8	48	48	117	0	1
+prose_01_sky	pld k=16	48	48	181	0	1
+prose_01_sky	jacobi k=4	48	46	184	55.2	1
+prose_01_sky	jacobi+pool k=4 n=3 G=2	48	44	176	44.1	1
+prose_01_sky	jacobi k=8	48	46	368	67.9	1
+prose_01_sky	jacobi+pool k=8 n=3 G=2	48	42	336	62.3	1
+prose_01_sky	jacobi k=16	48	46	736	126.3	1
+prose_01_sky	jacobi+pool k=16 n=2 G=2	48	40	640	115.4	1
+prose_01_sky	jacobi+pool k=16 n=3 G=2	48	40	640	114.7	1
+prose_01_sky	jacobi+pool k=16 n=4 G=2	48	42	672	119.3	1
+prose_01_sky	jacobi+pool k=16 n=3 G=4	48	41	656	108.8	1
+prose_02_story	greedy	48	48	48	36.8	1	prompt_tokens=37
+prose_02_story	pld k=4	48	46	80	0	1
+prose_02_story	pld k=8	48	46	113	0	1
+prose_02_story	pld k=16	48	46	145	0	1
+prose_02_story	jacobi k=4	48	44	176	42.1	1
+prose_02_story	jacobi+pool k=4 n=3 G=2	48	44	176	42.2	1
+prose_02_story	jacobi k=8	48	44	352	63.3	1
+prose_02_story	jacobi+pool k=8 n=3 G=2	48	42	336	59.0	1
+prose_02_story	jacobi k=16	48	44	704	117.2	1
+prose_02_story	jacobi+pool k=16 n=2 G=2	48	38	608	108.3	1
+prose_02_story	jacobi+pool k=16 n=3 G=2	48	42	672	111.3	1
+prose_02_story	jacobi+pool k=16 n=4 G=2	48	44	704	120.6	1
+prose_02_story	jacobi+pool k=16 n=3 G=4	48	42	672	114.2	1

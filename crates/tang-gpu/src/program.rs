@@ -1169,7 +1169,9 @@ impl Program {
     /// Overwrite `t` (usually an input) from the host.
     pub fn write(&self, rt: &Runtime, t: TensorId, data: &[f32]) {
         let b = &self.program.buffers[self.buffer_index(t)];
-        assert_eq!(data.len(), b.len, "write length");
+        // a block format (GGUF weights) is written as its raw words
+        let want = if b.format.is_block() { words(b) } else { b.len };
+        assert_eq!(data.len(), want, "write length");
         let s = self.slot_of(t);
         match (rt, &self.storage) {
             (Runtime::Wgpu { device, cache }, Storage::Wgpu(slots)) => {

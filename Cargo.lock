@@ -6241,6 +6241,7 @@ dependencies = [
  "tang-gpu",
  "tang-infer",
  "tang-la",
+ "tang-llm",
  "tang-otel",
  "tang-tensor",
  "tang-train",

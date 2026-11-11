@@ -463,6 +463,7 @@ impl TensorGraph {
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
                 super::Format::Q4K
                 | super::Format::Q5K
+                | super::Format::Q6K
                 | super::Format::Q8x32
                 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
@@ -1138,6 +1139,7 @@ impl TensorGraph {
                             ),
                             super::Format::Q4K
                             | super::Format::Q5K
+                            | super::Format::Q6K
                             | super::Format::Q8x32
                             | super::Format::Q8x32F => {
                                 unreachable!("block formats lower only through the int8 MMA kernel")
@@ -1723,6 +1725,7 @@ impl TensorGraph {
                 super::Format::BF16 => format!("tang_f2b({v})"),
                 super::Format::Q4K
                 | super::Format::Q5K
+                | super::Format::Q6K
                 | super::Format::Q8x32
                 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
@@ -3000,6 +3003,7 @@ impl TensorGraph {
                 super::Format::BF16 => format!("tang_b2f(b{j}[{idx}])"),
                 super::Format::Q4K
                 | super::Format::Q5K
+                | super::Format::Q6K
                 | super::Format::Q8x32
                 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
@@ -4361,6 +4365,7 @@ impl TensorGraph {
                 super::Format::BF16 => format!("tang_f2b({v})"),
                 super::Format::Q4K
                 | super::Format::Q5K
+                | super::Format::Q6K
                 | super::Format::Q8x32
                 | super::Format::Q8x32F => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
@@ -4415,6 +4420,7 @@ impl TensorGraph {
                     super::Format::BF16 => format!("tang_f2b({v})"),
                     super::Format::Q4K
                     | super::Format::Q5K
+                    | super::Format::Q6K
                     | super::Format::Q8x32
                     | super::Format::Q8x32F => {
                         unreachable!("block formats lower only through the int8 MMA kernel")

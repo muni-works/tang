@@ -139,6 +139,7 @@ impl ExprGraph {
             Node::Recip(a) => format!("(1.0 / {})", self.wgsl_ref(a)),
             Node::Sqrt(a) => format!("sqrt({})", self.wgsl_ref(a)),
             Node::Sin(a) => format!("sin({})", self.wgsl_ref(a)),
+            Node::Floor(a) => format!("floor({})", self.wgsl_ref(a)),
             Node::Atan2(y, x) => {
                 format!("atan2({}, {})", self.wgsl_ref(y), self.wgsl_ref(x))
             }

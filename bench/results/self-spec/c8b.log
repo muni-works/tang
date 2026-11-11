@@ -1,0 +1,25 @@
+loaded in 33s; full weight read 4.26 GB
+drafter full-sanity layers=36 bits=4 cost=1.000
+drafter exit-L33 layers=33 bits=4 cost=0.924
+drafter skip-every4th layers=27 bits=4 cost=0.771
+drafter q3-all layers=36 bits=3 cost=0.796
+prompt 0: 39 + 48 tokens in 66s (0.73 tok/s decode)
+---
+Here's a Rust function that parses a semantic version string like `"1.2.3-beta"` into a custom `SemVer` struct, returning a `Result`:
+
+```rust
+use std::fmt;
+use std::str::
+---
+  full-sanity : 12 windows, mean match 8.00 (146s)
+  exit-L33 : 24 windows, mean match 2.92 (81s)
+  skip-every4th : 24 windows, mean match 4.29 (103s)
+  q3-all : 24 windows, mean match 5.42 (224s)
+prompt 1: 37 + 48 tokens in 65s (0.74 tok/s decode)
+---
+To implement an **LRU (Least Recently Used) Cache** in Python with **O(1)** time complexity for both `get` and `put` operations, you can use a **dictionary** to store the key-value pairs and
+---
+  full-sanity : 0 windows, mean match 0.00 (0s)
+  exit-L33 : 24 windows, mean match 1.38 (58s)
+  skip-every4th : 24 windows, mean match 3.62 (99s)
+  q3-all : 24 windows, mean match 5.25 (172s)

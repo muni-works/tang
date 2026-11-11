@@ -107,6 +107,9 @@ impl ExprId {
 }
 
 #[cfg(test)]
+mod floor_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tang::{Scalar, Vec3};

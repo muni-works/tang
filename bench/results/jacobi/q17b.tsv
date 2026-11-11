@@ -1,0 +1,253 @@
+# prompt	method	tokens	iters	rows	secs	exact
+code_01_rust_complete	greedy	64	64	64	13.0	1	prompt_tokens=199
+code_01_rust_complete	pld k=4	64	57	149	0	1
+code_01_rust_complete	pld k=8	64	57	259	0	1
+code_01_rust_complete	pld k=16	64	57	428	0	1
+code_01_rust_complete	jacobi k=4	64	61	244	16.2	1
+code_01_rust_complete	jacobi+pool k=4 n=2 G=2	64	57	228	14.4	1
+code_01_rust_complete	jacobi+pool k=4 n=3 G=2	64	59	236	14.4	1
+code_01_rust_complete	jacobi+pool k=4 n=4 G=2	64	57	228	14.3	1
+code_01_rust_complete	jacobi k=8	64	61	488	24.3	1
+code_01_rust_complete	jacobi+pool k=8 n=2 G=2	64	52	416	19.8	1
+code_01_rust_complete	jacobi+pool k=8 n=3 G=2	64	57	456	21.5	1
+code_01_rust_complete	jacobi+pool k=8 n=4 G=2	64	58	464	21.3	1
+code_01_rust_complete	jacobi+pool k=8 n=3 G=4	64	57	456	20.8	1
+code_01_rust_complete	jacobi k=16	64	61	976	42.7	1
+code_01_rust_complete	jacobi+pool k=16 n=2 G=2	64	50	800	32.6	1
+code_01_rust_complete	jacobi+pool k=16 n=3 G=2	64	51	816	34.1	1
+code_01_rust_complete	jacobi+pool k=16 n=4 G=2	64	58	928	39.9	1
+code_01_rust_complete	jacobi+pool k=16 n=3 G=4	64	52	832	33.4	1
+code_02_python_complete	greedy	64	64	64	17.2	1	prompt_tokens=222
+code_02_python_complete	pld k=4	64	35	95	0	1
+code_02_python_complete	pld k=8	64	31	140	0	1
+code_02_python_complete	pld k=16	64	29	186	0	1
+code_02_python_complete	jacobi k=4	64	61	244	17.3	1
+code_02_python_complete	jacobi+pool k=4 n=2 G=2	64	45	180	11.7	1
+code_02_python_complete	jacobi+pool k=4 n=3 G=2	64	48	192	11.8	1
+code_02_python_complete	jacobi+pool k=4 n=4 G=2	64	46	184	11.6	1
+code_02_python_complete	jacobi k=8	64	61	488	44.5	1
+code_02_python_complete	jacobi+pool k=8 n=2 G=2	64	40	320	23.1	1
+code_02_python_complete	jacobi+pool k=8 n=3 G=2	64	37	296	38.3	1
+code_02_python_complete	jacobi+pool k=8 n=4 G=2	64	40	320	26.8	1
+code_02_python_complete	jacobi+pool k=8 n=3 G=4	64	45	360	20.3	1
+code_02_python_complete	jacobi k=16	64	61	976	40.2	1
+code_02_python_complete	jacobi+pool k=16 n=2 G=2	64	36	576	23.3	1
+code_02_python_complete	jacobi+pool k=16 n=3 G=2	64	33	528	21.4	1
+code_02_python_complete	jacobi+pool k=16 n=4 G=2	64	36	576	23.0	1
+code_02_python_complete	jacobi+pool k=16 n=3 G=4	64	39	624	28.5	1
+code_03_ts_complete	greedy	64	64	64	15.5	1	prompt_tokens=135
+code_03_ts_complete	pld k=4	64	34	115	0	1
+code_03_ts_complete	pld k=8	64	31	199	0	1
+code_03_ts_complete	pld k=16	64	31	391	0	1
+code_03_ts_complete	jacobi k=4	64	58	232	14.3	1
+code_03_ts_complete	jacobi+pool k=4 n=2 G=2	64	42	168	10.5	1
+code_03_ts_complete	jacobi+pool k=4 n=3 G=2	64	46	184	11.7	1
+code_03_ts_complete	jacobi+pool k=4 n=4 G=2	64	49	196	15.1	1
+code_03_ts_complete	jacobi k=8	64	58	464	21.4	1
+code_03_ts_complete	jacobi+pool k=8 n=2 G=2	64	33	264	12.5	1
+code_03_ts_complete	jacobi+pool k=8 n=3 G=2	64	37	296	13.4	1
+code_03_ts_complete	jacobi+pool k=8 n=4 G=2	64	40	320	19.3	1
+code_03_ts_complete	jacobi+pool k=8 n=3 G=4	64	42	336	16.8	1
+code_03_ts_complete	jacobi k=16	64	58	928	39.5	1
+code_03_ts_complete	jacobi+pool k=16 n=2 G=2	64	33	528	21.2	1
+code_03_ts_complete	jacobi+pool k=16 n=3 G=2	64	35	560	22.4	1
+code_03_ts_complete	jacobi+pool k=16 n=4 G=2	64	37	592	23.6	1
+code_03_ts_complete	jacobi+pool k=16 n=3 G=4	64	33	528	21.1	1
+code_04_rust_tests	greedy	64	64	64	12.8	1	prompt_tokens=206
+code_04_rust_tests	pld k=4	64	24	90	0	1
+code_04_rust_tests	pld k=8	64	19	138	0	1
+code_04_rust_tests	pld k=16	64	16	226	0	1
+code_04_rust_tests	jacobi k=4	64	54	216	13.3	1
+code_04_rust_tests	jacobi+pool k=4 n=2 G=2	64	37	148	9.1	1
+code_04_rust_tests	jacobi+pool k=4 n=3 G=2	64	37	148	9.1	1
+code_04_rust_tests	jacobi+pool k=4 n=4 G=2	64	41	164	10.1	1
+code_04_rust_tests	jacobi k=8	64	53	424	25.8	1
+code_04_rust_tests	jacobi+pool k=8 n=2 G=2	64	31	248	11.5	1
+code_04_rust_tests	jacobi+pool k=8 n=3 G=2	64	29	232	11.1	1
+code_04_rust_tests	jacobi+pool k=8 n=4 G=2	64	30	240	11.0	1
+code_04_rust_tests	jacobi+pool k=8 n=3 G=4	64	36	288	41.8	1
+code_04_rust_tests	jacobi k=16	64	54	864	92.6	1
+code_04_rust_tests	jacobi+pool k=16 n=2 G=2	64	26	416	45.0	1
+code_04_rust_tests	jacobi+pool k=16 n=3 G=2	64	24	384	37.7	1
+code_04_rust_tests	jacobi+pool k=16 n=4 G=2	64	24	384	38.4	1
+code_04_rust_tests	jacobi+pool k=16 n=3 G=4	64	27	432	43.0	1
+code_05_sql_complete	greedy	64	64	64	27.4	1	prompt_tokens=179
+code_05_sql_complete	pld k=4	64	26	86	0	1
+code_05_sql_complete	pld k=8	64	21	126	0	1
+code_05_sql_complete	pld k=16	64	18	198	0	1
+code_05_sql_complete	jacobi k=4	64	61	244	26.6	1
+code_05_sql_complete	jacobi+pool k=4 n=2 G=2	64	40	160	11.1	1
+code_05_sql_complete	jacobi+pool k=4 n=3 G=2	64	41	164	10.2	1
+code_05_sql_complete	jacobi+pool k=4 n=4 G=2	64	41	164	10.3	1
+code_05_sql_complete	jacobi k=8	64	61	488	23.3	1
+code_05_sql_complete	jacobi+pool k=8 n=2 G=2	64	32	256	12.1	1
+code_05_sql_complete	jacobi+pool k=8 n=3 G=2	64	33	264	12.3	1
+code_05_sql_complete	jacobi+pool k=8 n=4 G=2	64	33	264	12.1	1
+code_05_sql_complete	jacobi+pool k=8 n=3 G=4	64	40	320	14.6	1
+code_05_sql_complete	jacobi k=16	64	61	976	48.4	1
+code_05_sql_complete	jacobi+pool k=16 n=2 G=2	64	28	448	19.5	1
+code_05_sql_complete	jacobi+pool k=16 n=3 G=2	64	25	400	15.9	1
+code_05_sql_complete	jacobi+pool k=16 n=4 G=2	64	29	464	18.7	1
+code_05_sql_complete	jacobi+pool k=16 n=3 G=4	64	30	480	19.0	1
+code_06_edit_rename	greedy	64	64	64	13.0	1	prompt_tokens=193
+code_06_edit_rename	pld k=4	64	24	89	0	1
+code_06_edit_rename	pld k=8	64	17	117	0	1
+code_06_edit_rename	pld k=16	64	15	189	0	1
+code_06_edit_rename	jacobi k=4	64	64	256	15.8	1
+code_06_edit_rename	jacobi+pool k=4 n=2 G=2	64	41	164	10.0	1
+code_06_edit_rename	jacobi+pool k=4 n=3 G=2	64	41	164	10.0	1
+code_06_edit_rename	jacobi+pool k=4 n=4 G=2	64	41	164	9.9	1
+code_06_edit_rename	jacobi k=8	64	64	512	23.4	1
+code_06_edit_rename	jacobi+pool k=8 n=2 G=2	64	33	264	12.0	1
+code_06_edit_rename	jacobi+pool k=8 n=3 G=2	64	28	224	10.3	1
+code_06_edit_rename	jacobi+pool k=8 n=4 G=2	64	31	248	11.4	1
+code_06_edit_rename	jacobi+pool k=8 n=3 G=4	64	39	312	14.3	1
+code_06_edit_rename	jacobi k=16	64	64	1024	40.5	1
+code_06_edit_rename	jacobi+pool k=16 n=2 G=2	64	23	368	14.3	1
+code_06_edit_rename	jacobi+pool k=16 n=3 G=2	64	22	352	13.7	1
+code_06_edit_rename	jacobi+pool k=16 n=4 G=2	64	26	416	16.6	1
+code_06_edit_rename	jacobi+pool k=16 n=3 G=4	64	28	448	17.5	1
+code_07_edit_errors	greedy	64	64	64	13.0	1	prompt_tokens=218
+code_07_edit_errors	pld k=4	64	24	77	0	1
+code_07_edit_errors	pld k=8	64	18	97	0	1
+code_07_edit_errors	pld k=16	64	15	137	0	1
+code_07_edit_errors	jacobi k=4	64	63	252	15.6	1
+code_07_edit_errors	jacobi+pool k=4 n=2 G=2	64	47	188	11.5	1
+code_07_edit_errors	jacobi+pool k=4 n=3 G=2	64	40	160	9.8	1
+code_07_edit_errors	jacobi+pool k=4 n=4 G=2	64	41	164	10.1	1
+code_07_edit_errors	jacobi k=8	64	63	504	22.9	1
+code_07_edit_errors	jacobi+pool k=8 n=2 G=2	64	39	312	14.3	1
+code_07_edit_errors	jacobi+pool k=8 n=3 G=2	64	27	216	9.9	1
+code_07_edit_errors	jacobi+pool k=8 n=4 G=2	64	30	240	11.0	1
+code_07_edit_errors	jacobi+pool k=8 n=3 G=4	64	39	312	14.3	1
+code_07_edit_errors	jacobi k=16	64	63	1008	39.8	1
+code_07_edit_errors	jacobi+pool k=16 n=2 G=2	64	31	496	19.6	1
+code_07_edit_errors	jacobi+pool k=16 n=3 G=2	64	23	368	14.4	1
+code_07_edit_errors	jacobi+pool k=16 n=4 G=2	64	24	384	15.2	1
+code_07_edit_errors	jacobi+pool k=16 n=3 G=4	64	26	416	16.5	1
+code_08_edit_ts	greedy	64	64	64	12.8	1	prompt_tokens=168
+code_08_edit_ts	pld k=4	64	37	117	0	1
+code_08_edit_ts	pld k=8	64	33	183	0	1
+code_08_edit_ts	pld k=16	64	31	301	0	1
+code_08_edit_ts	jacobi k=4	64	63	252	15.5	1
+code_08_edit_ts	jacobi+pool k=4 n=2 G=2	64	47	188	11.6	1
+code_08_edit_ts	jacobi+pool k=4 n=3 G=2	64	44	176	10.8	1
+code_08_edit_ts	jacobi+pool k=4 n=4 G=2	64	48	192	11.6	1
+code_08_edit_ts	jacobi k=8	64	63	504	22.8	1
+code_08_edit_ts	jacobi+pool k=8 n=2 G=2	64	40	320	14.5	1
+code_08_edit_ts	jacobi+pool k=8 n=3 G=2	64	39	312	14.2	1
+code_08_edit_ts	jacobi+pool k=8 n=4 G=2	64	42	336	15.1	1
+code_08_edit_ts	jacobi+pool k=8 n=3 G=4	64	43	344	15.4	1
+code_08_edit_ts	jacobi k=16	64	63	1008	39.8	1
+code_08_edit_ts	jacobi+pool k=16 n=2 G=2	64	36	576	22.6	1
+code_08_edit_ts	jacobi+pool k=16 n=3 G=2	64	31	496	19.5	1
+code_08_edit_ts	jacobi+pool k=16 n=4 G=2	64	38	608	23.8	1
+code_08_edit_ts	jacobi+pool k=16 n=3 G=4	64	38	608	23.8	1
+code_09_go_complete	greedy	64	64	64	12.9	1	prompt_tokens=172
+code_09_go_complete	pld k=4	64	31	103	0	1
+code_09_go_complete	pld k=8	64	25	151	0	1
+code_09_go_complete	pld k=16	64	21	231	0	1
+code_09_go_complete	jacobi k=4	64	60	240	14.7	1
+code_09_go_complete	jacobi+pool k=4 n=2 G=2	64	45	180	11.0	1
+code_09_go_complete	jacobi+pool k=4 n=3 G=2	64	42	168	10.3	1
+code_09_go_complete	jacobi+pool k=4 n=4 G=2	64	44	176	10.8	1
+code_09_go_complete	jacobi k=8	64	60	480	21.6	1
+code_09_go_complete	jacobi+pool k=8 n=2 G=2	64	39	312	14.5	1
+code_09_go_complete	jacobi+pool k=8 n=3 G=2	64	34	272	12.3	1
+code_09_go_complete	jacobi+pool k=8 n=4 G=2	64	34	272	12.3	1
+code_09_go_complete	jacobi+pool k=8 n=3 G=4	64	39	312	14.2	1
+code_09_go_complete	jacobi k=16	64	60	960	38.2	1
+code_09_go_complete	jacobi+pool k=16 n=2 G=2	64	34	544	21.2	1
+code_09_go_complete	jacobi+pool k=16 n=3 G=2	64	28	448	17.6	1
+code_09_go_complete	jacobi+pool k=16 n=4 G=2	64	30	480	19.1	1
+code_09_go_complete	jacobi+pool k=16 n=3 G=4	64	28	448	17.9	1
+code_10_write_fn	greedy	64	64	64	12.9	1	prompt_tokens=36
+code_10_write_fn	pld k=4	64	51	106	0	1
+code_10_write_fn	pld k=8	64	49	158	0	1
+code_10_write_fn	pld k=16	64	49	266	0	1
+code_10_write_fn	jacobi k=4	64	63	252	16.2	1
+code_10_write_fn	jacobi+pool k=4 n=2 G=2	64	50	200	12.8	1
+code_10_write_fn	jacobi+pool k=4 n=3 G=2	64	55	220	14.2	1
+code_10_write_fn	jacobi+pool k=4 n=4 G=2	64	59	236	15.2	1
+code_10_write_fn	jacobi k=8	64	63	504	23.7	1
+code_10_write_fn	jacobi+pool k=8 n=2 G=2	64	44	352	16.4	1
+code_10_write_fn	jacobi+pool k=8 n=3 G=2	64	48	384	17.8	1
+code_10_write_fn	jacobi+pool k=8 n=4 G=2	64	57	456	21.3	1
+code_10_write_fn	jacobi+pool k=8 n=3 G=4	64	52	416	19.5	1
+code_10_write_fn	jacobi k=16	64	63	1008	39.8	1
+code_10_write_fn	jacobi+pool k=16 n=2 G=2	64	41	656	25.7	1
+code_10_write_fn	jacobi+pool k=16 n=3 G=2	64	44	704	27.5	1
+code_10_write_fn	jacobi+pool k=16 n=4 G=2	64	53	848	33.2	1
+code_10_write_fn	jacobi+pool k=16 n=3 G=4	64	43	688	26.9	1
+prose_01_sky	greedy	64	64	64	12.8	1	prompt_tokens=30
+prose_01_sky	pld k=4	64	64	138	0	1
+prose_01_sky	pld k=8	64	64	227	0	1
+prose_01_sky	pld k=16	64	64	362	0	1
+prose_01_sky	jacobi k=4	64	63	252	16.3	1
+prose_01_sky	jacobi+pool k=4 n=2 G=2	64	58	232	14.9	1
+prose_01_sky	jacobi+pool k=4 n=3 G=2	64	62	248	15.9	1
+prose_01_sky	jacobi+pool k=4 n=4 G=2	64	63	252	16.2	1
+prose_01_sky	jacobi k=8	64	63	504	23.5	1
+prose_01_sky	jacobi+pool k=8 n=2 G=2	64	51	408	18.9	1
+prose_01_sky	jacobi+pool k=8 n=3 G=2	64	59	472	22.0	1
+prose_01_sky	jacobi+pool k=8 n=4 G=2	64	63	504	23.5	1
+prose_01_sky	jacobi+pool k=8 n=3 G=4	64	59	472	22.1	1
+prose_01_sky	jacobi k=16	64	63	1008	39.7	1
+prose_01_sky	jacobi+pool k=16 n=2 G=2	64	45	720	28.3	1
+prose_01_sky	jacobi+pool k=16 n=3 G=2	64	58	928	36.2	1
+prose_01_sky	jacobi+pool k=16 n=4 G=2	64	63	1008	39.3	1
+prose_01_sky	jacobi+pool k=16 n=3 G=4	64	58	928	36.4	1
+prose_02_story	greedy	64	64	64	12.8	1	prompt_tokens=37
+prose_02_story	pld k=4	64	61	110	0	1
+prose_02_story	pld k=8	64	61	169	0	1
+prose_02_story	pld k=16	64	61	256	0	1
+prose_02_story	jacobi k=4	64	60	240	15.5	1
+prose_02_story	jacobi+pool k=4 n=2 G=2	64	55	220	14.1	1
+prose_02_story	jacobi+pool k=4 n=3 G=2	64	59	236	15.3	1
+prose_02_story	jacobi+pool k=4 n=4 G=2	64	60	240	15.5	1
+prose_02_story	jacobi k=8	64	60	480	22.5	1
+prose_02_story	jacobi+pool k=8 n=2 G=2	64	53	424	19.9	1
+prose_02_story	jacobi+pool k=8 n=3 G=2	64	60	480	22.3	1
+prose_02_story	jacobi+pool k=8 n=4 G=2	64	60	480	22.5	1
+prose_02_story	jacobi+pool k=8 n=3 G=4	64	59	472	22.0	1
+prose_02_story	jacobi k=16	64	60	960	37.8	1
+prose_02_story	jacobi+pool k=16 n=2 G=2	64	54	864	34.0	1
+prose_02_story	jacobi+pool k=16 n=3 G=2	64	55	880	34.6	1
+prose_02_story	jacobi+pool k=16 n=4 G=2	64	56	896	35.4	1
+prose_02_story	jacobi+pool k=16 n=3 G=4	64	59	944	37.1	1
+prose_03_history	greedy	64	64	64	13.1	1	prompt_tokens=28
+prose_03_history	pld k=4	64	63	130	0	1
+prose_03_history	pld k=8	64	63	204	0	1
+prose_03_history	pld k=16	64	63	322	0	1
+prose_03_history	jacobi k=4	64	58	232	14.4	1
+prose_03_history	jacobi+pool k=4 n=2 G=2	64	55	220	13.9	1
+prose_03_history	jacobi+pool k=4 n=3 G=2	64	57	228	14.4	1
+prose_03_history	jacobi+pool k=4 n=4 G=2	64	61	244	15.8	1
+prose_03_history	jacobi k=8	64	60	480	22.5	1
+prose_03_history	jacobi+pool k=8 n=2 G=2	64	54	432	20.3	1
+prose_03_history	jacobi+pool k=8 n=3 G=2	64	57	456	21.3	1
+prose_03_history	jacobi+pool k=8 n=4 G=2	64	59	472	21.9	1
+prose_03_history	jacobi+pool k=8 n=3 G=4	64	58	464	21.5	1
+prose_03_history	jacobi k=16	64	60	960	37.8	1
+prose_03_history	jacobi+pool k=16 n=2 G=2	64	49	784	30.8	1
+prose_03_history	jacobi+pool k=16 n=3 G=2	64	52	832	32.6	1
+prose_03_history	jacobi+pool k=16 n=4 G=2	64	57	912	35.8	1
+prose_03_history	jacobi+pool k=16 n=3 G=4	64	52	832	32.6	1
+prose_04_email	greedy	64	64	64	12.8	1	prompt_tokens=39
+prose_04_email	pld k=4	64	62	109	0	1
+prose_04_email	pld k=8	64	62	165	0	1
+prose_04_email	pld k=16	64	62	253	0	1
+prose_04_email	jacobi k=4	64	61	244	15.7	1
+prose_04_email	jacobi+pool k=4 n=2 G=2	64	56	224	14.4	1
+prose_04_email	jacobi+pool k=4 n=3 G=2	64	60	240	15.5	1
+prose_04_email	jacobi+pool k=4 n=4 G=2	64	61	244	15.7	1
+prose_04_email	jacobi k=8	64	60	480	22.4	1
+prose_04_email	jacobi+pool k=8 n=2 G=2	64	51	408	19.0	1
+prose_04_email	jacobi+pool k=8 n=3 G=2	64	54	432	20.2	1
+prose_04_email	jacobi+pool k=8 n=4 G=2	64	60	480	22.2	1
+prose_04_email	jacobi+pool k=8 n=3 G=4	64	55	440	20.5	1
+prose_04_email	jacobi k=16	64	60	960	37.6	1
+prose_04_email	jacobi+pool k=16 n=2 G=2	64	46	736	28.9	1
+prose_04_email	jacobi+pool k=16 n=3 G=2	64	55	880	34.7	1
+prose_04_email	jacobi+pool k=16 n=4 G=2	64	60	960	37.7	1
+prose_04_email	jacobi+pool k=16 n=3 G=4	64	55	880	34.5	1

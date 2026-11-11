@@ -237,6 +237,7 @@ pub(crate) fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dia
         Node::Recip(a) => format!("(1.0{suffix} / {})", ref_str(graph, a, suffix)),
         Node::Sqrt(a) => format!("sqrt({})", ref_str(graph, a, suffix)),
         Node::Sin(a) => format!("sin({})", ref_str(graph, a, suffix)),
+        Node::Floor(a) => format!("floor({})", ref_str(graph, a, suffix)),
         Node::Atan2(y, x) => format!(
             "atan2({}, {})",
             ref_str(graph, y, suffix),
