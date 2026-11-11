@@ -58,6 +58,9 @@ opencl = ["tang-gpu/opencl"]
 # OpenTelemetry (crates/tang-otel): qwen_session prefill/decode spans, tuner runs, and
 # tang-gpu's OpenCL builds and sampled kernel times. OTLP/JSON lines to a file by default.
 otel = ["dep:tang-otel", "tang-gpu/otel"]
+# GGUF checkpoints through tang-llm's reader: ir_coder_real (Qwen3-Coder-Next
+# at real size from its derived graph) and the coder_derived runner.
+gguf = ["dep:tang-llm"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -70,6 +73,10 @@ algebraic = [
 
 [[example]]
 name = "algebraic_reductions"
+
+[[example]]
+name = "coder_derived"
+required-features = ["cuda", "gguf"]
 
 [dependencies]
 tang        = { workspace = true, features = ["std"] }
@@ -87,6 +94,7 @@ memmap2 = "0.9"
 serde_json = "1"
 tokenizers = { workspace = true }
 tang-otel = { workspace = true, optional = true }
+tang-llm = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

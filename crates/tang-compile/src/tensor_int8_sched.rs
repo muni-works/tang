@@ -156,8 +156,8 @@ impl TensorGraph {
         ng.n_inputs = g.n_inputs;
         let mut map: Vec<TensorId> = Vec::with_capacity(n);
         let mut copies: HashMap<usize, TensorId> = HashMap::new();
-        for i in 0..n {
-            let sched = cand[i].filter(|&(wi, _)| {
+        for (i, &ci) in cand.iter().enumerate() {
+            let sched = ci.filter(|&(wi, _)| {
                 let w = self.comp_at(i).unwrap().args[wi].src.n();
                 keep.get(&w).copied().unwrap_or(false)
             });

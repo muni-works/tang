@@ -112,6 +112,8 @@ pub struct RealStep {
     pub storage: Vec<Option<Format>>,
     /// Names of GGUF block tensors uploaded as dequantized f32.
     pub f32_inputs: Vec<String>,
+    /// `(updated cache, step input)` pairs written in place.
+    pub inplace: Vec<(tang_compile::tensor::TensorId, usize)>,
 }
 
 /// The derived step with its weights stored as the GGUF stores them where
@@ -189,6 +191,7 @@ pub fn lower_real_step(
         sched,
         storage,
         f32_inputs,
+        inplace: opts.inplace,
     }
 }
 
