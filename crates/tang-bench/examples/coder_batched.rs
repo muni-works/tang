@@ -247,6 +247,73 @@ fn main() {
         }
     }
 
+    // greedy generation: stream s's prompt is `--gen-ids` with every id
+    // shifted by 7·s (mod vocab); all streams step together from position 0,
+    // then `--gen` greedy tokens each. Writes `D/ids-s.txt` per stream and the
+    // top-5 logprobs `D/s.jsonl` (the race's format, from the last prompt
+    // token on) for the first `--gen-logprobs` streams.
+    if let Some(f) = opt("--gen-ids") {
+        let base: Vec<usize> = std::fs::read_to_string(f)
+            .unwrap()
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let n: usize = opt("--gen").map_or(64, |v| v.parse().unwrap());
+        let dir = opt("--gen-dir").unwrap_or_else(|| ".".into());
+        let nlp: usize = opt("--gen-logprobs").map_or(2, |v| v.parse().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        for &k in &cache_ins {
+            prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
+        }
+        let prompt = |s: usize| -> Vec<usize> { base.iter().map(|&t| (t + 7 * s) % vocab).collect() };
+        let prompts: Vec<Vec<usize>> = (0..nb).map(prompt).collect();
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        let mut lines: Vec<Vec<String>> = vec![Vec::new(); nb.min(nlp)];
+        let lp = base.len();
+        let t = Instant::now();
+        let mut next: Vec<usize> = prompts.iter().map(|p| p[0]).collect();
+        for i in 0..lp + n - 1 {
+            let toks: Vec<f32> = (0..nb)
+                .map(|b| (if i < lp { prompts[b][i] } else { next[b] }) as f32)
+                .collect();
+            step(&toks, &vec![i as f32; nb]);
+            if i + 1 < lp {
+                continue;
+            }
+            let l = prog.read(&rt, outs[0]);
+            for b in 0..nb {
+                let row = &l[b * vocab..(b + 1) * vocab];
+                let m = row.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x)) as f64;
+                let z: f64 = row.iter().map(|&x| (x as f64 - m).exp()).sum();
+                let mut idx: Vec<usize> = (0..vocab).collect();
+                idx.sort_by(|&a, &c| row[c].partial_cmp(&row[a]).unwrap().then(a.cmp(&c)));
+                next[b] = idx[0];
+                out[b].push(idx[0]);
+                if b < lines.len() {
+                    let top: Vec<String> = idx[..5]
+                        .iter()
+                        .map(|&j| format!("[{j}, {:.6}]", row[j] as f64 - m - z.ln()))
+                        .collect();
+                    lines[b].push(format!("{{\"pos\": {i}, \"top\": [{}]}}", top.join(", ")));
+                }
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        for b in 0..nb {
+            let s = |v: &[usize]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
+            std::fs::write(format!("{dir}/prompt-{b}.txt"), s(&prompts[b])).unwrap();
+            std::fs::write(format!("{dir}/ids-{b}.txt"), s(&out[b])).unwrap();
+        }
+        for (b, l) in lines.iter().enumerate() {
+            std::fs::write(format!("{dir}/{b}.jsonl"), l.join("\n") + "\n").unwrap();
+        }
+        println!(
+            "gen B={nb}: {} prompt + {n} greedy tokens a stream in {secs:.2}s end to end ({:.1} tok/s aggregate incl. host sampling)",
+            lp,
+            (nb * (lp + n)) as f64 / secs
+        );
+    }
+
     if let Some(ls) = opt("--lens") {
         for l in ls.split(',').map(|v| v.parse::<usize>().unwrap()) {
             let pos: Vec<f32> = (0..nb)
