@@ -283,6 +283,10 @@ pub mod prompt_lookup;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
 /// without a GPU.
 pub mod cuda_cpu;
+/// DS pieces on a CUDA device: the top-k block select, the Engram table
+/// in host-mapped memory.
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_ds;
 /// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_coder_real;

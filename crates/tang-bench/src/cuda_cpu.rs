@@ -79,6 +79,7 @@ static std::barrier<>* tang_block;
 static std::barrier<>* tang_warp[32];
 static uint64_t tang_xch[32][32];
 static inline void __syncthreads() { tang_block->arrive_and_wait(); }
+static inline int atomicAdd(int* p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 static inline void __syncwarp(unsigned = 0xffffffffu) { tang_warp[threadIdx.x >> 5]->arrive_and_wait(); }
 template <class T> static inline T tang_shfl(T v, int src_lane) {
     unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -410,8 +411,8 @@ mod tests {
             let y = g
                 .map(&[x, ssb, wb], |v| {
                     let one = tang_expr::ExprId::ONE;
-                    let k = tang_expr::ExprId::from_f64(1.0 / d as f64);
-                    let eps = tang_expr::ExprId::from_f64(1e-6);
+                    let k = <tang_expr::ExprId as tang::Scalar>::from_f64(1.0 / d as f64);
+                    let eps = <tang_expr::ExprId as tang::Scalar>::from_f64(1e-6);
                     v[0] * (one / (v[1] * k + eps).sqrt()) * v[2]
                 })
                 .unwrap();
@@ -441,6 +442,57 @@ mod tests {
             assert_eq!((n2, n1), (2, 1));
             assert!(two.iter().any(|&x| x != 0.0));
             assert_eq!(bits(&two), bits(&one), "{f:?}");
+        }
+    }
+
+    /// Top-k reductions (k = 512 over rows longer than a chunk, with
+    /// ties; argmax over a vocab-sized row) lower to the block-select
+    /// kernel, and it agrees with the interpreter.
+    #[test]
+    fn topk_select_kernel_runs_on_the_cpu() {
+        use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, View};
+        let arg = |src, forms: Vec<Form>| Arg {
+            src,
+            view: View { gather: None, guard: false, forms },
+        };
+        for (rows, n, k, argmax) in [(2usize, 1500usize, 512usize, false), (3, 5000, 32, false), (1, 300, 64, false), (2, 3000, 1, true)] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[rows, n]);
+            let j = g.iota(&[rows, n], 1);
+            let m = if argmax { Monoid::argmax() } else { Monoid::topk(k) };
+            let top = g
+                .comp_tuple(
+                    &[rows, 2 * k],
+                    &[n],
+                    vec![
+                        arg(x, vec![Form::unit(2, 0), Form::unit(2, 1)]),
+                        arg(j, vec![Form::unit(2, 0), Form::unit(2, 1)]),
+                    ],
+                    Some(m),
+                    |v| {
+                        let mut o = vec![v[1], v[0]];
+                        for _ in 1..k {
+                            o.push(<tang_expr::ExprId as tang::Scalar>::from_f64(0.0));
+                            o.push(<tang_expr::ExprId as tang::Scalar>::from_f64(-(f32::MAX as f64)));
+                        }
+                        o
+                    },
+                )
+                .unwrap();
+            // values on a coarse grid: many ties
+            let vals: Vec<f64> = (0..rows * n).map(|i| ((i * 7919 + 13) % 97) as f64 * 0.25 - 9.0).collect();
+            let want = g.eval(&[vals.clone()], &[top]).remove(0);
+            let dp = g.to_cuda_decode(&[top], &DecodeOpts::default());
+            let src = &dp.program.kernels.iter().map(|k| k.source.clone()).collect::<Vec<_>>().join("\n");
+            // argmax (k < 32) stays on the generic warp combine
+            assert_eq!(src.contains("block select"), k >= 32, "block select lowering");
+            let vf: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+            let got = super::run(&dp, &[vf], &[top]).remove(0);
+            assert_eq!(got.len(), want.len());
+            for (a, b) in got.iter().zip(&want) {
+                assert_eq!(*a as f64, *b, "rows {rows} n {n} k {k}");
+            }
+            eprintln!("top-{k} over {n} x {rows} rows: kernel = interpreter");
         }
     }
 }

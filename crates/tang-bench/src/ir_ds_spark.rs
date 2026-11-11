@@ -50,6 +50,9 @@ pub struct SparkGraph {
     pub logits: TensorId,
     /// `[T, block]`: the confidence head.
     pub conf: TensorId,
+    /// `[T, block · vocab]`: each slot's head logits before the Markov bias
+    /// (sampled drafting adds the bias of the token it drew).
+    pub base: TensorId,
     pub named: Vec<(String, TensorId)>,
 }
 
@@ -316,11 +319,12 @@ pub fn spark_graph(dm: &DsDims) -> SparkGraph {
     let proj = b.w(format!("{last}.confidence_head.proj.weight"), &[1, d + rk]);
     let vi = b.g.iota(&[T, fx(v)], 1);
     let mut idx = next;
-    let (mut ids, mut lgs, mut confs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut ids, mut lgs, mut confs, mut bases) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for i in 0..blk {
         let x = b.hc_pre(hs[i], pres[i], hc, d);
         let xn = b.rms(x, nw);
         let lg = b.linear(xn, head);
+        bases.push(lg);
         let memb = b.g.gather(memb_w, 0, idx, false).unwrap();
         let bias = b.linear(memb, mhead);
         let ll = b.g.map(&[lg, bias], |v| v[0] + v[1]).unwrap();
@@ -371,12 +375,14 @@ pub fn spark_graph(dm: &DsDims) -> SparkGraph {
     let ids = stack(&mut b, &ids, 1);
     let logits = stack(&mut b, &lgs, v);
     let conf = stack(&mut b, &confs, 1);
+    let base = stack(&mut b, &bases, v);
     SparkGraph {
         g: b.g,
         inputs: b.inputs,
         ids,
         logits,
         conf,
+        base,
         named: b.named,
     }
 }
@@ -386,7 +392,7 @@ pub fn spark_graph(dm: &DsDims) -> SparkGraph {
 pub fn spark_step(sg: &SparkGraph, dm: &DsDims, k: usize) -> Result<StepGraph, String> {
     derive_step_with(
         &sg.g,
-        &[sg.ids, sg.logits, sg.conf],
+        &[sg.ids, sg.logits, sg.conf, sg.base],
         &StepSpec {
             seq: SEQ,
             new: k,
@@ -467,6 +473,8 @@ pub struct DsVerifier<'a> {
     pending: Option<(Vec<u32>, HashMap<Key, Vec<f64>>, Vec<f64>)>,
     /// The last window's target hiddens, `[k, n · dim]`.
     pub mains: Vec<f64>,
+    /// The last window's logits, `[k, vocab]`.
+    pub logits: Vec<f64>,
     pub reruns: usize,
 }
 
@@ -510,6 +518,7 @@ impl<'a> DsVerifier<'a> {
             seq: prompt.to_vec(),
             pending: None,
             mains: Vec::new(),
+            logits: Vec::new(),
             reruns: 0,
         };
         let len = prompt.len();
@@ -544,7 +553,7 @@ impl<'a> DsVerifier<'a> {
         &mut self,
         caches: &HashMap<Key, Vec<f64>>,
         toks: &[u32],
-    ) -> (Vec<u32>, Vec<f64>, HashMap<Key, Vec<f64>>) {
+    ) -> (Vec<u32>, Vec<f64>, Vec<f64>, HashMap<Key, Vec<f64>>) {
         let k = toks.len();
         let ut: Vec<usize> = toks.iter().map(|&t| t as usize).collect();
         let rows = self.row_inputs(&self.seq, &ut);
@@ -568,7 +577,7 @@ impl<'a> DsVerifier<'a> {
         let mains = got.remove(0);
         let am = logits.chunks(self.dm.vocab).map(argmax).collect();
         let upd = st.caches.iter().map(key).zip(got).collect();
-        (am, mains, upd)
+        (am, mains, logits, upd)
     }
 
     fn rows_only(&mut self) -> bool {
@@ -582,9 +591,10 @@ impl<'a> DsVerifier<'a> {
 impl Verifier for DsVerifier<'_> {
     fn window(&mut self, tokens: &[u32]) -> Vec<u32> {
         let caches = std::mem::take(&mut self.caches);
-        let (am, mains, upd) = self.run(&caches, tokens);
+        let (am, mains, logits, upd) = self.run(&caches, tokens);
         self.caches = caches;
         self.mains = mains;
+        self.logits = logits;
         self.pending = Some((tokens.to_vec(), upd, Vec::new()));
         am
     }
@@ -596,7 +606,7 @@ impl Verifier for DsVerifier<'_> {
             self.caches = upd;
         } else {
             let caches = std::mem::take(&mut self.caches);
-            let (_, _, upd) = self.run(&caches, &toks[..m]);
+            let (_, _, _, upd) = self.run(&caches, &toks[..m]);
             self.caches = upd;
             self.reruns += 1;
         }
@@ -620,6 +630,8 @@ pub struct Drafter<'a> {
     pub pos: usize,
     /// The drafts after the last row fed.
     pub draft: Vec<u32>,
+    /// The pre-Markov logits after the last row fed, `[block · vocab]`.
+    pub base: Vec<f64>,
 }
 
 impl<'a> Drafter<'a> {
@@ -652,6 +664,7 @@ impl<'a> Drafter<'a> {
             caches: HashMap::new(),
             pos: next.len(),
             draft: Vec::new(),
+            base: Vec::new(),
         };
         let len = next.len();
         let slots = d.step(1).caches.clone();
@@ -659,12 +672,14 @@ impl<'a> Drafter<'a> {
             ("mains", mains.to_vec()),
             ("next", next.iter().map(|&t| t as f64).collect()),
         ]);
-        let mut ids = vec![sg.ids];
+        let mut ids = vec![sg.ids, sg.base];
         ids.extend(slots.iter().map(|c| c.node));
         let g = sg.g.bind(&[(SEQ, len)]).unwrap();
         let vals = g.eval(&d.ins(&rows), &ids);
-        d.caches = seed_all(&sg.g, &slots, &vals[1..], len, dm.ctx);
+        d.caches = seed_all(&sg.g, &slots, &vals[2..], len, dm.ctx);
         let b = dm.dspark_block;
+        let bv = b * dm.vocab;
+        d.base = vals[1][(len - 1) * bv..len * bv].to_vec();
         d.draft = vals[0][(len - 1) * b..len * b]
             .iter()
             .map(|&x| x as u32)
@@ -703,7 +718,8 @@ impl<'a> Drafter<'a> {
         ids.extend(st.caches.iter().map(|c| c.updated));
         let mut got = st.graph.eval(&si, &ids);
         let draft: Vec<u32> = got[0].iter().map(|&x| x as u32).collect();
-        let upd: HashMap<Key, Vec<f64>> = st.caches.iter().map(key).zip(got.drain(3..)).collect();
+        self.base = got[3].clone();
+        let upd: HashMap<Key, Vec<f64>> = st.caches.iter().map(key).zip(got.drain(4..)).collect();
         self.caches = upd;
         self.draft = draft;
         self.pos += k;
@@ -749,6 +765,198 @@ pub fn generate_spark(
         d.advance(&mains, &am[..m]);
         out.extend_from_slice(&am[..m]);
         last = am[m - 1];
+    }
+    out.truncate(n);
+    (out, st)
+}
+
+/// forward.rs `SpecSampler`, in f64: temperature + nucleus sampling and
+/// speculative (rejection) sampling over it, same RNG (splitmix64), same
+/// transform, same draw order; temperature 0 is greedy.
+#[derive(Clone, Debug)]
+pub struct SpecSampler {
+    pub temp: f64,
+    pub top_p: f64,
+    pub rng: u64,
+}
+
+fn next_u64(s: &mut u64) -> u64 {
+    *s = s.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn uniform(rng: &mut u64) -> f64 {
+    (next_u64(rng) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+impl SpecSampler {
+    pub fn new(temp: f64, top_p: f64, seed: u64) -> Self {
+        Self { temp, top_p, rng: seed }
+    }
+
+    pub fn greedy(&self) -> bool {
+        self.temp <= 0.0
+    }
+
+    /// `(token, probability)` by decreasing probability (ties by token),
+    /// cut to the smallest prefix holding `top_p`, renormalised.
+    pub fn dist(&self, logits: &[f64]) -> Vec<(usize, f64)> {
+        if self.greedy() {
+            return vec![(argmax(logits) as usize, 1.0)];
+        }
+        let mx = logits.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let w: Vec<f64> = logits.iter().map(|&l| ((l - mx) / self.temp).exp()).collect();
+        let z: f64 = w.iter().sum();
+        let mut idx: Vec<usize> = (0..w.len()).collect();
+        idx.sort_by(|a, b| w[*b].partial_cmp(&w[*a]).unwrap().then(a.cmp(b)));
+        let mut keep = idx.len();
+        if self.top_p < 1.0 {
+            let mut acc = 0.0;
+            for (j, &i) in idx.iter().enumerate() {
+                acc += w[i] / z;
+                if acc >= self.top_p {
+                    keep = j + 1;
+                    break;
+                }
+            }
+        }
+        idx.truncate(keep);
+        let total: f64 = idx.iter().map(|&i| w[i]).sum();
+        idx.into_iter().map(|i| (i, w[i] / total)).collect()
+    }
+
+    fn draw(&mut self, d: &[(usize, f64)]) -> usize {
+        let mut r = uniform(&mut self.rng) * d.iter().map(|x| x.1).sum::<f64>();
+        for &(i, p) in d {
+            r -= p;
+            if r <= 0.0 {
+                return i;
+            }
+        }
+        d.last().unwrap().0
+    }
+
+    pub fn sample(&mut self, logits: &[f64]) -> usize {
+        if self.greedy() {
+            return argmax(logits) as usize;
+        }
+        let d = self.dist(logits);
+        self.draw(&d)
+    }
+
+    /// A verify row: target logits `p`, the draft `d` drawn from `q`
+    /// (`None`: the bonus row). `(token, accepted)`.
+    pub fn verify(&mut self, p: &[f64], draft: Option<(&[f64], usize)>) -> (usize, bool) {
+        if self.greedy() {
+            let t = argmax(p) as usize;
+            return (t, draft.is_some_and(|(_, d)| d == t));
+        }
+        let pd = self.dist(p);
+        let Some((q, d)) = draft else {
+            return (self.draw(&pd), false);
+        };
+        let qd = self.dist(q);
+        let at = |x: &[(usize, f64)], t: usize| x.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1);
+        let (pp, qq) = (at(&pd, d), at(&qd, d));
+        if qq > 0.0 && uniform(&mut self.rng) * qq < pp {
+            return (d, true);
+        }
+        let mut qm: HashMap<usize, f64> = qd.into_iter().collect();
+        let res: Vec<(usize, f64)> = pd
+            .iter()
+            .map(|&(i, x)| (i, (x - qm.remove(&i).unwrap_or(0.0)).max(0.0)))
+            .filter(|e| e.1 > 0.0)
+            .collect();
+        if res.is_empty() {
+            return (self.draw(&pd), false);
+        }
+        (self.draw(&res), false)
+    }
+}
+
+/// The drafts after `last` from the drafter's pre-Markov logits: slot i
+/// adds the Markov bias of the token slot i − 1 drew (`last` for slot 0)
+/// and draws from it (`q`, kept for the verify). forward.rs
+/// `forward_spec_with` with `draw` = the sampler's draft.
+pub fn draw_drafts(
+    d: &Drafter,
+    w: &HashMap<String, Vec<f64>>,
+    last: u32,
+    n: usize,
+    s: &mut SpecSampler,
+) -> (Vec<u32>, Vec<f64>) {
+    let dm = d.dm;
+    let (v, rk) = (dm.vocab, dm.dspark_rank);
+    let lp = format!("mtp.{}", dm.n_mtp - 1);
+    let memb = &w[&format!("{lp}.markov_head.embed.weight")];
+    let mhead = &w[&format!("{lp}.markov_head.head.weight")];
+    let mut prev = last as usize;
+    let (mut out, mut qs) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        let e = &memb[prev * rk..(prev + 1) * rk];
+        let q: Vec<f64> = (0..v)
+            .map(|t| d.base[i * v + t] + (0..rk).map(|r| mhead[t * rk + r] * e[r]).sum::<f64>())
+            .collect();
+        prev = s.sample(&q);
+        out.push(prev as u32);
+        qs.extend(q);
+    }
+    (out, qs)
+}
+
+/// Speculative sampling with DSpark: drafts drawn by `s` from the drafter,
+/// each window walked by forward.rs `verify_rows` (accept a draft with
+/// probability min(1, P/Q), else draw the residual; a bonus draw after a
+/// fully accepted window). Temperature 0 is [`generate_spark`]'s output.
+pub fn generate_spark_sampled(
+    v: &mut DsVerifier,
+    d: &mut Drafter,
+    w: &HashMap<String, Vec<f64>>,
+    s: &mut SpecSampler,
+    first: u32,
+    n: usize,
+    k: usize,
+) -> (Vec<u32>, Stats) {
+    let vocab = v.dm.vocab;
+    let mut out = vec![first];
+    let mut st = Stats::default();
+    let mut last = first;
+    while out.len() < n && v.room() > 0 {
+        let want = (n - out.len()).min(v.room()).min(k);
+        let (drafts, q) = draw_drafts(d, w, last, want - 1, s);
+        let mut toks = vec![last];
+        toks.extend_from_slice(&drafts);
+        v.window(&toks);
+        let p = v.logits.clone();
+        let mut new = Vec::new();
+        let mut kk = 0;
+        loop {
+            let row = &p[kk * vocab..(kk + 1) * vocab];
+            if kk + 1 == toks.len() {
+                new.push(s.verify(row, None).0 as u32);
+                break;
+            }
+            let (t, ok) = s.verify(row, Some((&q[kk * vocab..(kk + 1) * vocab], toks[kk + 1] as usize)));
+            new.push(t as u32);
+            if !ok {
+                break;
+            }
+            kk += 1;
+        }
+        let m = kk + 1;
+        v.accept(m);
+        st.windows += 1;
+        st.rows += toks.len();
+        st.drafted += toks.len() - 1;
+        st.accepted += kk;
+        st.emitted += m;
+        let mains = v.mains.clone();
+        d.advance(&mains, &new);
+        out.extend_from_slice(&new);
+        last = *new.last().unwrap();
     }
     out.truncate(n);
     (out, st)
@@ -1124,5 +1332,88 @@ pub(crate) mod tests {
                 v.reruns
             );
         }
+    }
+
+    /// Sampled speculation: at temperature 0 it is the greedy output; at
+    /// temperature 0.8 / top-p 0.9 each verify row's emitted token is
+    /// distributed as the target (drafts drawn from DSpark's q, accepted
+    /// with min(1, P/Q), else the residual), checked empirically on the
+    /// first window's rows.
+    #[test]
+    fn spark_sampled_speculation() {
+        let (dm, pg, sg, w, all) = fixture();
+        let meta = tiny_engram(&dm);
+        let prompt: Vec<usize> = all[..5].iter().map(|&x| x as usize).collect();
+        let n = 9;
+        let start = || {
+            let (v, first, mains) = DsVerifier::prefill(&pg, &dm, &w, Some(&meta), &prompt);
+            let mut next: Vec<u32> = prompt[1..].iter().map(|&t| t as u32).collect();
+            next.push(first);
+            let d = Drafter::prefill(&sg, &dm, &w, &mains, &next);
+            (v, d, first)
+        };
+        let (mut v, mut d, first) = start();
+        let (greedy, _) = generate_spark(&mut v, &mut d, first, n, 1, None);
+        let (mut v, mut d, first) = start();
+        let mut s0 = SpecSampler::new(0.0, 1.0, 7);
+        let (g0, _) = generate_spark_sampled(&mut v, &mut d, &w, &mut s0, first, n, dm.dspark_block + 1);
+        assert_eq!(g0, greedy, "temperature 0");
+        // the distribution of a verify row's token under rejection sampling
+        let (mut v, d, first) = start();
+        let mut s = SpecSampler::new(0.8, 0.9, 11);
+        let (drafts, q) = draw_drafts(&d, &w, first, dm.dspark_block, &mut s);
+        let mut toks = vec![first];
+        toks.extend_from_slice(&drafts);
+        v.window(&toks);
+        let vocab = dm.vocab;
+        for row in 0..2 {
+            let p = &v.logits[row * vocab..(row + 1) * vocab];
+            let qr = &q[row * vocab..(row + 1) * vocab];
+            let want = s.dist(p);
+            let trials = 40000;
+            let mut hist = vec![0usize; vocab];
+            let mut acc = 0;
+            for _ in 0..trials {
+                let dr = s.sample(qr);
+                let (t, ok) = s.verify(p, Some((qr, dr)));
+                hist[t] += 1;
+                acc += ok as usize;
+            }
+            let tv: f64 = 0.5
+                * (0..vocab)
+                    .map(|t| {
+                        let pw = want.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1);
+                        (hist[t] as f64 / trials as f64 - pw).abs()
+                    })
+                    .sum::<f64>();
+            // the draft distribution alone, for contrast
+            let qd = s.dist(qr);
+            let tvq: f64 = 0.5
+                * (0..vocab)
+                    .map(|t| {
+                        let pw = want.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1);
+                        let qw = qd.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1);
+                        (qw - pw).abs()
+                    })
+                    .sum::<f64>();
+            eprintln!(
+                "row {row}: TV(emitted, P) {tv:.4} over {trials} draws (TV(Q, P) {tvq:.3}); accept rate {:.2}",
+                acc as f64 / trials as f64
+            );
+            assert!(tv < 0.02, "{tv}");
+        }
+        // an end-to-end sampled run, and the drafter still matches its graph
+        let (mut v, mut d, first) = start();
+        let mut s = SpecSampler::new(0.8, 0.9, 3);
+        let (out, st) = generate_spark_sampled(&mut v, &mut d, &w, &mut s, first, n, dm.dspark_block + 1);
+        assert_eq!(out.len(), n);
+        eprintln!(
+            "sampled k={}: {out:?}, {:.2} tokens/window, acceptance {:.0}% ({}/{})",
+            dm.dspark_block + 1,
+            st.tokens_per_window(),
+            100.0 * st.acceptance(),
+            st.accepted,
+            st.drafted
+        );
     }
 }
