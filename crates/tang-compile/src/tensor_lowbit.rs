@@ -155,6 +155,253 @@ pub fn rotate(w: &mut [f64], cols: usize, b: usize, signs: &[f64], inverse: bool
     }
 }
 
+// ------------------------------------------------------------------ decode
+// The deployable form of `Vq { dim: 4, k: 2048, group: 128 }` behind the
+// block-Hadamard rotation (the format the spike picked): packed codes, f16
+// group scales and an f16 codebook, plus the decode GEMV that reads them.
+// The rotation moves onto the activation — `y = W x = W' x'` with
+// `x' = H(x ⊙ s)` per 128-block — so the kernel never un-rotates a weight:
+// it rotates `x` once per step, then per weight row gathers one 4-vector
+// per code and dots it with `x'`.
+
+/// Elements per codebook entry.
+pub const VQ_DIM: usize = 4;
+/// Codebook entries; a code is `log2(VQ_K)` = 11 bits.
+pub const VQ_K: usize = 2048;
+/// Bits per code.
+pub const VQ_BITS: usize = 11;
+/// Weights per f16 scale (one warp lane per code: 32 codes).
+pub const VQ_GROUP: usize = 128;
+/// Hadamard block on the input dim.
+pub const VQ_HB: usize = 128;
+
+/// A `rows × cols` matrix in the packed VQ format.
+#[derive(Clone, Debug)]
+pub struct VqMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    /// Codes, 11 bits each, row-major, as one little-endian bit stream in
+    /// u32 words (code `i` starts at bit `11 i`), plus one pad word.
+    pub codes: Vec<u32>,
+    /// f16 bits, one per `VQ_GROUP` weights, row-major.
+    pub scales: Vec<u16>,
+    /// f16 bits, `VQ_K × VQ_DIM`.
+    pub book: Vec<u16>,
+    /// ±1 per input column (the rotation's random signs).
+    pub signs: Vec<f32>,
+}
+
+fn h16(x: f64) -> u16 {
+    super::precision::f16_bits(x) as u16
+}
+
+fn f16v(b: u16) -> f64 {
+    super::precision::f16_from_bits(b.into())
+}
+
+/// The rotation's signs for a matrix: deterministic in `seed`.
+pub fn vq_signs(cols: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+    (0..cols)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            if s >> 63 == 1 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+impl VqMatrix {
+    /// Stored bits per weight (codes + scales + codebook; signs are a seed).
+    pub fn bits_per_weight(&self) -> f64 {
+        let bytes = self.codes.len() * 4 + self.scales.len() * 2 + self.book.len() * 2;
+        8.0 * bytes as f64 / (self.rows * self.cols) as f64
+    }
+
+    /// Bytes a decode step streams for this matrix.
+    pub fn bytes(&self) -> usize {
+        self.codes.len() * 4 + self.scales.len() * 2 + self.book.len() * 2
+    }
+
+    /// Encode `w` (`rows × cols`, row-major): rotate, scale per group, fit
+    /// a codebook (k-means, `iters` rounds) unless `book` (`VQ_K × VQ_DIM`)
+    /// is given, assign.
+    pub fn encode(
+        w: &[f64],
+        rows: usize,
+        cols: usize,
+        seed: u64,
+        book: Option<&[f64]>,
+        iters: usize,
+    ) -> Self {
+        assert!(w.len() == rows * cols && cols % VQ_GROUP == 0 && cols % VQ_HB == 0);
+        let signs = vq_signs(cols, seed);
+        let s64: Vec<f64> = signs.iter().map(|&x| x as f64).collect();
+        let mut v = w.to_vec();
+        rotate(&mut v, cols, VQ_HB, &s64, false);
+        let scales: Vec<u16> = v
+            .chunks(VQ_GROUP)
+            .map(|g| {
+                h16((g.iter().map(|x| x * x).sum::<f64>() / VQ_GROUP as f64)
+                    .sqrt()
+                    .max(1e-8))
+            })
+            .collect();
+        v.chunks_mut(VQ_GROUP)
+            .zip(&scales)
+            .for_each(|(g, &s)| g.iter_mut().for_each(|x| *x /= f16v(s)));
+        let fit = match book {
+            Some(b) => b.to_vec(),
+            None => kmeans(&v, VQ_DIM, VQ_K, iters),
+        };
+        let book: Vec<u16> = fit.iter().map(|&x| h16(x)).collect();
+        let bookq: Vec<f64> = book.iter().map(|&b| f16v(b)).collect();
+        let n = rows * cols / VQ_DIM;
+        let mut codes = vec![0u32; (n * VQ_BITS).div_ceil(32) + 1];
+        for (i, p) in v.chunks(VQ_DIM).enumerate() {
+            let c = nearest(p, &bookq, VQ_DIM) as u64;
+            let (word, bit) = (i * VQ_BITS / 32, i * VQ_BITS % 32);
+            let both = c << bit;
+            codes[word] |= both as u32;
+            codes[word + 1] |= (both >> 32) as u32;
+        }
+        VqMatrix {
+            rows,
+            cols,
+            codes,
+            scales,
+            book,
+            signs,
+        }
+    }
+
+    /// Code `i` (row-major over all `rows·cols/4` codes).
+    pub fn code(&self, i: usize) -> usize {
+        let (word, bit) = (i * VQ_BITS / 32, i * VQ_BITS % 32);
+        let both = self.codes[word] as u64 | (self.codes[word + 1] as u64) << 32;
+        ((both >> bit) & (VQ_K as u64 - 1)) as usize
+    }
+
+    /// Dequantize to the original (un-rotated) basis: the reference.
+    pub fn dequant(&self) -> Vec<f64> {
+        let mut w: Vec<f64> = (0..self.rows * self.cols)
+            .map(|e| {
+                let c = self.code(e / VQ_DIM);
+                f16v(self.book[c * VQ_DIM + e % VQ_DIM]) * f16v(self.scales[e / VQ_GROUP])
+            })
+            .collect();
+        let s64: Vec<f64> = self.signs.iter().map(|&x| x as f64).collect();
+        rotate(&mut w, self.cols, VQ_HB, &s64, true);
+        w
+    }
+
+    /// The decode kernel on CPU, shaped like the GPU one: rotate `x` once,
+    /// then per row, per group (one scale), per code (one gather), a
+    /// 4-wide dot against `x'`. f32 throughout, like the device.
+    pub fn gemv(&self, x: &[f32]) -> Vec<f32> {
+        let xr = rotate_x(x, &self.signs);
+        let book: Vec<f32> = self.book.iter().map(|&b| f16v(b) as f32).collect();
+        let cpr = self.cols / VQ_DIM;
+        (0..self.rows)
+            .map(|r| {
+                let mut acc = 0.0f32;
+                for g in 0..self.cols / VQ_GROUP {
+                    let mut part = 0.0f32;
+                    for j in 0..VQ_GROUP / VQ_DIM {
+                        let col = g * VQ_GROUP + j * VQ_DIM;
+                        let c = self.code(r * cpr + col / VQ_DIM);
+                        let e = &book[c * VQ_DIM..][..VQ_DIM];
+                        part += (0..VQ_DIM).map(|t| e[t] * xr[col + t]).sum::<f32>();
+                    }
+                    acc += part * f16v(self.scales[r * self.cols / VQ_GROUP + g]) as f32;
+                }
+                acc
+            })
+            .collect()
+    }
+}
+
+/// `x' = H(x ⊙ s)` per `VQ_HB` block, f32 (the kernel's prologue).
+pub fn rotate_x(x: &[f32], signs: &[f32]) -> Vec<f32> {
+    let mut v: Vec<f64> = x.iter().zip(signs).map(|(a, s)| (a * s) as f64).collect();
+    let ones = vec![1.0; v.len()];
+    rotate(&mut v, x.len(), VQ_HB, &ones, false);
+    v.into_iter().map(|a| a as f32).collect()
+}
+
+/// CUDA source for the decode step of one VQ matrix: `vq_rotate` (one
+/// block of 128 threads per Hadamard block: `x' = H(x ⊙ s)` in shared
+/// memory, an in-register butterfly over 7 stages) and `vq_gemv` (one warp
+/// per row; the codebook staged in shared memory as float4; lane `j` of a
+/// group decodes code `j` — 32 codes × 4 = the 128-wide group — so every
+/// lane reads one 11-bit code per group from a 64-bit window, gathers one
+/// float4, dots it with a float4 of `x'`, and the warp reduces once per
+/// row, scaling per group). Launch: `vq_rotate<<<cols/128, 128>>>`,
+/// `vq_gemv<<<ceil(rows/8), 256, 2048*16>>>`.
+pub fn vq_cuda_src() -> String {
+    format!(
+        r#"#include <cuda_fp16.h>
+#define VQ_K {k}
+#define VQ_BITS {bits}
+#define VQ_GROUP {group}
+
+extern "C" __global__ void vq_rotate(const float* __restrict__ x, const float* __restrict__ s,
+                                     float* __restrict__ xr) {{
+  __shared__ float b[128];
+  int t = threadIdx.x, base = blockIdx.x * 128;
+  b[t] = x[base + t] * s[base + t];
+  __syncthreads();
+  for (int h = 1; h < 128; h <<= 1) {{
+    float a = b[t], c = b[t ^ h];
+    __syncthreads();
+    b[t] = (t & h) ? c - a : a + c;
+    __syncthreads();
+  }}
+  xr[base + t] = b[t] * 0.08838834764831845f;  // 1/sqrt(128)
+}}
+
+extern "C" __global__ void vq_gemv(const unsigned* __restrict__ codes,
+                                   const __half* __restrict__ scales,
+                                   const __half* __restrict__ book,
+                                   const float* __restrict__ xr, float* __restrict__ y,
+                                   int rows, int cols) {{
+  extern __shared__ float4 cb[];
+  for (int i = threadIdx.x; i < VQ_K; i += blockDim.x) {{
+    const __half* e = book + 4 * i;
+    cb[i] = make_float4(__half2float(e[0]), __half2float(e[1]), __half2float(e[2]), __half2float(e[3]));
+  }}
+  __syncthreads();
+  int lane = threadIdx.x & 31, r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  int groups = cols / VQ_GROUP;
+  const float4* x4 = reinterpret_cast<const float4*>(xr);
+  size_t c0 = (size_t)r * (cols / 4);
+  float acc = 0.f;
+  for (int g = 0; g < groups; ++g) {{
+    size_t i = c0 + (size_t)g * 32 + lane;
+    size_t bit = i * VQ_BITS;
+    unsigned long long w = (unsigned long long)codes[bit >> 5] |
+                           ((unsigned long long)codes[(bit >> 5) + 1] << 32);
+    int c = (int)((w >> (bit & 31)) & (VQ_K - 1));
+    float4 e = cb[c], v = x4[g * 32 + lane];
+    acc += (e.x * v.x + e.y * v.y + e.z * v.z + e.w * v.w) *
+           __half2float(scales[(size_t)r * groups + g]);
+  }}
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) y[r] = acc;
+}}
+"#,
+        k = VQ_K,
+        bits = VQ_BITS,
+        group = VQ_GROUP
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +536,93 @@ mod tests {
             .lookups_per_weight(),
             0.25
         );
+    }
+
+    fn vq_fixture(rows: usize, cols: usize) -> (Vec<f64>, VqMatrix) {
+        let w = weights(rows, cols);
+        // a fixed codebook (no k-means) keeps the test fast: a 4-d grid
+        // over [-2, 2] with 2048 points (8·8·8·4)
+        let lv = |n: usize, i: usize| -2.0 + 4.0 * i as f64 / (n - 1) as f64;
+        let book: Vec<f64> = (0..VQ_K)
+            .flat_map(|c| {
+                [
+                    lv(8, c % 8),
+                    lv(8, c / 8 % 8),
+                    lv(8, c / 64 % 8),
+                    lv(4, c / 512),
+                ]
+            })
+            .collect();
+        let m = VqMatrix::encode(&w, rows, cols, 7, Some(&book), 0);
+        (w, m)
+    }
+
+    #[test]
+    fn vq_codes_pack_11_bits() {
+        let (_, m) = vq_fixture(4, 256);
+        assert_eq!(m.codes.len(), (4 * 256 / 4 * 11usize).div_ceil(32) + 1);
+        assert!((0..256).all(|i| m.code(i) < VQ_K));
+        // 2.875 bits/weight + 0.008 for the codebook at 4096×4096
+        let bpw = 11.0 / 4.0 + 16.0 / 128.0 + (16 * VQ_K * 4) as f64 / (4096.0 * 4096.0);
+        assert!((bpw - 2.883).abs() < 1e-3, "{bpw}");
+        let fmt = LowBit::Vq {
+            dim: 4,
+            k: 2048,
+            group: 128,
+        }
+        .bits_per_weight(4096 * 4096);
+        assert!((fmt - bpw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vq_gemv_matches_dequant_reference() {
+        let (rows, cols) = (24, 512);
+        let (w, m) = vq_fixture(rows, cols);
+        let deq = m.dequant();
+        // the format is a real approximation of w
+        let rel = mse(&deq, &w) / (w.iter().map(|x| x * x).sum::<f64>() / w.len() as f64);
+        assert!(rel < 0.2, "rel {rel}");
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect();
+        let y = m.gemv(&x);
+        for r in 0..rows {
+            let want: f64 = (0..cols).map(|c| deq[r * cols + c] * x[c] as f64).sum();
+            let scale: f64 = (0..cols)
+                .map(|c| (deq[r * cols + c] * x[c] as f64).abs())
+                .sum();
+            assert!(
+                (y[r] as f64 - want).abs() < 1e-5 * scale.max(1.0),
+                "row {r}: {} vs {want}",
+                y[r]
+            );
+        }
+    }
+
+    #[test]
+    fn vq_rotation_is_moved_onto_x() {
+        let s = vq_signs(256, 3);
+        let x: Vec<f32> = (0..256).map(|i| (i as f32).sin()).collect();
+        let xr = rotate_x(&x, &s);
+        let n0: f32 = x.iter().map(|a| a * a).sum();
+        let n1: f32 = xr.iter().map(|a| a * a).sum();
+        assert!((n0 - n1).abs() < 1e-3 * n0);
+    }
+
+    #[test]
+    fn vq_cuda_src_names_both_kernels() {
+        let s = vq_cuda_src();
+        assert!(
+            s.contains("vq_rotate") && s.contains("vq_gemv") && s.contains("#define VQ_BITS 11")
+        );
+    }
+
+    /// Writes the kernel source for bench/lowbit/vq_bench.cu:
+    /// `VQ_CU_OUT=vq.cu cargo test -p tang-compile --lib vq_cuda_src_dump -- --ignored`
+    #[test]
+    #[ignore]
+    fn vq_cuda_src_dump() {
+        let out = std::env::var("VQ_CU_OUT").unwrap_or_else(|_| "vq.cu".into());
+        std::fs::write(out, vq_cuda_src()).unwrap();
     }
 }
