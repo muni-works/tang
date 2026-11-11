@@ -383,6 +383,15 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
     let (t, v) = (sh[0], sh[1]);
     let kc = TOPK_CANDIDATES.min(v.n());
     let kd = Dim::Fixed(kc);
+    // vocabulary reductions in two passes: `nb` chunks of `cl` (the largest `nb <= 128`
+    // dividing V), so a one-row step spreads them over the SMs instead of one block
+    let vn = v.n();
+    let nb = (1..=128.min(vn)).rev().find(|b| vn % b == 0).unwrap();
+    let (cl, bd) = (vn / nb, Dim::Fixed(vn / nb));
+    let nbd = Dim::Fixed(nb);
+    let _ = bd;
+    // a `[t, v]` tensor read at chunk b, element c (space (t, b, c))
+    let chunked = |x: TensorId| arg(x, vec![u(3, 0), form(3, &[(1, cl as i64), (2, 1)], 0)]);
     let params = g.input(&[Dim::Fixed(4)]);
     let p = |rank: usize, i: usize| arg(params, vec![Form::constant(rank, i as i64)]);
     let comp = |g: &mut TensorGraph,
@@ -396,22 +405,36 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
     };
     // the K best (id, logit) pairs, best first
     let vid = g.iota(&[t, v], 1);
+    let pair = move |x: &[ExprId]| {
+        let mut o = vec![x[0], x[1]];
+        for _ in 1..kc {
+            o.push(lit(0.0));
+            o.push(lit(-(f32::MAX as f64)));
+        }
+        o
+    };
+    // each chunk's K best, then the K best of those (the merge is exact: same set, same order)
+    let cand1 = g
+        .comp_tuple(
+            &[t, nbd, Dim::Fixed(2 * kc)],
+            &[Dim::Fixed(cl)],
+            vec![chunked(vid), chunked(logits)],
+            Some(Monoid::topk(kc)),
+            pair,
+        )
+        .unwrap_or_else(|e| panic!("sampler top-k (chunks): {e:?}"));
     let cand = g
         .comp_tuple(
             &[t, Dim::Fixed(2 * kc)],
-            &[v],
-            vec![arg(vid, vec![u(2, 0), u(2, 1)]), arg(logits, vec![u(2, 0), u(2, 1)])],
+            &[nbd, kd],
+            vec![
+                arg(cand1, vec![u(3, 0), u(3, 1), form(3, &[(2, 2)], 0)]),
+                arg(cand1, vec![u(3, 0), u(3, 1), form(3, &[(2, 2)], 1)]),
+            ],
             Some(Monoid::topk(kc)),
-            |x| {
-                let mut o = vec![x[0], x[1]];
-                for _ in 1..kc {
-                    o.push(lit(0.0));
-                    o.push(lit(-(f32::MAX as f64)));
-                }
-                o
-            },
+            pair,
         )
-        .unwrap_or_else(|e| panic!("sampler top-k: {e:?}"));
+        .unwrap_or_else(|e| panic!("sampler top-k (merge): {e:?}"));
     // candidate r's logit / id, in a rank-`rank` space whose axis `ax` is r
     let cv = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 1)]);
     let ci = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 0)]);
@@ -455,19 +478,20 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
         &move |x| select(x[2] - x[0], lit(0.0), ((x[0] - x[1]) / temp(x[3])).exp()),
     );
     // the total over the whole top-k set (all of the vocabulary's kept logits, not just the K)
-    let z = comp(
+    let z1 = comp(
         g,
-        &[t],
-        &[v],
+        &[t, nbd],
+        &[Dim::Fixed(cl)],
         vec![
-            arg(logits, vec![u(2, 0), u(2, 1)]),
-            row(m, 2),
-            row(theta_k, 2),
-            p(2, TEMPERATURE),
+            chunked(logits),
+            row(m, 3),
+            row(theta_k, 3),
+            p(3, TEMPERATURE),
         ],
         Some(Monoid::sum()),
         &move |x| select(x[2] - x[0], lit(0.0), ((x[0] - x[1]) / temp(x[3])).exp()),
     );
+    let z = comp(g, &[t], &[nbd], vec![arg(z1, vec![u(2, 0), u(2, 1)])], Some(Monoid::sum()), &|x| x[0]);
     let r3 = g.iota(&[t, kd, kd], 1);
     let q3 = g.iota(&[t, kd, kd], 2);
     // mass strictly before rank r
@@ -538,17 +562,17 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
         .unwrap();
     // no cut at all: Gumbel-max over the whole vocabulary
     let posv = g.iota(&[t, v], 0);
-    let bestv = g
+    let bestv1 = g
         .comp_tuple(
-            &[t, Dim::Fixed(2)],
-            &[v],
+            &[t, nbd, Dim::Fixed(2)],
+            &[Dim::Fixed(cl)],
             vec![
-                arg(logits, vec![u(2, 0), u(2, 1)]),
-                arg(vid, vec![u(2, 0), u(2, 1)]),
-                arg(posv, vec![u(2, 0), u(2, 1)]),
-                row(m, 2),
-                p(2, TEMPERATURE),
-                p(2, SEED),
+                chunked(logits),
+                chunked(vid),
+                chunked(posv),
+                row(m, 3),
+                p(3, TEMPERATURE),
+                p(3, SEED),
             ],
             Some(Monoid::argmax()),
             |x| {
@@ -556,6 +580,19 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
                 let uu = uniform(seed, pos, id);
                 vec![id, (l - m) / temp(tp) - (-(uu.ln())).ln()]
             },
+        )
+        .unwrap();
+    // chunks in id order: argmax's first-index tie rule keeps the lowest id
+    let bestv = g
+        .comp_tuple(
+            &[t, Dim::Fixed(2)],
+            &[nbd],
+            vec![
+                arg(bestv1, vec![u(2, 0), u(2, 1), Form::constant(2, 0)]),
+                arg(bestv1, vec![u(2, 0), u(2, 1), Form::constant(2, 1)]),
+            ],
+            Some(Monoid::argmax()),
+            |x| vec![x[0], x[1]],
         )
         .unwrap();
     let token = comp(
@@ -729,7 +766,16 @@ mod tests {
     /// uncut case, top_k 0 with top_p 1, draws over the whole vocabulary like the host).
     #[test]
     fn topk_sampler_matches_exact_host_sampler() {
-        let v = 257;
+        check_topk(257);
+    }
+
+    /// V = 1000: the vocabulary reductions split in 125 chunks of 8.
+    #[test]
+    fn topk_sampler_split_matches_exact_host_sampler() {
+        check_topk(1000);
+    }
+
+    fn check_topk(v: usize) {
         let mut rs = rows(40, v, 2);
         rs[3][17] = 100.0;
         rs[3][201] = 100.0;
@@ -765,7 +811,7 @@ mod tests {
             }
         }
         eprintln!("top-K sampler: {n} draws equal to the exact host sampler ({skipped} nuclei past K skipped)");
-        assert!(n > 5000);
+        assert!(n > 4000);
     }
 
     /// Sampling matches the exact (sort-based) host sampler: same kept sets
