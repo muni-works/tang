@@ -234,6 +234,18 @@ pub trait ServeEngine {
     fn set_slot_mtp(&mut self, _on: bool) {}
     /// Fill the MTP K/V over wide prefill windows (`Coder::mtp_fill`).
     fn set_mtp_fill(&mut self, _on: bool) {}
+    /// Logit rows' width (0: this engine has no structured output).
+    fn vocab_size(&self) -> usize {
+        0
+    }
+    /// A no-draft verify of `cur` that also returns the row's logits, for structured output.
+    fn step_logits(&mut self, _cur: u32) -> Result<(u32, Vec<f32>)> {
+        bail!("structured output needs the qwen3next engine")
+    }
+    /// `decode_batch` that also returns the window's logits (`[rows][vocab]`).
+    fn decode_batch_logits(&mut self, _rows: &[(usize, u32)]) -> Result<(Vec<u32>, Vec<f32>)> {
+        bail!("structured output needs the qwen3next engine")
+    }
     /// Verify-window cost by width relative to one token, for pricing suffix drafts.
     fn draft_cost(&self) -> Vec<(usize, f32)> {
         vec![(1, 1.0), (2, 1.12), (4, 1.35), (8, 1.9)]
@@ -241,6 +253,9 @@ pub trait ServeEngine {
 }
 
 impl ServeEngine for Engine {
+    fn vocab_size(&self) -> usize {
+        self.hp.n_vocab
+    }
     fn tokens(&self) -> &Vec<u32> {
         &self.tokens
     }
@@ -318,6 +333,16 @@ impl ServeEngine for Engine {
 }
 
 impl ServeEngine for super::coder::Coder {
+    fn vocab_size(&self) -> usize {
+        self.hp.n_vocab
+    }
+    fn step_logits(&mut self, cur: u32) -> Result<(u32, Vec<f32>)> {
+        super::coder::Coder::step_logits(self, cur)
+    }
+    fn decode_batch_logits(&mut self, rows: &[(usize, u32)]) -> Result<(Vec<u32>, Vec<f32>)> {
+        let (out, logits) = super::coder::Coder::decode_batch_keep(self, rows, true)?;
+        Ok((out, logits.unwrap_or_default()))
+    }
     fn tokens(&self) -> &Vec<u32> {
         &self.tokens
     }
@@ -604,6 +629,8 @@ pub struct FlashServe {
     tags: Tags,
     ctx: usize,
     eos: Vec<u32>,
+    /// Structured output's grammar compiler over this vocabulary (built on first use).
+    structured: Option<llguidance::ParserFactory>,
     think: (u32, u32),
     im_start: u32,
     wrap_up: Vec<u32>,
@@ -890,6 +917,7 @@ impl FlashServe {
             tok,
             ctx: s.ctx,
             eos,
+            structured: None,
             think,
             wrap_up,
             snaps: Vec::new(),
@@ -1106,13 +1134,19 @@ impl FlashServe {
         let msgs = &self.shield.protect(msgs);
         let tools = req.tools.as_ref().map(|t| self.shield.protect(t));
         let stable = std::env::var("TANG_FLASH_STABLE_SYSTEM").map_or(true, |v| v != "0");
-        if !stable || req.think != Some(false) {
-            return self.tok.render(msgs, tools.as_ref(), req.think);
+        // Structured output answers with the JSON value alone: no reasoning block.
+        let think = if req.response_schema.is_some() {
+            Some(false)
+        } else {
+            req.think
+        };
+        if !stable || think != Some(false) {
+            return self.tok.render(msgs, tools.as_ref(), think);
         }
         let text = self.tok.render(msgs, tools.as_ref(), Some(true))?;
         match text.strip_suffix("<think>\n") {
             Some(head) => Ok(format!("{head}<think>\n\n</think>\n\n")),
-            None => self.tok.render(msgs, tools.as_ref(), req.think),
+            None => self.tok.render(msgs, tools.as_ref(), think),
         }
     }
 
@@ -1645,7 +1679,25 @@ impl FlashServe {
                     .join(" "),
             )?;
         }
-        let (reused, cur) = self.prefill(&ids, &text)?;
+        // Structured output: the prompt's last token is decoded like an output step, so every
+        // output token (the first too) is checked against the grammar with its row's logits.
+        let mut constraint = self.constraint(req)?;
+        let hs = crate::structured::HostSampling {
+            temperature: temp,
+            top_k,
+            top_p,
+            seed: req.sampling.seed,
+        };
+        let (reused, cur) = match constraint.as_mut() {
+            Some(c) => {
+                ensure!(ids.len() >= 2, "prompt too short for structured output");
+                let n = ids.len() - 1;
+                let (reused, _) = self.prefill(&ids[..n], &text)?;
+                let (proposed, mut lg) = self.e.step_logits(ids[n])?;
+                (reused, c.choose(proposed, &mut lg, &hs, ids.len() as u64)?)
+            }
+            None => self.prefill(&ids, &text)?,
+        };
         let prefill_s = t0.elapsed().as_secs_f64();
         self.line.prompt = ids.len();
         self.line.reused = reused;
@@ -1725,6 +1777,9 @@ impl FlashServe {
                     break 'gen;
                 }
                 out.push(tok);
+                if let Some(c) = constraint.as_mut() {
+                    c.accept(tok)?;
+                }
                 if let Some(ss) = sess.as_mut() {
                     ss.push(tok);
                 }
@@ -1752,7 +1807,10 @@ impl FlashServe {
                         Some(i) => new[..new.len().saturating_sub(text_out.len() - i)].to_string(),
                         None => new,
                     };
+                    // Constrained output is the grammar's JSON verbatim: tool-call or think
+                    // markers inside a string value are data, not structure.
                     let pieces = match tag {
+                        _ if constraint.is_some() => vec![Piece::Text(new)],
                         Some(t) if new == t => parser.push_tag(t),
                         _ => parser.push_text(&new),
                     };
@@ -1765,11 +1823,25 @@ impl FlashServe {
                         break 'gen;
                     }
                 }
+                // The JSON value is complete: nothing but an end of turn may follow.
+                if constraint.as_ref().is_some_and(|c| c.finished()) {
+                    finish = Finish::Stop;
+                    break 'gen;
+                }
                 if out.len() >= limit {
                     break 'gen;
                 }
             }
             let last = *pending.last().unwrap();
+            // Structured output: one token a window, no drafts (an accepted draft is committed
+            // before the grammar could reject it), checked against the grammar.
+            if let Some(c) = constraint.as_mut() {
+                let (proposed, mut lg) = self.e.step_logits(last)?;
+                let pos = (ids.len() + out.len()) as u64;
+                pending = vec![c.choose(proposed, &mut lg, &hs, pos)?];
+                windows += 1;
+                continue;
+            }
             if wrap && out.len() + self.wrap_up.len() < limit {
                 // Out of thinking budget: the wrap-up and `</think>` as if the model wrote them.
                 think.closed(self.wrap_up.len());
@@ -1917,6 +1989,37 @@ impl FlashServe {
     /// whether to pin each: the end of the tools block, the end of the system prompt (the second
     /// `<|im_start|>`) and the last turn boundary (the last one, which opens the generation
     /// prompt).
+    /// `req`'s structured-output constraint, if it has a schema.
+    pub(super) fn constraint(
+        &mut self,
+        req: &Request,
+    ) -> Result<Option<crate::structured::Constraint>> {
+        let Some(schema) = &req.response_schema else {
+            return Ok(None);
+        };
+        ensure!(
+            req.stop.is_empty(),
+            "stop strings cannot be combined with structured output"
+        );
+        ensure!(
+            self.e.vocab_size() > 0,
+            "structured output needs the qwen3next engine"
+        );
+        if self.structured.is_none() {
+            let eos = *self.eos.first().context("model has no EOS token")?;
+            self.structured = Some(crate::structured::model_factory(
+                &self.tok.tok,
+                self.e.vocab_size(),
+                eos,
+            )?);
+        }
+        Ok(Some(crate::structured::Constraint::new(
+            self.structured.as_ref().unwrap(),
+            schema.clone(),
+            self.eos.clone(),
+        )?))
+    }
+
     pub(super) fn marks(&self, ids: &[u32], text: &str) -> Vec<(usize, bool)> {
         let starts: Vec<usize> = ids
             .iter()
