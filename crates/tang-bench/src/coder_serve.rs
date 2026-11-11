@@ -34,7 +34,7 @@ use tang_llm::gguf::{GgmlType, Gguf};
 
 use crate::ir_coder_prefill::{prefill_graph, CoderInput};
 use crate::ir_coder_real::{bind, dims_from_gguf, lower_real_step};
-use crate::ir_sample::{append_sampler, SampleSpec, SEED, TEMPERATURE, TOP_K, TOP_P};
+use crate::ir_sample::{append_sampler, append_sampler_topk, SampleSpec, SEED, TEMPERATURE, TOP_K, TOP_P};
 use crate::qwen_session::{runtime, slot_plan};
 
 /// `tang-llm serve` with `TANG_CODER_ENGINE=derived` available: register before serving.
@@ -111,10 +111,17 @@ impl DerivedCoder {
         let dims = dims_from_gguf(&g).map_err(anyhow::Error::msg)?;
         let mut pg = prefill_graph(&dims);
         let mut tys = bind(&pg, &g).map_err(anyhow::Error::msg)?;
-        let sampled = std::env::var("TANG_CODER_DERIVED_SAMPLER").as_deref() != Ok("0");
+        // TANG_CODER_DERIVED_SAMPLER: topk (default: one top-64 select, the rest over the 64),
+        // bisect (the vocabulary-wide bisections), 0 (none: greedy only, host argmax)
+        let which = std::env::var("TANG_CODER_DERIVED_SAMPLER").unwrap_or_default();
+        let sampled = which != "0";
         let mut step_outs = vec![pg.logits];
         if sampled {
-            let s = append_sampler(&mut pg.g, pg.logits, SampleSpec::default());
+            let s = if which == "bisect" {
+                append_sampler(&mut pg.g, pg.logits, SampleSpec::default())
+            } else {
+                append_sampler_topk(&mut pg.g, pg.logits)
+            };
             pg.inputs.push(CoderInput {
                 name: "sample.params".into(),
                 shape: vec![tang_compile::tensor::Dim::Fixed(4)],
@@ -379,7 +386,13 @@ impl DerivedCoder {
             "coder derived: {} slot(s), ctx {ctx}, {ncache} caches ({kv_mb} MB of K/V a slot), graphs {}, sampler {}, ready in {:.1} s",
             me.slots.len(),
             if capture { "on" } else { "off" },
-            if me.params_in.is_some() { "on the device" } else { "off (host argmax)" },
+            if me.params_in.is_none() {
+                "off (host argmax)"
+            } else if which == "bisect" {
+                "bisect, on the device"
+            } else {
+                "top-64, on the device"
+            },
             t0.elapsed().as_secs_f64()
         );
         Ok(me)

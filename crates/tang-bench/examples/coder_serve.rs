@@ -132,6 +132,24 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         println!("prompt {i}: {} tokens, hand==derived {}/{n} ({note}); first-step max |dlogit| {maxdiff:.4}; slots deterministic {slots_same}", p.len(), k);
         all_ok &= slots_same;
     }
+    // sampled (T 0.8, top-p 0.95, top-k 40, seed 7) on slot 0: compare across samplers
+    d.free_slot(0);
+    d.set_slot_sampling(
+        0,
+        tang_llm::flash::sampler::RowSampling {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            seed: 7,
+            presence: 0.0,
+        },
+    )?;
+    for (i, p) in ids.iter().enumerate() {
+        d.free_slot(0);
+        let (t, _) = greedy(&mut d, Some(0), p, n)?;
+        println!("sampled prompt {i}: tokens {t:?}");
+    }
+    d.set_slot_sampling(0, tang_llm::flash::sampler::RowSampling::greedy())?;
     // the server's C=4 shape: four prefills, then decode_batch over all four rows at once
     let mut solo = Vec::new();
     for p in &ids {

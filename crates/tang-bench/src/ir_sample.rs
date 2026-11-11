@@ -348,6 +348,243 @@ pub fn append_sampler(
     }
 }
 
+/// Candidates [`append_sampler_topk`] keeps: the hand sampler's `MAX_K`.
+pub const TOPK_CANDIDATES: usize = 64;
+
+fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
+    let mut f = Form::constant(rank, offset);
+    for &(d, c) in terms {
+        f.coefs[d] += c;
+    }
+    f
+}
+
+/// [`append_sampler`] without the vocabulary-wide bisections: ONE top-`K`
+/// reduction (`K` = [`TOPK_CANDIDATES`], the block select on CUDA) picks the
+/// candidates sorted best first (ties to the lower id), and everything after
+/// runs over those `K`:
+///
+/// - top-k: the k-th candidate's logit is the threshold (`k` capped at `K`,
+///   `0` = all `K`), exact, no bisection;
+/// - top-p: prefix masses over the sorted candidates; the kept set is the
+///   ranks whose preceding mass is below `top_p` of the total (the smallest
+///   nucleus, as the host sampler's sort-and-cumsum);
+/// - the draw: Gumbel-max over the kept candidates with the same
+///   `uniform(seed, position, id)` as [`append_sampler`], so the same kept set
+///   gives the same token;
+/// - `top_k = 0` with `top_p ≥ 1` (no cut at all): Gumbel-max over the whole
+///   vocabulary (one more reduction), as the hand sampler does;
+/// - greedy: the first candidate (the first maximum).
+///
+/// Same params and outputs as [`append_sampler`]. Unlike it, a nucleus that
+/// would need more than `K` tokens stops at `K` (the hand sampler's cap).
+pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
+    let sh = g.shape(logits).to_vec();
+    let (t, v) = (sh[0], sh[1]);
+    let kc = TOPK_CANDIDATES.min(v.n());
+    let kd = Dim::Fixed(kc);
+    let params = g.input(&[Dim::Fixed(4)]);
+    let p = |rank: usize, i: usize| arg(params, vec![Form::constant(rank, i as i64)]);
+    let comp = |g: &mut TensorGraph,
+                out: &[Dim],
+                red: &[Dim],
+                args: Vec<Arg>,
+                m: Option<Monoid>,
+                f: &dyn Fn(&[ExprId]) -> ExprId| {
+        g.comp(out, red, args, m, |x| vec![f(x)])
+            .unwrap_or_else(|e| panic!("sampler comp {out:?}/{red:?}: {e:?}"))
+    };
+    // the K best (id, logit) pairs, best first
+    let vid = g.iota(&[t, v], 1);
+    let cand = g
+        .comp_tuple(
+            &[t, Dim::Fixed(2 * kc)],
+            &[v],
+            vec![arg(vid, vec![u(2, 0), u(2, 1)]), arg(logits, vec![u(2, 0), u(2, 1)])],
+            Some(Monoid::topk(kc)),
+            |x| {
+                let mut o = vec![x[0], x[1]];
+                for _ in 1..kc {
+                    o.push(lit(0.0));
+                    o.push(lit(-(f32::MAX as f64)));
+                }
+                o
+            },
+        )
+        .unwrap_or_else(|e| panic!("sampler top-k: {e:?}"));
+    // candidate r's logit / id, in a rank-`rank` space whose axis `ax` is r
+    let cv = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 1)]);
+    let ci = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 0)]);
+    let row = |x: TensorId, rank: usize| arg(x, vec![u(rank, 0)]);
+    let m = comp(g, &[t], &[], vec![arg(cand, vec![u(1, 0), Form::constant(1, 1)])], None, &|x| x[0]);
+    let first = comp(g, &[t], &[], vec![arg(cand, vec![u(1, 0), Form::constant(1, 0)])], None, &|x| x[0]);
+    let kf = kc as f64;
+    // top-k threshold: candidate min(k, K) − 1 (k = 0: K − 1)
+    let rk = g.iota(&[t, kd], 1);
+    let theta_k = comp(
+        g,
+        &[t],
+        &[kd],
+        vec![cv(2, 1), arg(rk, vec![u(2, 0), u(2, 1)]), p(2, TOP_K)],
+        Some(Monoid::sum()),
+        &move |x| {
+            let k = select(x[2] - lit(0.5), x[2].min(lit(kf)), lit(kf));
+            let d = x[1] - (k - lit(1.0));
+            select(lit(0.25) - d * d, x[0], lit(0.0))
+        },
+    );
+    // the top-k set's floor over the whole vocabulary: top_k = 0 keeps every logit within
+    // `range` of the max (the host sampler's set), else the k-th candidate
+    let range = 64.0;
+    let theta_k = comp(
+        g,
+        &[t],
+        &[],
+        vec![row(theta_k, 1), row(m, 1), p(1, TOP_K)],
+        None,
+        &move |x| select(x[2] - lit(0.5), x[0], x[1] - lit(range)),
+    );
+    // tempered weights of the top-k set, their total, and prefix masses
+    let temp = |x: ExprId| select(x, x, lit(1.0));
+    let w = comp(
+        g,
+        &[t, kd],
+        &[],
+        vec![cv(2, 1), row(m, 2), row(theta_k, 2), p(2, TEMPERATURE)],
+        None,
+        &move |x| select(x[2] - x[0], lit(0.0), ((x[0] - x[1]) / temp(x[3])).exp()),
+    );
+    // the total over the whole top-k set (all of the vocabulary's kept logits, not just the K)
+    let z = comp(
+        g,
+        &[t],
+        &[v],
+        vec![
+            arg(logits, vec![u(2, 0), u(2, 1)]),
+            row(m, 2),
+            row(theta_k, 2),
+            p(2, TEMPERATURE),
+        ],
+        Some(Monoid::sum()),
+        &move |x| select(x[2] - x[0], lit(0.0), ((x[0] - x[1]) / temp(x[3])).exp()),
+    );
+    let r3 = g.iota(&[t, kd, kd], 1);
+    let q3 = g.iota(&[t, kd, kd], 2);
+    // mass strictly before rank r
+    let before = comp(
+        g,
+        &[t, kd],
+        &[kd],
+        vec![
+            arg(w, vec![u(3, 0), u(3, 2)]),
+            arg(r3, vec![u(3, 0), u(3, 1), u(3, 2)]),
+            arg(q3, vec![u(3, 0), u(3, 1), u(3, 2)]),
+        ],
+        Some(Monoid::sum()),
+        &|x| select(x[1] - x[2] - lit(0.5), x[0], lit(0.0)),
+    );
+    // nucleus threshold: the smallest logit among ranks with mass-before < top_p · z
+    // (as a max of negated logits)
+    let neg_th = comp(
+        g,
+        &[t],
+        &[kd],
+        vec![
+            cv(2, 1),
+            arg(before, vec![u(2, 0), u(2, 1)]),
+            row(z, 2),
+            p(2, TOP_P),
+            row(theta_k, 2),
+        ],
+        Some(Monoid::max()),
+        &|x| {
+            let kept = x[3] * x[2] - x[1];
+            // inside the nucleus and the top-k set
+            select(kept, select(x[4] - x[0], lit(-1e30), -x[0]), lit(-1e30))
+        },
+    );
+    let one = |x: TensorId| arg(x, vec![u(1, 0)]);
+    let threshold = comp(
+        g,
+        &[t],
+        &[],
+        vec![one(neg_th), one(theta_k), p(1, TOP_P)],
+        None,
+        &|x| select(x[2], select(lit(1.0) - x[2], -x[0], x[1]), x[1]),
+    );
+    // Gumbel-max over the kept candidates
+    let pos2 = g.iota(&[t, kd], 0);
+    let bestk = g
+        .comp_tuple(
+            &[t, Dim::Fixed(2)],
+            &[kd],
+            vec![
+                cv(2, 1),
+                ci(2, 1),
+                arg(pos2, vec![u(2, 0), u(2, 1)]),
+                row(m, 2),
+                row(threshold, 2),
+                p(2, TEMPERATURE),
+                p(2, SEED),
+            ],
+            Some(Monoid::argmax()),
+            |x| {
+                let (l, id, pos, m, th, tp, seed) = (x[0], x[1], x[2], x[3], x[4], x[5], x[6]);
+                let uu = uniform(seed, pos, id);
+                let gumbel = -(-(uu.ln())).ln();
+                vec![id, select(th - l, lit(-1e30), (l - m) / temp(tp) + gumbel)]
+            },
+        )
+        .unwrap();
+    // no cut at all: Gumbel-max over the whole vocabulary
+    let posv = g.iota(&[t, v], 0);
+    let bestv = g
+        .comp_tuple(
+            &[t, Dim::Fixed(2)],
+            &[v],
+            vec![
+                arg(logits, vec![u(2, 0), u(2, 1)]),
+                arg(vid, vec![u(2, 0), u(2, 1)]),
+                arg(posv, vec![u(2, 0), u(2, 1)]),
+                row(m, 2),
+                p(2, TEMPERATURE),
+                p(2, SEED),
+            ],
+            Some(Monoid::argmax()),
+            |x| {
+                let (l, id, pos, m, tp, seed) = (x[0], x[1], x[2], x[3], x[4], x[5]);
+                let uu = uniform(seed, pos, id);
+                vec![id, (l - m) / temp(tp) - (-(uu.ln())).ln()]
+            },
+        )
+        .unwrap();
+    let token = comp(
+        g,
+        &[t],
+        &[],
+        vec![
+            arg(bestk, vec![u(1, 0), Form::constant(1, 0)]),
+            arg(bestv, vec![u(1, 0), Form::constant(1, 0)]),
+            one(first),
+            p(1, TEMPERATURE),
+            p(1, TOP_K),
+            p(1, TOP_P),
+        ],
+        None,
+        &|x| {
+            // all of the vocabulary: top_k = 0 (< 0.5) and top_p ≥ 1 (not in (0, 1))
+            let nucleus = select(x[5], select(lit(1.0) - x[5], lit(1.0), lit(0.0)), lit(0.0));
+            let full = select(lit(0.5) - x[4], lit(1.0) - nucleus, lit(0.0));
+            select(x[3], select(full - lit(0.5), x[1], x[0]), x[2])
+        },
+    );
+    Sampler {
+        params,
+        token,
+        threshold,
+    }
+}
+
 /// The host sampler with the same semantics, exact sets (sort-based), for
 /// checks: `None` params fields mean off. Returns `(token, kept set size)`.
 pub fn sample_host(l: &[f64], params: [f64; 4], pos: u64, range: f64) -> (usize, usize) {
@@ -476,6 +713,59 @@ mod tests {
             assert_eq!(tok[r], sample_host(row, [0.0, 0.0, 0.0, 0.0], r as u64, 64.0).0);
         }
         assert_eq!(tok[3], 17);
+    }
+
+    fn run_topk(v: usize, rows: &[Vec<f64>], params: [f64; 4]) -> (Vec<usize>, Vec<f64>) {
+        let mut g = TensorGraph::new();
+        let l = g.input(&[Dim::Sym(SEQ), Dim::Fixed(v)]);
+        let s = append_sampler_topk(&mut g, l);
+        let b = g.bind(&[(SEQ, rows.len())]).unwrap();
+        let out = b.eval(&[rows.concat(), params.to_vec()], &[s.token, s.threshold]);
+        (out[0].iter().map(|&x| x as usize).collect(), out[1].clone())
+    }
+
+    /// The top-K sampler: greedy is the first maximum; sampled tokens and kept sets equal
+    /// the exact host sampler's wherever its kept set fits in the K candidates (and the
+    /// uncut case, top_k 0 with top_p 1, draws over the whole vocabulary like the host).
+    #[test]
+    fn topk_sampler_matches_exact_host_sampler() {
+        let v = 257;
+        let mut rs = rows(40, v, 2);
+        rs[3][17] = 100.0;
+        rs[3][201] = 100.0;
+        let (tok, _) = run_topk(v, &rs, [0.0, 0.9, 40.0, 7.0]);
+        for (r, row) in rs.iter().enumerate() {
+            assert_eq!(tok[r], sample_host(row, [0.0; 4], r as u64, 64.0).0, "greedy row {r}");
+        }
+        assert_eq!(tok[3], 17);
+        let rs = rows(40, v, 2);
+        let (mut n, mut skipped) = (0, 0);
+        for &tp in &[0.3, 0.7, 1.0, 1.6] {
+            for &k in &[0.0, 1.0, 5.0, 40.0, 64.0] {
+                for &pp in &[1.0, 0.95, 0.5, 0.1] {
+                    for &seed in &[1.0, 99.0] {
+                        let params = [tp, pp, k, seed];
+                        let (tok, th) = run_topk(v, &rs, params);
+                        let uncut = k == 0.0 && pp >= 1.0;
+                        for (r, row) in rs.iter().enumerate() {
+                            let (want, kept) = sample_host(row, params, r as u64, 64.0);
+                            if !uncut && kept > TOPK_CANDIDATES {
+                                skipped += 1;
+                                continue;
+                            }
+                            if !uncut {
+                                let got_kept = row.iter().filter(|&&x| x >= th[r]).count();
+                                assert_eq!(got_kept, kept, "kept set {params:?} row {r}");
+                            }
+                            assert_eq!(tok[r], want, "token {params:?} row {r}");
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("top-K sampler: {n} draws equal to the exact host sampler ({skipped} nuclei past K skipped)");
+        assert!(n > 5000);
     }
 
     /// Sampling matches the exact (sort-based) host sampler: same kept sets
