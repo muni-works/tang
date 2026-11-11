@@ -118,8 +118,28 @@ fn main() {
         program,
         outs,
         storage,
+        graph,
         ..
     } = low;
+    let kinfo: Vec<(String, String)> = program
+        .program
+        .kernels
+        .iter()
+        .map(|k| {
+            let nd = &graph.nodes()[k.node.index()];
+            let what = match graph.comp_at(k.node.index()) {
+                Some(c) => format!(
+                    "{:?} red {:?} gathers {} int8 {:?}",
+                    nd.shape,
+                    c.red,
+                    c.args.iter().filter(|a| a.view.is_gather()).count(),
+                    nd.int_mma.map(|m| (m.stage, m.pos_tile))
+                ),
+                None => format!("{:?} (not a comp)", nd.shape),
+            };
+            (what, k.source.lines().next().unwrap_or("").chars().take(60).collect())
+        })
+        .collect();
     // `--no-plan`: every buffer its own allocation (no aliasing)
     let mut prog = if args.iter().any(|a| a == "--no-plan") {
         Program::new(&rt, program.program, &empty)
@@ -328,6 +348,37 @@ fn main() {
             let mut best = f64::INFINITY;
             for _ in 0..3 {
                 best = best.min(prog.time(&rt, 20));
+            }
+            if args.iter().any(|a| a == "--profile") {
+                let mut t: Vec<(f64, usize)> = prog
+                    .order()
+                    .iter()
+                    .map(|&i| (prog.time_kernel(&rt, i, 5), i))
+                    .collect();
+                let total: f64 = t.iter().map(|x| x.0).sum();
+                t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                println!("profile B={nb} len {l}: {} kernels, sum {total:.3} ms", t.len());
+                for (ms, i) in t.iter().take(15) {
+                    println!("  {ms:8.4} ms  k{i:<5} {} | {}", kinfo[*i].0, kinfo[*i].1);
+                }
+                let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+                for (ms, i) in &t {
+                    // group by kind: int8 stage, or shape rank + first line
+                    let w = &kinfo[*i].0;
+                    let key = if let Some(p) = w.find("int8 Some") {
+                        w[p..].to_string()
+                    } else {
+                        format!("{} {}", if w.contains("gathers 0") { "plain" } else { "gather" }, kinfo[*i].1)
+                    };
+                    let e = by.entry(key).or_default();
+                    e.0 += 1;
+                    e.1 += ms;
+                }
+                let mut by: Vec<_> = by.into_iter().collect();
+                by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+                for (k, (n, ms)) in by.iter().take(14) {
+                    println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
+                }
             }
             println!(
                 "batched decode B={nb} ragged around len {l}: {best:.3} ms device a step = {:.1} tok/s aggregate ({:.1} tok/s a stream)",
