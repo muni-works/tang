@@ -117,6 +117,24 @@ impl Runtime {
         CudaDevice::new(0).map(Self::Cuda)
     }
 
+    /// CUDA device `ordinal` (one rank of a multi-GPU program).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_on(ordinal: usize) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::new(ordinal).map(Self::Cuda)
+    }
+
+    /// The CUDA stream every launch and copy of this runtime goes on.
+    #[cfg(feature = "cuda")]
+    pub fn cu_stream(&self) -> cudarc::driver::sys::CUstream {
+        match self {
+            Self::Cuda(d) => d.stream.cu_stream(),
+            _ => panic!("cu_stream: not CUDA"),
+        }
+    }
+
     /// CUDA device 0 set up for [`Program::capture`]
     /// ([`CudaDevice::new_capturable`]).
     #[cfg(feature = "cuda")]
@@ -750,6 +768,17 @@ impl Program {
         p
     }
 
+    /// Whether `t` has a device buffer (an unused input or a folded value doesn't).
+    pub fn has_buffer(&self, t: TensorId) -> bool {
+        let t = self.program.storage(t);
+        self.program.buffers.iter().any(|b| b.node == t)
+    }
+
+    /// Whether input `k` is bound to a buffer (an input no kernel reads isn't).
+    pub fn has_input(&self, k: usize) -> bool {
+        self.program.buffers.iter().any(|b| b.input == Some(k))
+    }
+
     fn buffer_index(&self, t: TensorId) -> usize {
         let t = self.program.storage(t);
         self.program
@@ -1284,6 +1313,23 @@ impl Program {
         match b.format {
             Format::F16 => unpack_f16(&raw, b.len),
             _ => raw[..b.len].to_vec(),
+        }
+    }
+
+    /// The raw device address and f32 length of `t`'s buffer, for code that
+    /// works on it in place outside the program (NCCL collectives). Valid
+    /// while the program lives; work on it must go on [`Runtime::cu_stream`].
+    #[cfg(feature = "cuda")]
+    pub fn cuda_buffer(&self, rt: &Runtime, t: TensorId) -> (u64, usize) {
+        use cudarc::driver::DevicePtr;
+        let b = &self.program.buffers[self.buffer_index(t)];
+        assert!(b.format == Format::F32, "cuda_buffer: an f32 buffer only");
+        match (rt, &self.storage) {
+            (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
+                let (p, _sync) = slots[self.slot_of(t)].device_ptr(&d.stream);
+                (p, b.len)
+            }
+            _ => panic!("cuda_buffer: not a CUDA program"),
         }
     }
 

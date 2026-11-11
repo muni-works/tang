@@ -284,6 +284,8 @@ pub mod ir_glm_real;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Multi-GPU decode: the derived step split across ranks (EP + TP), checked on CPU.
+pub mod ir_shard;
 /// Prompt-lookup speculative decoding over a derived k-token window.
 pub mod prompt_lookup;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
