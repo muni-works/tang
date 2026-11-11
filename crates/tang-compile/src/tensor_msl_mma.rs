@@ -597,6 +597,7 @@ impl TensorGraph {
             points: numel(c.points()) as u32,
             count: (n_tiles * THREADS) as u32,
             workgroup_size: THREADS as u32,
+            writes: Vec::new(),
         })
     }
 }

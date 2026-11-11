@@ -1723,6 +1723,7 @@ impl TensorGraph {
             points: pts.iter().product::<usize>() as u32,
             count: (n_tiles * threads) as u32,
             workgroup_size: threads as u32,
+            writes: Vec::new(),
         })
     }
 }

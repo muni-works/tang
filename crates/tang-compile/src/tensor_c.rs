@@ -160,6 +160,7 @@ impl TensorGraph {
                     points,
                     count: points,
                     workgroup_size: 1,
+                    writes: Vec::new(),
                 }
             })
             .collect();
