@@ -81,6 +81,10 @@ name = "coder_derived"
 required-features = ["cuda", "gguf"]
 
 [[example]]
+name = "glm_real_gpu"
+required-features = ["cuda", "gguf"]
+
+[[example]]
 name = "ds_real_gpu"
 required-features = ["cuda"]
 
@@ -112,6 +116,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
+rayon     = "1"
 tang-derive-wasm = { path = "../tang-derive-wasm" }
 # ir_glm_prefill tests (flash::glm5) and ir_coder_prefill (flash::reference):
 # tang-llm's CPU references as oracles
@@ -146,3 +151,7 @@ required-features = ["cuda"]
 [[example]]
 name = "floors_cuda"
 required-features = ["cuda"]
+
+[[example]]
+name = "attention_fragments"
+required-features = ["metal"]

@@ -522,6 +522,19 @@ impl Monoid {
         })
     }
 
+    /// `Some(k)` when this is [`Monoid::topk`]`(k)` (same identity, same
+    /// combine at probe points).
+    pub fn topk_k(&self) -> Option<usize> {
+        if self.width < 2 || self.width % 2 != 0 {
+            return None;
+        }
+        let k = self.width / 2;
+        let id_ok = (0..k).all(|r| {
+            self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64)
+        });
+        (id_ok && self.matches(&Monoid::topk(k))).then_some(k)
+    }
+
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
     /// `m' = max(m, s)`, `accᵢ' = accᵢ·exp(m−m') + gᵢ·exp(s−m')`.
     pub fn online_softmax(k: usize) -> Self {
@@ -795,6 +808,13 @@ pub struct TNode {
     /// backend's default. Ignored unless `fragment` is set and the node
     /// has an attention plan.
     pub frag_cfg: [u8; 4],
+    /// Schedule (decode, CUDA): no kernel of its own. The kernel of node
+    /// `host` evaluates it inline wherever its own tree reads it, and
+    /// also stores it to this node's buffer (a side job of that launch),
+    /// so other readers read the buffer as usual. Set by
+    /// [`TensorGraph::schedule_cokernels`]; passes that rebuild the graph
+    /// drop it.
+    pub host: Option<TensorId>,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -1097,6 +1117,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1119,6 +1140,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1156,6 +1178,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1185,6 +1208,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1336,6 +1360,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1931,6 +1956,7 @@ impl TensorGraph {
                 detach: node.detach,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
+                host: None,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -3198,6 +3224,7 @@ impl TensorGraph {
                 detach: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
+                host: None,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3834,6 +3861,7 @@ impl TensorGraph {
                     detach: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
+                    host: None,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
@@ -4299,6 +4327,10 @@ impl TensorGraph {
                     Op::Comp(c) => Some(Compiled {
                         body: Prog::new(&c.body, &c.body_outs),
                         combine: c.monoid.as_ref().map(|m| Prog::new(&m.combine, &m.outs)),
+                        topk: c
+                            .monoid
+                            .as_ref()
+                            .and_then(|m| if emulate { None } else { m.topk_k() }),
                         direct: c
                             .args
                             .iter()
@@ -4580,6 +4612,9 @@ struct Scratch {
 struct Compiled {
     body: Prog,
     combine: Option<Prog>,
+    /// `Some(k)` when the monoid is [`Monoid::topk`]`(k)`: the reduce
+    /// merges natively (O(k) a combine instead of the k²/2 selects).
+    topk: Option<usize>,
     /// Per arg: a precomputed flat-address read, when the arg reads a
     /// plain buffer (see [`direct_read`]).
     direct: Vec<Option<Direct>>,
@@ -4862,6 +4897,10 @@ impl Evaluator<'_> {
                 }
                 continue;
             }
+            if let Some(kk) = k.topk {
+                topk_merge(vals, elem, kk, pair);
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(elem);
             combine.eval(pair, vals, cprog);
@@ -4871,6 +4910,38 @@ impl Evaluator<'_> {
             }
         }
     }
+}
+
+/// [`Monoid::topk`]'s combine, natively: merge the sorted `(index,
+/// value)` lists `acc` and `el` (value descending, smaller index first on
+/// a tie; an exact tie takes `el`'s pair, as the select form does) into
+/// `acc`, using `tmp` (≥ 2k) as scratch.
+fn topk_merge(acc: &mut [f64], el: &[f64], k: usize, tmp: &mut [f64]) {
+    let better = |x: (f64, f64), y: (f64, f64)| {
+        let d = x.1 - y.1;
+        if d > 0.0 {
+            true
+        } else if -d > 0.0 {
+            false
+        } else {
+            y.0 - x.0 > 0.0
+        }
+    };
+    let (mut i, mut j) = (0, 0);
+    for r in 0..k {
+        let a = (acc[2 * i], acc[2 * i + 1]);
+        let b = (el[2 * j], el[2 * j + 1]);
+        let (p, q) = if better(a, b) {
+            i += 1;
+            a
+        } else {
+            j += 1;
+            b
+        };
+        tmp[2 * r] = p;
+        tmp[2 * r + 1] = q;
+    }
+    acc[..2 * k].copy_from_slice(&tmp[..2 * k]);
 }
 
 /// Advance row-major coordinates `idx` in `shape` by one (last dim fastest).

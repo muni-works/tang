@@ -268,17 +268,33 @@ pub mod ir_qwen;
 /// DeepSeek-V4.1-Flash as one prefill graph over symbolic T (decode derived by derive_step).
 pub mod ir_ds_prefill;
 pub mod ir_ds_real;
+pub mod ir_ds_spark;
 /// Qwen3-Coder-Next as one prefill graph, checked against tang-llm's CPU reference.
 pub mod ir_coder_prefill;
 pub mod qwen_session;
 
 /// GLM-5.3 as one prefill graph over symbolic T; its step via `derive_step`.
 pub mod ir_glm_prefill;
+/// Temperature / top-k / top-p / greedy sampling written into a prefill graph,
+/// so the derived step picks the next token on the device.
+pub mod ir_sample;
+/// GLM-5.3 at real size from its derived graph (GGUF binding, hand-engine reference).
+#[cfg(any(feature = "gguf", test))]
+pub mod ir_glm_real;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
 /// Multi-GPU decode: the derived step split across ranks (EP + TP), checked on CPU.
 pub mod ir_shard;
+/// Prompt-lookup speculative decoding over a derived k-token window.
+pub mod prompt_lookup;
+/// Generated CUDA decode kernels run on the CPU (host g++), for checks
+/// without a GPU.
+pub mod cuda_cpu;
+/// DS pieces on a CUDA device: the top-k block select, the Engram table
+/// in host-mapped memory.
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_ds;
 /// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_coder_real;

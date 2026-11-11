@@ -1160,6 +1160,11 @@ fn fmt_prec(p: Precision) -> String {
         Format::Q4K => "q4k",
         Format::Q5K => "q5k",
         Format::Q8x32 => "q8x32",
+        Format::Q8x32F => "q8x32f",
+        Format::Q8_0 => "q8_0",
+        Format::Q6K => "q6k",
+        Format::Fp8B32 => "fp8b32",
+        Format::Mxfp4 => "mxfp4",
     };
     if p.accum == Format::F32 {
         f(p.storage).to_string()

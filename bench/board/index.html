@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tang bench board</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b6b6b; --line: #e3e3e3; --card: #fafafa;
+    --hand: #8a8a8a; --derived: #2563eb; --ok: #15803d; --bad: #b91c1c;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111214; --fg: #e8e8e8; --muted: #9a9a9a; --line: #2a2c30; --card: #18191c;
+      --hand: #9ca3af; --derived: #60a5fa; --ok: #4ade80; --bad: #f87171;
+      color-scheme: dark;
+    }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .chart { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .chart h3 { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { fill: var(--muted); font-size: 10px; }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .sw { display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin: 0 4px 0 10px; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  td.l, th.l { text-align: left; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  .faster { color: var(--ok); } .slower { color: var(--bad); }
+  #err { color: var(--bad); }
+  code { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>tang bench board</h1>
+  <p class="sub">Hand vs derived decode step, per model and GPU. Device ms per step and tok/s.
+    Rows come from <code>bench/results/board.jsonl</code> (<code>scripts/bench-all.sh</code>).</p>
+  <p id="err"></p>
+  <p class="sub" id="pick" hidden>Couldn't fetch <code>../results/board.jsonl</code> (opened as a file?).
+    Serve the repo (<code>python3 -m http.server</code> at the root, then open
+    <code>/bench/board/</code>) or pick the file: <input type="file" id="file" accept=".jsonl,.json,.txt"></p>
+  <div id="board"></div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (x, d = 1) => (x == null ? "–" : Number(x).toFixed(d));
+const esc = (s) => String(s ?? "–").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const shortGpu = (g) => (g || "unknown GPU").replace(/^NVIDIA /, "").replace(/ Blackwell Server Edition/, "");
+
+function parse(text) {
+  return text.split("\n").map((l) => l.trim()).filter(Boolean).map((l, i) => {
+    const r = JSON.parse(l);
+    r._i = i;
+    return r;
+  });
+}
+
+// run order: date, then line order in the file
+const order = (a, b) => String(a.date).localeCompare(String(b.date)) || a._i - b._i;
+
+function chart(rows, title) {
+  const W = 360, H = 180, L = 36, R = 8, T = 8, B = 22;
+  const pts = rows.slice().sort(order);
+  const vals = pts.flatMap((r) => [r.hand_tok_s, r.derived_tok_s]).filter((v) => v != null);
+  if (!vals.length) return "";
+  const max = Math.max(...vals) * 1.1, min = 0;
+  const n = pts.length;
+  const x = (i) => L + (n === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (n - 1));
+  const y = (v) => T + (H - T - B) * (1 - (v - min) / (max - min));
+  const line = (key, color, dash) => {
+    const p = pts.map((r, i) => (r[key] == null ? null : [x(i), y(r[key]), r])).filter(Boolean);
+    if (!p.length) return "";
+    const d = p.map(([a, b], i) => `${i ? "L" : "M"}${a.toFixed(1)},${b.toFixed(1)}`).join("");
+    const dots = p.map(([a, b, r]) => {
+      const tip = `${key.startsWith("hand") ? "hand" : "derived"} ${fmt(r[key])} tok/s, ` +
+        `${fmt(r[key.replace("tok_s", "ms")], 3)} ms · ${r.commit || "no commit"} · ${r.date}` +
+        (r.ids_matched === false ? " · ids differ" : "");
+      return `<circle cx="${a.toFixed(1)}" cy="${b.toFixed(1)}" r="3" fill="${color}"><title>${esc(tip)}</title></circle>`;
+    }).join("");
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" ${dash ? 'stroke-dasharray="4 3"' : ""}/>${dots}`;
+  };
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => {
+    const v = min + f * (max - min);
+    return `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/>` +
+      `<text x="${L - 4}" y="${y(v) + 3}" text-anchor="end">${v.toFixed(0)}</text>`;
+  }).join("");
+  const bad = pts.map((r, i) => (r.ids_matched === false
+    ? `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" style="fill:var(--bad)">✗ ids</text>` : "")).join("");
+  const first = pts[0], last = pts[n - 1];
+  const xl = `<text x="${L}" y="${H - 6}">${esc(first.commit || first.date)}</text>` +
+    (n > 1 ? `<text x="${W - R}" y="${H - 6}" text-anchor="end">${esc(last.commit || last.date)}</text>` : "");
+  return `<div class="chart"><h3>${esc(title)}</h3>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(title)} tok/s over runs">
+      ${ticks}${line("hand_tok_s", "var(--hand)", true)}${line("derived_tok_s", "var(--derived)", false)}${bad}${xl}
+      <text x="${L + 2}" y="${T + 9}">tok/s</text>
+    </svg></div>`;
+}
+
+function render(rows) {
+  const models = [...new Set(rows.map((r) => r.model))].sort();
+  let html = "";
+  for (const m of models) {
+    const mr = rows.filter((r) => r.model === m);
+    html += `<h2>${esc(m)}</h2><div class="charts">`;
+    const groups = {};
+    // one chart per (GPU, what was timed, knobs): a staged0 or cokernel run
+    // isn't a point on the default's line
+    const what = (r) => r.kind === "window" ? `window ${r.window}` : r.kind === "spec" ? `spec k=${r.window} ${r.prompt || ""}` : "step";
+    for (const r of mr) (groups[`${shortGpu(r.gpu)} · ${what(r)} · ctx ${r.context ?? "–"}${r.config ? ` · ${r.config}` : ""}`] ||= []).push(r);
+    for (const k of Object.keys(groups).sort()) html += chart(groups[k], k);
+    html += `</div><div class="legend"><span class="sw" style="border-color:var(--derived)"></span>derived
+      <span class="sw" style="border-color:var(--hand);border-top-style:dashed"></span>hand · tok/s per run, oldest to newest; hover a point for ms and commit</div>`;
+    html += `<div class="wrap"><table><thead><tr>
+      <th class="l">date</th><th class="l">commit</th><th class="l">branch</th><th class="l">GPU</th><th class="l">timed</th><th class="l">config</th><th>ctx</th>
+      <th>hand ms</th><th>hand tok/s</th><th>derived ms</th><th>derived tok/s</th><th>derived / hand</th>
+      <th>ids</th><th>kernels</th></tr></thead><tbody>`;
+    for (const r of mr.slice().sort(order).reverse()) {
+      const ratio = r.hand_tok_s && r.derived_tok_s ? r.derived_tok_s / r.hand_tok_s : null;
+      const ids = r.ids_matched == null ? "–"
+        : `<span class="${r.ids_matched ? "ok" : "bad"}">${r.ids_matched ? "✓" : "✗"} ${esc(r.ids || "")}</span>`;
+      html += `<tr title="${esc(r.source)}"><td class="l">${esc(r.date)}</td><td class="l"><code>${esc(r.commit)}</code></td>
+        <td class="l">${esc(r.branch)}</td><td class="l">${esc(shortGpu(r.gpu))}</td><td class="l">${esc(what(r))}${r.acceptance != null ? ` <small title="draft acceptance; greedy ${fmt(r.greedy_tok_s)} tok/s">${Math.round(r.acceptance * 100)}%</small>` : ""}</td>
+        <td class="l">${r.config ? `<code>${esc(r.config)}</code>` : "default"}${r.note ? ` <small title="${esc(r.note)}">ⓘ</small>` : ""}</td><td>${r.context ?? "–"}</td>
+        <td>${fmt(r.hand_ms, 3)}</td><td>${fmt(r.hand_tok_s)}${r.hand_ctx ? ` <small title="hand bench ran at ctx ${r.hand_ctx}">@${r.hand_ctx}</small>` : ""}</td>
+        <td>${fmt(r.derived_ms, 3)}</td><td>${fmt(r.derived_tok_s)}</td>
+        <td class="${ratio == null ? "" : ratio >= 1 ? "faster" : "slower"}">${ratio == null ? "–" : (ratio * 100).toFixed(0) + "%"}</td>
+        <td>${ids}</td><td>${r.kernels ?? "–"}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  $("#board").innerHTML = html || "<p class='sub'>No rows yet.</p>";
+}
+
+function load(text) {
+  try { render(parse(text)); $("#err").textContent = ""; }
+  catch (e) { $("#err").textContent = "board.jsonl: " + e.message; }
+}
+
+$("#file").addEventListener("change", (e) => e.target.files[0]?.text().then(load));
+fetch("../results/board.jsonl", { cache: "no-store" })
+  .then((r) => (r.ok ? r.text() : Promise.reject(r.status)))
+  .then(load)
+  .catch(() => { $("#pick").hidden = false; });
+</script>
+</body>
+</html>
