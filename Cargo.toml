@@ -94,7 +94,7 @@ xz2 = "0.1"
 brotli = "8"
 crc32fast = "1"
 tang-moe = { version = "0.1", path = "crates/tang-moe" }
-tang-verify = { version = "0.1", path = "crates/tang-verify" }
+tang-verify = { path = "crates/tang-verify" }  # unpublished; path-only so publishing tang-gpu drops its dev-dep
 iroh = "0.96"
 tarpc = { version = "0.35", features = ["tokio1", "serde-transport"] }
 tokio = { version = "1", features = ["full"] }
