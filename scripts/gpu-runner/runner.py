@@ -74,8 +74,16 @@ def checkout(ref, log):
         rc, _ = sh(f"git clone -q {REPO_URL} {SRC}", log)
         if rc:
             return None
-    rc, _ = sh(f"git fetch -q --no-prune origin {ref} && git checkout -q -f --detach FETCH_HEAD"
-               " && git clean -fdq -e target", log, cwd=SRC)
+    # a branch, tag or full SHA fetches directly; a short SHA can't be
+    # fetched by name, so fetch all branches and resolve it locally
+    rc, _ = sh(f"git fetch -q --no-prune origin {ref} && git checkout -q -f --detach FETCH_HEAD",
+               log, cwd=SRC)
+    if rc:
+        rc, _ = sh("git fetch -q --no-prune origin '+refs/heads/*:refs/remotes/origin/*'"
+                   f" && git checkout -q -f --detach \"$(git rev-parse --verify -q {ref}^{{commit}})\"",
+                   log, cwd=SRC)
+    if not rc:
+        rc, _ = sh("git clean -fdq -e target", log, cwd=SRC)
     if rc:
         return None
     return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=SRC,
