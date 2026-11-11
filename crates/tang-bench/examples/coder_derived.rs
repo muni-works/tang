@@ -64,6 +64,10 @@ fn main() {
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
     let st = derived_step(&pg, 1, ctx).unwrap();
+    // the device first: its tuning cache (tune/<gpu>.tsv) steers the lowering
+    let rt = runtime();
+    let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
+    eprintln!("runtime: {}; tuning cache: {tuned} entries", rt.name());
     let low = lower_real_step(&pg, &st, &tys);
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
@@ -74,8 +78,6 @@ fn main() {
         low.f32_inputs,
         t0.elapsed().as_secs_f64()
     );
-    let rt = runtime();
-    eprintln!("runtime: {}", rt.name());
     let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
     let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
     let RealStep {
@@ -255,6 +257,41 @@ fn main() {
         for (k, (n, ms)) in by.iter().take(12) {
             println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
         }
+    }
+    // --tune: the autotuner over this step on the live buffers (after the
+    // generation: variant steps write the shared caches), cache written to
+    // TANG_TUNE_OUT or tune/<gpu>.tsv
+    #[cfg(feature = "cuda")]
+    if args.iter().any(|a| a == "--tune") {
+        use tang_bench::autotune;
+        use tang_gpu::program::Shared;
+        let p = ctx.min(ids.len() + gen) - 1;
+        prog.write(&rt, prog.input(pos_in), &[p as f32]);
+        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let t = autotune::tune_step(
+            &rt,
+            "coder-next",
+            &[("TANG_STAGED_MAP", &["1"]), ("TANG_COKERNEL", &["1"])],
+            || {
+                let low = lower_real_step(&pg, &st, &tys);
+                let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
+                let shared: Vec<Shared> = (0..st.inputs.len())
+                    .map(|k| Shared {
+                        input: k,
+                        from: &prog,
+                        tensor: prog.input(k),
+                    })
+                    .collect();
+                Program::with_shared(&rt, low.program.program, &empty, &plan, &shared)
+            },
+            reps,
+        );
+        autotune::report(&t);
+        let path = std::env::var("TANG_TUNE_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| tang_compile::tensor::tune::repo_file(rt.name()));
+        autotune::write_cache(&path, rt.name(), "coder-next", &t);
+        println!("tuning cache written: {}", path.display());
     }
     if let Some(ls) = opt("--bench") {
         for l in ls.split(',').map(|v| v.parse::<usize>().unwrap()) {
