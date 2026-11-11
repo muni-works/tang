@@ -251,8 +251,16 @@ impl TensorGraph {
             }
             // many-row contractions as tensor-core matmuls (attention's
             // p·v in a k-row step; see `tensor_cuda_split.rs`)
+            // (not over packed inputs: the tile reads plain f32/f16 only)
+            let packed_in: Vec<usize> = opts
+                .packed
+                .iter()
+                .filter_map(|&(k, _)| {
+                    (0..self.nodes.len()).find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
+                })
+                .collect();
             if std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
-                if let Some(g) = self.split_bilinear(outputs) {
+                if let Some(g) = self.split_bilinear_avoiding(outputs, &packed_in) {
                     // factors were appended after their readers: lower the
                     // graph renumbered in dependency order, then give the
                     // program this graph's ids back (new factors keep ids
@@ -350,7 +358,7 @@ impl TensorGraph {
                 && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0")
                 && self.nodes[root].int_mma.is_none()
                 && self.mma_candidate(root)
-                && !reads.iter().any(|&r| blocky(r))
+                && !reads.iter().any(|&r| blocky(r) || packed.contains_key(&r))
             {
                 if let Some(src) = self.cuda_mma_kernel(root, &reads) {
                     let threads = super::cuda::src_define(&src, "TANG_THREADS");

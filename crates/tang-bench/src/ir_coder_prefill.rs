@@ -512,9 +512,10 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
 
     let visible = |t: ExprId, j: ExprId| t - j + lit(0.5);
     let scale = 1.0 / (hd as f64).sqrt();
-    // scores[t, g, r, j] over c: space (t, g, r, j, c)
+    // scores[t, g, r, j] over c: space (t, g, r, j, c). Unmasked: the
+    // statistics and p·v below mask every read, so the scores are a plain
+    // q·kᵀ (a tensor-core matmul in a many-row step)
     let sp = [T, Dim::Fixed(kvh), Dim::Fixed(per), T, Dim::Fixed(hd)];
-    let (ts, js) = (b.g.iota(&sp, 0), b.g.iota(&sp, 3));
     let scores =
         b.g.comp(
             &sp[..4],
@@ -529,17 +530,9 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
                     ],
                 ),
                 arg(k, vec![unit(5, 3), unit(5, 1), unit(5, 4)]),
-                arg(ts, ident(5)),
-                arg(js, ident(5)),
             ],
             Some(Monoid::sum()),
-            |v| {
-                vec![select(
-                    visible(v[2], v[3]),
-                    v[0] * v[1] * lit(scale),
-                    lit(0.0),
-                )]
-            },
+            |v| vec![v[0] * v[1] * lit(scale)],
         )
         .unwrap();
     // softmax statistics over j: space (t, g, r, j)
@@ -849,6 +842,27 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
         |v| vec![v[0] + sigmoid(v[1]) * v[2]],
     )
     .unwrap()
+}
+
+/// [`derived_step`] with only the rows `rows` of the logits (a prefill
+/// chunk needs the last).
+pub fn derived_step_rows(
+    pg: &CoderPrefill,
+    k: usize,
+    capacity: usize,
+    rows: tang_compile::tensor::step::Rows,
+) -> Result<StepGraph, String> {
+    tang_compile::tensor::step::derive_step_with(
+        &pg.g,
+        &[pg.logits],
+        &StepSpec {
+            seq: SEQ,
+            new: k,
+            capacity,
+        },
+        &tang_compile::tensor::step::StepOptions { rows, batch: None },
+    )
+    .map_err(|e| e.0)
 }
 
 /// The derived step of `pg` appending `k` tokens against `capacity`-row

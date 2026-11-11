@@ -21,6 +21,8 @@ use tang_expr::{ExprGraph, ExprId, Node};
 pub(super) const MMA_ROWS: usize = 64;
 /// Reduce length below which a contraction stays a warp reduction.
 pub(super) const MMA_RED: usize = 256;
+/// Largest materialized factor, in elements (2 GB of f32).
+const MAX_FACTOR: usize = 1 << 29;
 
 /// The dims a read depends on: nonzero coefficients over the comp space.
 fn dims_of(v: &View, rank: usize) -> Vec<bool> {
@@ -88,8 +90,12 @@ impl TensorGraph {
     /// body is linear in one leaf read split into a materialized factor and
     /// a plain contraction (see the module docs); `None` when nothing
     /// splits.
-    pub(super) fn split_bilinear(&self, outputs: &[TensorId]) -> Option<TensorGraph> {
-        self.split_bilinear_min(outputs, MMA_ROWS, MMA_RED)
+    pub(super) fn split_bilinear_avoiding(
+        &self,
+        outputs: &[TensorId],
+        avoid: &[usize],
+    ) -> Option<TensorGraph> {
+        self.split_bilinear_with(outputs, MMA_ROWS, MMA_RED, avoid)
     }
 
     /// [`split_bilinear`](Self::split_bilinear) with the size thresholds
@@ -100,6 +106,18 @@ impl TensorGraph {
         outputs: &[TensorId],
         min_rows: usize,
         min_red: usize,
+    ) -> Option<TensorGraph> {
+        self.split_bilinear_with(outputs, min_rows, min_red, &[])
+    }
+
+    /// The split, leaving alone comps that read a node of `avoid`
+    /// (packed inputs) or a block-format buffer.
+    fn split_bilinear_with(
+        &self,
+        outputs: &[TensorId],
+        min_rows: usize,
+        min_red: usize,
+        avoid: &[usize],
     ) -> Option<TensorGraph> {
         let live = self.live(outputs);
         let mut out: Option<TensorGraph> = None;
@@ -112,19 +130,32 @@ impl TensorGraph {
                 continue;
             }
             let c = self.comp_at(r).unwrap();
-            if c.args.iter().any(|a| a.view.gather.is_some() || a.view.guard) {
+            if c.args.iter().any(|a| {
+                let st = self.storage(a.src).n();
+                a.view.gather.is_some()
+                    || a.view.guard
+                    || avoid.contains(&st)
+                    || self.nodes[st].precision.storage.is_block()
+            }) {
                 continue;
             }
-            // already a product of two reads
+            // already a product of two reads (times literals)
             let e = c.body_outs[0];
             let nodes = c.body.nodes_slice();
-            if let Node::Mul(a, b) = nodes[e.index() as usize] {
-                let leaf = |x: ExprId| {
-                    matches!(nodes[x.index() as usize], Node::Var(_) | Node::Lit(_))
-                };
-                if leaf(a) && leaf(b) {
-                    continue;
+            fn reads(nodes: &[Node], e: ExprId, n: &mut usize) -> bool {
+                match nodes[e.index() as usize] {
+                    Node::Mul(a, b) => reads(nodes, a, n) && reads(nodes, b, n),
+                    Node::Var(_) => {
+                        *n += 1;
+                        true
+                    }
+                    Node::Lit(_) => true,
+                    _ => false,
                 }
+            }
+            let mut nv = 0;
+            if reads(nodes, e, &mut nv) && nv == 2 {
+                continue;
             }
             let np = c.points().len();
             let rank = np + 1;
@@ -193,7 +224,9 @@ impl TensorGraph {
                 // A: space (points without the columns, j), body with B = 1
                 let keep: Vec<usize> = (0..np).filter(|&d| !cols[d]).collect();
                 let rows: usize = keep.iter().map(|&d| c.points()[d].n()).product();
-                if rows < min_rows {
+                // the factor is [rows, red]: at most 2 GB of f32
+                let red_n = c.red[0].n();
+                if rows < min_rows || rows.saturating_mul(red_n) > MAX_FACTOR {
                     continue;
                 }
                 let mut ashape: Vec<_> = keep.iter().map(|&d| c.points()[d]).collect();

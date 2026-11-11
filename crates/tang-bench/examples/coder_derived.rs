@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use tang_bench::ir_coder_prefill::{derived_step, prefill_graph};
+use tang_bench::ir_coder_prefill::{derived_step, derived_step_rows, prefill_graph};
 use tang_bench::ir_coder_real::*;
 use tang_bench::qwen_session::{runtime, slot_plan};
 use tang_compile::tensor::step::StepInput;
@@ -105,7 +105,12 @@ fn main() {
     let dims = dims_from_gguf(&g).unwrap();
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
-    let st = derived_step(&pg, chunk, ctx).unwrap();
+    // a prefill chunk needs only its last row's logits (all rows for --check)
+    let st = if chunk > 1 && opt("--check").is_none() {
+        derived_step_rows(&pg, chunk, ctx, tang_compile::tensor::step::Rows::Last).unwrap()
+    } else {
+        derived_step(&pg, chunk, ctx).unwrap()
+    };
     let low = lower_real_step(&pg, &st, &tys);
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
