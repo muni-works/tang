@@ -2,263 +2,272 @@
 //! GLM-5.3) through one `derive_step`: does each derive, its cache set,
 //! chained steps against the grown prefill (NaN in unwritten cache rows),
 //! and the derived step through the CUDA decode lowering (nvrtc with
-//! `--features cuda`; no device).
+//! `--features cuda`; no device). The builders are shared with
+//! `examples/derive_tiny_gpu.rs`.
+
+use std::collections::HashMap;
+
+use tang_compile::tensor::step::{
+    derive_step_with, seed_cache, CacheSlot, Rows, StepGraph, StepOptions, StepSpec,
+};
+use tang_compile::tensor::{Dim, TensorGraph, TensorId};
+
+const T: Dim = Dim::Sym("T");
+/// Cache capacity: no tiny model has a dim this size, so a reduction over
+/// it is a reduction over the cache.
+pub const CAP: usize = 21;
+
+pub struct Model {
+    pub name: &'static str,
+    pub g: TensorGraph,
+    pub inputs: Vec<(String, Vec<Dim>)>,
+    pub logits: TensorId,
+    pub named: Vec<(String, TensorId)>,
+    pub cap: usize,
+}
+
+/// The four tiny models, by name.
+pub fn all_models() -> Vec<Model> {
+    vec![qwen(), coder(), deepseek(), glm()]
+}
+
+pub fn qwen() -> Model {
+    use crate::ir_qwen::prefill::prefill_graph;
+    let dims = crate::ir_qwen::QwenDims {
+        d_model: 128,
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 32,
+        ff: 192,
+        vocab: 256,
+        layers: 2,
+        ctx: 16,
+        eps: 1e-6,
+        theta: 1e4,
+        kv_f16: false,
+        vocab_chunks: 1,
+        prefill_q4: false,
+    };
+    let pg = prefill_graph(&dims);
+    let named =
+        pg.k.iter()
+            .enumerate()
+            .map(|(l, &t)| (format!("blk.{l}.k"), t))
+            .chain(
+                pg.v.iter()
+                    .enumerate()
+                    .map(|(l, &t)| (format!("blk.{l}.v"), t)),
+            )
+            .collect();
+    Model {
+        name: "qwen3",
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
+        logits: pg.logits,
+        g: pg.g,
+        named,
+        cap: CAP,
+    }
+}
+
+pub fn coder() -> Model {
+    use crate::ir_coder_prefill::*;
+    let pg = prefill_graph(&CoderDims::tiny());
+    let named =
+        pg.k.iter()
+            .enumerate()
+            .map(|(l, &t)| (format!("attn.{l}.k"), t))
+            .chain(
+                pg.v.iter()
+                    .enumerate()
+                    .map(|(l, &t)| (format!("attn.{l}.v"), t)),
+            )
+            .chain(
+                pg.gdn_state
+                    .iter()
+                    .enumerate()
+                    .map(|(l, &t)| (format!("gdn.{l}.state"), t)),
+            )
+            .collect();
+    Model {
+        name: "coder-next",
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
+        logits: pg.logits,
+        g: pg.g,
+        named,
+        cap: CAP,
+    }
+}
+
+pub fn deepseek() -> Model {
+    use crate::ir_ds_prefill::*;
+    let dm = DsDims::tiny();
+    let pg = prefill_graph(&dm);
+    Model {
+        name: "deepseek-v4.1",
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
+        logits: pg.logits,
+        named: pg.named.clone(),
+        g: pg.g,
+        cap: CAP,
+    }
+}
+
+pub fn glm() -> Model {
+    use crate::ir_glm_prefill::*;
+    let pg = prefill_graph(&GlmDims::tiny());
+    Model {
+        name: "glm-5.3",
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
+        logits: pg.logits,
+        named: pg.named.clone(),
+        g: pg.g,
+        cap: CAP,
+    }
+}
+
+pub fn vocab(m: &Model) -> usize {
+    m.g.shape(m.logits).last().unwrap().n()
+}
+
+/// Deterministic weights by name, scaled so activations stay O(1).
+pub fn weights(m: &Model) -> HashMap<String, Vec<f64>> {
+    m.inputs
+        .iter()
+        .filter(|(n, _)| n != "tokens")
+        .map(|(name, shape)| {
+            let n: usize = shape.iter().map(|d| d.n()).product();
+            let mut s = name.bytes().fold(1469598103934665603u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(1099511628211)
+            });
+            let cols = shape.last().map_or(1, |d| d.n()) as f64;
+            let v = (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let r = (s >> 11) as f64 / (1u64 << 53) as f64;
+                    if name.contains("norm") || name.ends_with("decay_rate") {
+                        0.8 + 0.4 * r
+                    } else if name.ends_with("freqs") {
+                        0.3 * r
+                    } else {
+                        1.5 * (2.0 * r - 1.0) / cols.sqrt()
+                    }
+                })
+                .collect();
+            (name.clone(), v)
+        })
+        .collect()
+}
+
+pub fn concrete(shape: &[Dim], t: usize) -> Vec<usize> {
+    shape
+        .iter()
+        .map(|&d| if d == T { t } else { d.n() })
+        .collect()
+}
+
+pub fn name_of(m: &Model, n: TensorId) -> String {
+    m.named
+        .iter()
+        .find(|(_, t)| *t == n)
+        .map_or(format!("{n:?}"), |(s, _)| s.clone())
+}
+
+pub fn spec(m: &Model, k: usize) -> StepSpec {
+    StepSpec {
+        seq: "T",
+        new: k,
+        capacity: m.cap,
+    }
+}
+
+pub fn derive(m: &Model, k: usize, rows: Rows) -> Result<StepGraph, String> {
+    derive_step_with(
+        &m.g,
+        &[m.logits],
+        &spec(m, k),
+        &StepOptions { rows, batch: None },
+    )
+    .map_err(|e| e.0)
+}
+
+/// The cache set: name, kind, step buffer shape, floats vs all-full.
+pub fn report(m: &Model, st: &StepGraph) -> Vec<String> {
+    st.caches
+        .iter()
+        .map(|c| {
+            let sh: Vec<usize> = st.graph.shape(c.input).iter().map(|d| d.n()).collect();
+            let kind = match (c.state, c.ring) {
+                (true, _) => "state".to_string(),
+                (false, Some(r)) => format!("ring {r}"),
+                (false, None) => "rows".to_string(),
+            };
+            format!("{} ({kind}) {sh:?}", name_of(m, c.node))
+        })
+        .collect()
+}
+
+/// The step's cache buffer for slot `c` after a prefill of `len` rows.
+pub fn seed(m: &Model, c: &CacheSlot, v: Vec<f64>, len: usize) -> Vec<f64> {
+    let sh = concrete(m.g.shape(c.node), len);
+    if !c.state {
+        return seed_cache(c, &sh, &v, len, m.cap);
+    }
+    if !m.g.shape(c.node).contains(&T) {
+        return v;
+    }
+    let outer: usize = sh[..c.axis].iter().product();
+    let inner: usize = sh[c.axis + 1..].iter().product();
+    (0..outer)
+        .flat_map(|o| {
+            let b = (o * len + len - 1) * inner;
+            v[b..b + inner].to_vec()
+        })
+        .collect()
+}
+
+/// Worst `|a − b| / max|b|`; NaN or ∞ anywhere is ∞.
+pub fn rel(a: &[f64], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let scale = b
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(1e-300f64, |s, x| s.max(x.abs()));
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let e = (x - y).abs() / scale;
+            if e.is_finite() {
+                e
+            } else {
+                f64::INFINITY
+            }
+        })
+        .fold(0.0, f64::max)
+}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
+    use super::*;
     use tang_compile::tensor::cuda_gemv::DecodeOpts;
-    use tang_compile::tensor::step::{
-        derive_step_with, seed_cache, CacheSlot, Rows, StepGraph, StepInput, StepOptions, StepSpec,
-    };
-    use tang_compile::tensor::{Dim, TensorGraph, TensorId};
-
-    const T: Dim = Dim::Sym("T");
-    /// Cache capacity: no tiny model has a dim this size, so a reduction
-    /// over it is a reduction over the cache.
-    const CAP: usize = 21;
-
-    struct Model {
-        name: &'static str,
-        g: TensorGraph,
-        inputs: Vec<(String, Vec<Dim>)>,
-        logits: TensorId,
-        named: Vec<(String, TensorId)>,
-        cap: usize,
-    }
-
-    fn qwen() -> Model {
-        use crate::ir_qwen::prefill::prefill_graph;
-        let dims = crate::ir_qwen::QwenDims {
-            d_model: 128,
-            heads: 4,
-            kv_heads: 2,
-            head_dim: 32,
-            ff: 192,
-            vocab: 256,
-            layers: 2,
-            ctx: 16,
-            eps: 1e-6,
-            theta: 1e4,
-            kv_f16: false,
-            vocab_chunks: 1,
-            prefill_q4: false,
-        };
-        let pg = prefill_graph(&dims);
-        let named =
-            pg.k.iter()
-                .enumerate()
-                .map(|(l, &t)| (format!("blk.{l}.k"), t))
-                .chain(
-                    pg.v.iter()
-                        .enumerate()
-                        .map(|(l, &t)| (format!("blk.{l}.v"), t)),
-                )
-                .collect();
-        Model {
-            name: "qwen3",
-            inputs: pg
-                .inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.shape.clone()))
-                .collect(),
-            logits: pg.logits,
-            g: pg.g,
-            named,
-            cap: CAP,
-        }
-    }
-
-    fn coder() -> Model {
-        use crate::ir_coder_prefill::*;
-        let pg = prefill_graph(&CoderDims::tiny());
-        let named =
-            pg.k.iter()
-                .enumerate()
-                .map(|(l, &t)| (format!("attn.{l}.k"), t))
-                .chain(
-                    pg.v.iter()
-                        .enumerate()
-                        .map(|(l, &t)| (format!("attn.{l}.v"), t)),
-                )
-                .chain(
-                    pg.gdn_state
-                        .iter()
-                        .enumerate()
-                        .map(|(l, &t)| (format!("gdn.{l}.state"), t)),
-                )
-                .collect();
-        Model {
-            name: "coder-next",
-            inputs: pg
-                .inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.shape.clone()))
-                .collect(),
-            logits: pg.logits,
-            g: pg.g,
-            named,
-            cap: CAP,
-        }
-    }
-
-    fn deepseek() -> Model {
-        use crate::ir_ds_prefill::*;
-        let dm = DsDims::tiny();
-        let pg = prefill_graph(&dm);
-        Model {
-            name: "deepseek-v4.1",
-            inputs: pg
-                .inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.shape.clone()))
-                .collect(),
-            logits: pg.logits,
-            named: pg.named.clone(),
-            g: pg.g,
-            cap: CAP,
-        }
-    }
-
-    fn glm() -> Model {
-        use crate::ir_glm_prefill::*;
-        let pg = prefill_graph(&GlmDims::tiny());
-        Model {
-            name: "glm-5.3",
-            inputs: pg
-                .inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.shape.clone()))
-                .collect(),
-            logits: pg.logits,
-            named: pg.named.clone(),
-            g: pg.g,
-            cap: CAP,
-        }
-    }
-
-    fn vocab(m: &Model) -> usize {
-        m.g.shape(m.logits).last().unwrap().n()
-    }
-
-    /// Deterministic weights by name, scaled so activations stay O(1).
-    fn weights(m: &Model) -> HashMap<String, Vec<f64>> {
-        m.inputs
-            .iter()
-            .filter(|(n, _)| n != "tokens")
-            .map(|(name, shape)| {
-                let n: usize = shape.iter().map(|d| d.n()).product();
-                let mut s = name.bytes().fold(1469598103934665603u64, |h, b| {
-                    (h ^ b as u64).wrapping_mul(1099511628211)
-                });
-                let cols = shape.last().map_or(1, |d| d.n()) as f64;
-                let v = (0..n)
-                    .map(|_| {
-                        s = s
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        let r = (s >> 11) as f64 / (1u64 << 53) as f64;
-                        if name.contains("norm") || name.ends_with("decay_rate") {
-                            0.8 + 0.4 * r
-                        } else if name.ends_with("freqs") {
-                            0.3 * r
-                        } else {
-                            1.5 * (2.0 * r - 1.0) / cols.sqrt()
-                        }
-                    })
-                    .collect();
-                (name.clone(), v)
-            })
-            .collect()
-    }
-
-    fn concrete(shape: &[Dim], t: usize) -> Vec<usize> {
-        shape
-            .iter()
-            .map(|&d| if d == T { t } else { d.n() })
-            .collect()
-    }
-
-    fn name_of(m: &Model, n: TensorId) -> String {
-        m.named
-            .iter()
-            .find(|(_, t)| *t == n)
-            .map_or(format!("{n:?}"), |(s, _)| s.clone())
-    }
-
-    fn spec(m: &Model, k: usize) -> StepSpec {
-        StepSpec {
-            seq: "T",
-            new: k,
-            capacity: m.cap,
-        }
-    }
-
-    fn derive(m: &Model, k: usize, rows: Rows) -> Result<StepGraph, String> {
-        derive_step_with(
-            &m.g,
-            &[m.logits],
-            &spec(m, k),
-            &StepOptions { rows, batch: None },
-        )
-        .map_err(|e| e.0)
-    }
-
-    /// The cache set: name, kind, step buffer shape, floats vs all-full.
-    fn report(m: &Model, st: &StepGraph) -> Vec<String> {
-        st.caches
-            .iter()
-            .map(|c| {
-                let sh: Vec<usize> = st.graph.shape(c.input).iter().map(|d| d.n()).collect();
-                let kind = match (c.state, c.ring) {
-                    (true, _) => "state".to_string(),
-                    (false, Some(r)) => format!("ring {r}"),
-                    (false, None) => "rows".to_string(),
-                };
-                format!("{} ({kind}) {sh:?}", name_of(m, c.node))
-            })
-            .collect()
-    }
-
-    /// The step's cache buffer for slot `c` after a prefill of `len` rows.
-    fn seed(m: &Model, c: &CacheSlot, v: Vec<f64>, len: usize) -> Vec<f64> {
-        let sh = concrete(m.g.shape(c.node), len);
-        if !c.state {
-            return seed_cache(c, &sh, &v, len, m.cap);
-        }
-        if !m.g.shape(c.node).contains(&T) {
-            return v;
-        }
-        let outer: usize = sh[..c.axis].iter().product();
-        let inner: usize = sh[c.axis + 1..].iter().product();
-        (0..outer)
-            .flat_map(|o| {
-                let b = (o * len + len - 1) * inner;
-                v[b..b + inner].to_vec()
-            })
-            .collect()
-    }
-
-    /// Worst `|a − b| / max|b|`; NaN or ∞ anywhere is ∞.
-    fn rel(a: &[f64], b: &[f64]) -> f64 {
-        assert_eq!(a.len(), b.len());
-        let scale = b
-            .iter()
-            .filter(|x| x.is_finite())
-            .fold(1e-300f64, |s, x| s.max(x.abs()));
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| {
-                let e = (x - y).abs() / scale;
-                if e.is_finite() {
-                    e
-                } else {
-                    f64::INFINITY
-                }
-            })
-            .fold(0.0, f64::max)
-    }
+    use tang_compile::tensor::step::StepInput;
 
     /// Chained steps from `p0` against the grown prefill: the new rows'
     /// logits (or the last row's), every written cache row, every state.
