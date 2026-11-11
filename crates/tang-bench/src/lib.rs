@@ -271,6 +271,7 @@ pub mod qwen_session;
 
 /// GLM-5.3 as one prefill graph over symbolic T; its step via `derive_step`.
 pub mod ir_glm_prefill;
+pub mod ring_ports;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]
