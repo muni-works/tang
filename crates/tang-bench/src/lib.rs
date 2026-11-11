@@ -273,6 +273,12 @@ pub mod qwen_session;
 
 /// GLM-5.3 as one prefill graph over symbolic T; its step via `derive_step`.
 pub mod ir_glm_prefill;
+/// Temperature / top-k / top-p / greedy sampling written into a prefill graph,
+/// so the derived step picks the next token on the device.
+pub mod ir_sample;
+/// GLM-5.3 at real size from its derived graph (GGUF binding, hand-engine reference).
+#[cfg(any(feature = "gguf", test))]
+pub mod ir_glm_real;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
