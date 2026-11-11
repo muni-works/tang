@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::{
-    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, ShapeError, TensorGraph, TensorId,
-    View,
+    err, replay, Arg, Comp, Dim, Form, Monoid, MonoidKind, Op, Segment, ShapeError, TensorGraph,
+    TensorId, View,
 };
 
 /// Options for [`TensorGraph::backward_with`].
@@ -87,6 +87,9 @@ impl TensorGraph {
                 continue;
             }
             let Some(&dy) = grads.get(&j) else { continue };
+            if self.nodes[j].detach {
+                continue;
+            }
             if let Op::Reshape(src) = self.nodes[j].op {
                 let shape = self.shape(src).to_vec();
                 let g = self.reshape(dy, &shape)?;
@@ -97,8 +100,67 @@ impl TensorGraph {
                 grads.insert(src.n(), acc);
                 continue;
             }
+            if let Op::Scan(sc) = &self.nodes[j].op {
+                let inputs = sc.inputs.clone();
+                let gs = self.scan_backward(j, dy)?;
+                for (src, g) in inputs.iter().zip(gs) {
+                    let Some(g) = g else { continue };
+                    let acc = match grads.get(&src.n()) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src.n(), acc);
+                }
+                continue;
+            }
+            if let Op::Operator(o) = &self.nodes[j].op {
+                let (op, inputs) = (o.op.clone(), o.inputs.clone());
+                let gs = op.backward(self, &inputs, TensorId(j as u32), dy)?;
+                if gs.len() != inputs.len() {
+                    return err(format!(
+                        "operator `{}` returned {} cotangents for {} inputs",
+                        op.name(),
+                        gs.len(),
+                        inputs.len()
+                    ));
+                }
+                for (src, g) in inputs.iter().zip(gs) {
+                    let Some(g) = g else { continue };
+                    let acc = match grads.get(&src.n()) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src.n(), acc);
+                }
+                continue;
+            }
             let Some(c) = self.comp_at(j) else { continue };
             let c = c.clone();
+            let generic = c.monoid.as_ref().is_some_and(|m| match m.kind() {
+                MonoidKind::OnlineSoftmax => false,
+                MonoidKind::Sum | MonoidKind::Max => c.tuple == 1,
+                MonoidKind::Other => true,
+            });
+            let tuple_map = c.monoid.is_none() && c.tuple == 1;
+            if generic || tuple_map {
+                let gs = if generic {
+                    self.monoid_backward(TensorId(j as u32), &c, dy)?
+                } else {
+                    self.tuple_map_backward(&c, dy)?
+                };
+                for (a, g) in gs.into_iter().enumerate() {
+                    if stable.contains(&c.args[a].src.n()) {
+                        continue;
+                    }
+                    let src = c.args[a].src.n();
+                    let acc = match grads.get(&src) {
+                        Some(&prev) => self.map(&[prev, g], |v| v[0] + v[1])?,
+                        None => g,
+                    };
+                    grads.insert(src, acc);
+                }
+                continue;
+            }
             for a in 0..c.args.len() {
                 if stable.contains(&c.args[a].src.n()) {
                     continue;
@@ -180,7 +242,7 @@ impl TensorGraph {
                 match dep.get(&a.src.n()) {
                     None => arg_deg.push(Deg::Hom(0.0)),
                     Some((d, f)) => {
-                        if a.view.guard && matches!(d, Deg::Lin(_)) {
+                        if (a.view.guard && matches!(d, Deg::Lin(_))) || a.view.is_gather() {
                             return false;
                         }
                         let fv = f.compose(&a.view, rank);
@@ -231,11 +293,272 @@ impl TensorGraph {
                     View {
                         guard: false,
                         forms,
+                        gather: None,
                     },
                 ),
             );
         }
         used
+    }
+
+    /// Backward of a reduction with an arbitrary (associative) tuple
+    /// monoid — the monoids [`discover`](super::discover) emits, top-k,
+    /// argmax. For `y = e₀ ⊕ … ⊕ e_{K−1}` along the one reduce dim,
+    /// `∂y/∂e_k` is the Jacobian of `P_k ⊕ e ⊕ S_k` in `e`, with `P_k`,
+    /// `S_k` the exclusive prefix and suffix folds: two scans of the
+    /// same monoid, then an elementwise vjp of the combine (derived by
+    /// `tang-expr`), chained through the body by the ordinary
+    /// [`arg_grad`](Self::arg_grad) of the map `Σⱼ ēⱼ·bodyⱼ`. Exact for
+    /// any associative combine; no structure assumed.
+    fn monoid_backward(
+        &mut self,
+        self_id: TensorId,
+        c: &Comp,
+        dy: TensorId,
+    ) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let m = c.monoid.clone().expect("a reduction");
+        if let Some(sv) = m.saved.clone() {
+            if c.tuple == 1 && c.red.len() == 1 && !c.has_gather() && body_is(c, &sv.element) {
+                return self.saved_backward(self_id, c, dy, &sv);
+            }
+        }
+        let w = m.width;
+        if c.red.len() != 1 || c.has_gather() {
+            return err("backward: generic monoids need one reduce dim and affine views");
+        }
+        let pts = c.points().to_vec();
+        let np = pts.len();
+        let mut space = pts.clone();
+        space.push(c.red[0]);
+        let r = np + 1;
+        let na = c.args.len();
+        // elements, one tensor per slot, over the comp's own space
+        let mut elems = vec![];
+        for j in 0..w {
+            let (body, out) = (c.body.clone(), c.body_outs[j]);
+            elems.push(self.comp(&space, &[], c.args.clone(), None, move |v| {
+                inline(&body, &[out], v)
+            })?);
+        }
+        let pre = self.scan(&elems, np, m.clone(), true, false)?;
+        let suf = self.scan(&elems, np, m.clone(), true, true)?;
+        let slot = |j: usize, wide: bool| {
+            let mut forms: Vec<Form> = (0..r).map(|d| Form::unit(r, d)).collect();
+            if wide {
+                forms.push(Form::constant(r, j as i64));
+            }
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+        };
+        let dyv = |j: usize| {
+            let mut forms: Vec<Form> = (0..np).map(|d| Form::unit(r, d)).collect();
+            if c.tuple == 1 {
+                forms.push(Form::constant(r, j as i64));
+            }
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+        };
+        // ē = dyᵀ ∂((pre ⊕ e) ⊕ suf)/∂e: vars pre 0..w, e w..2w, suf 2w..3w, seed 3w..4w
+        let (vg, vouts) = {
+            let (mut g, outs) = tang_expr::trace(|| {
+                let v: Vec<ExprId> = (0..3 * w).map(|i| ExprId::var(i as u16)).collect();
+                let mut a = v[..2 * w].to_vec();
+                let pe = inline(&m.combine, &m.outs, &a);
+                a = pe;
+                a.extend_from_slice(&v[2 * w..]);
+                inline(&m.combine, &m.outs, &a)
+            });
+            let seeds: Vec<ExprId> = (0..w).map(|i| g.var((3 * w + i) as u16)).collect();
+            let gr = g.vjp(&outs, &seeds, 3 * w);
+            (g, gr[w..2 * w].to_vec())
+        };
+        let mut ebar = vec![];
+        for jj in 0..w {
+            let mut args = c.args.clone();
+            for j in 0..w {
+                args.push(Arg {
+                    src: pre,
+                    view: slot(j, w > 1),
+                });
+            }
+            for j in 0..w {
+                args.push(Arg {
+                    src: suf,
+                    view: slot(j, w > 1),
+                });
+            }
+            for j in 0..w {
+                args.push(Arg {
+                    src: dy,
+                    view: dyv(j),
+                });
+            }
+            let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+            let (vg, out) = (vg.clone(), vouts[jj]);
+            ebar.push(self.comp(&space, &[], args, None, move |v| {
+                let e = inline(&body, &bouts, &v[..na]);
+                let mut u = v[na..na + w].to_vec();
+                u.extend(e);
+                u.extend_from_slice(&v[na + w..na + 2 * w]);
+                u.extend_from_slice(&v[na + 2 * w..na + 3 * w]);
+                inline(&vg, &[out], &u)
+            })?);
+        }
+        // the map Σⱼ ēⱼ·bodyⱼ(args), differentiated in each original arg
+        let mut args = c.args.clone();
+        for &e in &ebar {
+            args.push(Arg {
+                src: e,
+                view: slot(0, false),
+            });
+        }
+        let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..na + w).map(|i| ExprId::var(i as u16)).collect();
+            let b = inline(&body, &bouts, &v[..na]);
+            let mut acc = b[0] * v[na];
+            for j in 1..w {
+                acc += b[j] * v[na + j];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: space.clone(),
+            tuple: 0,
+            red: vec![],
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&space, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
+    }
+
+    /// Elementwise backward of a discovered online lift from its saved
+    /// final state (see [`SavedBwd::element_grad`](super::discover::SavedBwd::element_grad)):
+    /// one pass reading the elements, the state and its cotangent — the
+    /// FlashAttention-backward shape, derived for every lift.
+    fn saved_backward(
+        &mut self,
+        self_id: TensorId,
+        c: &Comp,
+        dy: TensorId,
+        sv: &super::discover::SavedBwd,
+    ) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let w = sv.w1 + sv.r;
+        let na = c.args.len();
+        let pts = c.points().to_vec();
+        let np = pts.len();
+        let mut space = pts.clone();
+        space.push(c.red[0]);
+        let r = np + 1;
+        let row = |src: TensorId, j: usize| {
+            let mut forms: Vec<Form> = (0..np).map(|d| Form::unit(r, d)).collect();
+            forms.push(Form::constant(r, j as i64));
+            Arg {
+                src,
+                view: View {
+                    forms,
+                    guard: false,
+                    gather: None,
+                },
+            }
+        };
+        let (eg, eo) = sv.element_grad();
+        let mut xbar = vec![];
+        for a in 0..na {
+            let mut args = c.args.clone();
+            args.extend((0..w).map(|j| row(self_id, j)));
+            args.extend((0..w).map(|j| row(dy, j)));
+            let (eg, out) = (eg.clone(), eo[a]);
+            xbar.push(self.comp(&space, &[], args, None, move |v| inline(&eg, &[out], v))?);
+        }
+        let mut args = c.args.clone();
+        for &x in &xbar {
+            args.push(Arg {
+                src: x,
+                view: View::identity(r, r),
+            });
+        }
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..2 * na).map(|i| ExprId::var(i as u16)).collect();
+            let mut acc = v[0] * v[na];
+            for a in 1..na {
+                acc += v[a] * v[na + a];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: space.clone(),
+            tuple: 0,
+            red: vec![],
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&space, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
+    }
+
+    /// Backward of a tuple-valued map (`comp_tuple` without a monoid):
+    /// the scalar map `Σⱼ dyⱼ·bodyⱼ(args)` with `dy`'s slots as extra
+    /// args, differentiated by [`arg_grad`](Self::arg_grad).
+    fn tuple_map_backward(&mut self, c: &Comp, dy: TensorId) -> Result<Vec<TensorId>, ShapeError> {
+        use super::discover::inline;
+        let w = c.width();
+        let pts = c.points().to_vec();
+        let r = pts.len();
+        let na = c.args.len();
+        let mut args = c.args.clone();
+        for j in 0..w {
+            let mut forms: Vec<Form> = (0..r).map(|d| Form::unit(r, d)).collect();
+            forms.push(Form::constant(r, j as i64));
+            args.push(Arg {
+                src: dy,
+                view: View {
+                    forms,
+                    guard: false,
+                    gather: None,
+                },
+            });
+        }
+        let (body, bouts) = (c.body.clone(), c.body_outs.clone());
+        let (cb, cbo) = tang_expr::trace(|| {
+            let v: Vec<ExprId> = (0..na + w).map(|i| ExprId::var(i as u16)).collect();
+            let b = inline(&body, &bouts, &v[..na]);
+            let mut acc = b[0] * v[na];
+            for j in 1..w {
+                acc += b[j] * v[na + j];
+            }
+            vec![acc]
+        });
+        let synth = Comp {
+            out: pts.clone(),
+            tuple: 0,
+            red: c.red.clone(),
+            args,
+            body: cb,
+            body_outs: cbo,
+            monoid: None,
+        };
+        let ones = self.comp(&pts, &[], vec![], None, |_| vec![ExprId::ONE])?;
+        (0..na)
+            .map(|a| self.arg_grad(ones, &synth, a, ones))
+            .collect()
     }
 
     /// `∂L/∂(arg a of c)` given `dy = ∂L/∂c`.
@@ -277,8 +600,17 @@ impl TensorGraph {
         // `[coord == form(...)]`, with the form's coords reduced over.
         let mut rename: Vec<Option<usize>> = vec![None; old_rank];
         let mut scatter: Vec<usize> = Vec::new();
+        // A gathered dim is always a scatter dim: its coordinate is data,
+        // so the gate compares against `form + coef · index`, the index
+        // read through the renamed index arg (a scatter-add written as a
+        // dense gated sum — see docs/tensor-ir.md for what this costs).
+        let gathered = |d: usize| arg.view.gather.as_ref().is_some_and(|g| g.coefs[d] != 0);
         for (d, f) in arg.view.forms.iter().enumerate() {
             let zero = f.coefs.iter().all(|&x| x == 0) && f.offset == 0;
+            if gathered(d) {
+                scatter.push(d);
+                continue;
+            }
             match f.as_unit() {
                 Some(coord) if rename[coord].is_none() => rename[coord] = Some(d),
                 // size-1 dim read at 0: nothing to gate
@@ -295,6 +627,9 @@ impl TensorGraph {
         let mut elim: Vec<Option<usize>> = vec![None; old_rank];
         if arg.view.guard {
             scatter.retain(|&d| {
+                if gathered(d) {
+                    return true;
+                }
                 let f = &arg.view.forms[d];
                 let pick = (0..n_points).find(|&x| {
                     f.coefs[x].abs() == 1
@@ -359,16 +694,23 @@ impl TensorGraph {
         let subst_view = View {
             guard: false,
             forms: subst.clone(),
+            gather: None,
         };
+        let base = if online { 2 * c.width() } else { 1 };
         let rename_view = |v: &View| {
             let mut r = v.compose(&subst_view, new_rank);
             r.guard = v.guard || guard_all;
+            // the index arg moves with every other arg, `base` slots on
+            if let Some(g) = &mut r.gather {
+                g.arg += base;
+            }
             r
         };
         // dy is indexed by the old out coords (plus a slot for tuple comps)
         let w = c.width();
         let dy_view = |slot: Option<i64>| View {
             guard: guard_all,
+            gather: None,
             forms: (0..c.points().len())
                 .map(|x| subst[x].clone())
                 .chain(slot.map(|s| Form::constant(new_rank, s)))
@@ -394,7 +736,7 @@ impl TensorGraph {
                 view: dy_view(None),
             });
         }
-        let base = args.len();
+        debug_assert_eq!(base, args.len());
         args.extend(c.args.iter().map(|x| Arg {
             src: x.src,
             view: rename_view(&x.view),
@@ -465,10 +807,16 @@ impl TensorGraph {
                 let f = rename_view(&View {
                     guard: false,
                     forms: vec![arg.view.forms[d].clone()],
+                    gather: None,
                 })
                 .forms
                 .remove(0);
                 let mut target = body.lit(f.offset as f64);
+                if let Some(g) = arg.view.gather.as_ref().filter(|g| g.coefs[d] != 0) {
+                    let cl = body.lit(g.coefs[d] as f64);
+                    let t = body.mul(cl, vars[base + g.arg]);
+                    target = body.add(target, t);
+                }
                 for (k, &coef) in f.coefs.iter().enumerate() {
                     if coef != 0 {
                         let v = coord_var(k, &mut body, &mut args);
@@ -512,6 +860,25 @@ impl TensorGraph {
             body_outs: vec![out],
             monoid: (!free.is_empty()).then(Monoid::sum),
         })
+        .inspect(|id| {
+            // a dim gathered as `a[key[x]]`, key sorted and x reduced here:
+            // only x's run with key == the dim's coord contributes
+            let seg = arg.view.gather.as_ref().and_then(|g| {
+                let ia = &c.args[g.arg];
+                let key = ia.src;
+                if !self.nodes[key.n()].sorted || ia.view.forms.len() != 1 || ia.view.is_gather() {
+                    return None;
+                }
+                let x = ia.view.forms[0].as_unit()?;
+                let red = free.iter().position(|&f| f == x)?;
+                let d = scatter.iter().copied().find(|&d| {
+                    let f = &arg.view.forms[d];
+                    g.coefs[d] == 1 && f.offset == 0 && f.coefs.iter().all(|&v| v == 0)
+                })?;
+                Some(Segment { red, key, point: d })
+            });
+            self.nodes[id.n()].segment = seg;
+        })
     }
 }
 
@@ -539,6 +906,24 @@ impl Deg {
             _ => None,
         }
     }
+}
+
+/// Whether `c`'s body is `element(args)` (probed at a few points).
+fn body_is(c: &Comp, element: &super::discover::Fun) -> bool {
+    let na = c.args.len();
+    if element.outs.len() != c.body_outs.len() {
+        return false;
+    }
+    (0..3).all(|t| {
+        let v: Vec<f64> = (0..na)
+            .map(|i| 0.31 + ((i * 5 + t * 3) % 7) as f64 * 0.23)
+            .collect();
+        let a = c.body.eval_many::<f64>(&c.body_outs, &v);
+        let b = element.call(&v);
+        a.iter()
+            .zip(&b)
+            .all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + y.abs()) || (x.is_nan() && y.is_nan()))
+    })
 }
 
 fn same(a: f64, b: f64) -> bool {
@@ -603,7 +988,7 @@ fn go_degree(
             Deg::Lin(x) => Some(Deg::Hom(-x * std::f64::consts::LN_2)),
             d => d.is_clean().then_some(clean),
         },
-        Node::Sin(a) | Node::Log2(a) => go(a)?.is_clean().then_some(clean),
+        Node::Sin(a) | Node::Floor(a) | Node::Log2(a) => go(a)?.is_clean().then_some(clean),
         Node::Atan2(a, b) => (go(a)?.is_clean() && go(b)?.is_clean()).then_some(clean),
         Node::Select(c, a, b) => {
             if !go(c)?.is_clean() {
@@ -743,6 +1128,7 @@ mod tests {
                 vec![Arg {
                     src: r,
                     view: View {
+                        gather: None,
                         guard: false,
                         forms: vec![
                             Form::unit(2, 0),
@@ -945,6 +1331,7 @@ mod tests {
         let x = g.input(&[ci, t]);
         let w = g.input(&[co, ci, k]);
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(4, 2),
                 Form {
@@ -989,6 +1376,7 @@ mod tests {
         let w = g.input(&[co, ci, s * taps]);
         // space: (o, q, r, j, c)
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(5, 4),
                 Form {
@@ -999,6 +1387,7 @@ mod tests {
             guard: true,
         };
         let wv = View {
+            gather: None,
             forms: vec![
                 Form::unit(5, 0),
                 Form::unit(5, 4),
@@ -1041,6 +1430,7 @@ mod tests {
         let mut g = TensorGraph::new();
         let x = g.input(&[7]);
         let v = View {
+            gather: None,
             forms: vec![Form {
                 coefs: vec![1],
                 offset: -2,
@@ -1128,6 +1518,461 @@ mod tests {
             for (x, y) in a.iter().zip(b) {
                 assert!((x - y).abs() < 1e-9, "{x} vs {y}");
             }
+        }
+    }
+
+    // ---- implicit differentiation (the KL projection of ribt's glottis) ----
+
+    fn sh(off: i64) -> View {
+        let mut f = Form::unit(1, 0);
+        f.offset = off;
+        View {
+            forms: vec![f],
+            guard: true,
+            gather: None,
+        }
+    }
+
+    /// `y[m] = Σ_k W[k,m]·x[k]`
+    fn to_bands(g: &mut TensorGraph, w: TensorId, x: TensorId, m: usize, k: usize) -> TensorId {
+        g.comp(
+            &[m],
+            &[k],
+            vec![
+                Arg {
+                    src: x,
+                    view: View::pick(2, &[Some(1)]),
+                },
+                Arg {
+                    src: w,
+                    view: View::pick(2, &[Some(1), Some(0)]),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    }
+
+    /// `y[k] = Σ_m W[k,m]·z[m]`
+    fn to_bins(g: &mut TensorGraph, w: TensorId, z: TensorId, m: usize, k: usize) -> TensorId {
+        g.comp(
+            &[k],
+            &[m],
+            vec![
+                Arg {
+                    src: z,
+                    view: View::pick(2, &[Some(1)]),
+                },
+                Arg {
+                    src: w,
+                    view: View::pick(2, &[Some(0), Some(1)]),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap()
+    }
+
+    /// Symmetric tridiagonal solve over `[M]` by parallel cyclic reduction
+    /// (`up[m]` couples m and m+1), as ribt's `glottis::pcr`.
+    fn pcr(
+        g: &mut TensorGraph,
+        valid: TensorId,
+        up: TensorId,
+        d: TensorId,
+        r: TensorId,
+        m: usize,
+    ) -> TensorId {
+        let id = || View::identity(1, 1);
+        let mut lo = g
+            .comp(
+                &[m],
+                &[],
+                vec![Arg {
+                    src: up,
+                    view: sh(-1),
+                }],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let (mut d, mut up, mut r) = (d, up, r);
+        let mut s = 1i64;
+        while (s as usize) < m {
+            let q = [lo, d, up, r];
+            let args = || {
+                let mut a: Vec<Arg> = q.iter().map(|&t| Arg { src: t, view: id() }).collect();
+                for o in [-s, s] {
+                    for &t in &q {
+                        a.push(Arg {
+                            src: t,
+                            view: sh(o),
+                        });
+                    }
+                    a.push(Arg {
+                        src: valid,
+                        view: sh(o),
+                    });
+                }
+                a
+            };
+            // v: 0 lo,1 d,2 up,3 r | 4 lo⁻,5 d⁻,6 up⁻,7 r⁻,8 valid⁻ | 9 lo⁺,10 d⁺,11 up⁺,12 r⁺,13 valid⁺
+            let k = |v: &[ExprId]| {
+                (
+                    v[0] / (v[5] + ExprId::ONE - v[8]),
+                    v[2] / (v[10] + ExprId::ONE - v[13]),
+                )
+            };
+            let nlo = g
+                .comp(&[m], &[], args(), None, |v| vec![-(k(v).0 * v[4])])
+                .unwrap();
+            let nd = g
+                .comp(&[m], &[], args(), None, |v| {
+                    let (k1, k2) = k(v);
+                    vec![v[1] - k1 * v[6] - k2 * v[9]]
+                })
+                .unwrap();
+            let nup = g
+                .comp(&[m], &[], args(), None, |v| vec![-(k(v).1 * v[11])])
+                .unwrap();
+            let nr = g
+                .comp(&[m], &[], args(), None, |v| {
+                    let (k1, k2) = k(v);
+                    vec![v[3] - k1 * v[7] - k2 * v[12]]
+                })
+                .unwrap();
+            (lo, d, up, r) = (nlo, nd, nup, nr);
+            s *= 2;
+        }
+        g.map(&[r, d], |v| v[0] / v[1]).unwrap()
+    }
+
+    /// The KL projection `s = x ⊙ exp(F λ)` with `Fᵀ s = exp(mel)`, by
+    /// `newton` Newton steps on the convex dual (Hessian `Fᵀ diag(s) F`,
+    /// tridiagonal), as ribt's `glottis::project_keep`: steps clamped to
+    /// ±4, exp arguments capped at 80. `implicit`: detach the iteration
+    /// and take one more step with a detached Hessian
+    /// ([`TensorGraph::detach`]). Returns `s` and the last step `Δλ`.
+    /// Inputs: x [K], mel [M], F, F², F·F₊ [K, M], valid [M].
+    fn project(
+        g: &mut TensorGraph,
+        m: usize,
+        k: usize,
+        newton: usize,
+        implicit: bool,
+    ) -> (TensorId, TensorId) {
+        let x = g.input(&[k]);
+        let mel = g.input(&[m]);
+        let fb = g.input(&[k, m]);
+        let fb2 = g.input(&[k, m]);
+        let fbn = g.input(&[k, m]);
+        let valid = g.input(&[m]);
+        let e = g.map(&[mel], |v| v[0].exp()).unwrap();
+        let fx = to_bands(g, fb, x, m, k);
+        let lit = ExprId::from_f64;
+        let mut lam = g
+            .map(&[mel, fx], |v| v[0] - (v[1] + lit(1e-30)).ln())
+            .unwrap();
+        let s_of = |g: &mut TensorGraph, lam: TensorId| {
+            let fl = to_bins(g, fb, lam, m, k);
+            g.map(&[x, fl], |v| {
+                let z = ExprId::select(v[1] - lit(80.0), lit(80.0), v[1]);
+                v[0] * z.exp()
+            })
+            .unwrap()
+        };
+        let step = |g: &mut TensorGraph, lam: TensorId, detach_h: bool| {
+            let s = s_of(g, lam);
+            let fs = to_bands(g, fb, s, m, k);
+            let mut d = to_bands(g, fb2, s, m, k);
+            let mut up = to_bands(g, fbn, s, m, k);
+            if detach_h {
+                d = g.detach(d).unwrap();
+                up = g.detach(up).unwrap();
+            }
+            let r = g.map(&[e, fs], |v| v[0] - v[1]).unwrap();
+            let dl = pcr(g, valid, up, d, r, m);
+            let next = g
+                .map(&[lam, dl], |v| {
+                    let hi = ExprId::select(v[1] - lit(4.0), lit(4.0), v[1]);
+                    v[0] + ExprId::select(lit(-4.0) - v[1], lit(-4.0), hi)
+                })
+                .unwrap();
+            (next, dl)
+        };
+        let mut dl = lam;
+        for _ in 0..newton {
+            (lam, dl) = step(g, lam, false);
+        }
+        if implicit {
+            let fixed = g.detach(lam).unwrap();
+            (lam, dl) = step(g, fixed, true);
+        }
+        (s_of(g, lam), dl)
+    }
+
+    #[test]
+    fn implicit_gradient_of_a_newton_solve() {
+        let (m, k, newton) = (8usize, 33usize, 8usize);
+        // overlapping triangles: band c peaks at bin 4c + 2, reaches ±4 bins
+        let mut fb = vec![0.0; k * m];
+        for kk in 0..k {
+            for c in 0..m {
+                let w = 1.0 - (kk as f64 - (4 * c + 2) as f64).abs() / 4.0;
+                fb[kk * m + c] = w.max(0.0);
+            }
+        }
+        let fb2: Vec<f64> = fb.iter().map(|w| w * w).collect();
+        let fbn: Vec<f64> = (0..k * m)
+            .map(|i| {
+                if i % m + 1 < m {
+                    fb[i] * fb[i + 1]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let x: Vec<f64> = ramp(k, 0.02, 0.4);
+        let mel: Vec<f64> = (0..m).map(|c| 0.3 * ((c * 5) % 7) as f64 - 0.5).collect();
+        let ins = vec![x, mel, fb.clone(), fb2, fbn, vec![1.0; m]];
+
+        let build = |implicit: bool, newton: usize| {
+            let mut g = TensorGraph::new();
+            let (s, dl) = project(&mut g, m, k, newton, implicit);
+            // a fixed non-uniform readout, so the gradient is not trivial
+            let wts = g.iota(&[k], 0);
+            let y = g
+                .map(&[s, wts], |v| v[0] * (v[1] * ExprId::from_f64(0.37)).sin())
+                .unwrap();
+            let (xi, mi) = (TensorId(0), TensorId(1));
+            let before = g.nodes().len();
+            let grads = g.backward(y, &[xi, mi]).unwrap();
+            let added = g.live(&grads).iter().skip(before).filter(|l| **l).count();
+            (g, y, s, dl, grads, added)
+        };
+
+        // the projection holds: Fᵀ s = exp(mel)
+        let (g, y, s, dl, gi, n_imp) = build(true, newton);
+        let mut ev = g.eval(&ins, &[s, dl]);
+        let (sv, dlv) = (ev.remove(0), ev.remove(0));
+        // converged: the last step is far inside the ±4 clamp, so the
+        // clamp is the identity there and the implicit step is exact
+        let step = dlv.iter().fold(0.0f64, |a, d| a.max(d.abs()));
+        assert!(step < 1e-9, "last Newton step {step}");
+        for c in 0..m {
+            let b: f64 = (0..k).map(|kk| fb[kk * m + c] * sv[kk]).sum();
+            assert!((b - ins[1][c].exp()).abs() < 1e-10, "band {c}: {b}");
+        }
+        // implicit gradient = finite differences of the solve
+        check_grad(&g, y, &ins, 0, gi[0]);
+        check_grad(&g, y, &ins, 1, gi[1]);
+        // ... = the gradient unrolled through every Newton step
+        let (gu, _, _, _, gun, n_unr) = build(false, newton);
+        let (a, b) = (g.eval(&ins, &gi), gu.eval(&ins, &gun));
+        for (p, q) in a.iter().zip(&b) {
+            for (u, v) in p.iter().zip(q) {
+                assert!((u - v).abs() <= 1e-8 * (1.0 + v.abs()), "{u} vs {v}");
+            }
+        }
+        // and its backward does not grow with the iteration count
+        let (.., n_imp2) = build(true, 2 * newton);
+        let (.., n_unr2) = build(false, 2 * newton);
+        println!("backward nodes: implicit {n_imp} / {n_imp2}, unrolled {n_unr} / {n_unr2}");
+        assert_eq!(n_imp, n_imp2);
+        assert!(n_unr2 > n_unr && n_unr > 3 * n_imp);
+    }
+
+    // ---- detach survives rewrites ----
+
+    /// `y = Σ (detach(2x)·x + c·(2x))`, `c` a fixed weight: `dy/dx =
+    /// 2x + 2c`. The detached node and its undetached twin `t` (the same
+    /// identity map of `a`) are what a careless pass would merge, splice
+    /// or drop.
+    fn detach_graph(n: usize) -> (TensorGraph, TensorId) {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[n]);
+        let a = g.map(&[x], |v| v[0] * ExprId::from_f64(2.0)).unwrap();
+        let d = g.detach(a).unwrap();
+        let t = g.map(&[a], |v| v[0]).unwrap();
+        let c = g.iota(&[n], 0);
+        let e = g
+            .map(&[d, x, c, t], |v| v[0] * v[1] + (v[2] + ExprId::ONE) * v[3])
+            .unwrap();
+        let y = g.reduce(e, 0, Monoid::sum()).unwrap();
+        (g, y)
+    }
+
+    fn input_node(g: &TensorGraph, k: usize) -> TensorId {
+        let i = g
+            .nodes()
+            .iter()
+            .position(|nd| matches!(nd.op, Op::Input(j) if j == k))
+            .unwrap();
+        TensorId(i as u32)
+    }
+
+    fn assert_detached_grad(g: &mut TensorGraph, y: TensorId, pass: &str) {
+        assert!(
+            g.nodes().iter().any(|nd| nd.detach),
+            "{pass}: detach node dropped"
+        );
+        let x = input_node(g, 0);
+        let gx = g.backward(y, &[x]).unwrap()[0];
+        let n = g.shape(x)[0].fixed().unwrap();
+        let xs = ramp(n, 0.1, -0.3);
+        let got = g.eval(std::slice::from_ref(&xs), &[gx]).remove(0);
+        for i in 0..n {
+            let want = 2.0 * xs[i] + 2.0 * (i as f64 + 1.0);
+            assert!(
+                (got[i] - want).abs() < 1e-12,
+                "{pass}[{i}]: {} vs {want}",
+                got[i]
+            );
+        }
+    }
+
+    #[test]
+    fn detach_survives_rewrite_passes() {
+        type Pass = fn(&TensorGraph, &[TensorId]) -> (TensorGraph, Vec<TensorId>);
+        let passes: [(&str, Pass); 7] = [
+            ("substitute_maps", |g, o| g.substitute_maps(o)),
+            ("substitute_maps_all", |g, o| {
+                g.substitute_maps_with(o, false)
+            }),
+            ("eliminate_common", |g, o| g.eliminate_common(o)),
+            ("eliminate_dead", |g, o| g.eliminate_dead(o)),
+            ("merge_siblings", |g, o| g.merge_siblings(o)),
+            ("relayout", |g, o| g.relayout(o)),
+            ("stabilize_softmax", |g, o| g.stabilize_softmax(o)),
+        ];
+        let (g0, y0) = detach_graph(6);
+        assert_detached_grad(&mut g0.clone(), y0, "none");
+        for (name, pass) in passes {
+            let (mut g, o) = pass(&g0, &[y0]);
+            assert_detached_grad(&mut g, o[0], name);
+        }
+        // all of them in a row, then the scheduling passes (in place)
+        let (mut g, mut o) = (g0.clone(), vec![y0]);
+        for (_, pass) in passes {
+            (g, o) = pass(&g, &o);
+        }
+        g.schedule_auto(&o);
+        g.schedule_inline(&o);
+        assert_detached_grad(&mut g, o[0], "all");
+    }
+
+    /// A detached term inside a softmax: `stabilize_softmax` reads
+    /// reduction bodies through their maps, and must stop at the detach.
+    #[test]
+    fn detach_survives_stabilize_softmax() {
+        let n = 6;
+        let mut g0 = TensorGraph::new();
+        let x = g0.input(&[n]);
+        let d = g0.detach(x).unwrap();
+        let c = g0.iota(&[n], 0);
+        let s = g0.map(&[x, d, c], |v| v[0] + v[1] * v[2]).unwrap();
+        let m = g0.reduce(s, 0, Monoid::max()).unwrap();
+        let p = g0
+            .comp(
+                &[n],
+                &[],
+                vec![
+                    Arg {
+                        src: s,
+                        view: View::identity(1, 1),
+                    },
+                    Arg {
+                        src: m,
+                        view: View::pick(1, &[None]),
+                    },
+                ],
+                None,
+                |v| vec![(v[0] - v[1]).exp()],
+            )
+            .unwrap();
+        let w = g0.map(&[p, c], |v| v[0] * v[1]).unwrap();
+        let num = g0.reduce(w, 0, Monoid::sum()).unwrap();
+        let den = g0.reduce(p, 0, Monoid::sum()).unwrap();
+        let y = g0.map(&[num, den], |v| v[0] / v[1]).unwrap();
+        let xs = ramp(n, 0.1, -0.2);
+        let want = {
+            let mut g = g0.clone();
+            let gx = g.backward(y, &[x]).unwrap()[0];
+            g.eval(std::slice::from_ref(&xs), &[gx]).remove(0)
+        };
+        let (g1, o) = g0.substitute_maps(&[y]);
+        let (mut g2, o) = g1.stabilize_softmax(&o);
+        assert!(g2.nodes().iter().any(|nd| nd.detach));
+        // the rewrite fired (max and sums fused into one reduction)
+        assert!(g2.nodes().len() < g1.nodes().len());
+        let x2 = input_node(&g2, 0);
+        let gx = g2.backward(o[0], &[x2]).unwrap()[0];
+        let got = g2.eval(&[xs], &[gx]).remove(0);
+        for (u, v) in got.iter().zip(&want) {
+            assert!((u - v).abs() < 1e-12, "{u} vs {v}");
+        }
+    }
+
+    /// After `backward`, the detach node is an identity map that schedules
+    /// inline: lowered, it adds no buffer and no kernel.
+    #[test]
+    fn detach_costs_nothing_lowered() {
+        let lower = |detach: bool| {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[64]);
+            let a = g.map(&[x], |v| v[0].exp()).unwrap();
+            let d = if detach { g.detach(a).unwrap() } else { a };
+            let e = g.map(&[d, x], |v| v[0] * v[1]).unwrap();
+            let y = g.reduce(e, 0, Monoid::sum()).unwrap();
+            let gx = g.backward(y, &[x]).unwrap()[0];
+            let (mut g, o) = g.substitute_maps(&[y, gx]);
+            let (mut g, o) = {
+                let (h, o) = g.eliminate_common(&o);
+                g = h;
+                (g, o)
+            };
+            g.schedule_auto(&o);
+            let p = g.to_wgsl(&o);
+            (p.kernels.len(), p.buffers.len())
+        };
+        let (k1, b1) = lower(true);
+        let (k0, b0) = lower(false);
+        assert_eq!(
+            (k1, b1),
+            (k0, b0),
+            "detach: {k1} kernels / {b1} buffers vs {k0} / {b0}"
+        );
+    }
+
+    /// vjp-of-vjp: a gradient graph that reads a detached node treats it
+    /// as a constant again. `y = Σ x²·detach(x)`: `∂y/∂x = 2x·d`, and the
+    /// derivative of `Σ w·∂y/∂x` is `2·d·w`, not the `6x·w` of `Σ x³`.
+    #[test]
+    fn detach_second_order_is_stop_gradient() {
+        let n = 5;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[n]);
+        let d = g.detach(x).unwrap();
+        let e = g.map(&[x, d], |v| v[0] * v[0] * v[1]).unwrap();
+        let y = g.reduce(e, 0, Monoid::sum()).unwrap();
+        let gx = g.backward(y, &[x]).unwrap()[0];
+        let w = g.iota(&[n], 0);
+        let z = g.map(&[gx, w], |v| v[0] * v[1]).unwrap();
+        let zs = g.reduce(z, 0, Monoid::sum()).unwrap();
+        let hx = g.backward(zs, &[x]).unwrap()[0];
+        let xs = ramp(n, 0.2, 0.1);
+        let mut ev = g.eval(std::slice::from_ref(&xs), &[gx, hx]);
+        let (gv, hv) = (ev.remove(0), ev.remove(0));
+        for i in 0..n {
+            assert!((gv[i] - 2.0 * xs[i] * xs[i]).abs() < 1e-12);
+            assert!(
+                (hv[i] - 2.0 * xs[i] * i as f64).abs() < 1e-12,
+                "{} vs {}",
+                hv[i],
+                2.0 * xs[i] * i as f64
+            );
         }
     }
 }

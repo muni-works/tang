@@ -39,6 +39,9 @@ unsafe fn str_arg<'a>(p: *const c_char) -> Result<&'a str> {
 /// Load a model directory (config.json, tokenizer.json, safetensors). `q4` quantizes bf16
 /// weights at load; 4-bit MLX checkpoints load as 4-bit either way. On failure returns null
 /// and, if `error` isn't null, a message to free with [`tang_string_free`].
+///
+/// # Safety
+/// `dir` and `error` must be valid C strings/buffers, or null for `error`.
 #[no_mangle]
 pub unsafe extern "C" fn tang_load(
     dir: *const c_char,
@@ -70,6 +73,8 @@ pub unsafe extern "C" fn tang_load(
     }
 }
 
+/// # Safety
+/// `h` must be a handle from [`tang_load`], freed at most once, or null.
 #[no_mangle]
 pub unsafe extern "C" fn tang_free(h: *mut Handle) {
     if !h.is_null() {
@@ -77,6 +82,8 @@ pub unsafe extern "C" fn tang_free(h: *mut Handle) {
     }
 }
 
+/// # Safety
+/// `s` must be a string handed out by this API, freed at most once, or null.
 #[no_mangle]
 pub unsafe extern "C" fn tang_string_free(s: *mut c_char) {
     if !s.is_null() {
@@ -85,6 +92,8 @@ pub unsafe extern "C" fn tang_string_free(s: *mut c_char) {
 }
 
 /// What the model is and how long it took to load.
+/// # Safety
+/// `h` must be a live handle from [`tang_load`] or null.
 #[no_mangle]
 pub unsafe extern "C" fn tang_info(h: *mut Handle) -> *mut c_char {
     let Some(h) = h.as_ref() else {
@@ -153,6 +162,8 @@ fn prompt_of(e: &Engine<MetalDevice>, tokens: usize) -> Result<String> {
 
 /// Cold prefill of about `prompt_tokens`, then `gen_tokens` of decode; then a warm follow-up
 /// turn that reuses the KV cache, as an agent's next step would.
+/// # Safety
+/// `h` must be a live handle from [`tang_load`].
 #[no_mangle]
 pub unsafe extern "C" fn tang_bench(
     h: *mut Handle,
@@ -179,6 +190,9 @@ pub unsafe extern "C" fn tang_bench(
 
 /// Stream a chat reply. `messages` is an OpenAI-style JSON array. `on_text` gets each piece of
 /// text and returns false to stop. Returns the usage as JSON.
+/// # Safety
+/// `h` must be a live handle from [`tang_load`]; `on_text` and `ctx` must stay
+/// valid for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn tang_chat(
     h: *mut Handle,

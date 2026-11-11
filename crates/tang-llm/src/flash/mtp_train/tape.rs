@@ -45,16 +45,71 @@ struct Node {
     op: Op,
     track: bool,
 }
+/// Device copies of frozen leaf values (head, embedding rows, dequantized experts), keyed by
+/// the `Arc`'s address and kept alive with it, so they upload once per run, not per op.
+pub struct DeviceCache<D: ComputeDevice> {
+    map: std::cell::RefCell<std::collections::HashMap<usize, (Arc<Vec<f32>>, Arc<D::Buffer>)>>,
+}
+impl<D: ComputeDevice> Default for DeviceCache<D> {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+}
 pub struct Tape<'a, D: ComputeDevice> {
     pub dev: &'a D,
     nodes: Vec<Node>,
+    cache: Option<&'a DeviceCache<D>>,
+    /// Trainable weights' device copies for this tape only (they change every step).
+    local: std::cell::RefCell<std::collections::HashMap<usize, Arc<D::Buffer>>>,
 }
 impl<'a, D: ComputeDevice> Tape<'a, D> {
     pub fn new(dev: &'a D) -> Self {
         Self {
             dev,
             nodes: Vec::new(),
+            cache: None,
+            local: Default::default(),
         }
+    }
+    pub fn with_cache(dev: &'a D, cache: &'a DeviceCache<D>) -> Self {
+        Self {
+            dev,
+            nodes: Vec::new(),
+            cache: Some(cache),
+            local: Default::default(),
+        }
+    }
+    /// The device copy of node `i`: cached for untracked leaves, else a fresh upload.
+    fn device(&self, i: Id) -> Arc<D::Buffer> {
+        let node = &self.nodes[i];
+        // Only values shared with an owner outside the tape (Weights); a tape constant's
+        // fresh `Arc` would leak an entry per window.
+        let shared = Arc::strong_count(&node.value) > 1;
+        let key = Arc::as_ptr(&node.value) as usize;
+        if shared && node.track && matches!(node.op, Op::Leaf) {
+            let mut local = self.local.borrow_mut();
+            return local
+                .entry(key)
+                .or_insert_with(|| Arc::new(self.dev.upload_f32(&node.value)))
+                .clone();
+        }
+        let Some(cache) = self
+            .cache
+            .filter(|_| shared && !node.track && matches!(node.op, Op::Leaf))
+        else {
+            return Arc::new(self.dev.upload_f32(&node.value));
+        };
+        if let Some((_, b)) = cache.map.borrow().get(&key) {
+            return b.clone();
+        }
+        let b = Arc::new(self.dev.upload_f32(&node.value));
+        cache
+            .map
+            .borrow_mut()
+            .insert(key, (node.value.clone(), b.clone()));
+        b
     }
     fn push(&mut self, value: Vec<f32>, op: Op, parents: &[Id]) -> Id {
         let track = parents.iter().any(|&i| self.nodes[i].track);
@@ -82,7 +137,13 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
         &self.nodes[i].value
     }
     pub fn gather(&mut self, a: Id, idx: Vec<usize>) -> Id {
-        let v = idx.iter().map(|&j| self.data(a)[j]).collect();
+        use rayon::prelude::*;
+        let src = self.data(a);
+        let v = idx
+            .par_iter()
+            .with_min_len(1 << 16)
+            .map(|&j| src[j])
+            .collect();
         self.push(v, Op::Gather(a, idx), &[a])
     }
     pub fn join(&mut self, a: &[Id]) -> Id {
@@ -129,36 +190,41 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
                 }
             })
             .collect();
-        let mut jac = Vec::with_capacity(self.data(a).len());
-        for chunk in self.data(a).chunks(1024) {
-            let x: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
-            let g = tang_ad::grad(
-                |vars| {
-                    let terms: Vec<_> = vars
-                        .iter()
-                        .map(|x| {
-                            // Equivalent sigmoid with a bounded intermediate at extreme logits.
-                            let p = (x * 0.5).tanh() * 0.5 + 0.5;
-                            if silu {
-                                x * &p
-                            } else {
-                                p
-                            }
-                        })
-                        .collect();
-                    terms.into_iter().reduce(|a, b| a + b).unwrap()
-                },
-                &x,
-            );
-            jac.extend(g.as_slice().iter().map(|&v| v as f32));
-        }
+        use rayon::prelude::*;
+        let parts: Vec<Vec<f32>> = self
+            .data(a)
+            .par_chunks(1024)
+            .map(|chunk| {
+                let x: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
+                let g = tang_ad::grad(
+                    |vars| {
+                        let terms: Vec<_> = vars
+                            .iter()
+                            .map(|x| {
+                                // Equivalent sigmoid with a bounded intermediate at extreme logits.
+                                let p = (x * 0.5).tanh() * 0.5 + 0.5;
+                                if silu {
+                                    x * &p
+                                } else {
+                                    p
+                                }
+                            })
+                            .collect();
+                        terms.into_iter().reduce(|a, b| a + b).unwrap()
+                    },
+                    &x,
+                );
+                g.as_slice().iter().map(|&v| v as f32).collect()
+            })
+            .collect();
+        let jac: Vec<f32> = parts.concat();
         self.push(v, Op::Unary(a, jac), &[a])
     }
     pub fn linear(&mut self, x: Id, w: Id, m: usize, k: usize, n: usize) -> Id {
         assert_eq!(self.data(x).len(), m * k);
         assert_eq!(self.data(w).len(), n * k);
         let a = self.dev.upload_f32(self.data(x));
-        let b = self.dev.upload_f32(self.data(w));
+        let b = self.device(w);
         let c = self.dev.matmul_b_transposed(&a, &b, m, k, n);
         self.push(self.dev.download(&c), Op::Linear { x, w, m, k, n }, &[x, w])
     }
@@ -166,17 +232,20 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
         let gamma = self.data(w);
         assert_eq!(self.data(x).len() % dim, 0);
         assert_eq!(gamma.len() % dim, 0);
-        let mut out = Vec::with_capacity(self.data(x).len());
-        let mut inv = Vec::new();
-        for (r, row) in self.data(x).chunks(dim).enumerate() {
-            let z = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / dim as f32 + eps).sqrt();
-            inv.push(z);
-            out.extend(
-                row.iter()
-                    .enumerate()
-                    .map(|(i, &v)| v * z * gamma[(r * dim + i) % gamma.len()]),
-            );
-        }
+        use rayon::prelude::*;
+        let mut out = vec![0.0; self.data(x).len()];
+        let inv: Vec<f32> = out
+            .par_chunks_mut(dim)
+            .zip(self.data(x).par_chunks(dim))
+            .enumerate()
+            .map(|(r, (o, row))| {
+                let z = 1.0 / (row.iter().map(|v| v * v).sum::<f32>() / dim as f32 + eps).sqrt();
+                for (i, &v) in row.iter().enumerate() {
+                    o[i] = v * z * gamma[(r * dim + i) % gamma.len()];
+                }
+                z
+            })
+            .collect();
         self.push(out, Op::Norm { x, w, dim, inv }, &[x, w])
     }
     pub fn softmax(&mut self, x: Id, dim: usize) -> Id {
@@ -249,18 +318,22 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
         hd: usize,
         visible: Vec<Vec<usize>>,
     ) -> Id {
-        let mut out = vec![0.0; visible.len() * nh * hd];
-        let mut probs = Vec::new();
+        use rayon::prelude::*;
         let scale = 1.0 / (hd as f32).sqrt();
-        for (t, rows) in visible.iter().enumerate() {
-            for h in 0..nh {
-                let qh = &self.data(q)[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+        let (qd, kd, vd) = (self.data(q), self.data(k), self.data(v));
+        // One (query row, head) per task; rows see up to the whole teacher prefix.
+        let cells: Vec<(Vec<f32>, Vec<f32>)> = (0..visible.len() * nh)
+            .into_par_iter()
+            .map(|i| {
+                let (t, h) = (i / nh, i % nh);
+                let rows = &visible[t];
+                let qh = &qd[i * hd..(i + 1) * hd];
                 let g = h / (nh / nkv);
                 let scores: Vec<_> = rows
                     .iter()
                     .map(|&r| {
                         qh.iter()
-                            .zip(&self.data(k)[(r * nkv + g) * hd..(r * nkv + g + 1) * hd])
+                            .zip(&kd[(r * nkv + g) * hd..(r * nkv + g + 1) * hd])
                             .map(|(a, b)| a * b)
                             .sum::<f32>()
                             * scale
@@ -272,13 +345,21 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
                 for x in &mut p {
                     *x /= z;
                 }
+                let mut o = vec![0.0; hd];
                 for (j, &r) in rows.iter().enumerate() {
+                    let vr = &vd[(r * nkv + g) * hd..(r * nkv + g + 1) * hd];
                     for d in 0..hd {
-                        out[(t * nh + h) * hd + d] += p[j] * self.data(v)[(r * nkv + g) * hd + d];
+                        o[d] += p[j] * vr[d];
                     }
                 }
-                probs.push(p);
-            }
+                (o, p)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(visible.len() * nh * hd);
+        let mut probs = Vec::with_capacity(cells.len());
+        for (o, p) in cells {
+            out.extend(o);
+            probs.push(p);
         }
         self.push(
             out,
@@ -359,7 +440,7 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
                 Op::Linear { x, w, m, k, n } => {
                     let gb = self.dev.upload_f32(&g);
                     if self.nodes[*x].track {
-                        let wb = self.dev.upload_f32(self.data(*w));
+                        let wb = self.device(*w);
                         let gx = self.dev.matmul(&gb, &wb, *m, *n, *k);
                         put(&mut grads, *x, self.dev.download(&gx));
                     }
@@ -370,21 +451,39 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
                     }
                 }
                 Op::Norm { x, w, dim, inv } => {
-                    let mut gx = vec![0.0; self.data(*x).len()];
-                    let mut gw = vec![0.0; self.data(*w).len()];
-                    for (r, row) in self.data(*x).chunks(*dim).enumerate() {
-                        let z = inv[r];
-                        let start = r * dim;
-                        let dot = (0..*dim)
-                            .map(|j| g[start + j] * self.data(*w)[(start + j) % gw.len()] * row[j])
-                            .sum::<f32>();
-                        for j in 0..*dim {
-                            let wi = (start + j) % gw.len();
-                            gx[start + j] = z * g[start + j] * self.data(*w)[wi]
-                                - row[j] * z * z * z * dot / *dim as f32;
-                            gw[wi] += g[start + j] * row[j] * z;
-                        }
-                    }
+                    use rayon::prelude::*;
+                    let (xd, wd, dim) = (self.data(*x), self.data(*w), *dim);
+                    let wl = wd.len();
+                    let mut gx = vec![0.0; xd.len()];
+                    // gx rows in parallel; gw (per-feature sums) folded per thread.
+                    let gw = gx
+                        .par_chunks_mut(dim)
+                        .zip(xd.par_chunks(dim))
+                        .enumerate()
+                        .fold(
+                            || vec![0.0f32; wl],
+                            |mut gw, (r, (gxr, row))| {
+                                let z = inv[r];
+                                let start = r * dim;
+                                let dot = (0..dim)
+                                    .map(|j| g[start + j] * wd[(start + j) % wl] * row[j])
+                                    .sum::<f32>();
+                                for j in 0..dim {
+                                    let wi = (start + j) % wl;
+                                    gxr[j] = z * g[start + j] * wd[wi]
+                                        - row[j] * z * z * z * dot / dim as f32;
+                                    gw[wi] += g[start + j] * row[j] * z;
+                                }
+                                gw
+                            },
+                        )
+                        .reduce(
+                            || vec![0.0f32; wl],
+                            |mut a, b| {
+                                a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                                a
+                            },
+                        );
                     put(&mut grads, *x, gx);
                     put(&mut grads, *w, gw);
                 }
@@ -409,36 +508,54 @@ impl<'a, D: ComputeDevice> Tape<'a, D> {
                     visible,
                     probs,
                 } => {
-                    let mut gq = vec![0.0; self.data(*q).len()];
-                    let mut gk = vec![0.0; self.data(*k).len()];
-                    let mut gv = vec![0.0; self.data(*v).len()];
+                    use rayon::prelude::*;
                     let scale = 1.0 / (*hd as f32).sqrt();
-                    for (t, rows) in visible.iter().enumerate() {
-                        for h in 0..*nh {
+                    let (qd, kd, vd) = (self.data(*q), self.data(*k), self.data(*v));
+                    let (nh, nkv, hd) = (*nh, *nkv, *hd);
+                    let zero = || {
+                        (
+                            vec![0.0f32; qd.len()],
+                            vec![0.0f32; kd.len()],
+                            vec![0.0f32; vd.len()],
+                        )
+                    };
+                    // Per-thread accumulators over (query row, head) tasks, summed at the end.
+                    let tasks = visible.len() * nh;
+                    let (gq, gk, gv) = (0..tasks)
+                        .into_par_iter()
+                        // Few, large splits: each accumulator spans every K/V row.
+                        .with_min_len(tasks.div_ceil(rayon::current_num_threads()).max(1))
+                        .fold(zero, |(mut gq, mut gk, mut gv), i| {
+                            let (t, h) = (i / nh, i % nh);
+                            let rows = &visible[t];
                             let group = h / (nh / nkv);
-                            let qo = (t * nh + h) * hd;
-                            let p = &probs[t * nh + h];
+                            let qo = i * hd;
+                            let p = &probs[i];
                             let dp: Vec<_> = rows
                                 .iter()
                                 .map(|&r| {
                                     let ko = (r * nkv + group) * hd;
-                                    (0..*hd)
-                                        .map(|d| g[qo + d] * self.data(*v)[ko + d])
-                                        .sum::<f32>()
+                                    (0..hd).map(|d| g[qo + d] * vd[ko + d]).sum::<f32>()
                                 })
                                 .collect();
                             let dot = p.iter().zip(&dp).map(|(a, b)| a * b).sum::<f32>();
                             for (j, &r) in rows.iter().enumerate() {
                                 let ko = (r * nkv + group) * hd;
                                 let ds = p[j] * (dp[j] - dot) * scale;
-                                for d in 0..*hd {
-                                    gq[qo + d] += ds * self.data(*k)[ko + d];
-                                    gk[ko + d] += ds * self.data(*q)[qo + d];
+                                for d in 0..hd {
+                                    gq[qo + d] += ds * kd[ko + d];
+                                    gk[ko + d] += ds * qd[qo + d];
                                     gv[ko + d] += p[j] * g[qo + d];
                                 }
                             }
-                        }
-                    }
+                            (gq, gk, gv)
+                        })
+                        .reduce(zero, |mut a, b| {
+                            for (x, y) in [(&mut a.0, &b.0), (&mut a.1, &b.1), (&mut a.2, &b.2)] {
+                                x.iter_mut().zip(y).for_each(|(x, y)| *x += y);
+                            }
+                            a
+                        });
                     put(&mut grads, *q, gq);
                     put(&mut grads, *k, gk);
                     put(&mut grads, *v, gv);

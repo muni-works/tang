@@ -147,7 +147,7 @@ impl MetalDevice {
 
     /// Create a Metal buffer from f32 data.
     fn make_buffer(&self, data: &[f32]) -> metal::Buffer {
-        let len = data.len() * std::mem::size_of::<f32>();
+        let len = std::mem::size_of_val(data);
         self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
             len as u64,
@@ -157,7 +157,7 @@ impl MetalDevice {
 
     /// Create a Metal buffer from u32 data.
     fn make_buffer_u32(&self, data: &[u32]) -> metal::Buffer {
-        let len = data.len() * std::mem::size_of::<u32>();
+        let len = std::mem::size_of_val(data);
         self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
             len as u64,
@@ -250,7 +250,7 @@ impl MetalDevice {
     /// Dispatch a compute pipeline with given buffers.
     fn dispatch(&self, pipeline: &ComputePipelineState, buffers: &[&metal::Buffer], threads: u64) {
         let tg_size = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), 256);
-        let tg_count = (threads + tg_size - 1) / tg_size;
+        let tg_count = threads.div_ceil(tg_size);
 
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(pipeline);
@@ -269,8 +269,8 @@ impl MetalDevice {
         grid: (u64, u64),
         tg_size: (u64, u64),
     ) {
-        let tg_count_x = (grid.0 + tg_size.0 - 1) / tg_size.0;
-        let tg_count_y = (grid.1 + tg_size.1 - 1) / tg_size.1;
+        let tg_count_x = grid.0.div_ceil(tg_size.0);
+        let tg_count_y = grid.1.div_ceil(tg_size.1);
 
         self.with_encoder(|enc| {
             enc.set_compute_pipeline_state(pipeline);
@@ -755,12 +755,11 @@ const SMALL_GEMM_GROUPS: usize = 160;
 const MULTI_ATTN_GROUPS: usize = 256;
 
 fn multi_attn(k: &MetalBuffer, q_len: usize, n_heads: usize, n_kv: usize, d: usize) -> bool {
-    q_len >= 1
-        && q_len <= MULTI_ATTN_ROWS
-        && d % 4 == 0
+    (1..=MULTI_ATTN_ROWS).contains(&q_len)
+        && d.is_multiple_of(4)
         && d <= 256
-        && n_heads % n_kv == 0
-        && (k.kind != Kind::Bf16 || d % 8 == 0)
+        && n_heads.is_multiple_of(n_kv)
+        && (k.kind != Kind::Bf16 || d.is_multiple_of(8))
 }
 
 impl ComputeDevice for MetalDevice {
@@ -1051,7 +1050,8 @@ impl ComputeDevice for MetalDevice {
         let output_buf = self.make_buffer_empty(m * n * 4);
         let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
 
-        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+        if m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8) && m >= 32 && n >= 32
+        {
             // Simdgroup matmul for aligned dimensions (8x8 tile loads require alignment)
             let pipeline = self.get_pipeline(matmul_msl::MATMUL_MSL, "matmul");
             let tg_x = (n / 32) as u64;
@@ -1093,7 +1093,8 @@ impl ComputeDevice for MetalDevice {
         k: usize,
         n: usize,
     ) -> MetalBuffer {
-        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+        if m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8) && m >= 32 && n >= 32
+        {
             let pipeline = self.get_pipeline(matmul_msl::MATMUL_BT_MSL, "matmul_bt");
             let output_buf = self.make_buffer_empty(m * n * 4);
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
@@ -1126,7 +1127,8 @@ impl ComputeDevice for MetalDevice {
         k: usize,
         n: usize,
     ) -> MetalBuffer {
-        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+        if m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8) && m >= 32 && n >= 32
+        {
             let pipeline = self.get_pipeline(matmul_msl::MATMUL_AT_MSL, "matmul_at");
             let output_buf = self.make_buffer_empty(m * n * 4);
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
@@ -1160,7 +1162,8 @@ impl ComputeDevice for MetalDevice {
         k: usize,
         n: usize,
     ) {
-        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+        if m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8) && m >= 32 && n >= 32
+        {
             let pipeline = self.get_pipeline(matmul_msl::MATMUL_ACC_MSL, "matmul_acc");
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
             let tg_x = (n / 32) as u64;
@@ -1188,7 +1191,8 @@ impl ComputeDevice for MetalDevice {
         k: usize,
         n: usize,
     ) {
-        if m % 32 == 0 && n % 32 == 0 && k % 8 == 0 && m >= 32 && n >= 32 {
+        if m.is_multiple_of(32) && n.is_multiple_of(32) && k.is_multiple_of(8) && m >= 32 && n >= 32
+        {
             let pipeline = self.get_pipeline(matmul_msl::MATMUL_ACC_AT_MSL, "matmul_acc_at");
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32]);
             let tg_x = (n / 32) as u64;
@@ -1430,9 +1434,9 @@ kernel void embedding(
         // Tiled prefill needs K/V readable to a 32-row boundary past the end.
         let kv_rows_needed = (cache_start + q_len).next_multiple_of(32);
         if q_len > 1
-            && head_dim % 8 == 0
+            && head_dim.is_multiple_of(8)
             && head_dim <= 128
-            && n_heads % n_kv_heads == 0
+            && n_heads.is_multiple_of(n_kv_heads)
             && k_cache.len >= kv_rows_needed * n_kv_heads * head_dim
             && v_cache.len >= kv_rows_needed * n_kv_heads * head_dim
         {
@@ -1449,7 +1453,7 @@ kernel void embedding(
                 None,
             );
         }
-        if head_dim % 32 == 0 && head_dim <= 256 && n_heads % n_kv_heads == 0 {
+        if head_dim.is_multiple_of(32) && head_dim <= 256 && n_heads.is_multiple_of(n_kv_heads) {
             return self.flash_attention(
                 q,
                 k_cache,
@@ -2007,7 +2011,7 @@ kernel void embedding(
     ) -> MetalBuffer {
         // The tiled simdgroup-matrix kernel when the shape allows (vision towers: D 64-128).
         let rows = n.next_multiple_of(32) * nh * hd;
-        if hd % 8 == 0 && hd <= 128 && k.len >= rows && v.len >= rows {
+        if hd.is_multiple_of(8) && hd <= 128 && k.len >= rows && v.len >= rows {
             return self.flash_prefill(q, k, v, 0, n, nh, nh, hd, true, None);
         }
         self.flash_attention(q, k, v, 0, n, nh, nh, hd, 0, true, None)
@@ -2337,7 +2341,7 @@ kernel void bias_add(
         let pipeline = self.get_pipeline(adamw_msl::REDUCE_SUM_SQ_MSL, "reduce_sum_sq");
         let params = self.make_buffer_u32(&[src.len as u32]);
         // Each thread handles 4 elements
-        let threads = ((src.len + 3) / 4) as u64;
+        let threads = src.len.div_ceil(4) as u64;
         self.dispatch(&pipeline, &[&src.buffer, &acc.buffer, &params], threads);
     }
 
@@ -2364,7 +2368,11 @@ kernel void bias_add(
             let out = self.make_buffer_empty(m * n * 4);
             // TANG_Q4_SMALL=old: the previous small-row paths (for comparison).
             let new_small = std::env::var("TANG_Q4_SMALL").as_deref() != Ok("old");
-            if new_small && (4..=8).contains(&m) && k % 128 == 0 && group % 64 == 0 {
+            if new_small
+                && (4..=8).contains(&m)
+                && k.is_multiple_of(128)
+                && group.is_multiple_of(64)
+            {
                 // A few rows (a verify forward): the matrix units, weights streamed once.
                 let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "qmv_mma");
                 let (so, bo) = w.q4_offsets(group as usize);
@@ -2388,7 +2396,7 @@ kernel void bias_add(
                     kind: Kind::F32,
                 };
             }
-            if new_small && (2..=3).contains(&m) && k % 16 == 0 {
+            if new_small && (2..=3).contains(&m) && k.is_multiple_of(16) {
                 // Two or three rows: each weight unpacked once and applied to every row.
                 let pipeline = self.get_pipeline(llm_msl::Q4_MSL, &format!("gemv_q4_m{m}"));
                 let (so, bo) = w.q4_offsets(group as usize);
@@ -2412,7 +2420,7 @@ kernel void bias_add(
                     kind: Kind::F32,
                 };
             }
-            if (2..=4).contains(&m) && k % 16 == 0 {
+            if (2..=4).contains(&m) && k.is_multiple_of(16) {
                 // A few rows: the GEMV that unpacks each weight once for all of them.
                 let pipeline = self.get_pipeline(llm_msl::Q4_MSL, "gemv_q4_rows");
                 let (so, bo) = w.q4_offsets(group as usize);
@@ -2436,7 +2444,7 @@ kernel void bias_add(
                     kind: Kind::F32,
                 };
             }
-            if (2..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
+            if (2..=SMALL_GEMM_ROWS).contains(&m) && k.is_multiple_of(32) {
                 return self.gemm_small(x, w, m, k, n);
             }
             let params = self.make_buffer_u32(&[m as u32, k as u32, n as u32, group]);
@@ -2466,7 +2474,7 @@ kernel void bias_add(
                 kind: Kind::F32,
             };
         }
-        if w.kind == Kind::Bf16 && (5..=SMALL_GEMM_ROWS).contains(&m) && k % 32 == 0 {
+        if w.kind == Kind::Bf16 && (5..=SMALL_GEMM_ROWS).contains(&m) && k.is_multiple_of(32) {
             return self.gemm_small(x, w, m, k, n);
         }
         if w.kind == Kind::Bf16 {
@@ -2507,7 +2515,7 @@ kernel void bias_add(
                 kind: Kind::F32,
             };
         }
-        if n % 32 != 0 || k % 8 != 0 {
+        if !n.is_multiple_of(32) || !k.is_multiple_of(8) {
             return self.matmul_b_transposed(x, w, m, k, n);
         }
         // The simdgroup kernel works in 32-row tiles: pad the rows, then drop the padding.

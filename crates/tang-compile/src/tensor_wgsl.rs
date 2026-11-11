@@ -54,6 +54,55 @@ pub(super) fn with_dialect<T>(d: Dialect, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Optional device features a WGSL lowering may use. The default (none)
+/// is portable WGSL that every adapter runs; [`TensorGraph::to_wgsl_caps`]
+/// opts in to what the device has (wgpu `SUBGROUP`, `SHADER_F16`). The
+/// MSL dialect has both natively and ignores this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WgslCaps {
+    /// `subgroupAdd`/`subgroupMax`/`subgroupShuffleXor` and the
+    /// `subgroup_size` builtins: `subgroup`-scheduled splits use them.
+    pub subgroups: bool,
+    /// `enable f16;`: f16 buffers are native `array<f16>` (same bytes as
+    /// the packed-u32 fallback) with plain stores instead of atomics, and
+    /// f16 accumulator rounding is an `f16` cast.
+    pub f16: bool,
+}
+
+thread_local! {
+    static CAPS: std::cell::Cell<WgslCaps> = const { std::cell::Cell::new(WgslCaps { subgroups: false, f16: false }) };
+}
+
+/// Caps in effect: the MSL dialect always has subgroups (simdgroups)
+/// and native half.
+pub(super) fn caps() -> WgslCaps {
+    match dialect() {
+        Dialect::Msl => WgslCaps {
+            subgroups: true,
+            f16: true,
+        },
+        Dialect::Cuda => WgslCaps::default(),
+        Dialect::Wgsl => CAPS.with(|c| c.get()),
+    }
+}
+
+/// Run `f` with the WGSL emitters allowed `c`.
+pub(super) fn with_caps<T>(c: WgslCaps, f: impl FnOnce() -> T) -> T {
+    let prev = CAPS.with(|x| x.replace(c));
+    struct Reset(WgslCaps);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAPS.with(|x| x.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
+fn native_f16() -> bool {
+    dialect() == Dialect::Wgsl && caps().f16
+}
+
 /// One dispatch.
 /// Which shading language a [`WgslProgram`]'s kernels are emitted in.
 /// `MslMma` lowers matmul-shaped f32 tiles to simdgroup matrices (see
@@ -78,6 +127,17 @@ pub struct WgslKernel {
     /// Threads to launch (`points`, padded or multiplied for workgroup schedules).
     pub count: u32,
     pub workgroup_size: u32,
+    /// Further nodes this launch writes (multi-output kernels, see
+    /// `TNode::host`): bound read-write after `out`, in this order,
+    /// before the uniform. Empty for a one-output kernel.
+    pub writes: Vec<TensorId>,
+}
+
+impl WgslKernel {
+    /// Every node this launch writes: `node`, then `writes`.
+    pub fn outputs(&self) -> impl Iterator<Item = TensorId> + '_ {
+        std::iter::once(self.node).chain(self.writes.iter().copied())
+    }
 }
 
 /// A buffer the program needs.
@@ -173,6 +233,40 @@ impl TensorGraph {
         self.to_program(outputs, Target::Wgsl)
     }
 
+    /// [`to_wgsl`](Self::to_wgsl) using the device features in `caps`.
+    pub fn to_wgsl_caps(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || self.to_program(outputs, Target::Wgsl))
+    }
+
+    /// [`to_msl_mma`](Self::to_msl_mma) using the device features in `caps`
+    /// for its WGSL kernels.
+    pub fn to_msl_mma_caps(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || self.to_program(outputs, Target::MslMma))
+    }
+
+    /// [`to_wgsl_caps`](Self::to_wgsl_caps) for a wgpu device with MSL
+    /// passthrough: nodes scheduled `fragment` with a simdgroup-matrix
+    /// plan run their native Metal kernel; everything else stays WGSL
+    /// (unlike [`to_msl_mma_caps`](Self::to_msl_mma_caps), which also
+    /// moves f32 tiles to MSL).
+    pub fn to_wgsl_fragments(&self, outputs: &[TensorId], caps: WgslCaps) -> WgslProgram {
+        with_caps(caps, || {
+            let mut g = self.clone();
+            g.schedule_nested_contractions_scalar(outputs);
+            let mut p = g.to_program_numbered(outputs, Target::Wgsl);
+            g.splice_fragment_kernels(outputs, &mut p);
+            p.canonical()
+        })
+    }
+
+    /// [`to_wgsl`](Self::to_wgsl) with short contractions nested in the
+    /// tiles that read them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions))
+    /// or, for `nested: false`, materialized as scheduled.
+    pub fn to_wgsl_with(&self, outputs: &[TensorId], nested: bool) -> WgslProgram {
+        self.to_program_with(outputs, Target::Wgsl, nested)
+    }
+
     /// Like [`to_wgsl`](Self::to_wgsl) with matmul-shaped f32 tiles
     /// lowered to Metal simdgroup matrices (`tensor_msl_mma.rs`, run
     /// through wgpu's MSL passthrough); everything else stays WGSL. The
@@ -184,8 +278,67 @@ impl TensorGraph {
     /// Lower to kernels. Sources are [canonical](canonical_source): the
     /// same kernel at different node numbers (say, in another layer) is
     /// the same string, so source-keyed caches compile it once.
+    ///
+    /// Short contractions read only by tiles are nested in them
+    /// ([`schedule_nested_contractions`](Self::schedule_nested_contractions)):
+    /// the tiled emitter computes an inlined producer that varies along
+    /// the reduce and row axes once per chunk into workgroup memory, so
+    /// the flash backward recomputes `S` and `dP` there instead of
+    /// writing them.
     pub fn to_program(&self, outputs: &[TensorId], target: Target) -> WgslProgram {
-        self.to_program_numbered(outputs, target).canonical()
+        self.to_program_with(outputs, target, true)
+    }
+
+    /// [`to_program`](Self::to_program), nesting short contractions or not.
+    pub fn to_program_with(
+        &self,
+        outputs: &[TensorId],
+        target: Target,
+        nested: bool,
+    ) -> WgslProgram {
+        let g = if nested {
+            let mut g = self.clone();
+            g.schedule_nested_contractions_scalar(outputs);
+            std::borrow::Cow::Owned(g)
+        } else {
+            std::borrow::Cow::Borrowed(self)
+        };
+        let mut p = g.to_program_numbered(outputs, target);
+        if target == Target::MslMma {
+            g.splice_fragment_kernels(outputs, &mut p);
+        }
+        p.canonical()
+    }
+
+    /// Under MSL passthrough, nodes scheduled `fragment` that have a
+    /// simdgroup-matrix plan (an f16 contraction, fused f16 attention)
+    /// run the native backend's fragment kernel instead of the WGSL one:
+    /// same buffers in the same `[[buffer(i)]]` order, static threadgroup
+    /// memory, the same `x + y·65535` grid. The kernels map one to one
+    /// (`to_msl_for` lowers this same program kernel by kernel).
+    fn splice_fragment_kernels(&self, outputs: &[TensorId], p: &mut WgslProgram) {
+        let live = self.live(outputs);
+        let any = (0..self.nodes.len()).any(|i| live[i] && self.nodes[i].fragment);
+        if !any {
+            return;
+        }
+        let msl = self.to_msl_for(outputs, &super::msl::FragmentTarget::APPLE);
+        // nesting can change the kernel list; splice only when it maps 1:1
+        if msl.kernels.len() != p.kernels.len() {
+            return;
+        }
+        for (k, m) in p.kernels.iter_mut().zip(msl.kernels) {
+            if !m.fragment || k.node != m.node || k.reads != m.reads {
+                continue;
+            }
+            k.source = m.source.replacen(
+                &format!("kernel void {}(", m.entry),
+                "kernel void main0(",
+                1,
+            );
+            k.workgroup_size = m.threads;
+            k.count = m.groups.0 * m.groups.1 * m.threads;
+        }
     }
 
     /// [`to_program`](Self::to_program) without
@@ -210,7 +363,12 @@ impl TensorGraph {
                 let (len, input) = match &self.nodes[i].op {
                     Op::Input(k) => (numel(&self.nodes[i].shape), Some(*k)),
                     Op::Comp(c) => (numel(c.points()) * c.width(), None),
+                    Op::Scan(_) => (numel(&self.nodes[i].shape), None),
                     Op::Iota(_) | Op::Reshape(_) => unreachable!(),
+                    Op::Operator(o) => panic!(
+                        "operator node `{}` has no device lowering; evaluate it on the host",
+                        o.op.name()
+                    ),
                 };
                 let format = self.nodes[i].precision.storage;
                 assert!(
@@ -227,8 +385,31 @@ impl TensorGraph {
             .collect();
 
         let kernels = (0..n)
-            .filter(|&i| needs_buffer(i) && self.comp_at(i).is_some())
-            .map(|i| self.kernel_for(i, target))
+            .filter(|&i| {
+                needs_buffer(i)
+                    && self.nodes[i].host.is_none()
+                    && (self.comp_at(i).is_some() || matches!(self.nodes[i].op, Op::Scan(_)))
+            })
+            .map(|i| {
+                let mut k = match self.nodes[i].op {
+                    Op::Scan(_) => self.scan_kernel(i),
+                    _ => self.kernel_for(i, target),
+                };
+                // multi-output: the nodes this kernel also stores (its
+                // side jobs), their buffers read through its own bindings
+                for u in
+                    (0..n).filter(|&u| live[u] && self.nodes[u].host == Some(TensorId(i as u32)))
+                {
+                    k.writes.push(TensorId(u as u32));
+                    for j in self.host_reads(u, i) {
+                        let t = TensorId(j as u32);
+                        if !k.reads.contains(&t) {
+                            k.reads.push(t);
+                        }
+                    }
+                }
+                k
+            })
             .collect();
 
         WgslProgram {
@@ -236,6 +417,33 @@ impl TensorGraph {
             buffers,
             aliases,
         }
+    }
+
+    /// Whether `j` is evaluated inline in the kernel of `root`: an
+    /// inlined node, or one hosted by `root` (`TNode::host`).
+    pub(super) fn inlined_in(&self, j: usize, root: usize) -> bool {
+        self.nodes[j].inline || self.nodes[j].host == Some(TensorId(root as u32))
+    }
+
+    /// The buffer-backed nodes side job `u` of kernel `host` reads: `u`'s
+    /// inline closure as seen from that kernel.
+    pub(super) fn host_reads(&self, u: usize, host: usize) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut stack = self.deps(u);
+        while let Some(j) = stack.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            match &self.nodes[j].op {
+                Op::Iota(_) => {}
+                Op::Reshape(_) => stack.extend(self.deps(j)),
+                Op::Comp(_) if self.inlined_in(j, host) => stack.extend(self.deps(j)),
+                _ => out.push(j),
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Nodes reachable from `i` through inlined comps, including `i`,
@@ -254,9 +462,13 @@ impl TensorGraph {
             }
             stack.push((j, true));
             let descend = match &self.nodes[j].op {
-                Op::Comp(_) => j == i || self.nodes[j].inline,
+                Op::Comp(_) => j == i || self.inlined_in(j, i),
                 Op::Reshape(_) => true,
-                Op::Input(_) | Op::Iota(_) => false,
+                Op::Input(_) | Op::Iota(_) | Op::Scan(_) => false,
+                Op::Operator(o) => panic!(
+                    "operator node `{}` has no device lowering; evaluate it on the host",
+                    o.op.name()
+                ),
             };
             if descend {
                 stack.extend(self.deps(j).into_iter().map(|d| (d, false)));
@@ -274,12 +486,19 @@ impl TensorGraph {
             .copied()
             .filter(|&j| {
                 j != root
-                    && !self.nodes[j].inline
+                    && !self.inlined_in(j, root)
                     && !matches!(self.nodes[j].op, Op::Iota(_) | Op::Reshape(_))
             })
             .collect();
 
         let mut s = String::new();
+        let uses_f16 = order.iter().chain(std::iter::once(&root)).any(|&j| {
+            self.nodes[j].precision.storage == Format::F16
+                || self.nodes[j].precision.accum == Format::F16
+        });
+        if native_f16() && uses_f16 {
+            writeln!(s, "enable f16;").unwrap();
+        }
         writeln!(s, "// Auto-generated by tang-compile from a TensorGraph").unwrap();
         writeln!(
             s,
@@ -362,6 +581,7 @@ impl TensorGraph {
                 points,
                 count: points,
                 workgroup_size: 256,
+                writes: Vec::new(),
             };
         }
 
@@ -375,11 +595,24 @@ impl TensorGraph {
         let m = rc.monoid.as_ref().expect("split needs a reduction");
         let (w, w_out) = (rc.width(), c.width());
         let r_total = numel(&rc.red);
-        writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {split}>;").unwrap();
+        // needs whole subgroups: split a power of two ≥ 128 covers every
+        // subgroup size in use (4–128 lanes)
+        let sg = self.nodes[root].subgroup
+            && caps().subgroups
+            && split >= 128
+            && split.is_power_of_two();
+        // subgroup tree: one partial per subgroup (≥ 4 lanes everywhere)
+        let slots = if sg { split.div_ceil(4) } else { split };
+        writeln!(s, "var<workgroup> wg_acc: array<array<f32, {w}>, {slots}>;").unwrap();
         writeln!(s, "@compute @workgroup_size({split})").unwrap();
+        let sg_args = if sg {
+            ", @builtin(subgroup_size) sg_size: u32, @builtin(subgroup_invocation_id) sg_lane: u32"
+        } else {
+            ""
+        };
         writeln!(
             s,
-            "fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{"
+            "fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>{sg_args}) {{"
         )
         .unwrap();
         writeln!(s, "    let g = wid.x + wid.y * 65535u;").unwrap();
@@ -409,23 +642,48 @@ impl TensorGraph {
             self.nodes[red_node].precision.accum,
         );
         writeln!(s, "    }}").unwrap();
-        writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
-        writeln!(s, "    workgroupBarrier();").unwrap();
-        writeln!(
-            s,
-            "    for (var stride: u32 = {split}u / 2u; stride > 0u; stride = stride / 2u) {{"
-        )
-        .unwrap();
-        writeln!(s, "        if (tid < stride) {{").unwrap();
-        writeln!(
-            s,
-            "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
-        )
-        .unwrap();
-        writeln!(s, "        }}").unwrap();
-        writeln!(s, "        workgroupBarrier();").unwrap();
-        writeln!(s, "    }}").unwrap();
-        writeln!(s, "    if (tid == 0u) {{").unwrap();
+        if sg {
+            emit_subgroup_reduce(&mut s, "    ", m, red_node);
+            writeln!(
+                s,
+                "    if (sg_lane == 0u) {{ wg_acc[tid / sg_size] = {}; }}",
+                acc_array(w)
+            )
+            .unwrap();
+            writeln!(s, "    workgroupBarrier();").unwrap();
+            // the subgroups' partials, folded by thread 0 (a handful:
+            // split / subgroup size)
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+            writeln!(
+                s,
+                "        for (var i: u32 = 1u; i < {split}u / sg_size; i = i + 1u) {{"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "            wg_acc[0] = combine_{red_node}(wg_acc[0], wg_acc[i]);"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+        } else {
+            writeln!(s, "    wg_acc[tid] = {};", acc_array(w)).unwrap();
+            writeln!(s, "    workgroupBarrier();").unwrap();
+            writeln!(
+                s,
+                "    for (var stride: u32 = {split}u / 2u; stride > 0u; stride = stride / 2u) {{"
+            )
+            .unwrap();
+            writeln!(s, "        if (tid < stride) {{").unwrap();
+            writeln!(
+                s,
+                "            wg_acc[tid] = combine_{red_node}(wg_acc[tid], wg_acc[tid + stride]);"
+            )
+            .unwrap();
+            writeln!(s, "        }}").unwrap();
+            writeln!(s, "        workgroupBarrier();").unwrap();
+            writeln!(s, "    }}").unwrap();
+            writeln!(s, "    if (tid == 0u) {{").unwrap();
+        }
         if red_node == root {
             for slot in 0..w {
                 let st = store(
@@ -464,6 +722,7 @@ impl TensorGraph {
             points,
             count: points * split,
             workgroup_size: split,
+            writes: Vec::new(),
         }
     }
 
@@ -477,7 +736,7 @@ impl TensorGraph {
             .collect::<Vec<_>>()
             .join(", ");
         match &node.op {
-            Op::Input(_) => {
+            Op::Input(_) | Op::Scan(_) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 let v = load(
                     node.precision.storage,
@@ -487,6 +746,10 @@ impl TensorGraph {
                 writeln!(s, "    return {v};").unwrap();
                 writeln!(s, "}}\n").unwrap();
             }
+            Op::Operator(o) => panic!(
+                "operator node `{}` has no device lowering; evaluate it on the host",
+                o.op.name()
+            ),
             Op::Iota(d) => {
                 writeln!(s, "fn read_{j}({coords}) -> f32 {{").unwrap();
                 writeln!(s, "    return f32(c{d});").unwrap();
@@ -543,6 +806,32 @@ impl TensorGraph {
         }
     }
 
+    /// Node `j`'s [`Segment`](super::Segment) as `(reduce dim, key buffer,
+    /// point dim)` when it still holds: the key a materialized 1-D buffer
+    /// read by an arg of `c` as `key[r_red]`. `TANG_NO_SEGMENT=1` ignores it.
+    fn segment_read(&self, j: usize, c: &Comp) -> Option<(usize, usize, usize)> {
+        let sg = self.nodes[j].segment?;
+        if std::env::var("TANG_NO_SEGMENT").as_deref() == Ok("1") {
+            return None;
+        }
+        let key = sg.key.n();
+        let k = c.points().len();
+        let node = &self.nodes[key];
+        let ok = sg.red < c.red.len()
+            && sg.point < k
+            && node.sorted
+            && !node.inline
+            && node.shape.len() == 1
+            && matches!(node.precision.storage, super::Format::F32)
+            && c.args.iter().any(|a| {
+                a.src == sg.key
+                    && !a.view.is_gather()
+                    && !a.view.guard
+                    && a.view.forms[0].as_unit() == Some(k + sg.red)
+            });
+        ok.then_some((sg.red, key, sg.point))
+    }
+
     /// `point_j(p…) -> array<f32, W>`: the comp at one output point.
     fn emit_point(&self, s: &mut String, j: usize, c: &Comp) {
         let w = c.width();
@@ -559,13 +848,45 @@ impl TensorGraph {
             return;
         };
         emit_scalar_acc(s, "    ", m);
+        // a segmented sum: the run of the sorted key equal to the point
+        // coord, found by two binary searches (the body still gates)
+        let seg = self.segment_read(j, c);
+        if let Some((red, key, point)) = seg {
+            let n = fixed(&c.red)[red];
+            let steps = usize::BITS - n.leading_zeros() + 1;
+            // one statement a line: the CUDA and MSL dialects translate
+            // declarations at line starts
+            for (name, cmp) in [("seg_lo", "<"), ("seg_hi", "<=")] {
+                write!(
+                    s,
+                    "    var {name}: u32 = 0u;
+    var {name}_end: u32 = {n}u;
+    for (var {name}_it: u32 = 0u; {name}_it < {steps}u; {name}_it = {name}_it + 1u) {{
+        if ({name} < {name}_end) {{
+            let {name}_mid: u32 = ({name} + {name}_end) / 2u;
+            if (read_{key}({name}_mid) {cmp} f32(p{point})) {{ {name} = {name}_mid + 1u; }} else {{ {name}_end = {name}_mid; }}
+        }}
+    }}
+"
+                )
+                .unwrap();
+            }
+        }
         let mut indent = String::from("    ");
         for (i, n) in fixed(&c.red).into_iter().enumerate() {
-            writeln!(
-                s,
-                "{indent}for (var r{i}: u32 = 0u; r{i} < {n}u; r{i} = r{i} + 1u) {{"
-            )
-            .unwrap();
+            if seg.is_some_and(|q| q.0 == i) {
+                writeln!(
+                    s,
+                    "{indent}for (var r{i}: u32 = seg_lo; r{i} < seg_hi; r{i} = r{i} + 1u) {{"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "{indent}for (var r{i}: u32 = 0u; r{i} < {n}u; r{i} = r{i} + 1u) {{"
+                )
+                .unwrap();
+            }
             indent.push_str("    ");
         }
         emit_step(
@@ -582,6 +903,47 @@ impl TensorGraph {
         writeln!(s, "    return {};", acc_array(w)).unwrap();
         writeln!(s, "}}\n").unwrap();
     }
+}
+
+/// Reduce the scalar accumulators `acc0…` across the subgroup, leaving
+/// the total in every lane. Sum and max use the subgroup built-ins; any
+/// other monoid runs a butterfly of `subgroupShuffleXor`s through its
+/// combine (associative, so the pairing order is free; the combine
+/// may be non-commutative only if it is order-insensitive in value,
+/// which every monoid here is — the tree combine already assumes it).
+fn emit_subgroup_reduce(s: &mut String, indent: &str, m: &Monoid, j: usize) {
+    use super::MonoidKind;
+    match m.kind() {
+        MonoidKind::Sum => {
+            writeln!(s, "{indent}acc0 = subgroupAdd(acc0);").unwrap();
+            return;
+        }
+        MonoidKind::Max => {
+            writeln!(s, "{indent}acc0 = subgroupMax(acc0);").unwrap();
+            return;
+        }
+        _ => {}
+    }
+    let w = m.width;
+    writeln!(
+        s,
+        "{indent}for (var o: u32 = sg_size / 2u; o > 0u; o = o / 2u) {{"
+    )
+    .unwrap();
+    let others = (0..w)
+        .map(|i| format!("subgroupShuffleXor(acc{i}, o)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        s,
+        "{indent}    let sx = combine_{j}({}, array<f32, {w}>({others}));",
+        acc_array(w)
+    )
+    .unwrap();
+    for i in 0..w {
+        writeln!(s, "{indent}    acc{i} = sx[{i}];").unwrap();
+    }
+    writeln!(s, "{indent}}}").unwrap();
 }
 
 /// `var acc0: f32 = id0; …` — accumulator slots as scalars, so the
@@ -647,6 +1009,7 @@ pub(super) fn emit_scalar_mapped(
             Node::Recip(a) => format!("1.0 / {}", e(a)),
             Node::Sqrt(a) => format!("sqrt({})", e(a)),
             Node::Sin(a) => format!("sin({})", e(a)),
+            Node::Floor(a) => format!("floor({})", e(a)),
             Node::Atan2(a, b) => format!("atan2({}, {})", e(a), e(b)),
             Node::Exp2(a) => format!("exp2({})", e(a)),
             Node::Log2(a) => format!("log2({})", e(a)),
@@ -725,6 +1088,24 @@ fn arg_read_with(g: &TensorGraph, c: &Comp, a: &super::Arg, pts: &str) -> String
             format!("({})", terms.join(" + "))
         })
         .collect();
+    // a gather adds `coef · index`, the index arg's value rounded to an
+    // integer (index tensors are f32; exact below 2^24)
+    let signed = match &a.view.gather {
+        None => signed,
+        Some(gt) => {
+            let index = arg_read_with(g, c, &c.args[gt.arg], pts);
+            let iv = format!("i32(round({index}))");
+            signed
+                .into_iter()
+                .zip(&gt.coefs)
+                .map(|(e, &coef)| match coef {
+                    0 => e,
+                    1 => format!("({e} + {iv})"),
+                    _ => format!("({e} + {coef} * {iv})"),
+                })
+                .collect()
+        }
+    };
     let idx: Vec<String> = signed.iter().map(|e| format!("u32({e})")).collect();
     let read = format!("read_{}({})", a.src.n(), idx.join(", "));
     if !a.view.guard {
@@ -765,11 +1146,14 @@ pub(super) fn emit_decompose(s: &mut String, g: &str, shape: &[usize], prefix: &
 }
 
 pub(super) fn lit(v: f64) -> String {
-    if v == f64::NEG_INFINITY {
-        return "-3.4028235e38".into();
+    // ±f32::MAX (the max monoid's identity stands in for ±∞) as an exact hex float. The
+    // shortest decimal, 3.4028235e38, is above f32::MAX before rounding: naga accepts it,
+    // but Tint (Chrome's WebGPU) rejects it as unrepresentable.
+    if v == f64::NEG_INFINITY || (v as f32) == f32::MIN {
+        return "-0x1.fffffep+127f".into();
     }
-    if v == f64::INFINITY {
-        return "3.4028235e38".into();
+    if v == f64::INFINITY || (v as f32) == f32::MAX {
+        return "0x1.fffffep+127f".into();
     }
     let s = format!("{:?}", v as f32);
     if s.contains('.') || s.contains('e') {
@@ -790,7 +1174,7 @@ fn emit_scalar_fn(s: &mut String, name: &str, g: &ExprGraph, outs: &[ExprId], n_
     writeln!(s, "}}\n").unwrap();
 }
 
-fn emit_combine(s: &mut String, j: usize, m: &Monoid, accum: Format) {
+pub(super) fn emit_combine(s: &mut String, j: usize, m: &Monoid, accum: Format) {
     let w = m.width;
     writeln!(
         s,
@@ -823,6 +1207,7 @@ fn emit_scalar_body(s: &mut String, g: &ExprGraph, outs: &[ExprId], round: Forma
             Node::Recip(a) => format!("1.0 / {}", e(a)),
             Node::Sqrt(a) => format!("sqrt({})", e(a)),
             Node::Sin(a) => format!("sin({})", e(a)),
+            Node::Floor(a) => format!("floor({})", e(a)),
             Node::Atan2(a, b) => format!("atan2({}, {})", e(a), e(b)),
             Node::Exp2(a) => format!("exp2({})", e(a)),
             Node::Log2(a) => format!("log2({})", e(a)),
@@ -851,20 +1236,36 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
             Format::F32 => "f32",
             Format::F16 => "f16",
             Format::BF16 => "bf16",
+            Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => "fp8",
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
         Format::F32 => "f32",
+        Format::F16 if native_f16() => "f16",
         Format::F16 => "u32",
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
 /// Element type of the output buffer: packed f16 halves of one word are
 /// written by different threads, so the word is atomic.
-fn out_ty(f: Format) -> &'static str {
+pub(super) fn out_ty(f: Format) -> &'static str {
     match f {
-        Format::F16 if dialect() == Dialect::Wgsl => "atomic<u32>",
+        Format::F16 if dialect() == Dialect::Wgsl && !native_f16() => "atomic<u32>",
         f => elem_ty(f),
     }
 }
@@ -883,12 +1284,30 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
             Format::F32 => format!("{buf}[{idx}]"),
             Format::F16 => format!("tang_h2f({buf}[{idx}])"),
             Format::BF16 => format!("tang_b2f({buf}[{idx}])"),
+            Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+                format!("tang_fp8_needs_tile({buf}[{idx}])")
+            }
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
         Format::F32 => format!("{buf}[{idx}]"),
+        Format::F16 if native_f16() => format!("f32({buf}[{idx}])"),
         Format::F16 => format!("unpack2x16float({buf}[({idx}) >> 1u])[({idx}) & 1u]"),
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -901,6 +1320,17 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             Format::F32 => format!("out[{idx}] = {v};"),
             Format::F16 => format!("out[{idx}] = half({v});"),
             Format::BF16 => format!("out[{idx}] = bfloat({v});"),
+            Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+                panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+            }
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     if dialect() == Dialect::Cuda {
@@ -908,16 +1338,34 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             Format::F32 => format!("out[{idx}] = {v};"),
             Format::F16 => format!("out[{idx}] = tang_f2h({v});"),
             Format::BF16 => format!("out[{idx}] = tang_f2b({v});"),
+            Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+                panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+            }
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     match f {
         Format::F32 => format!("out[{idx}] = {v};"),
+        Format::F16 if native_f16() => format!("out[{idx}] = f16({v});"),
         Format::F16 => format!(
             "{{ let i_ = {idx}; let sh_ = (i_ & 1u) * 16u; \
              atomicAnd(&out[i_ >> 1u], ~(0xffffu << sh_)); \
              atomicOr(&out[i_ >> 1u], (pack2x16float(vec2<f32>({v}, 0.0)) & 0xffffu) << sh_); }}"
         ),
         Format::BF16 => panic!("bf16 storage is interpreter-only: WGSL has no bf16 type"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 
@@ -931,6 +1379,17 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             Format::F32 => e.to_string(),
             Format::F16 => format!("f32(half({e}))"),
             Format::BF16 => format!("f32(bfloat({e}))"),
+            Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+                panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+            }
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
         };
     }
     if dialect() == Dialect::Cuda {
@@ -938,12 +1397,29 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             Format::F32 => e.to_string(),
             Format::F16 => format!("tang_h2f(tang_f2h({e}))"),
             Format::BF16 => format!("tang_b2f(tang_f2b({e}))"),
+            Format::Q4K
+            | Format::Q5K
+            | Format::Q6K
+            | Format::Q8_0
+            | Format::Q8x32
+            | Format::Q8x32F => {
+                unreachable!("block formats lower only through the int8 MMA kernel")
+            }
+            // only the FP8 tile reads it; this fallback body is replaced
+            _ => e.to_string(),
         };
     }
     match f {
         Format::F32 => e.to_string(),
+        Format::F16 if native_f16() => format!("f32(f16({e}))"),
         Format::F16 => format!("unpack2x16float(pack2x16float(vec2<f32>({e}, 0.0))).x"),
         Format::BF16 => panic!("bf16 accumulation is interpreter-only"),
+        Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
+            panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
+        }
+        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+            unreachable!("block formats lower only through the int8 MMA kernel")
+        }
     }
 }
 

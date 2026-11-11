@@ -145,21 +145,21 @@ impl ComputeBuffer for CudaBuffer {
 
     fn to_vec(&self) -> Vec<f32> {
         match self.storage() {
-            CudaStorage::F32(s) => s.stream().memcpy_dtov(s).unwrap(),
+            CudaStorage::F32(s) => s.stream().clone_dtoh(s).unwrap(),
             CudaStorage::Bf16(s) => {
-                let u16_data: Vec<u16> = s.stream().memcpy_dtov(s).unwrap();
+                let u16_data: Vec<u16> = s.stream().clone_dtoh(s).unwrap();
                 u16_data.iter().map(|&b| bf16_to_f32(b)).collect()
             }
             // The raw repacked bytes, 4 per element (what the portable `upload_q2` stores).
             CudaStorage::Q2(q) => {
-                let bytes: Vec<u8> = q.data.stream().memcpy_dtov(&q.data).unwrap();
+                let bytes: Vec<u8> = q.data.stream().clone_dtoh(&q.data).unwrap();
                 crate::flash::words_of(&crate::flash::bytes_to_words(&bytes))
             }
             CudaStorage::Q4(q) => {
                 let stream = q.packed.stream();
-                let packed: Vec<u32> = stream.memcpy_dtov(&q.packed).unwrap();
-                let scales: Vec<u16> = stream.memcpy_dtov(&q.scales).unwrap();
-                let biases: Vec<u16> = stream.memcpy_dtov(&q.biases).unwrap();
+                let packed: Vec<u32> = stream.clone_dtoh(&q.packed).unwrap();
+                let scales: Vec<u16> = stream.clone_dtoh(&q.scales).unwrap();
+                let biases: Vec<u16> = stream.clone_dtoh(&q.biases).unwrap();
                 (0..self.len)
                     .map(|i| {
                         let v = (packed[i / 8] >> (4 * (i % 8))) & 0xf;
@@ -216,6 +216,8 @@ use crate::pool::BufferPool;
 mod flash;
 mod llm;
 mod moe;
+mod rows;
+pub use rows::{Real, RowKernel, RowLoad, RowStore};
 
 /// Extended pool diagnostics.
 pub struct PoolStats {
@@ -255,6 +257,63 @@ pub fn cuda_memory_info() -> Result<(String, usize, usize), cudarc::driver::Driv
 }
 
 impl CudaComputeDevice {
+    /// Create a CUDA device on `ordinal` (the default [`CudaComputeDevice::new`] is 0).
+    pub fn on(ordinal: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let ctx = CudaContext::new(ordinal)?;
+        // Single-stream: disable event tracking to avoid per-op cuEventRecord overhead
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        // Use non-blocking stream to support CUDA graph capture
+        let stream = ctx.new_stream()?;
+        let cublas = CudaBlas::new(stream.clone()).expect("Failed to create cuBLAS handle");
+        if std::env::var("GAIA_TF32")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            unsafe {
+                cudarc::cublas::sys::cublasSetMathMode(
+                    *cublas.handle(),
+                    cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+                );
+            }
+        }
+        Ok(CudaComputeDevice {
+            ctx,
+            stream,
+            cublas,
+            module_cache: RefCell::new(HashMap::new()),
+            mixed_precision: false,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
+        })
+    }
+
+    /// Borrow an existing cudarc context and stream (e.g. phyz-gpu's or the host
+    /// application's) so tang kernels and cuBLAS run on the caller's context, in order with
+    /// the caller's work on `stream`. f32 precision. Event tracking is left as the caller set
+    /// it (the owned constructors disable it; CUDA graph capture needs it off and a non-default
+    /// stream). `stream` must belong to `ctx`.
+    pub fn from_stream(
+        ctx: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Result<Self, cudarc::cublas::result::CublasError> {
+        let cublas = CudaBlas::new(stream.clone())?;
+        Ok(CudaComputeDevice {
+            ctx,
+            stream,
+            cublas,
+            module_cache: RefCell::new(HashMap::new()),
+            mixed_precision: false,
+            pool: Arc::new(Mutex::new(BufferPool::new())),
+            llm_funcs: RefCell::new(HashMap::new()),
+            flash_sync: RefCell::new(None),
+            flash_src: RefCell::new(None),
+        })
+    }
+
     /// Create a new CUDA device (ordinal 0), f32 precision.
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
         let ctx = CudaContext::new(0)?;
@@ -345,6 +404,17 @@ impl CudaComputeDevice {
     }
 
     /// Wrap storage + len into a pooled CudaBuffer (returned to pool on drop).
+    /// The OOM path's end: the pool is cleared and the retry still failed. The device's
+    /// alloc signature is infallible (ComputeDevice::alloc -> Self::Buffer), so this is a
+    /// panic — but one that names the cause and the ask (a fallible alloc is the real fix,
+    /// so a full GPU answers 503 per request instead of killing the server).
+    fn oom(bytes: usize, e: &cudarc::driver::DriverError) -> ! {
+        panic!(
+            "tang-compute: CUDA alloc of {} MB failed after clearing the buffer pool: {e:?}              (the GPU is genuinely full — another process or model holds the rest; a per-             request 503 needs a fallible alloc, see crates/tang-compute/src/cuda.rs)",
+            bytes / (1024 * 1024),
+        )
+    }
+
     fn make_buf(&self, storage: CudaStorage, len: usize) -> CudaBuffer {
         CudaBuffer {
             storage: Some(storage),
@@ -379,8 +449,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = self.stream.alloc_zeros::<f32>(len).unwrap();
-                self.make_buf(CudaStorage::F32(slice), len)
+                match self.stream.alloc_zeros::<f32>(len) {
+                    Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+                    Err(e) => Self::oom(len * 4, &e),
+                }
             }
         }
     }
@@ -402,8 +474,10 @@ impl CudaComputeDevice {
             Err(_) => {
                 // OOM — evict pool and retry
                 self.pool.lock().unwrap().clear();
-                let slice = unsafe { self.stream.alloc::<f32>(len).unwrap() };
-                self.make_buf(CudaStorage::F32(slice), len)
+                match unsafe { self.stream.alloc::<f32>(len) } {
+                    Ok(slice) => self.make_buf(CudaStorage::F32(slice), len),
+                    Err(e) => Self::oom(len * 4, &e),
+                }
             }
         }
     }
@@ -424,8 +498,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = self.stream.alloc_zeros::<u16>(len).unwrap();
-                self.make_buf(CudaStorage::Bf16(slice), len)
+                match self.stream.alloc_zeros::<u16>(len) {
+                    Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+                    Err(e) => Self::oom(len * 2, &e),
+                }
             }
         }
     }
@@ -445,8 +521,10 @@ impl CudaComputeDevice {
             Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
             Err(_) => {
                 self.pool.lock().unwrap().clear();
-                let slice = unsafe { self.stream.alloc::<u16>(len).unwrap() };
-                self.make_buf(CudaStorage::Bf16(slice), len)
+                match unsafe { self.stream.alloc::<u16>(len) } {
+                    Ok(slice) => self.make_buf(CudaStorage::Bf16(slice), len),
+                    Err(e) => Self::oom(len * 2, &e),
+                }
             }
         }
     }
@@ -516,6 +594,20 @@ impl CudaComputeDevice {
         assert!(buf.len >= data.len(), "buffer too small for upload_into");
         let dst = buf.f32_data_mut();
         self.stream.memcpy_htod(data, dst).unwrap();
+    }
+
+    /// Upload f32 data into `buf` at element `offset`, leaving the rest alone (async,
+    /// ordered on this device's stream).
+    pub fn upload_into_f32_at(&self, buf: &mut CudaBuffer, offset: usize, data: &[f32]) {
+        assert!(
+            offset + data.len() <= buf.len,
+            "upload_into_f32_at out of bounds"
+        );
+        let mut view = buf
+            .f32_data_mut()
+            .try_slice_mut(offset..offset + data.len())
+            .unwrap();
+        self.stream.memcpy_htod(data, &mut view).unwrap();
     }
 
     /// Upload u32 data into an existing f32 buffer (async, graph-capturable).
@@ -614,7 +706,7 @@ impl CudaComputeDevice {
     /// Upload data as f32 regardless of mixed_precision mode.
     /// Used for elementwise kernels and other f32-only operations.
     fn upload_f32(&self, data: &[f32]) -> CudaBuffer {
-        let slice = self.stream.memcpy_stod(data).unwrap();
+        let slice = self.stream.clone_htod(data).unwrap();
         Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
     }
 
@@ -1290,10 +1382,10 @@ impl ComputeDevice for CudaComputeDevice {
     fn upload(&self, data: &[f32]) -> CudaBuffer {
         if self.mixed_precision {
             let bf16_data: Vec<u16> = data.iter().map(|&v| f32_to_bf16(v)).collect();
-            let slice = self.stream.memcpy_stod(&bf16_data).unwrap();
+            let slice = self.stream.clone_htod(&bf16_data).unwrap();
             Self::make_buf_unpooled(CudaStorage::Bf16(slice), data.len())
         } else {
-            let slice = self.stream.memcpy_stod(data).unwrap();
+            let slice = self.stream.clone_htod(data).unwrap();
             Self::make_buf_unpooled(CudaStorage::F32(slice), data.len())
         }
     }
@@ -4552,7 +4644,7 @@ impl ComputeDevice for CudaComputeDevice {
 
     fn download_bf16(&self, buf: &CudaBuffer) -> Vec<u16> {
         match buf.storage() {
-            CudaStorage::Bf16(s) => self.stream.memcpy_dtov(s).unwrap(),
+            CudaStorage::Bf16(s) => self.stream.clone_dtoh(s).unwrap(),
             _ => buf.to_vec().into_iter().map(f32_to_bf16).collect(),
         }
     }
@@ -4948,6 +5040,33 @@ impl ComputeDevice for CudaComputeDevice {
         )
     }
 
+    fn tkv_decode(
+        &self,
+        stream: &CudaBuffer,
+        lanes: &CudaBuffer,
+        chans: &CudaBuffer,
+        prior: &CudaBuffer,
+        scratch: &CudaBuffer,
+        out: &CudaBuffer,
+        rope: Option<(&CudaBuffer, &CudaBuffer)>,
+        n_lanes: usize,
+    ) {
+        CudaComputeDevice::tkv_decode(
+            self, stream, lanes, chans, prior, scratch, out, rope, n_lanes,
+        );
+    }
+
+    fn kivi_dequant(
+        &self,
+        codes: &CudaBuffer,
+        sz: &CudaBuffer,
+        out: &CudaBuffer,
+        pages: Option<(&CudaBuffer, u32)>,
+        p: [u32; 6],
+    ) {
+        CudaComputeDevice::kivi_dequant(self, codes, sz, out, pages, p);
+    }
+
     fn rope_half_cached(
         &self,
         input: &CudaBuffer,
@@ -5181,8 +5300,8 @@ impl ComputeDevice for CudaComputeDevice {
         let n_bufs = bufs.len() as u32;
 
         // Upload pointer and offset arrays to GPU
-        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
-        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+        let ptrs_gpu = self.stream.clone_htod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.clone_htod(&offsets).unwrap();
         let mut acc = self.stream.alloc_zeros::<f32>(1).unwrap();
 
         // Single fused kernel: all buffers in one launch
@@ -5268,8 +5387,8 @@ impl ComputeDevice for CudaComputeDevice {
             _records.push(record);
         }
 
-        let ptrs_gpu = self.stream.memcpy_stod(&ptrs).unwrap();
-        let offsets_gpu = self.stream.memcpy_stod(&offsets).unwrap();
+        let ptrs_gpu = self.stream.clone_htod(&ptrs).unwrap();
+        let offsets_gpu = self.stream.clone_htod(&offsets).unwrap();
 
         let cfg = LaunchConfig {
             block_dim: (256, 1, 1),
@@ -5293,7 +5412,7 @@ impl ComputeDevice for CudaComputeDevice {
         drop(_records);
 
         // Download norm for logging (memcpy_dtov syncs stream internally)
-        let norm_sq_val = self.stream.memcpy_dtov(norm_sq_buf.f32_data()).unwrap()[0];
+        let norm_sq_val = self.stream.clone_dtoh(norm_sq_buf.f32_data()).unwrap()[0];
         (norm_sq_val as f64).sqrt() as f32
     }
 }

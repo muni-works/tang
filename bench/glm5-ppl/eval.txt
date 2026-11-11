@@ -1,0 +1,367 @@
+The harbor town woke slowly in winter. Before the first ferry, the only sounds were gulls arguing over the fish market roof and the low knock of hulls against the pilings. Mara walked the length of the pier every morning at six, a habit she had kept since her father ran the bait shop that now sold coffee and postcards. She did not mind the change. The coffee was good, and the postcards showed the lighthouse as it had looked before the storm took its lantern room, which seemed to her a kind of honesty.
+
+That morning the water was flat and grey, the colour of a spoon left out overnight. A single trawler sat at the mouth of the channel with its lights still on. She watched it for a while, waiting for it to move, and when it did not she went inside the harbor office and asked Tomas whether anyone had called in.
+
+"Engine trouble," he said, without looking up from the radio. "They lost power around four. The Coast Guard boat is coming from Ardley, but it will be an hour at least."
+
+"Is anyone hurt?"
+
+"Cold, mostly. Three crew. The skipper is the Halvorsen boy."
+
+Mara knew the Halvorsen boy, who was nearly forty and still called a boy because his father had been the skipper before him. She knew, too, that the channel shoaled badly on the north side, and that the tide was going out. A boat without power at the channel mouth on a falling tide would drift north. She said this to Tomas, who nodded and said he had already told them to drop anchor, and that they had, and that it was holding. There was nothing to do but wait, so she made two cups of coffee from the machine in the corner and sat with him while the radio hissed.
+
+People who have not lived near the sea tend to imagine it as either peaceful or violent, as if it had moods the way a person does. Those who work on it think of it more as weather and arithmetic: the depth under the keel, the set of the current, the hours until dark. Most disasters, Tomas liked to say, are not caused by a wave. They are caused by a small mistake made early, followed by a long series of reasonable decisions that never go back to fix it.
+
+The Coast Guard boat arrived at seven fifteen. It took the trawler under tow without fuss, and by eight the three crew were in the harbor office drinking the rest of the coffee and complaining about the fuel filter that had clogged. Nobody made a speech. Halvorsen thanked Tomas, thanked Mara for the coffee, and went to call his wife. The trawler sat at the fuel dock for two days while a mechanic from the mainland replaced the filter and, at the skipper's insistence, the entire fuel line.
+
+Later, when people in town told the story, they made it more dramatic than it had been. There was a version in which the anchor dragged and the boat came within a few metres of the rocks, and another in which Mara herself rowed out with a thermos. She never corrected anyone. It seemed harmless, and anyway the real story was not very interesting: a filter clogged, a radio call was made, an anchor held, and a boat came to tow them in. The interesting part, if there was one, was everything that had been done years earlier so that the morning could be that boring. Someone had surveyed the channel. Someone had kept the radio working. Someone had taught a young skipper to drop his anchor before he did anything else.
+
+Economists have a name for spending that prevents a problem nobody will ever see. They call it a public good, and they note that it is chronically underfunded, because the benefit is diffuse and the cost is concrete. A town pays for a dredge every few years and receives, in return, nothing visible at all. The harbor stays the same depth. The boats keep coming in. A budget committee, looking for savings, sees a line item that produces no news and wonders whether it can be cut. Sometimes it is cut, and for a while nothing happens, which seems to prove the point, until the year something does.
+
+Mara thought about this sometimes on her morning walk. The pier itself had been rebuilt twice in her lifetime. Each time the new one looked exactly like the old one, which was the whole idea.
+
+User: I'm trying to understand why my sourdough starter smells like nail polish remover. Is it ruined?
+
+Assistant: It's almost certainly not ruined. That sharp, solvent-like smell usually means the yeast and bacteria have run out of food and are producing more acetone-like byproducts and ethyl acetate. It's a hunger signal. Try feeding it more often, or at a higher ratio, for example one part starter to five parts flour and five parts water by weight, and keep it somewhere a little warmer if your kitchen is cold. Within two or three feedings the smell should shift back toward yogurt or ripe fruit.
+
+User: How do I know when it's ready to bake with?
+
+Assistant: A few practical tests help. First, it should reliably double in volume within four to eight hours after a feeding at room temperature. Put a rubber band around the jar at the starting level so you can see the rise. Second, the top should be domed and full of bubbles at its peak, and it should smell pleasantly sour rather than harsh. Some people use the float test, dropping a spoonful into water to see whether it floats, but that test is unreliable for wetter starters, so I'd trust the rise more than the float.
+
+User: Okay. And if I go on holiday for two weeks?
+
+Assistant: Feed it, let it sit at room temperature for an hour or so, then put it in the fridge with the lid on. A healthy starter survives two weeks in the cold without trouble. When you return, discard most of it, feed it, and give it two or three feedings at room temperature before baking. A layer of grey liquid on top, often called hooch, is normal after a long rest; you can pour it off or stir it in.
+
+User: Thanks, that's really helpful.
+
+Assistant: You're welcome. Good luck with the bake, and if the first loaf comes out dense, that's normal too. Most people need a few tries before the timing feels natural.
+
+//! The tensor map: every GGUF tensor name of `glm5-next` with its shape, and what it is in the
+//! Hugging Face module (verified against llama.cpp's `models/glm5-next.cpp` `load_arch_tensors`
+//! and `conversion/glm.py` `Glm5NextModel.modify_tensors`).
+//!
+//! Conventions that differ from plain HF and matter when reading weights:
+//!
+//! - `ssm_a` holds `-exp(A_log)`, sliced to one value per head (the converter flattens and
+//!   negates).
+//! - `ssm_dt.bias` is HF's `dt_bias`.
+//! - The converter splits HF's fused `kv_b_proj` `[n_head, d_v + d_qk_nope, kv_lora]` into
+//!   `attn_k_b` `[d_qk_nope, kv_lora, n_head]` (transposed) and `attn_v_b` `[kv_lora, d_v, n_head]`.
+//! - The KDA conv1d weights are `[d_conv, 1, d_inner, 1]` (the converter reshapes; the loader
+//!   also accepts a 3-D fallback).
+//! - mHC tensors and `exp_probs_b` are kept F32 by the converter (`tensor_force_quant`).
+
+use super::Hparams;
+use crate::gguf::TensorInfo;
+use anyhow::{ensure, Context, Result};
+
+/// Every non-expert tensor of one trunk layer `l`, with its GGUF name suffix (after `blk.{l}.`)
+/// and shape, in load order. Expert tensors (`ffn_{gate,up,down}_exps`) are handled by [`moe`]
+/// (W5) and are not listed.
+///
+/// `hd` = `kda.head_dim`, `d_inner` = `hd * n_head`; `hc` = hyper-connection streams,
+/// `mix` = `(2 + hc) * hc`.
+#[allow(clippy::type_complexity)]
+pub fn layer_tensors(
+    hp: &Hparams,
+    l: usize,
+) -> Result<Vec<(&'static str, Vec<u64>)>> {
+    let n = hp.n_embd as u64;
+    let hc = hp.hc as u64;
+    let mix = hp.hc_mix_dim() as u64;
+    let mut out: Vec<(&'static str, Vec<u64>)> = vec![
+        ("attn_norm.weight", vec![n]),
+        ("ffn_norm.weight", vec![n]),
+        ("hc_attn_fn.weight", vec![hc * n, mix]),
+        ("hc_attn_base.weight", vec![mix]),
+        ("hc_attn_scale.weight", vec![3]),
+        ("hc_ffn_fn.weight", vec![hc * n, mix]),
+        ("hc_ffn_base.weight", vec![mix]),
+        ("hc_ffn_scale.weight", vec![3]),
+    ];
+    if hp.is_kda[l] {
+        let hd = hp.kda_head_dim as u64;
+        let heads = hp.n_head as u64;
+        let d_inner = hd * heads;
+        let d_conv = hp.ssm_d_conv as u64;
+        out.extend([
+            ("attn_q.weight", vec![n, d_inner]),
+            ("attn_k.weight", vec![n, d_inner]),
+            ("attn_v.weight", vec![n, d_inner]),
+            ("ssm_conv1d_q.weight", vec![d_conv, 1, d_inner, 1]),
+            ("ssm_conv1d_k.weight", vec![d_conv, 1, d_inner, 1]),
+            ("ssm_conv1d_v.weight", vec![d_conv, 1, d_inner, 1]),
+            ("ssm_f_a.weight", vec![n, hd]),
+            ("ssm_f_b.weight", vec![hd, d_inner]),
+            ("ssm_beta.weight", vec![n, heads]),
+            ("ssm_a", vec![heads]),
+            ("ssm_dt.bias", vec![d_inner]),
+            ("ssm_g_a.weight", vec![n, hd]),
+            ("ssm_g_b.weight", vec![hd, d_inner]),
+            ("ssm_norm.weight", vec![hd]),
+            ("attn_output.weight", vec![d_inner, n]),
+        ]);
+    } else {
+        let ql = hp.q_lora_rank as u64;
+        let kl = hp.kv_lora_rank as u64;
+        let heads = hp.n_head as u64;
+        let dqk = hp.d_qk as u64;
+        let dv = hp.d_v as u64;
+        let ih = hp.idx_heads as u64;
+        let idd = hp.idx_dim as u64;
+        let kp = hp.kpool as u64;
+        out.extend([
+            ("attn_q_a_norm.weight", vec![ql]),
+            ("attn_kv_a_norm.weight", vec![kl]),
+            ("attn_q_a.weight", vec![n, ql]),
+            ("attn_q_b.weight", vec![ql, heads * dqk]),
+            ("attn_kv_a_mqa.weight", vec![n, kl]), // NoPE: no rope column
+            ("attn_k_b.weight", vec![dqk, kl, heads]),
+            ("attn_v_b.weight", vec![kl, dv, heads]),
+            ("attn_output.weight", vec![heads * dv, n]),
+        ]);
+        if hp.indexer_full[l] {
+            out.extend([
+                ("indexer.k_norm.weight", vec![idd]),
+                ("indexer.k_norm.bias", vec![idd]),
+                ("indexer.proj.weight", vec![n, ih]),
+                ("indexer.attn_k.weight", vec![n, idd]),
+                ("indexer.attn_q_b.weight", vec![ql, ih * idd]),
+                ("indexer_compressor_gate.weight", vec![n, idd]),
+                ("indexer_compressor_ape.weight", vec![idd, kp]),
+            ]);
+        }
+    }
+    if hp.is_dense(l) {
+        let ff = hp.n_ff as u64;
+        out.extend([
+            ("ffn_gate.weight", vec![n, ff]),
+            ("ffn_down.weight", vec![ff, n]),
+            ("ffn_up.weight", vec![n, ff]),
+        ]);
+    } else {
+        let ne = hp.n_expert as u64;
+        let fe = hp.n_ff_exp as u64;
+        let nsh = hp.n_expert_shared as u64;
+        out.extend([
+            ("ffn_gate_inp.weight", vec![n, ne]),
+            ("exp_probs_b.bias", vec![ne]),
+            ("ffn_gate_exps.weight", vec![n, fe, ne]),
+            ("ffn_down_exps.weight", vec![fe, n, ne]),
+            ("ffn_up_exps.weight", vec![n, fe, ne]),
+            ("ffn_gate_shexp.weight", vec![n, fe * nsh]),
+            ("ffn_down_shexp.weight", vec![fe * nsh, n]),
+            ("ffn_up_shexp.weight", vec![n, fe * nsh]),
+        ]);
+    }
+    Ok(out)
+}
+
+/// Check the file's tensors against the map: every listed name must exist with the listed shape,
+/// and no `blk.{0..n_layer}` tensor may be unknown. Returns the number of trunk tensors checked.
+pub fn check_layer(g: &crate::gguf::Gguf, hp: &Hparams, l: usize) -> Result<usize> {
+    let mut n = 0;
+    for (suffix, dims) in layer_tensors(hp, l)? {
+        let name = super::t(l, suffix);
+        let info: &TensorInfo = g
+            .get(&name)
+            .with_context(|| format!("layer {l}: missing {suffix}"))?;
+        ensure!(
+            info.dims == dims,
+            "blk.{l}.{suffix}: dims {:?}, want {dims:?}",
+            info.dims
+        );
+        n += 1;
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_hp() -> Hparams {
+        Hparams {
+            n_vocab: 64,
+            n_embd: 32,
+            n_layer: 3,
+            n_dense_lead: 1,
+            n_expert_shared: 1,
+            n_ff: 16,
+            n_head: 4,
+            d_qk: 16,
+            d_v: 16,
+            q_lora_rank: 16,
+            kv_lora_rank: 8,
+            kda_head_dim: 8,
+            ssm_d_conv: 4,
+            kda_gate_lower_bound: Some(-5.0),
+            idx_heads: 2,
+            idx_dim: 8,
+            idx_top_k: 8,
+            kpool: 4,
+            kpool_select_tail: true,
+            is_kda: vec![true, false, true],
+            indexer_full: vec![true, true, true],
+            hc: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            n_expert: 4,
+            n_expert_used: 2,
+            n_ff_exp: 8,
+            expert_weights_scale: 2.5,
+            expert_weights_norm: true,
+            swiglu_limit: vec![Some(10.0); 3],
+            eps: 1e-5,
+            n_nextn: 0,
+        }
+    }
+
+    #[test]
+    fn dense_layer_has_no_experts_and_no_indexer() {
+        let hp = tiny_hp();
+        let names: Vec<String> = layer_tensors(&hp, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.to_string())
+            .collect();
+        assert!(names.contains(&"ffn_gate.weight".to_string()));
+        assert!(!names.iter().any(|s| s.contains("exps")));
+        assert!(!names.iter().any(|s| s.contains("indexer")));
+    }
+
+    #[test]
+    fn dsa_layer_has_indexer_and_moe() {
+        let hp = tiny_hp();
+        let names: Vec<String> = layer_tensors(&hp, 1)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.to_string())
+            .collect();
+        assert!(names.contains(&"attn_k_b.weight".to_string()));
+        assert!(names.contains(&"indexer.attn_k.weight".to_string()));
+        assert!(names.contains(&"indexer.proj.weight".to_string()));
+        assert!(names.contains(&"ffn_gate_exps.weight".to_string()));
+    }
+}
+
+#!/usr/bin/env python3
+"""Requantize GLM-5.3-Flash's KDA projection tensors, leave every other byte as it is.
+
+    glm5-kda-requant.py SRC_DIR DST_DIR {q4_k|q5_k} --ggml /path/libggml-base.so
+
+For each `*.gguf` shard in SRC_DIR: the KDA layers' (those with `blk.N.attn_q.weight`)
+attn_q / attn_k / attn_v / attn_output / ssm_f_a / ssm_g_a, stored Q8_0, are dequantized
+(gguf-py) and requantized with ggml's own `ggml_quantize_chunk` (ctypes, no imatrix). All
+metadata and all other tensors are copied verbatim. A shard with no target tensor is
+symlinked, not copied. The MLA layers' attn_output (16384 wide) is not touched.
+
+Needs gguf-py on PYTHONPATH (llama.cpp/gguf-py) and a built libggml-base.so.
+"""
+import argparse
+import ctypes
+import os
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import gguf
+
+TARGETS = ("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+           "ssm_f_a.weight", "ssm_g_a.weight")
+TYPES = {"q4_k": gguf.GGMLQuantizationType.Q4_K, "q5_k": gguf.GGMLQuantizationType.Q5_K}
+
+
+def kda_layers(paths):
+    out = set()
+    for p in paths:
+        for t in gguf.GGUFReader(p).tensors:
+            m = re.match(r"blk\.(\d+)\.attn_q\.weight$", t.name)
+            if m:
+                out.add(int(m.group(1)))
+    return out
+
+
+def is_target(name, layers):
+    m = re.match(r"blk\.(\d+)\.(.+)$", name)
+    return bool(m) and int(m.group(1)) in layers and m.group(2) in TARGETS
+
+
+def requant(lib, qtype, t):
+    assert t.tensor_type == gguf.GGMLQuantizationType.Q8_0, (t.name, t.tensor_type)
+    w = gguf.quants.dequantize(t.data, t.tensor_type).astype(np.float32, copy=False)
+    w = np.ascontiguousarray(w.reshape(-1, w.shape[-1]))
+    rows, cols = w.shape
+    bs, ts = gguf.GGML_QUANT_SIZES[qtype]
+    assert cols % bs == 0, (t.name, cols)
+    rb = cols // bs * ts
+    dst = np.empty((rows, rb), dtype=np.uint8)
+    chunk = max(1, rows // 32)
+
+    def run(r0):
+        n = min(chunk, rows - r0)
+        got = lib.ggml_quantize_chunk(int(qtype), w.ctypes.data_as(ctypes.c_void_p),
+                                      dst.ctypes.data_as(ctypes.c_void_p), r0 * cols, n, cols, None)
+        assert got == n * rb, (t.name, got, n * rb)
+
+    with ThreadPoolExecutor(32) as ex:
+        list(ex.map(run, range(0, rows, chunk)))
+    return dst
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src")
+    ap.add_argument("dst")
+    ap.add_argument("type", choices=TYPES)
+    ap.add_argument("--ggml", required=True)
+    a = ap.parse_args()
+    lib = ctypes.CDLL(a.ggml)
+    lib.ggml_quantize_chunk.restype = ctypes.c_size_t
+    lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+    qtype = TYPES[a.type]
+    srcs = sorted(Path(a.src).glob("*.gguf"))
+    dst = Path(a.dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    layers = kda_layers(srcs)
+    print(f"{len(layers)} KDA layers: {sorted(layers)}", flush=True)
+    tot_old = tot_new = 0
+    for p in srcs:
+        r = gguf.GGUFReader(p)
+        out = dst / p.name
+        if not any(is_target(t.name, layers) for t in r.tensors):
+            if out.exists() or out.is_symlink():
+                out.unlink()
+            os.symlink(p.resolve(), out)
+            print(f"{p.name}: no targets, symlinked", flush=True)
+            continue
+        w = gguf.GGUFWriter(out, arch="", endianess=r.endianess)
+        # the writer adds general.architecture itself; shards 2.. don't carry it: drop it and
+        # copy exactly the source's KV set
+        for kv in w.kv_data:
+            kv.pop(gguf.Keys.General.ARCHITECTURE, None)
+        for f in r.fields.values():
+            if f.name.startswith("GGUF."):
+                continue
+            vt = f.types[0]
+            st = f.types[-1] if vt == gguf.GGUFValueType.ARRAY else None
+            w.add_key_value(f.name, f.contents(), vt, sub_type=st)
+        new = {}
+        for t in r.tensors:
+            if is_target(t.name, layers):
+                d = requant(lib, qtype, t)
+                new[t.name] = d
+                tot_old += t.n_bytes
+                tot_new += d.nbytes
+                w.add_tensor_info(t.name, d.shape, d.dtype, d.nbytes, qtype)
+            else:
+                w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
+        print(f"{p.name}: {len(new)} tensors requantized", flush=True)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_ti_data_to_file()
+        for t in r.tensors:
+            w.write_tensor_data(new.pop(t.name, t.data), tensor_endianess=r.endianess)

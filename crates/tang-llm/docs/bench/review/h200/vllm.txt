@@ -1,0 +1,260 @@
+W1110 07:12:59.014000 20293 torch/_opaque_base.py:6] torch._opaque_base is deprecated, use torch._custom_class_base instead
+W1110 07:12:59.015000 20293 torch/_library/opaque_object.py:288] register_opaque_type is deprecated, use register_custom_class instead
+W1110 07:12:59.015000 20293 torch/_library/opaque_object.py:211] typ='value' is deprecated, use typ='constant' instead
+(MainProcess pid=20293) INFO 11-10 07:13:03 [startup.py:96] non-default args: {'max_model_len': 64000, 'disable_log_stats': True, 'model': '/workspace/fp8'}
+(MainProcess pid=20293) INFO 11-10 07:13:13 [model.py:744] Resolved architecture: Qwen3NextForCausalLM
+(MainProcess pid=20293) INFO 11-10 07:13:13 [model.py:2170] Using max model len 64000
+(MainProcess pid=20293) INFO 11-10 07:13:15 [scheduler.py:310] Chunked prefill is enabled with max_num_batched_tokens=16384.
+(MainProcess pid=20293) INFO 11-10 07:13:15 [config.py:766] Mamba cache mode is set to 'align' for Qwen3NextForCausalLM by default when prefix caching is enabled
+(MainProcess pid=20293) INFO 11-10 07:13:15 [kernel.py:480] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native'])
+(MainProcess pid=20293) INFO 11-10 07:13:15 [compilation.py:317] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=20967) INFO 11-10 07:13:17 [core.py:139] Initializing a V1 LLM engine (v0.33.0) with config: model='/workspace/fp8', speculative_config=None, tokenizer='/workspace/fp8', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=64000, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=fp8, quantization_config=None, enforce_eager=False, aux_output_config=AuxOutputConfig(enable_return_routed_experts=False, max_bytes=None), kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, custom_histogram_buckets=None, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/fp8, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'none', '+quant_fp8'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::qwen4_exp_ple_short_conv', 'vllm::qwen4_exp_qsa_with_output', 'vllm::qwen4_exp_qsa_prepare_with_output', 'vllm::linear_attention', 'vllm::qwen_gdn_attention_core', 'vllm::qwen_gdn_attention_core_fused_norm_packed', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::hpc_rope_norm_forward', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'cudagraph_decoder_replay': True, 'decoder_replay_cudagraph_capture_sizes': [], 'decoder_replay_trim_threshold': 768, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'], gelu_and_mul_sparse=['triton', 'native']), enable_flashinfer_autotune=True, enable_rocm_segmented_attn_autotune=False, enable_cutedsl_warmup=True, enable_jit_warmup=True, monokernel=False, moe_backend='auto', sparse_indexer_topk_backend='auto', linear_backend='auto', linear_backend_per_quant=None)
+(EngineCore pid=20967) INFO 11-10 07:13:17 [parallel_state.py:1929] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_e5b2d26bcf874da6bb0be2aafc8d05fa backend=nccl
+(EngineCore pid=20967) INFO 11-10 07:13:17 [parallel_state.py:2385] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=20967) INFO 11-10 07:13:17 [gpu_worker.py:513] Using V2 Model Runner
+(EngineCore pid=20967) WARNING 11-10 07:13:17 [flashinfer.py:143] FlashInfer's precompiled kernels are missing or do not match flashinfer-python 0.7.2.post1 (flashinfer-cubin not installed, flashinfer-jit-cache not installed). FlashInfer then downloads and compiles kernels at startup, which can take several minutes, or fails to import mismatched ones. Run `vllm download-kernels` in this Python environment to install them.
+(EngineCore pid=20967) INFO 11-10 07:13:18 [model_runner.py:399] Loading model from scratch...
+(EngineCore pid=20967) INFO 11-10 07:13:19 [__init__.py:778] Selected FlashInferFp8DeepGEMMDynamicBlockScaledKernel for Fp8LinearMethod
+(EngineCore pid=20967) INFO 11-10 07:13:19 [deep_gemm.py:200] deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233] Failed to set DeepGEMM PDL on vllm.third_party.deep_gemm: Assertion error (third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72): major > 12 or (major == 12 and minor >= 9): NVCC version must be at least 12.9
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233] C++ trace (most recent call first):
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #0 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x112b34 deep_jit::CUDA::get_compiler_info() const at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #1 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x114eb5 std::_Function_handler<std::shared_ptr<deep_jit::Runtime<deep_jit::CUDA> > (), deep_gemm::init_jit(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)::{lambda()#1}>::_M_invoke(std::_Any_data const&) at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:61
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #2 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x6411e deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA> >::operator->() [clone .constprop.0] at /opt/rh/gcc-toolset-13/root/usr/include/c++/13/bits/std_function.h:591
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #3 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x642d4 torch::stable::detail::boxer<void (bool const&), &deep_gemm::config::set_pdl>::boxed_fn(unsigned long*, unsigned long, unsigned long) at csrc/apis/config.hpp:32
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #4 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x66e24ff void c10::BoxedKernel::make_boxed_functor<StableIValueBoxedKernel>(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #5 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x6706ee7 c10::Dispatcher::callBoxed(c10::OperatorHandle const&, std::vector<c10::IValue, std::allocator<c10::IValue> >*) const [clone .isra.0] at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #6 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb94ce3 torch::jit::invokeOperatorFromPython(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, pybind11::args const&, pybind11::kwargs const&, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #7 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb952df torch::jit::_get_operation_for_overload_or_packet(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #8 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb954d7 torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #9 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xa670dd pybind11::cpp_function::initialize<torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}, pybind11::object, pybind11::args const&, pybind11::kwargs const&, pybind11::name, pybind11::doc>(torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}&&, pybind11::object (*)(pybind11::args const&, pybind11::kwargs const&), pybind11::name const&, pybind11::doc const&)::{lambda(pybind11::detail::function_call&)#1}::_FUN(pybind11::detail::function_call&) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #10 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0x4064f1 pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233]   #11 VLLM::EngineCore+0x1818ec <unknown function> at ??:0
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [deep_gemm.py:233] 
+(EngineCore pid=20967) INFO 11-10 07:13:19 [deep_gemm.py:139] DeepGEMM E8M0 enabled on current platform.
+(EngineCore pid=20967) INFO 11-10 07:13:19 [qwen_gdn_linear_attn.py:300] Using FlashInfer GDN prefill kernel (requested=auto, head_k_dim=128).
+(EngineCore pid=20967) WARNING 11-10 07:13:19 [qwen_gdn_linear_attn.py:307] FlashInfer GDN prefill is JIT-compiled; first run may take a while. Set --gdn-prefill-backend triton to skip JIT.
+(EngineCore pid=20967) INFO 11-10 07:13:19 [fp8.py:536] Using TRITON Fp8 MoE backend out of potential backends: ['TRITON', 'AITER', 'FLASHINFER_TRTLLM', 'FLASHINFER_CUTLASS', 'DEEPGEMM', 'HUMMING', 'MARLIN', 'BATCHED_DEEPGEMM', 'BATCHED_TRITON', 'XPU', 'CPU_W8A8', 'CPU', 'HPC'].
+(EngineCore pid=20967) INFO 11-10 07:13:19 [cuda.py:508] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore pid=20967) INFO 11-10 07:13:19 [flash_attn.py:1122] Using FlashAttention version 3
+(EngineCore pid=20967) INFO 11-10 07:13:20 [base_loader.py:82] Initializing model took 1.222461 seconds
+(EngineCore pid=20967) INFO 11-10 07:13:20 [weight_utils.py:1144] Filesystem type for checkpoints: OVERLAY. Checkpoint size: 74.86 GiB. Available RAM: 204.72 GiB.
+(EngineCore pid=20967) INFO 11-10 07:13:20 [weight_utils.py:1167] Auto-prefetch is disabled because the filesystem (OVERLAY) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/40 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   2% Completed | 1/40 [00:00<00:23,  1.66it/s]
+Loading safetensors checkpoint shards:   5% Completed | 2/40 [00:01<00:23,  1.60it/s]
+Loading safetensors checkpoint shards:   8% Completed | 3/40 [00:01<00:23,  1.55it/s]
+Loading safetensors checkpoint shards:  10% Completed | 4/40 [00:02<00:23,  1.53it/s]
+Loading safetensors checkpoint shards:  12% Completed | 5/40 [00:03<00:22,  1.56it/s]
+Loading safetensors checkpoint shards:  15% Completed | 6/40 [00:03<00:21,  1.55it/s]
+Loading safetensors checkpoint shards:  18% Completed | 7/40 [00:04<00:21,  1.56it/s]
+Loading safetensors checkpoint shards:  20% Completed | 8/40 [00:05<00:20,  1.57it/s]
+Loading safetensors checkpoint shards:  22% Completed | 9/40 [00:05<00:20,  1.55it/s]
+Loading safetensors checkpoint shards:  25% Completed | 10/40 [00:06<00:19,  1.57it/s]
+Loading safetensors checkpoint shards:  28% Completed | 11/40 [00:07<00:18,  1.55it/s]
+Loading safetensors checkpoint shards:  30% Completed | 12/40 [00:07<00:17,  1.57it/s]
+Loading safetensors checkpoint shards:  32% Completed | 13/40 [00:08<00:17,  1.57it/s]
+Loading safetensors checkpoint shards:  35% Completed | 14/40 [00:08<00:16,  1.58it/s]
+Loading safetensors checkpoint shards:  38% Completed | 15/40 [00:09<00:15,  1.57it/s]
+Loading safetensors checkpoint shards:  40% Completed | 16/40 [00:10<00:15,  1.55it/s]
+Loading safetensors checkpoint shards:  42% Completed | 17/40 [00:10<00:14,  1.54it/s]
+Loading safetensors checkpoint shards:  45% Completed | 18/40 [00:11<00:14,  1.56it/s]
+Loading safetensors checkpoint shards:  48% Completed | 19/40 [00:12<00:13,  1.58it/s]
+Loading safetensors checkpoint shards:  50% Completed | 20/40 [00:12<00:12,  1.59it/s]
+Loading safetensors checkpoint shards:  52% Completed | 21/40 [00:13<00:11,  1.59it/s]
+Loading safetensors checkpoint shards:  55% Completed | 22/40 [00:14<00:11,  1.59it/s]
+Loading safetensors checkpoint shards:  57% Completed | 23/40 [00:14<00:10,  1.59it/s]
+Loading safetensors checkpoint shards:  60% Completed | 24/40 [00:15<00:10,  1.57it/s]
+Loading safetensors checkpoint shards:  62% Completed | 25/40 [00:15<00:09,  1.55it/s]
+Loading safetensors checkpoint shards:  65% Completed | 26/40 [00:16<00:08,  1.56it/s]
+Loading safetensors checkpoint shards:  68% Completed | 27/40 [00:17<00:08,  1.57it/s]
+Loading safetensors checkpoint shards:  70% Completed | 28/40 [00:17<00:07,  1.57it/s]
+Loading safetensors checkpoint shards:  72% Completed | 29/40 [00:18<00:06,  1.59it/s]
+Loading safetensors checkpoint shards:  75% Completed | 30/40 [00:19<00:06,  1.59it/s]
+Loading safetensors checkpoint shards:  78% Completed | 31/40 [00:19<00:05,  1.60it/s]
+Loading safetensors checkpoint shards:  80% Completed | 32/40 [00:20<00:05,  1.57it/s]
+Loading safetensors checkpoint shards:  82% Completed | 33/40 [00:21<00:04,  1.56it/s]
+Loading safetensors checkpoint shards:  85% Completed | 34/40 [00:21<00:03,  1.58it/s]
+Loading safetensors checkpoint shards:  88% Completed | 35/40 [00:22<00:03,  1.53it/s]
+Loading safetensors checkpoint shards:  90% Completed | 36/40 [00:22<00:02,  1.55it/s]
+Loading safetensors checkpoint shards:  92% Completed | 37/40 [00:23<00:01,  1.55it/s]
+Loading safetensors checkpoint shards:  95% Completed | 38/40 [00:24<00:01,  1.56it/s]
+Loading safetensors checkpoint shards:  98% Completed | 39/40 [00:24<00:00,  1.57it/s]
+Loading safetensors checkpoint shards: 100% Completed | 40/40 [00:25<00:00,  1.62it/s]
+Loading safetensors checkpoint shards: 100% Completed | 40/40 [00:25<00:00,  1.57it/s]
+
+(EngineCore pid=20967) INFO 11-10 07:13:45 [default_loader.py:506] Loading weights took 25.49 seconds
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584] EngineCore failed to start.
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584] Traceback (most recent call last):
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1555, in run_engine_core
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return func(*args, **kwargs)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1232, in __init__
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     super().__init__(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 150, in __init__
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return func(*args, **kwargs)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 120, in __init__
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self._init_executor()
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 74, in _init_executor
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.driver_worker.load_model()
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 601, in load_model
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 403, in load_model
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.model = model or model_loader.load_model(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]                           ^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return func(*args, **kwargs)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 109, in load_model
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     process_weights_after_loading(model, model_config, target_device)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 186, in process_weights_after_loading
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     quant_method.process_weights_after_loading(module)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/fp8.py", line 416, in process_weights_after_loading
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.fp8_linear.process_weights_after_loading(layer)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py", line 181, in process_weights_after_loading
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     self.fallback.process_weights_after_loading(layer)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/scaled_mm/deep_gemm.py", line 92, in process_weights_after_loading
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py", line 1241, in deepgemm_post_process_fp8_weight_block
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     dg_ws = deepgemm_post_process_weight_scale_block(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py", line 1185, in deepgemm_post_process_weight_scale_block
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return transform_sf_into_required_layout(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/vllm/utils/deep_gemm.py", line 591, in transform_sf_into_required_layout
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return _transform_sf_into_required_layout_impl(
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   File "/workspace/vv/lib/python3.12/site-packages/torch/_ops.py", line 1350, in __call__
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]     return self._op(*args, **kwargs)
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584] RuntimeError: Assertion error (third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72): major > 12 or (major == 12 and minor >= 9): NVCC version must be at least 12.9
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584] C++ trace (most recent call first):
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #0 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x112b34 deep_jit::CUDA::get_compiler_info() const at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #1 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x114eb5 std::_Function_handler<std::shared_ptr<deep_jit::Runtime<deep_jit::CUDA> > (), deep_gemm::init_jit(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)::{lambda()#1}>::_M_invoke(std::_Any_data const&) at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:61
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #2 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x6411e deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA> >::operator->() [clone .constprop.0] at /opt/rh/gcc-toolset-13/root/usr/include/c++/13/bits/std_function.h:591
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #3 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x78397 deep_gemm::layout::transform_sf_into_required_layout(torch::stable::Tensor const&, int const&, int const&, std::variant<std::tuple<int, int, int>, std::tuple<int, int> > const&, std::optional<int> const&, std::optional<bool> const&, bool const&, std::optional<torch::stable::Tensor> const&) at csrc/apis/layout.hpp:24
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #4 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x78f69 torch::stable::detail::boxer<torch::stable::Tensor (torch::stable::Tensor const&, long const&, long const&, std::vector<long, std::allocator<long> > const&, std::optional<long> const&, std::optional<bool> const&, bool const&, std::optional<torch::stable::Tensor> const&), &deep_gemm::torch_registration::transform_sf_into_required_layout>::boxed_fn(unsigned long*, unsigned long, unsigned long) at csrc/apis/layout.hpp:158
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #5 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x66e24ff void c10::BoxedKernel::make_boxed_functor<StableIValueBoxedKernel>(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #6 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x5d9f143 void c10::BoxedKernel::make_boxed_function<&torch::autograd::basicAutogradNotImplementedFallbackImpl>(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #7 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x6706ee7 c10::Dispatcher::callBoxed(c10::OperatorHandle const&, std::vector<c10::IValue, std::allocator<c10::IValue> >*) const [clone .isra.0] at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #8 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb94ce3 torch::jit::invokeOperatorFromPython(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, pybind11::args const&, pybind11::kwargs const&, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #9 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb952df torch::jit::_get_operation_for_overload_or_packet(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #10 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb954d7 torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #11 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xa670dd pybind11::cpp_function::initialize<torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}, pybind11::object, pybind11::args const&, pybind11::kwargs const&, pybind11::name, pybind11::doc>(torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}&&, pybind11::object (*)(pybind11::args const&, pybind11::kwargs const&), pybind11::name const&, pybind11::doc const&)::{lambda(pybind11::detail::function_call&)#1}::_FUN(pybind11::detail::function_call&) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #12 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0x4064f1 pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584]   #13 VLLM::EngineCore+0x1818ec <unknown function> at ??:0
+(EngineCore pid=20967) ERROR 11-10 07:13:50 [core.py:1584] 
+Process EngineCore:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1588, in run_engine_core
+    raise e
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1555, in run_engine_core
+    engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1232, in __init__
+    super().__init__(
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 150, in __init__
+    self.model_executor = executor_class(vllm_config)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 120, in __init__
+    self._init_executor()
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 74, in _init_executor
+    self.driver_worker.load_model()
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 601, in load_model
+    self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 403, in load_model
+    self.model = model or model_loader.load_model(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 109, in load_model
+    process_weights_after_loading(model, model_config, target_device)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 186, in process_weights_after_loading
+    quant_method.process_weights_after_loading(module)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/fp8.py", line 416, in process_weights_after_loading
+    self.fp8_linear.process_weights_after_loading(layer)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py", line 181, in process_weights_after_loading
+    self.fallback.process_weights_after_loading(layer)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/scaled_mm/deep_gemm.py", line 92, in process_weights_after_loading
+    dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py", line 1241, in deepgemm_post_process_fp8_weight_block
+    dg_ws = deepgemm_post_process_weight_scale_block(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py", line 1185, in deepgemm_post_process_weight_scale_block
+    return transform_sf_into_required_layout(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/utils/deep_gemm.py", line 591, in transform_sf_into_required_layout
+    return _transform_sf_into_required_layout_impl(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/torch/_ops.py", line 1350, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Assertion error (third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72): major > 12 or (major == 12 and minor >= 9): NVCC version must be at least 12.9
+C++ trace (most recent call first):
+  #0 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x112b34 deep_jit::CUDA::get_compiler_info() const at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:72
+  #1 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x114eb5 std::_Function_handler<std::shared_ptr<deep_jit::Runtime<deep_jit::CUDA> > (), deep_gemm::init_jit(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)::{lambda()#1}>::_M_invoke(std::_Any_data const&) at third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp:61
+  #2 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x6411e deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA> >::operator->() [clone .constprop.0] at /opt/rh/gcc-toolset-13/root/usr/include/c++/13/bits/std_function.h:591
+  #3 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x78397 deep_gemm::layout::transform_sf_into_required_layout(torch::stable::Tensor const&, int const&, int const&, std::variant<std::tuple<int, int, int>, std::tuple<int, int> > const&, std::optional<int> const&, std::optional<bool> const&, bool const&, std::optional<torch::stable::Tensor> const&) at csrc/apis/layout.hpp:24
+  #4 /workspace/vv/lib/python3.12/site-packages/vllm/third_party/deep_gemm/_C_extension.abi3.so+0x78f69 torch::stable::detail::boxer<torch::stable::Tensor (torch::stable::Tensor const&, long const&, long const&, std::vector<long, std::allocator<long> > const&, std::optional<long> const&, std::optional<bool> const&, bool const&, std::optional<torch::stable::Tensor> const&), &deep_gemm::torch_registration::transform_sf_into_required_layout>::boxed_fn(unsigned long*, unsigned long, unsigned long) at csrc/apis/layout.hpp:158
+  #5 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x66e24ff void c10::BoxedKernel::make_boxed_functor<StableIValueBoxedKernel>(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) at ??:0
+  #6 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x5d9f143 void c10::BoxedKernel::make_boxed_function<&torch::autograd::basicAutogradNotImplementedFallbackImpl>(c10::OperatorKernel*, c10::OperatorHandle const&, c10::DispatchKeySet, std::vector<c10::IValue, std::allocator<c10::IValue> >*) at ??:0
+  #7 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so+0x6706ee7 c10::Dispatcher::callBoxed(c10::OperatorHandle const&, std::vector<c10::IValue, std::allocator<c10::IValue> >*) const [clone .isra.0] at ??:0
+  #8 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb94ce3 torch::jit::invokeOperatorFromPython(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, pybind11::args const&, pybind11::kwargs const&, std::optional<c10::DispatchKey>) at ??:0
+  #9 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb952df torch::jit::_get_operation_for_overload_or_packet(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+  #10 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xb954d7 torch::jit::_get_operation_for_overload_or_packet(std::vector<std::shared_ptr<torch::jit::Operator>, std::allocator<std::shared_ptr<torch::jit::Operator> > > const&, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) at ??:0
+  #11 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0xa670dd pybind11::cpp_function::initialize<torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}, pybind11::object, pybind11::args const&, pybind11::kwargs const&, pybind11::name, pybind11::doc>(torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}&&, pybind11::object (*)(pybind11::args const&, pybind11::kwargs const&), pybind11::name const&, pybind11::doc const&)::{lambda(pybind11::detail::function_call&)#1}::_FUN(pybind11::detail::function_call&) at ??:0
+  #12 /workspace/vv/lib/python3.12/site-packages/torch/lib/libtorch_python.so+0x4064f1 pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) at ??:0
+  #13 VLLM::EngineCore+0x1818ec <unknown function> at ??:0
+
+(MainProcess pid=20293) INFO 11-10 07:13:50 [utils.py:628] [shutdown] Process manager: send sigterm to process EngineCore
+Traceback (most recent call last):
+  File "/workspace/tang/scripts/review/vllm_ttft.py", line 8, in <module>
+    llm = LLM(model=model, max_model_len=64000, gpu_memory_utilization=0.92, enforce_eager=False)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/entrypoints/llm.py", line 341, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 191, in from_engine_args
+    return cls(
+           ^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 116, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 129, in make_client
+    return SyncMPClient(
+           ^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 175, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 966, in __init__
+    super().__init__(
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 699, in __init__
+    with launch_core_engines(
+  File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1393, in launch_core_engines
+    wait_for_engine_startup(
+  File "/workspace/vv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1473, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+exit 1

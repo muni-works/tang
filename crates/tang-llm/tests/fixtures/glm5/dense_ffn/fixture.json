@@ -1,0 +1,37 @@
+{
+ "hidden": 32,
+ "ff": 16,
+ "swiglu_limit": 10.0,
+ "files": {
+  "gate_proj": {
+   "shape": [
+    16,
+    32
+   ]
+  },
+  "up_proj": {
+   "shape": [
+    16,
+    32
+   ]
+  },
+  "down_proj": {
+   "shape": [
+    32,
+    16
+   ]
+  },
+  "x": {
+   "shape": [
+    5,
+    32
+   ]
+  },
+  "y": {
+   "shape": [
+    5,
+    32
+   ]
+  }
+ }
+}

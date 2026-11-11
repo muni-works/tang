@@ -1,0 +1,20 @@
+[package]
+name = "tang-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kernel verification harness: every GPU kernel checked against its CPU oracle (shadow runs, NaN poisoning, divergence attribution)"
+repository.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "testing", "verification", "kernels"]
+categories = ["development-tools::testing"]
+include = ["src/**/*", "README.md"]
+
+[features]
+default = []
+# The device side (poisoned buffers, tap readback, GPU test cases) on tang-moe's CUDA layer.
+cuda = ["dep:tang-moe", "tang-moe/cuda"]
+
+[dependencies]
+tang-moe = { workspace = true, optional = true }

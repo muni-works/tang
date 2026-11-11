@@ -1,0 +1,373 @@
+{
+ "dtype": "f32",
+ "endian": "little",
+ "tensors": {
+  "x": {
+   "file": "x.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "router.weight": {
+   "file": "router_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "router.bias": {
+   "file": "router_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "router_out.weights": {
+   "file": "router_out_weights.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "router_out.indices": {
+   "file": "router_out_indices.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "experts.gate_up_proj": {
+   "file": "experts_gate_up_proj.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "experts.down_proj": {
+   "file": "experts_down_proj.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "experts_out": {
+   "file": "experts_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "experts_l1.gate_up_proj": {
+   "file": "experts_l1_gate_up_proj.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "experts_l1.down_proj": {
+   "file": "experts_l1_down_proj.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "experts_l1_out": {
+   "file": "experts_l1_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "router_g4.weight": {
+   "file": "router_g4_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "router_g4.bias": {
+   "file": "router_g4_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "router_g4_out.weights": {
+   "file": "router_g4_out_weights.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "router_g4_out.indices": {
+   "file": "router_g4_out_indices.bin",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "shared.gate_proj": {
+   "file": "shared_gate_proj.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared.up_proj": {
+   "file": "shared_up_proj.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared.down_proj": {
+   "file": "shared_down_proj.bin",
+   "shape": [
+    64,
+    64
+   ]
+  },
+  "shared_out": {
+   "file": "shared_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "moe.experts.gate_up_proj": {
+   "file": "moe_experts_gate_up_proj.bin",
+   "shape": [
+    16,
+    64,
+    64
+   ]
+  },
+  "moe.experts.down_proj": {
+   "file": "moe_experts_down_proj.bin",
+   "shape": [
+    16,
+    64,
+    32
+   ]
+  },
+  "moe.gate.weight": {
+   "file": "moe_gate_weight.bin",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "moe.shared_experts.gate_proj.weight": {
+   "file": "moe_shared_experts_gate_proj_weight.bin",
+   "shape": [
+    32,
+    64
+   ]
+  },
+  "moe.shared_experts.up_proj.weight": {
+   "file": "moe_shared_experts_up_proj_weight.bin",
+   "shape": [
+    32,
+    64
+   ]
+  },
+  "moe.shared_experts.down_proj.weight": {
+   "file": "moe_shared_experts_down_proj_weight.bin",
+   "shape": [
+    64,
+    32
+   ]
+  },
+  "moe.gate.e_score_correction_bias": {
+   "file": "moe_gate_e_score_correction_bias.bin",
+   "shape": [
+    16
+   ]
+  },
+  "moe_out": {
+   "file": "moe_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "dense.gate_proj.weight": {
+   "file": "dense_gate_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense.up_proj.weight": {
+   "file": "dense_up_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense.down_proj.weight": {
+   "file": "dense_down_proj_weight.bin",
+   "shape": [
+    64,
+    256
+   ]
+  },
+  "dense_out": {
+   "file": "dense_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "dense_l1.gate_proj.weight": {
+   "file": "dense_l1_gate_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense_l1.up_proj.weight": {
+   "file": "dense_l1_up_proj_weight.bin",
+   "shape": [
+    256,
+    64
+   ]
+  },
+  "dense_l1.down_proj.weight": {
+   "file": "dense_l1_down_proj_weight.bin",
+   "shape": [
+    64,
+    256
+   ]
+  },
+  "dense_l1_out": {
+   "file": "dense_l1_out.bin",
+   "shape": [
+    12,
+    64
+   ]
+  },
+  "tiny_x": {
+   "file": "tiny_x.bin",
+   "shape": [
+    8,
+    256
+   ]
+  },
+  "tiny_l0_dense_out": {
+   "file": "tiny_l0_dense_out.bin",
+   "shape": [
+    8,
+    256
+   ]
+  },
+  "tiny_l2_moe_out": {
+   "file": "tiny_l2_moe_out.bin",
+   "shape": [
+    8,
+    256
+   ]
+  },
+  "tiny_l2_router_out.indices": {
+   "file": "tiny_l2_router_out_indices.bin",
+   "shape": [
+    8,
+    2
+   ]
+  },
+  "tiny_l2_router_out.weights": {
+   "file": "tiny_l2_router_out_weights.bin",
+   "shape": [
+    8,
+    2
+   ]
+  },
+  "quant_f16_raw": {
+   "file": "quant_f16_raw.bin",
+   "shape": [
+    1024
+   ],
+   "dtype": "u8",
+   "ggml_type": 1
+  },
+  "quant_f16_want": {
+   "file": "quant_f16_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q8_0_raw": {
+   "file": "quant_q8_0_raw.bin",
+   "shape": [
+    544
+   ],
+   "dtype": "u8",
+   "ggml_type": 8
+  },
+  "quant_q8_0_want": {
+   "file": "quant_q8_0_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q5_0_raw": {
+   "file": "quant_q5_0_raw.bin",
+   "shape": [
+    352
+   ],
+   "dtype": "u8",
+   "ggml_type": 6
+  },
+  "quant_q5_0_want": {
+   "file": "quant_q5_0_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q4_k_raw": {
+   "file": "quant_q4_k_raw.bin",
+   "shape": [
+    288
+   ],
+   "dtype": "u8",
+   "ggml_type": 12
+  },
+  "quant_q4_k_want": {
+   "file": "quant_q4_k_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q5_k_raw": {
+   "file": "quant_q5_k_raw.bin",
+   "shape": [
+    352
+   ],
+   "dtype": "u8",
+   "ggml_type": 13
+  },
+  "quant_q5_k_want": {
+   "file": "quant_q5_k_want.bin",
+   "shape": [
+    512
+   ]
+  },
+  "quant_q6_k_raw": {
+   "file": "quant_q6_k_raw.bin",
+   "shape": [
+    420
+   ],
+   "dtype": "u8",
+   "ggml_type": 14
+  },
+  "quant_q6_k_want": {
+   "file": "quant_q6_k_want.bin",
+   "shape": [
+    512
+   ]
+  }
+ }
+}

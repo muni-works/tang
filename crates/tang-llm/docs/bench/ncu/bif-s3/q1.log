@@ -1,0 +1,29 @@
+coder: 8 of 48 layers in VRAM (20 s)
+coder: 16 of 48 layers in VRAM (39 s)
+coder: 24 of 48 layers in VRAM (59 s)
+coder: 32 of 48 layers in VRAM (78 s)
+coder: 40 of 48 layers in VRAM (98 s)
+coder: blk.46.ffn_gate_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_up_shexp.weight requantized to Q8_0
+coder: blk.46.ffn_down_shexp.weight requantized to Q8_0
+coder: 48 of 48 layers in VRAM (119 s)
+coder: 48 layers (36 GDN, 12 attention), 512 experts top-10, hidden 2048, vocab 151936; 49.6 GB VRAM (46.9 GB experts), weights 120 s, kernels 136 s, total 256 s
+coder: 127 sequence slots fit (0.28 GB each, 99.9 GB free, 4 GB headroom)
+batch-check tolerance: tokens agree 100.00% (512/512, same history), max |dlogit| 0.0000, mean 0.00e0 (bar: 99%, mean <= 0.2)
+seq 0 (prompt 1380 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 1 (prompt 1377 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 2 (prompt 1374 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 3 (prompt 1371 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 4 (prompt 1368 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 5 (prompt 1365 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 6 (prompt 1362 tokens): tokens identical , logits differ in 0 of 9723904 entries
+seq 7 (prompt 1359 tokens): tokens identical , logits differ in 0 of 9723904 entries
+batch-check: PASS (bitwise) (logits checksum 0ceea8b6b2250ba9)
+batch 1: prefilled to ~1380 tokens in 1.7 s
+batch 1: 4.04 ms a step, 247 tok/s aggregate, 247 tok/s a stream (context ~1380)
+batch 2: prefilled to ~1380 tokens in 3.3 s
+batch 2: 4.81 ms a step, 416 tok/s aggregate, 208 tok/s a stream (context ~1380)
+batch 4: prefilled to ~1380 tokens in 6.7 s
+batch 4: 6.64 ms a step, 602 tok/s aggregate, 151 tok/s a stream (context ~1380)
+batch 8: prefilled to ~1380 tokens in 13.3 s
+batch 8: 10.03 ms a step, 798 tok/s aggregate, 100 tok/s a stream (context ~1380)

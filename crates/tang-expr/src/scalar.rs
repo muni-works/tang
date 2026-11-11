@@ -240,14 +240,7 @@ impl Scalar for ExprId {
 
     #[inline]
     fn floor(self) -> Self {
-        // Only works for literals
-        with_graph(|g| {
-            if let Some(v) = g.node(self).as_f64() {
-                g.lit(v.floor())
-            } else {
-                panic!("floor() requires a literal expression")
-            }
-        })
+        with_graph(|g| g.floor(self))
     }
 
     #[inline]

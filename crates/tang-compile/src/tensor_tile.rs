@@ -300,6 +300,7 @@ struct CompRegion {
     uses_py: bool,
 }
 
+#[derive(Clone)]
 enum Val {
     Expr(String),
     Arr(String),
@@ -341,6 +342,11 @@ struct Ctx<'a> {
     comp_regions: Vec<CompRegion>,
     /// inside a cooperative load loop: every read goes straight to its buffer
     in_load: bool,
+    /// inside a cooperative load: comps already expanded in this load
+    /// loop, by `(node, coords)` — the loads of several shared comps run
+    /// in one loop and evaluate a common producer (flash backward's
+    /// S = Q·Kᵀ under both P̃ and dS) once
+    load_memo: Vec<(usize, Vec<Sym>, Val)>,
     /// first pass collects regions, second emits against them
     collect: bool,
     /// node whose value is already in a named array (an epilogue's
@@ -351,6 +357,9 @@ struct Ctx<'a> {
     /// the last read consumed `guard`: its value is already zero-padded
     guard_done: bool,
     counter: usize,
+    /// cooperative load of a staged reduction: `(node, lanes)` — its
+    /// reduce loop starts at `lane_` and strides by `lanes`
+    load_lanes: Option<(usize, usize)>,
 }
 
 impl Ctx<'_> {
@@ -376,7 +385,15 @@ impl Ctx<'_> {
             .and_then(|n| addr.terms.get(n))
             .copied()
             .unwrap_or(0);
-        let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0);
+        // A staged guard is evaluated in the load loop, which only has the
+        // address's vars. A var that cancels in the flat address (a
+        // stride-s view read at `x + q`, `r − s·q`) still decides the
+        // padding, so that read stays in the loop body.
+        let guard_in_addr = self.guard.as_ref().is_none_or(|(cs, _)| {
+            cs.iter()
+                .all(|c| c.terms.keys().all(|k| addr.terms.contains_key(k)))
+        });
+        let shared = addr.terms.contains_key("r0") && (px == 0 || py == 0) && guard_in_addr;
         if !shared {
             self.guard = None;
             let has_inner = addr.terms.keys().any(|k| !k.starts_with('p') && k != "r0");
@@ -520,11 +537,15 @@ impl Ctx<'_> {
         }
         let node = &self.g.nodes[j];
         match &node.op {
-            Op::Input(_) => {
+            Op::Input(_) | Op::Scan(_) => {
                 let addr = flat(coords, &fixed(&node.shape));
                 Val::Expr(self.buffer_read(j, addr))
             }
             Op::Iota(d) => Val::Expr(format!("f32({})", coords[*d].wgsl())),
+            Op::Operator(o) => panic!(
+                "operator node `{}` has no device lowering; evaluate it on the host",
+                o.op.name()
+            ),
             Op::Reshape(_) => {
                 // flat index into the storage node's buffer; affine
                 let storage = self.g.storage(TensorId(j as u32)).n();
@@ -574,7 +595,30 @@ impl Ctx<'_> {
                     slot.wgsl()
                 ))
             }
-            Op::Comp(c) => {
+            Op::Comp(_) if self.in_load && !self.collect => {
+                if let Some((_, _, v)) = self
+                    .load_memo
+                    .iter()
+                    .find(|(m, cs, _)| *m == j && cs.as_slice() == coords)
+                {
+                    return v.clone();
+                }
+                let v = self.expand_comp(out, j, coords);
+                self.load_memo.push((j, coords.to_vec(), v.clone()));
+                v
+            }
+            Op::Comp(_) => self.expand_comp(out, j, coords),
+        }
+    }
+
+    /// An inlined comp evaluated at `coords`: its body, and its reduction
+    /// as a loop.
+    fn expand_comp(&mut self, out: &mut String, j: usize, coords: &[Sym]) -> Val {
+        let Op::Comp(c) = &self.g.nodes[j].op else {
+            unreachable!()
+        };
+        {
+            {
                 let k = c.points().len();
                 let n = self.fresh();
                 let w = c.width();
@@ -600,7 +644,20 @@ impl Ctx<'_> {
                     return Val::Arr(format!("v{n}"));
                 };
                 writeln!(out, "var acc{n} = array<f32, {w}>({});", identity(m)).unwrap();
+                let lanes = match self.load_lanes {
+                    Some((node, l)) if node == j && c.red.len() == 1 => l,
+                    _ => 1,
+                };
+                self.load_lanes = None;
                 for (v, ext) in red_vars.iter().zip(fixed(&c.red)) {
+                    if lanes > 1 {
+                        writeln!(
+                            out,
+                            "for (var {v}: u32 = lane_; {v} < {ext}u; {v} = {v} + {lanes}u) {{"
+                        )
+                        .unwrap();
+                        continue;
+                    }
                     writeln!(
                         out,
                         "for (var {v}: u32 = 0u; {v} < {ext}u; {v} = {v} + 1u) {{"
@@ -652,9 +709,13 @@ impl Ctx<'_> {
                 let pk = src_shape.len() - self.tuple_rank(a.src.n());
                 let slot = flat(&cs[pk..], &src_shape[pk..]);
                 let direct = match &self.g.nodes[a.src.n()].op {
-                    Op::Input(_) | Op::Reshape(_) => true,
+                    Op::Input(_) | Op::Reshape(_) | Op::Scan(_) => true,
                     Op::Comp(_) => self.reads.contains(&a.src.n()),
                     Op::Iota(_) => false,
+                    Op::Operator(o) => panic!(
+                        "operator node `{}` has no device lowering; evaluate it on the host",
+                        o.op.name()
+                    ),
                 };
                 self.guard = (a.view.guard && direct && pk == src_shape.len())
                     .then(|| (cs.clone(), src_shape.clone()));
@@ -690,7 +751,7 @@ impl Ctx<'_> {
     fn tuple_rank(&self, j: usize) -> usize {
         match &self.g.nodes[j].op {
             Op::Comp(c) => c.tuple,
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => 0,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => 0,
         }
     }
 }
@@ -756,6 +817,7 @@ pub(super) fn emit_scalar(
             Node::Recip(a) => format!("1.0 / {}", e(a)),
             Node::Sqrt(a) => format!("sqrt({})", e(a)),
             Node::Sin(a) => format!("sin({})", e(a)),
+            Node::Floor(a) => format!("floor({})", e(a)),
             Node::Atan2(a, b) => format!("atan2({}, {})", e(a), e(b)),
             Node::Exp2(a) => format!("exp2({})", e(a)),
             Node::Log2(a) => format!("log2({})", e(a)),
@@ -856,11 +918,13 @@ impl TensorGraph {
             hoists: Vec::new(),
             comp_regions: Vec::new(),
             in_load: false,
+            load_memo: Vec::new(),
             collect: true,
             subst: None,
             guard: None,
             guard_done: false,
             counter: 0,
+            load_lanes: None,
         };
         ctx.extents.insert("r0".into(), r_total);
         for (name, n) in &inner_red {
@@ -1010,8 +1074,14 @@ impl TensorGraph {
         }
         // Cooperative loads for shared comps are expanded in the load
         // phase with r0 := chunk + t and py := tile_y*by + ly.
-        let mut comp_loads: Vec<(usize, String)> = Vec::new();
-        for i in 0..ctx.comp_regions.len() {
+        // Regions with the same row count load in one loop, sharing the
+        // producers they have in common (`Ctx::load_memo`); a lane-split
+        // region (below) gets a loop of its own.
+        // (rows, load code, lanes per staged value, fold of the lanes)
+        let mut comp_loads: Vec<(usize, String, usize, String)> = Vec::new();
+        let mut order: Vec<usize> = (0..ctx.comp_regions.len()).collect();
+        order.sort_by_key(|&i| !ctx.comp_regions[i].uses_py);
+        for i in order {
             let r = &ctx.comp_regions[i];
             let rows = if r.uses_py { py_n } else { 1 };
             writeln!(
@@ -1040,27 +1110,104 @@ impl TensorGraph {
             let coords: Vec<Sym> = r.coords.iter().map(&mut sub).collect();
             let node = r.node;
             let width = r.width;
+            // A staged value that is itself a reduction (q·k in attention)
+            // (a serial loop per thread, few of them busy): split its reduce
+            // loop over `lanes` threads each and fold their partials with
+            // its own monoid, so the load phase uses the whole workgroup.
+            let total = rows * chunk;
+            let red_comp = ctx
+                .g
+                .comp_at(node)
+                .filter(|c| c.monoid.is_some() && c.red.len() == 1);
+            let lanes = red_comp.map_or(1, |c| {
+                let red = c.red[0].n();
+                let mut l = 1;
+                // up to a warp per value (coalesced reads of its operand
+                // rows), threads looping when values × lanes exceed them
+                while l < load_lanes() && l * 4 <= red && total * l * 2 * width <= 4096 {
+                    l *= 2;
+                }
+                l
+            });
+            let joins = lanes == 1
+                && comp_loads
+                    .last()
+                    .is_some_and(|(r, _, l, _)| *l == 1 && *r == rows);
+            if !joins {
+                ctx.load_memo.clear();
+            }
             let mut code = String::new();
             ctx.in_load = true;
+            ctx.load_lanes = (lanes > 1).then_some((node, lanes));
             let saved = ctx.counter;
             ctx.counter = 1000 * (i + 1);
             let v = ctx.expand(&mut code, node, &coords);
             ctx.counter = saved;
             ctx.in_load = false;
-            for slot in 0..width {
-                let sl = Sym {
-                    offset: slot as i64,
-                    ..Default::default()
-                };
+            ctx.load_lanes = None;
+            let mut fold = String::new();
+            if lanes > 1 {
                 writeln!(
-                    code,
-                    "cstage_{i}[((ly) * {chunk}u + t) * {width}u + {slot}u] = {};",
-                    v.slot(&sl)
+                    s,
+                    "var<workgroup> cscratch_{i}: array<f32, {}>;",
+                    total * lanes * width
                 )
                 .unwrap();
+                for slot in 0..width {
+                    let sl = Sym {
+                        offset: slot as i64,
+                        ..Default::default()
+                    };
+                    writeln!(
+                        code,
+                        "cscratch_{i}[idx * {width}u + {slot}u] = {};",
+                        v.slot(&sl)
+                    )
+                    .unwrap();
+                }
+                let m = red_comp.unwrap().monoid.as_ref().unwrap();
+                let part = |l: &str, slot: usize| {
+                    format!("cscratch_{i}[(idx * {lanes}u + {l}) * {width}u + {slot}u]")
+                };
+                let first: Vec<String> = (0..width).map(|sl| part("0u", sl)).collect();
+                writeln!(fold, "var f = array<f32, {width}>({});", first.join(", ")).unwrap();
+                writeln!(fold, "for (var l: u32 = 1u; l < {lanes}u; l = l + 1u) {{").unwrap();
+                let combined = emit_scalar(&mut fold, &m.combine, &m.outs, "f_", &|v| {
+                    if (v as usize) < width {
+                        format!("f[{v}]")
+                    } else {
+                        part("l", v as usize - width)
+                    }
+                });
+                writeln!(fold, "f = array<f32, {width}>({});", combined.join(", ")).unwrap();
+                writeln!(fold, "}}").unwrap();
+                for slot in 0..width {
+                    writeln!(
+                        fold,
+                        "cstage_{i}[((ly) * {chunk}u + t) * {width}u + {slot}u] = f[{slot}];"
+                    )
+                    .unwrap();
+                }
+            } else {
+                for slot in 0..width {
+                    let sl = Sym {
+                        offset: slot as i64,
+                        ..Default::default()
+                    };
+                    writeln!(
+                        code,
+                        "cstage_{i}[((ly) * {chunk}u + t) * {width}u + {slot}u] = {};",
+                        v.slot(&sl)
+                    )
+                    .unwrap();
+                }
             }
-            comp_loads.push((rows, code));
+            match comp_loads.last_mut() {
+                Some((r, c, 1, _)) if lanes == 1 && *r == rows => c.push_str(&code),
+                _ => comp_loads.push((rows, code, lanes, fold)),
+            }
         }
+        ctx.load_memo.clear();
 
         writeln!(s, "@compute @workgroup_size({threads})").unwrap();
         writeln!(
@@ -1328,8 +1475,49 @@ impl TensorGraph {
             }
             writeln!(s, "        }}").unwrap();
         }
-        for (i, (rows, code)) in comp_loads.iter().enumerate() {
+        for (i, (rows, code, lanes, fold)) in comp_loads.iter().enumerate() {
             let total = rows * chunk;
+            let lanes = *lanes;
+            if lanes > 1 {
+                // partials: thread idx is lane idx % lanes of value idx / lanes
+                writeln!(
+                    s,
+                    "        for (var idx: u32 = tid; idx < {}u; idx = idx + {threads}u) {{",
+                    total * lanes
+                )
+                .unwrap();
+                writeln!(s, "            let lane_ = idx % {lanes}u;").unwrap();
+                writeln!(s, "            let t = (idx / {lanes}u) % {chunk}u;").unwrap();
+                writeln!(s, "            let ly = idx / {lanes}u / {chunk}u;").unwrap();
+                writeln!(
+                    s,
+                    "            let gy = min(tile_y * {py_n}u + ly, {}u);",
+                    ny - 1
+                )
+                .unwrap();
+                writeln!(s, "            if (chunk + t < {r_total}u) {{").unwrap();
+                for line in code.lines() {
+                    writeln!(s, "                {line}").unwrap();
+                }
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+                writeln!(s, "        workgroupBarrier();").unwrap();
+                writeln!(
+                    s,
+                    "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
+                )
+                .unwrap();
+                writeln!(s, "            let t = idx % {chunk}u;").unwrap();
+                writeln!(s, "            let ly = idx / {chunk}u;").unwrap();
+                writeln!(s, "            if (chunk + t < {r_total}u) {{").unwrap();
+                for line in fold.lines() {
+                    writeln!(s, "                {line}").unwrap();
+                }
+                writeln!(s, "            }}").unwrap();
+                writeln!(s, "        }}").unwrap();
+                let _ = i;
+                continue;
+            }
             writeln!(
                 s,
                 "        for (var idx: u32 = tid; idx < {total}u; idx = idx + {threads}u) {{"
@@ -1535,6 +1723,21 @@ impl TensorGraph {
             points: pts.iter().product::<usize>() as u32,
             count: (n_tiles * threads) as u32,
             workgroup_size: threads as u32,
+            writes: Vec::new(),
         })
     }
+}
+
+/// Lanes per staged reduction value in a cooperative load (`TANG_LOAD_LANES`
+/// overrides; 1 is the one-thread-per-value load). 4, 8 and 16 were within
+/// 5% on decode attention on a 3090; 32 (a warp per value) lost 30% to the
+/// serial fold of the partials.
+fn load_lanes() -> usize {
+    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("TANG_LOAD_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
 }

@@ -7,92 +7,29 @@
 //!   extends the conversation), so only the new tokens are prefilled; otherwise a fresh slot,
 //!   evicting the least recently used parked one when all are taken. The recurrent state can't
 //!   rewind, so a slot is only ever extended.
-//! - **A step.** Prefilling streams advance by a chunk, shortest remaining prompt first (an
-//!   agent's cached turn prefills a few dozen tokens and shouldn't wait behind a cold 15k
-//!   prompt), then one batched decode window runs every decoding stream's next token (up to
-//!   `MAX_T` rows a window). While any stream is decoding, prefill gets `PREFILL_SLICE` tokens a
-//!   chunk and only as much GPU time as decode has had since, so decoders keep about half the
-//!   GPU instead of crawling at a token per prefill chunk.
-//! - **Greedy.** Batched windows sample greedily until the engine has per-row sampling; a
-//!   request that asks for a temperature is logged and runs greedy.
-//! - No drafts in batched windows yet (per-slot verify is engine work still to come).
+//! - **A step.** Prefilling streams advance by a chunk, then one batched decode window runs
+//!   every decoding stream's next token. Which prompts, how many tokens and how GPU time is split
+//!   is `crate::batch::prefill` (pure, tested on a simulated engine): shortest-first with aging
+//!   and a deadline; prefill held to a share of GPU time (higher while decode rows are below the
+//!   fill target), its chunk as long as the banked decode credit buys; knobs `TANG_SERVE_*`.
+//! - **Sampling.** Each stream samples with its own temperature / top-k / top-p / seed /
+//!   presence penalty (the engine's per-row sampler; greedy rows are the plain argmax). A
+//!   sampled stream takes no MTP drafts (verification is greedy). An engine without per-row
+//!   sampling refuses a sampled request instead of running it greedy.
+//! - **Drafts under batching** (`crate::batch::spec`): every greedy stream's MTP chain, ranked
+//!   across the window by cumulative probability (D-Cut); the window verifies the best ones in
+//!   the rows the streams leave (batch module up to its width, else `MAX_T`), the budget picked
+//!   from a measured step-cost table, none at full load. `TANG_SERVE_SPEC=off|auto|<rows>`.
 
 use super::{FlashServe, Memo};
+use crate::batch::prefill::{prefill_plan, Policy, Waiting};
 use crate::chat::{Chunk, Detok, Parser, Piece};
 use crate::engine::{Finish, Outcome, Request, Usage};
-use crate::server::{DynLane, Inflight};
-use anyhow::{bail, ensure, Result};
+use crate::server::{DynLane, Inflight, StepFailure};
+use anyhow::{bail, Result};
 use serde_json::Value;
 use std::time::Instant;
 use tang_compute::flash::MAX_T;
-
-/// Prompt tokens prefilled per step across all prefilling streams, when nothing is decoding.
-const PREFILL_BUDGET: usize = 256;
-/// The same while some stream is decoding: a shorter chunk, so a decode window is never far off.
-const PREFILL_SLICE: usize = 64;
-/// With wide prefill windows (`ServeEngine::wide_rows`): a step's prompt tokens when nothing
-/// decodes (capped at the window width), and while something does (a wide window of this many
-/// tokens takes a few hundred ms; the time slice still keeps prefill to about half the GPU).
-const WIDE_BUDGET: usize = 2048;
-const WIDE_SLICE: usize = 256;
-
-/// This step's prefill chunks, as `(lane, tokens)`: shortest remaining prompt first, up to
-/// `PREFILL_BUDGET` tokens when nothing decodes. While something decodes, `PREFILL_SLICE` tokens,
-/// and none while prefill is ahead of decode on GPU time (`debt` seconds), which keeps prefill to
-/// about half the GPU: a cold prompt slows down but always finishes.
-fn prefill_plan(waiting: &[(usize, usize)], decoding: bool, debt: f64) -> Vec<(usize, usize)> {
-    prefill_plan_with(waiting, decoding, debt, PREFILL_BUDGET, PREFILL_SLICE)
-}
-
-/// [`prefill_plan`] with the budgets given: `full` tokens when nothing decodes, `slice` while
-/// something does (wide windows: `WIDE_BUDGET` / `WIDE_SLICE`).
-fn prefill_plan_with(
-    waiting: &[(usize, usize)],
-    decoding: bool,
-    debt: f64,
-    full: usize,
-    slice: usize,
-) -> Vec<(usize, usize)> {
-    let mut budget = match (decoding, debt > 0.0) {
-        (false, _) => full,
-        (true, false) => slice,
-        (true, true) => 0,
-    };
-    let mut order = waiting.to_vec();
-    order.sort_unstable();
-    let mut plan = Vec::new();
-    for (rem, i) in order {
-        if budget == 0 {
-            break;
-        }
-        let n = rem.min(budget);
-        plan.push((i, n));
-        budget -= n;
-    }
-    plan
-}
-
-/// Draft rows per stream in one window, for streams wanting `want[i]` drafts: one row each for
-/// its token, and the window's spare rows (`MAX_T` minus the streams) shared out round-robin, so
-/// a lone stream can draft its whole chain and a full window drafts nothing.
-fn share_drafts(want: &[usize]) -> Vec<usize> {
-    let mut give = vec![0; want.len()];
-    let mut spare = MAX_T.saturating_sub(want.len());
-    while spare > 0 {
-        let mut moved = false;
-        for (g, &w) in give.iter_mut().zip(want) {
-            if spare > 0 && *g < w {
-                *g += 1;
-                spare -= 1;
-                moved = true;
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    give
-}
 
 /// A parked or running sequence slot.
 pub(super) struct SlotInfo {
@@ -114,8 +51,9 @@ pub(super) struct Stream {
     reused: usize,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
-    /// MTP drafts for the next window (the engine's chain for this slot).
-    drafts: Vec<u32>,
+    /// MTP drafts for the next window (the engine's chain for this slot, with the head's
+    /// probabilities).
+    drafts: Vec<(u32, f32)>,
     /// Draft rows verified and accepted, and verify windows run.
     drafted: usize,
     accepted: usize,
@@ -133,8 +71,15 @@ pub(super) struct Stream {
     t0: Instant,
     first: Option<f64>,
     prefill_s: f64,
+    /// Of `prefill_s`, saving prefix states at its marks.
+    snap_s: f64,
     decode_from: Option<Instant>,
     prefill_only: bool,
+    /// Sampled (temperature > 0): no drafts.
+    sampled: bool,
+    /// A step failed this stream: its slot's state is suspect, so retiring frees the slot
+    /// instead of parking it for reuse.
+    broken: bool,
 }
 
 impl FlashServe {
@@ -252,26 +197,28 @@ impl FlashServe {
         let t0 = Instant::now();
         let (ids, text, _spliced) = self.prompt(req)?;
         self.record_warm(req);
-        ensure!(
-            ids.len() + 1 < self.ctx,
-            "prompt is {} tokens; the context window is {}",
-            ids.len(),
-            self.ctx
-        );
-        if req.temperature_set && req.sampling.temperature > 0.0 {
-            eprintln!(
-                "tang-llm: batched windows are greedy; ignoring temperature {}",
-                req.sampling.temperature
-            );
-        }
+        // Refused here, before a slot is taken (a 400 for the client); a prompt that fits
+        // generates up to the window's end and stops there with `length`.
+        let limit = crate::batch::token_limit(ids.len(), self.ctx, req.max_tokens)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let (temperature, top_k, top_p, presence) = self.request_sampling(req);
+        let samp = crate::flash::sampler::RowSampling {
+            temperature,
+            top_k,
+            top_p,
+            seed: (req.sampling.seed ^ (req.sampling.seed >> 32)) as u32,
+            presence,
+        };
         let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        // An engine without per-row sampling refuses a sampled request: release the slot.
+        if let Err(e) = self.e.set_slot_sampling(slot, samp) {
+            if let Some(sl) = self.slots.iter_mut().find(|x| x.id == slot) {
+                sl.busy = false;
+            }
+            return Err(e);
+        }
         let mut marks = self.marks(&ids, &text);
         marks.retain(|&(p, _)| p > reused);
-        let limit = req
-            .max_tokens
-            .unwrap_or(usize::MAX)
-            .min(self.ctx - ids.len() - 1)
-            .max(1);
         let gen_at = text
             .rfind("<|im_start|>assistant\n")
             .map_or(text.len(), |i| i + "<|im_start|>assistant\n".len());
@@ -302,8 +249,11 @@ impl FlashServe {
             t0,
             first: None,
             prefill_s: 0.0,
+            snap_s: 0.0,
             decode_from: None,
             prefill_only: req.prefill_only,
+            sampled: samp.sampled(),
+            broken: false,
         }))
     }
 
@@ -369,7 +319,37 @@ impl FlashServe {
         Ok(())
     }
 
+    /// One step for every lane; a failure names the lanes it hurt ([`StepFailure`]), whose
+    /// streams are marked broken so retiring them drops their slots.
     pub(super) fn batch_step(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
+        let result = self.batch_step_lanes(lanes);
+        if let Some(f) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<StepFailure>())
+        {
+            for &i in &f.lanes {
+                if let Some(s) = lanes
+                    .get_mut(i)
+                    .and_then(|l| l.stream.downcast_mut::<Stream>())
+                {
+                    s.broken = true;
+                    s.finish.get_or_insert(Finish::Cancelled);
+                }
+            }
+        }
+        result
+    }
+
+    fn batch_step_lanes(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
+        let t_step = Instant::now();
+        let prefill_tokens0: usize = lanes
+            .iter()
+            .map(|l| {
+                let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                s.done_prompt
+            })
+            .sum();
         // Cancellations first.
         for l in lanes.iter_mut() {
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -384,29 +364,43 @@ impl FlashServe {
             s.finish.is_none() && s.pending.is_some()
         });
         if !decoding {
-            self.prefill_debt = 0.0;
+            self.sched.idle();
         }
-        let waiting: Vec<(usize, usize)> = lanes
+        let waiting: Vec<Waiting> = lanes
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
                 let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
-                (s.finish.is_none() && s.done_prompt < s.ids.len())
-                    .then(|| (s.ids.len() - s.done_prompt, i))
+                (s.finish.is_none() && s.done_prompt < s.ids.len()).then(|| Waiting {
+                    idx: i,
+                    rem: s.ids.len() - s.done_prompt,
+                    age: s.t0.elapsed().as_secs_f64(),
+                })
             })
             .collect();
         let wide = self.e.wide_rows();
-        let plan = if wide > 0 {
-            prefill_plan_with(
-                &waiting,
-                decoding,
-                self.prefill_debt,
-                WIDE_BUDGET.min(wide),
-                WIDE_SLICE.min(wide),
-            )
-        } else {
-            prefill_plan(&waiting, decoding, self.prefill_debt)
-        };
+        let policy = self
+            .prefill_policy
+            .get_or_insert_with(|| {
+                let p = Policy::from_env(wide);
+                eprintln!("tang-llm: batch prefill policy {p:?}");
+                p
+            })
+            .clone();
+        let plan = prefill_plan(&waiting, &policy, self.sched.budget(&policy, decoding));
+        let oldest = waiting.iter().map(|w| w.age).reduce(f64::max);
+        let n_chunks = plan.len();
+        // The prompts' MTP K/V only pays if they'll draft: skip the fill with spec off, or
+        // while every row of a decode window is taken (drafts need spare rows), as at C = 64.
+        if self.e.use_mtp() && !plan.is_empty() {
+            let live = lanes
+                .iter()
+                .filter(|l| l.stream.downcast_ref::<Stream>().unwrap().finish.is_none())
+                .count();
+            let width = crate::batch::window_width(MAX_T, self.e.batch_rows(), self.deterministic);
+            let spec = self.spec.mode != crate::batch::spec::Mode::Off;
+            self.e.set_mtp_fill(spec && live < width);
+        }
         for (i, n) in plan {
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -418,23 +412,24 @@ impl FlashServe {
             let t = Instant::now();
             let chunk = &s.ids[s.done_prompt..s.done_prompt + n];
             let next = if wide > 0 && n > 2 * MAX_T {
-                self.e.prefill_slot_wide(s.slot, chunk)?
+                self.e.prefill_slot_wide(s.slot, chunk)
             } else {
-                self.e.prefill_slot(s.slot, chunk)?
-            };
+                self.e.prefill_slot(s.slot, chunk)
+            }
+            .map_err(|e| StepFailure::lanes(vec![i], e))?;
             let dt = t.elapsed().as_secs_f64();
             s.prefill_s += dt;
-            if decoding {
-                self.prefill_debt += dt;
-            }
+            self.sched.prefilled(n, dt, decoding);
             s.done_prompt += n;
             if let Some(&(_, pinned)) = s.marks.first().filter(|m| m.0 == s.done_prompt) {
                 s.marks.remove(0);
                 let t = Instant::now();
                 let slot = s.slot;
-                self.snapshot_at(slot, pinned)?;
+                self.snapshot_at(slot, pinned)
+                    .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 let s = lanes[i].stream.downcast_mut::<Stream>().unwrap();
                 s.prefill_s += t.elapsed().as_secs_f64();
+                s.snap_s += t.elapsed().as_secs_f64();
             }
             let l = &mut lanes[i];
             let s = l.stream.downcast_mut::<Stream>().expect("a flash stream");
@@ -443,7 +438,8 @@ impl FlashServe {
                     s.finish = Some(Finish::Stop);
                 } else {
                     s.decode_from = Some(Instant::now());
-                    self.batch_take(s, next, l.on)?;
+                    self.batch_take(s, next, l.on)
+                        .map_err(|e| StepFailure::lanes(vec![i], e))?;
                     if s.finish.is_none() {
                         s.pending = Some(next);
                         s.drafts = self.e.slot_drafts(s.slot);
@@ -451,7 +447,8 @@ impl FlashServe {
                 }
             }
         }
-        // Decode: every stream with a pending token, MAX_T rows a window.
+        // Decode: every stream with a pending token, MAX_T rows a window (verify windows, with
+        // drafts), or the batch module's width (plain decode, `enable_batch`).
         let ready: Vec<usize> = lanes
             .iter_mut()
             .enumerate()
@@ -461,45 +458,87 @@ impl FlashServe {
             })
             .collect();
         let mtp = self.e.use_mtp();
-        for group in ready.chunks(MAX_T) {
-            // Drafts for each stream, cut at an end of turn and the token limit, then the
-            // window's spare rows shared out.
-            let want: Vec<Vec<u32>> = group
+        // Streams per window: the batch module's width (spare rows go to drafts), or MAX_T
+        // (no batch module, or TANG_SERVE_DETERMINISTIC=1).
+        let width = crate::batch::window_width(MAX_T, self.e.batch_rows(), self.deterministic);
+        for group in ready.chunks(width) {
+            // Each stream's chain, cut at an end of turn and the token limit; sampled streams
+            // draft nothing (verification is greedy).
+            let chains: Vec<Vec<(u32, f32)>> = group
                 .iter()
                 .map(|&i| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    if !mtp {
+                    if !mtp || s.sampled {
                         return Vec::new();
                     }
                     let room = s.limit.saturating_sub(s.out.len() + 1);
-                    let mut d: Vec<u32> = s.drafts.iter().take(room).copied().collect();
-                    if let Some(k) = d.iter().position(|x| self.eos.contains(x)) {
+                    let mut d: Vec<(u32, f32)> = s.drafts.iter().take(room).copied().collect();
+                    if let Some(k) = d.iter().position(|x| self.eos.contains(&x.0)) {
                         d.truncate(k);
                     }
                     d
                 })
                 .collect();
-            let give = share_drafts(&want.iter().map(Vec::len).collect::<Vec<_>>());
+            // D-Cut over the window's spare rows, the budget from the measured table.
+            let conf: Vec<Vec<f32>> = chains
+                .iter()
+                .map(|c| c.iter().map(|x| x.1).collect())
+                .collect();
+            // A window of sampled streams only: no drafts, no MTP pass.
+            let greedy = group
+                .iter()
+                .any(|&i| !lanes[i].stream.downcast_ref::<Stream>().unwrap().sampled);
+            let choice = if greedy {
+                self.spec.choose(&conf, width.saturating_sub(group.len()))
+            } else {
+                crate::batch::spec::Choice {
+                    drafts: vec![0; group.len()],
+                    predicted: 0.0,
+                    raw: 0.0,
+                    mtp: false,
+                }
+            };
+            self.e.set_slot_mtp(mtp && choice.mtp);
             let items: Vec<(usize, u32, Vec<u32>)> = group
                 .iter()
-                .zip(want.iter().zip(&give))
-                .map(|(&i, (d, &g))| {
+                .zip(chains.iter().zip(&choice.drafts))
+                .map(|(&i, (c, &g))| {
                     let s = lanes[i].stream.downcast_ref::<Stream>().unwrap();
-                    (s.slot, s.pending.unwrap(), d[..g].to_vec())
+                    (
+                        s.slot,
+                        s.pending.unwrap(),
+                        c[..g].iter().map(|x| x.0).collect(),
+                    )
                 })
                 .collect();
+            let extra: usize = choice.drafts.iter().sum();
             let t = Instant::now();
-            let kept = if mtp {
-                self.e.verify_batch(&items)?
+            // A window's failure is its rows' (a slot past its context, say), unless it's a
+            // device fault (`StepFailure::lanes` marks those fatal).
+            let kept = if extra > 0 {
+                self.e.verify_batch(&items)
             } else {
                 let rows: Vec<(usize, u32)> = items.iter().map(|x| (x.0, x.1)).collect();
                 self.e
-                    .decode_batch(&rows)?
-                    .into_iter()
-                    .map(|k| vec![k])
-                    .collect()
-            };
-            self.prefill_debt = (self.prefill_debt - t.elapsed().as_secs_f64()).max(0.0);
+                    .decode_batch(&rows)
+                    .map(|k| k.into_iter().map(|k| vec![k]).collect())
+            }
+            .map_err(|e| StepFailure::lanes(group.to_vec(), e))?;
+            let dt = t.elapsed().as_secs_f64();
+            let share = policy.share_for(ready.len(), self.batch, oldest);
+            self.sched.decoded(dt, share, &policy);
+            let accepted: usize = kept.iter().map(|k| k.len() - 1).sum();
+            if mtp {
+                self.spec.observe(
+                    group.len(),
+                    extra,
+                    choice.mtp,
+                    dt * 1e3,
+                    choice.raw,
+                    accepted,
+                );
+                self.spec_note(group.len(), extra, accepted, dt);
+            }
             for ((&i, toks), item) in group.iter().zip(&kept).zip(&items) {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
@@ -508,7 +547,8 @@ impl FlashServe {
                 s.drafted += item.2.len();
                 s.accepted += toks.len() - 1;
                 for &tok in toks {
-                    self.batch_take(s, tok, l.on)?;
+                    self.batch_take(s, tok, l.on)
+                        .map_err(|e| StepFailure::lanes(vec![i], e))?;
                     if s.finish.is_some() {
                         break;
                     }
@@ -523,7 +563,75 @@ impl FlashServe {
                 }
             }
         }
+        // One step's shape, for the otel gauges/histograms (zero-sized without the feature).
+        crate::telemetry::step(&crate::engine::StepStats {
+            decode_rows: lanes
+                .iter()
+                .filter(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.windows > 0
+                })
+                .count(),
+            decode_streams: lanes
+                .iter()
+                .filter(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.finish.is_none() && s.pending.is_some()
+                })
+                .count(),
+            prefill_tokens: lanes
+                .iter()
+                .map(|l| {
+                    let s = l.stream.downcast_ref::<Stream>().expect("a flash stream");
+                    s.done_prompt
+                })
+                .sum::<usize>()
+                .saturating_sub(prefill_tokens0),
+            prefill_chunks: n_chunks,
+            secs: t_step.elapsed().as_secs_f64(),
+        });
         Ok(())
+    }
+
+    /// Count one window for the spec-decode summary (`tang-llm: spec:` every 30 s while
+    /// windows run; every window with `TANG_SERVE_SPEC_LOG=1`).
+    fn spec_note(&mut self, live: usize, extra: usize, accepted: usize, dt: f64) {
+        let (c, at) = &mut self.spec_log;
+        for (k, v) in [
+            1.0,
+            extra as f64,
+            extra as f64,
+            accepted as f64,
+            (live + accepted) as f64,
+            dt * 1e3,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c[k] += v;
+        }
+        if std::env::var("TANG_SERVE_SPEC_LOG").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "tang-llm: spec window: {live} streams + {extra} drafts, {accepted} accepted, {:.1} ms, alpha {:.2}",
+                dt * 1e3,
+                self.spec.alpha
+            );
+        }
+        if at.elapsed().as_secs_f64() >= 30.0 {
+            eprintln!(
+                "tang-llm: spec: {:.0} windows, {:.1} draft rows a window, {:.0}/{:.0} accepted ({:.0} %), {:.2} tokens a stream-window, {:.0} tok/s in windows, alpha {:.2}",
+                c[0],
+                c[1] / c[0].max(1.0),
+                c[3],
+                c[2],
+                100.0 * c[3] / c[2].max(1.0),
+                c[4] / (c[4] - c[3]).max(1.0),
+                c[4] / (c[5] / 1e3).max(1e-9),
+                self.spec.alpha
+            );
+            *c = [0.0; 6];
+            *at = Instant::now();
+        }
     }
 
     pub(super) fn batch_state(s: &Inflight) -> (bool, bool) {
@@ -545,7 +653,12 @@ impl FlashServe {
         }
         // Park the slot. The pending token (if any) was sampled but never fed: the slot's
         // tokens are the prompt plus the output before it.
-        if let Some(sl) = self.slots.iter_mut().find(|x| x.id == s.slot) {
+        if s.broken {
+            if let Some(k) = self.slots.iter().position(|x| x.id == s.slot) {
+                self.slots.remove(k);
+                self.e.free_slot(s.slot);
+            }
+        } else if let Some(sl) = self.slots.iter_mut().find(|x| x.id == s.slot) {
             sl.busy = false;
             sl.key = s.key.clone();
         }
@@ -566,12 +679,13 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms, state saves {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
             s.slot,
             s.ids.len(),
             s.reused,
             prefilled,
             s.prefill_s * 1e3,
+            s.snap_s * 1e3,
             s.first.unwrap_or(0.0),
             s.out.len(),
             decode_s,
@@ -592,100 +706,5 @@ impl FlashServe {
                 ..Default::default()
             },
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A simulated engine: prefill costs `PF` seconds a token, a decode window `DW` seconds.
-    /// Stream 0 is a cold 15k prompt, stream 1 decodes throughout, stream 2 is a cached agent
-    /// turn (27 new tokens) admitted 5 s in. Steps follow `batch_step`'s accounting.
-    #[test]
-    fn short_tails_jump_the_queue_and_decoders_keep_the_gpu() {
-        const PF: f64 = 1.0 / 590.0;
-        const DW: f64 = 0.006;
-        let mut rem = [15_000usize, 0, 0];
-        let (mut clock, mut debt) = (0.0f64, 0.0f64);
-        let (mut tail_admit, mut tail_ttft) = (None, None);
-        let (mut windows, mut chunks) = (0usize, 0usize);
-        let mut cold_done = None;
-        while cold_done.is_none() || tail_ttft.is_none() {
-            if tail_admit.is_none() && clock >= 5.0 {
-                rem[2] = 27;
-                tail_admit = Some(clock);
-            }
-            let waiting: Vec<(usize, usize)> = rem
-                .iter()
-                .enumerate()
-                .filter(|(_, &r)| r > 0)
-                .map(|(i, &r)| (r, i))
-                .collect();
-            for (i, n) in prefill_plan(&waiting, true, debt) {
-                let dt = n as f64 * PF;
-                clock += dt;
-                debt += dt;
-                rem[i] -= n;
-                chunks += 1;
-                if rem[i] == 0 && i == 2 {
-                    tail_ttft = Some(clock - tail_admit.unwrap());
-                }
-                if rem[i] == 0 && i == 0 {
-                    cold_done = Some(clock);
-                }
-            }
-            clock += DW;
-            debt = (debt - DW).max(0.0);
-            windows += 1;
-            assert!(clock < 120.0, "the cold prompt starved");
-        }
-        // The cached tail's first token comes within about one prefill slice of its admission.
-        let ttft = tail_ttft.unwrap();
-        assert!(ttft < 0.2, "tail ttft {ttft:.3} s");
-        // Decoders get about half the GPU: many windows a prefill chunk, ~80 tok/s or better.
-        let per_chunk = windows as f64 / chunks as f64;
-        assert!(per_chunk >= 10.0, "{per_chunk:.1} windows a chunk");
-        assert!(
-            windows as f64 / clock >= 80.0,
-            "{:.0} windows/s",
-            windows as f64 / clock
-        );
-        // And the cold prompt still finishes, at no worse than half its solo speed (+ slack).
-        let solo = 15_000.0 * PF;
-        assert!(
-            cold_done.unwrap() < 2.2 * solo,
-            "cold done {:.1} s vs solo {solo:.1} s",
-            cold_done.unwrap()
-        );
-    }
-
-    #[test]
-    fn wide_budgets_slice_while_decoding() {
-        let w = [(10_000, 0), (27, 1)];
-        assert_eq!(
-            prefill_plan_with(&w, false, 0.0, WIDE_BUDGET, WIDE_SLICE),
-            vec![(1, 27), (0, WIDE_BUDGET - 27)]
-        );
-        assert_eq!(
-            prefill_plan_with(&w, true, 0.0, WIDE_BUDGET, WIDE_SLICE),
-            vec![(1, 27), (0, WIDE_SLICE - 27)]
-        );
-        assert!(prefill_plan_with(&w, true, 0.5, WIDE_BUDGET, WIDE_SLICE).is_empty());
-    }
-
-    #[test]
-    fn spare_rows_go_to_drafts_round_robin() {
-        assert_eq!(share_drafts(&[2]), vec![2]);
-        assert_eq!(share_drafts(&[2, 2, 2]), vec![2, 2, 1]);
-        assert_eq!(share_drafts(&[0, 3, 1]), vec![0, 3, 1]);
-        assert_eq!(share_drafts(&[2; 8]), vec![0; 8]);
-        assert_eq!(share_drafts(&[2; 6]), vec![1, 1, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn nothing_decoding_gets_the_full_budget_shortest_first() {
-        let plan = prefill_plan(&[(1000, 0), (30, 1), (500, 2)], false, 5.0);
-        assert_eq!(plan, vec![(1, 30), (2, PREFILL_BUDGET - 30)]);
     }
 }

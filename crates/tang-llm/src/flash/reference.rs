@@ -584,7 +584,7 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 }
 
 #[inline]
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 

@@ -1,0 +1,26 @@
+{
+ "S": 2100,
+ "width": 19,
+ "shapes": {
+  "long_topk_indices": [
+   2100,
+   19
+  ],
+  "long_input_x": [
+   2100,
+   64
+  ],
+  "long_q_resid": [
+   2100,
+   16
+  ],
+  "long_index_scores": [
+   2100,
+   525
+  ],
+  "long_pool_keys": [
+   525,
+   6
+  ]
+ }
+}

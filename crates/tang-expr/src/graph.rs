@@ -134,6 +134,30 @@ impl ExprGraph {
         self.insert(Node::Log2(a))
     }
 
+    /// Floor (largest integer <= x). Folds literals.
+    #[inline]
+    pub fn floor(&mut self, a: ExprId) -> ExprId {
+        if let Some(v) = self.node(a).as_f64() {
+            return self.lit(v.floor());
+        }
+        self.insert(Node::Floor(a))
+    }
+
+    /// Integer `a mod b` for integer-valued `a` and a positive integer `b`
+    /// (floored, so `-1 mod 4 == 3`): `a - b * floor((a + 0.5) / b)`. The
+    /// half offset keeps the quotient at least `0.5 / b` from an integer, so
+    /// rounding in `1 / b` (and f32 kernels) cannot flip the floor.
+    pub fn imod(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        let half = self.lit(0.5);
+        let ah = self.add(a, half);
+        let rb = self.recip(b);
+        let q = self.mul(ah, rb);
+        let fq = self.floor(q);
+        let bq = self.mul(b, fq);
+        let nbq = self.neg(bq);
+        self.add(a, nbq)
+    }
+
     /// Branchless select: returns `a` if `cond > 0`, else `b`.
     #[inline]
     pub fn select(&mut self, cond: ExprId, a: ExprId, b: ExprId) -> ExprId {

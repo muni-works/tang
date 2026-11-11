@@ -1,0 +1,135 @@
+   Compiling tang-gpu v0.1.0 (/work/tang3/crates/tang-gpu)
+   Compiling tang-bench v0.1.0 (/work/tang3/crates/tang-bench)
+    Finished `release` profile [optimized] target(s) in 11.83s
+BUILD_DONE
+0 %, 0 MiB
+cublas matmul 1024x1024x1024 b=[k,n]: 0.0096 ms 223.0 TFLOP/s
+cublas matmul 1024x1024x1024 b=[n,k]: 0.0109 ms 196.7 TFLOP/s
+cublas matmul 2048x2048x2048 b=[k,n]: 0.0247 ms 695.6 TFLOP/s
+cublas matmul 2048x2048x2048 b=[n,k]: 0.0247 ms 694.7 TFLOP/s
+cublas matmul 4096x4096x4096 b=[k,n]: 0.1712 ms 802.6 TFLOP/s
+cublas matmul 4096x4096x4096 b=[n,k]: 0.1721 ms 798.7 TFLOP/s
+cublas matmul 8192x8192x8192 b=[k,n]: 1.4477 ms 759.5 TFLOP/s
+cublas matmul 8192x8192x8192 b=[n,k]: 1.5487 ms 709.9 TFLOP/s
+cublas matmul 16384x2048x2048 b=[k,n]: 0.2079 ms 661.1 TFLOP/s
+cublas matmul 16384x2048x2048 b=[n,k]: 0.2036 ms 675.1 TFLOP/s
+cublas matmul 16384x2048x8192 b=[k,n]: 0.8025 ms 685.1 TFLOP/s
+cublas matmul 16384x2048x8192 b=[n,k]: 0.8020 ms 685.5 TFLOP/s
+cublas matmul 16384x8192x2048 b=[k,n]: 0.7477 ms 735.3 TFLOP/s
+cublas matmul 16384x8192x2048 b=[n,k]: 0.7601 ms 723.2 TFLOP/s
+tang matmul 1024x1024x1024 b=[k,n]:  mma.sync 0.0192 ms 111.8 TFLOP/s (variant 4, rel_err 3.2e-3)  wgmma 0.0146 ms 147.5 TFLOP/s (variant 10, rel_err 3.2e-3)
+tang matmul 1024x1024x1024 b=[n,k]:  mma.sync 0.0191 ms 112.6 TFLOP/s (variant 4, rel_err 3.2e-3)  wgmma 0.0143 ms 149.8 TFLOP/s (variant 9, rel_err 3.2e-3)
+tang matmul 2048x2048x2048 b=[k,n]:  mma.sync 0.0811 ms 212.0 TFLOP/s (variant 5, rel_err 3.4e-3)  wgmma 0.0517 ms 332.4 TFLOP/s (variant 9, rel_err 3.4e-3)
+tang matmul 2048x2048x2048 b=[n,k]:  mma.sync 0.0826 ms 208.0 TFLOP/s (variant 5, rel_err 3.4e-3)  wgmma 0.0508 ms 338.5 TFLOP/s (variant 8, rel_err 3.4e-3)
+tang matmul 4096x4096x4096 b=[k,n]:  mma.sync 0.5983 ms 229.7 TFLOP/s (variant 5, rel_err 3.6e-3)  wgmma 0.3429 ms 400.8 TFLOP/s (variant 7, rel_err 3.6e-3)
+tang matmul 4096x4096x4096 b=[n,k]:  mma.sync 0.6014 ms 228.5 TFLOP/s (variant 4, rel_err 3.6e-3)  wgmma 0.3438 ms 399.8 TFLOP/s (variant 7, rel_err 3.6e-3)
+tang matmul 8192x8192x8192 b=[k,n]:  mma.sync 4.5844 ms 239.8 TFLOP/s (variant 4, rel_err 3.7e-3)  wgmma 2.5362 ms 433.5 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 8192x8192x8192 b=[n,k]:  mma.sync 4.5936 ms 239.4 TFLOP/s (variant 4, rel_err 3.7e-3)  wgmma 2.5343 ms 433.8 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 16384x2048x2048 b=[k,n]:  mma.sync 0.5926 ms 231.9 TFLOP/s (variant 5, rel_err 3.6e-3)  wgmma 0.3579 ms 384.0 TFLOP/s (variant 8, rel_err 3.6e-3)
+tang matmul 16384x2048x2048 b=[n,k]:  mma.sync 0.5879 ms 233.8 TFLOP/s (variant 5, rel_err 3.3e-3)  wgmma 0.3305 ms 415.8 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x2048x8192 b=[k,n]:  mma.sync 2.3307 ms 235.9 TFLOP/s (variant 4, rel_err 3.3e-3)  wgmma 1.4633 ms 375.7 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x2048x8192 b=[n,k]:  mma.sync 2.3156 ms 237.4 TFLOP/s (variant 4, rel_err 3.3e-3)  wgmma 1.3650 ms 402.7 TFLOP/s (variant 7, rel_err 3.3e-3)
+tang matmul 16384x8192x2048 b=[k,n]:  mma.sync 2.2062 ms 249.2 TFLOP/s (variant 5, rel_err 3.7e-3)  wgmma 1.1665 ms 471.3 TFLOP/s (variant 7, rel_err 3.7e-3)
+tang matmul 16384x8192x2048 b=[n,k]:  mma.sync 2.2258 ms 247.0 TFLOP/s (variant 4, rel_err 3.6e-3)  wgmma 1.0997 ms 499.9 TFLOP/s (variant 7, rel_err 3.6e-3)
+MATMUL_DONE
+sdpa fwd bh=512 n=1024 d=64 causal=False: 0.471 ms 291.7 TFLOP/s rel_err 3.37e-03
+sdpa bwd bh=512 n=1024 d=64 causal=False: 1.600 ms 214.7 TFLOP/s rel_err dq 3.63e-03 dk 3.25e-03 dv 3.03e-03
+fa3 fwd bh=512 n=1024 d=64 causal=False: 0.358 ms 384.3 TFLOP/s rel_err 3.37e-03
+fa3 bwd bh=512 n=1024 d=64 causal=False: 0.806 ms 426.5 TFLOP/s rel_err dq 3.63e-03 dk 3.25e-03 dv 3.03e-03
+fa3-fp8 fwd bh=512 n=1024 d=64 causal=False: 0.310 ms 443.6 TFLOP/s rel_err 8.57e-02
+sdpa fwd bh=256 n=2048 d=64 causal=False: 0.911 ms 301.8 TFLOP/s rel_err 2.76e-03
+sdpa bwd bh=256 n=2048 d=64 causal=False: 2.782 ms 247.0 TFLOP/s rel_err dq 4.58e-03 dk 3.89e-03 dv 2.97e-03
+fa3 fwd bh=256 n=2048 d=64 causal=False: 0.550 ms 499.6 TFLOP/s rel_err 2.76e-03
+fa3 bwd bh=256 n=2048 d=64 causal=False: 1.410 ms 487.5 TFLOP/s rel_err dq 4.58e-03 dk 3.89e-03 dv 2.97e-03
+fa3-fp8 fwd bh=256 n=2048 d=64 causal=False: 0.483 ms 569.3 TFLOP/s rel_err 6.11e-02
+sdpa fwd bh=128 n=4096 d=64 causal=False: 1.772 ms 310.3 TFLOP/s rel_err 2.23e-03
+sdpa bwd bh=128 n=4096 d=64 causal=False: 5.112 ms 268.9 TFLOP/s rel_err dq 4.11e-03 dk 4.47e-03 dv 3.13e-03
+fa3 fwd bh=128 n=4096 d=64 causal=False: 1.042 ms 527.7 TFLOP/s rel_err 2.23e-03
+fa3 bwd bh=128 n=4096 d=64 causal=False: 2.609 ms 526.7 TFLOP/s rel_err dq 4.11e-03 dk 4.47e-03 dv 3.13e-03
+fa3-fp8 fwd bh=128 n=4096 d=64 causal=False: 0.900 ms 610.9 TFLOP/s rel_err 1.12e-01
+sdpa fwd bh=64 n=8192 d=64 causal=False: 3.510 ms 313.3 TFLOP/s rel_err 2.93e-03
+sdpa bwd bh=64 n=8192 d=64 causal=False: 9.809 ms 280.2 TFLOP/s rel_err dq 3.14e-03 dk 3.05e-03 dv 2.84e-03
+fa3 fwd bh=64 n=8192 d=64 causal=False: 1.917 ms 573.6 TFLOP/s rel_err 2.93e-03
+fa3 bwd bh=64 n=8192 d=64 causal=False: 5.105 ms 538.4 TFLOP/s rel_err dq 3.14e-03 dk 3.05e-03 dv 2.84e-03
+fa3-fp8 fwd bh=64 n=8192 d=64 causal=False: 1.686 ms 652.1 TFLOP/s rel_err 8.20e-02
+sdpa fwd bh=32 n=16384 d=64 causal=False: 6.980 ms 315.0 TFLOP/s rel_err 3.06e-03
+sdpa bwd bh=32 n=16384 d=64 causal=False: 19.187 ms 286.5 TFLOP/s rel_err dq 3.42e-03 dk 2.75e-03 dv 3.15e-03
+fa3 fwd bh=32 n=16384 d=64 causal=False: 3.876 ms 567.4 TFLOP/s rel_err 3.06e-03
+fa3 bwd bh=32 n=16384 d=64 causal=False: 10.169 ms 540.6 TFLOP/s rel_err dq 3.42e-03 dk 2.52e-03 dv 3.15e-03
+fa3-fp8 fwd bh=32 n=16384 d=64 causal=False: 3.216 ms 683.8 TFLOP/s rel_err 7.08e-02
+sdpa fwd bh=512 n=1024 d=64 causal=True: 0.310 ms 221.7 TFLOP/s rel_err 2.64e-03
+sdpa bwd bh=512 n=1024 d=64 causal=True: 1.113 ms 154.3 TFLOP/s rel_err dq 3.73e-03 dk 2.97e-03 dv 2.49e-03
+fa3 fwd bh=512 n=1024 d=64 causal=True: 0.229 ms 299.7 TFLOP/s rel_err 2.64e-03
+fa3 bwd bh=512 n=1024 d=64 causal=True: 0.574 ms 299.3 TFLOP/s rel_err dq 3.73e-03 dk 2.97e-03 dv 2.49e-03
+fa3-fp8 fwd bh=512 n=1024 d=64 causal=True: 0.227 ms 302.4 TFLOP/s rel_err 6.79e-02
+sdpa fwd bh=256 n=2048 d=64 causal=True: 0.522 ms 263.2 TFLOP/s rel_err 1.59e-03
+sdpa bwd bh=256 n=2048 d=64 causal=True: 1.724 ms 199.3 TFLOP/s rel_err dq 3.02e-03 dk 3.55e-03 dv 2.67e-03
+fa3 fwd bh=256 n=2048 d=64 causal=True: 0.322 ms 426.6 TFLOP/s rel_err 1.59e-03
+fa3 bwd bh=256 n=2048 d=64 causal=True: 0.837 ms 410.5 TFLOP/s rel_err dq 3.02e-03 dk 3.55e-03 dv 2.67e-03
+fa3-fp8 fwd bh=256 n=2048 d=64 causal=True: 0.321 ms 427.9 TFLOP/s rel_err 4.16e-02
+sdpa fwd bh=128 n=4096 d=64 causal=True: 0.970 ms 283.3 TFLOP/s rel_err 2.45e-03
+sdpa bwd bh=128 n=4096 d=64 causal=True: 2.950 ms 232.9 TFLOP/s rel_err dq 4.26e-03 dk 2.69e-03 dv 2.75e-03
+fa3 fwd bh=128 n=4096 d=64 causal=True: 0.564 ms 487.5 TFLOP/s rel_err 2.45e-03
+fa3 bwd bh=128 n=4096 d=64 causal=True: 1.368 ms 502.2 TFLOP/s rel_err dq 4.26e-03 dk 2.69e-03 dv 2.75e-03
+fa3-fp8 fwd bh=128 n=4096 d=64 causal=True: 0.531 ms 517.7 TFLOP/s rel_err 4.26e-02
+sdpa fwd bh=64 n=8192 d=64 causal=True: 1.850 ms 297.2 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=64 n=8192 d=64 causal=True: 5.374 ms 255.7 TFLOP/s rel_err dq 2.92e-03 dk 2.36e-03 dv 2.28e-03
+fa3 fwd bh=64 n=8192 d=64 causal=True: 0.999 ms 550.5 TFLOP/s rel_err 2.41e-03
+fa3 bwd bh=64 n=8192 d=64 causal=True: 2.568 ms 535.2 TFLOP/s rel_err dq 2.92e-03 dk 2.36e-03 dv 2.28e-03
+fa3-fp8 fwd bh=64 n=8192 d=64 causal=True: 0.906 ms 606.5 TFLOP/s rel_err 6.17e-02
+sdpa fwd bh=32 n=16384 d=64 causal=True: 3.629 ms 303.0 TFLOP/s rel_err 2.38e-03
+sdpa bwd bh=32 n=16384 d=64 causal=True: 10.046 ms 273.6 TFLOP/s rel_err dq 4.78e-03 dk 4.86e-03 dv 2.49e-03
+fa3 fwd bh=32 n=16384 d=64 causal=True: 1.914 ms 574.3 TFLOP/s rel_err 2.38e-03
+fa3 bwd bh=32 n=16384 d=64 causal=True: 4.942 ms 556.2 TFLOP/s rel_err dq 4.78e-03 dk 4.86e-03 dv 2.49e-03
+fa3-fp8 fwd bh=32 n=16384 d=64 causal=True: 1.712 ms 642.1 TFLOP/s rel_err 3.41e-02
+sdpa fwd bh=256 n=1024 d=128 causal=False: 0.411 ms 334.3 TFLOP/s rel_err 3.20e-03
+sdpa bwd bh=256 n=1024 d=128 causal=False: 1.514 ms 226.9 TFLOP/s rel_err dq 3.22e-03 dk 3.48e-03 dv 2.87e-03
+fa3 fwd bh=256 n=1024 d=128 causal=False: 0.216 ms 635.8 TFLOP/s rel_err 3.20e-03
+fa3 bwd bh=256 n=1024 d=128 causal=False: 0.700 ms 491.1 TFLOP/s rel_err dq 3.22e-03 dk 3.48e-03 dv 2.87e-03
+fa3-fp8 fwd bh=256 n=1024 d=128 causal=False: 0.198 ms 695.4 TFLOP/s rel_err 7.25e-02
+sdpa fwd bh=128 n=2048 d=128 causal=False: 0.791 ms 347.4 TFLOP/s rel_err 2.83e-03
+sdpa bwd bh=128 n=2048 d=128 causal=False: 2.605 ms 263.8 TFLOP/s rel_err dq 2.38e-03 dk 3.25e-03 dv 3.28e-03
+fa3 fwd bh=128 n=2048 d=128 causal=False: 0.397 ms 691.9 TFLOP/s rel_err 2.83e-03
+fa3 bwd bh=128 n=2048 d=128 causal=False: 1.198 ms 573.5 TFLOP/s rel_err dq 2.38e-03 dk 3.25e-03 dv 3.28e-03
+fa3-fp8 fwd bh=128 n=2048 d=128 causal=False: 0.353 ms 779.0 TFLOP/s rel_err 5.91e-02
+sdpa fwd bh=64 n=4096 d=128 causal=False: 1.549 ms 354.9 TFLOP/s rel_err 3.68e-03
+sdpa bwd bh=64 n=4096 d=128 causal=False: 4.809 ms 285.8 TFLOP/s rel_err dq 3.08e-03 dk 3.64e-03 dv 3.46e-03
+fa3 fwd bh=64 n=4096 d=128 causal=False: 0.766 ms 717.5 TFLOP/s rel_err 3.68e-03
+fa3 bwd bh=64 n=4096 d=128 causal=False: 2.301 ms 597.4 TFLOP/s rel_err dq 3.08e-03 dk 3.64e-03 dv 3.46e-03
+fa3-fp8 fwd bh=64 n=4096 d=128 causal=False: 0.621 ms 884.8 TFLOP/s rel_err 9.42e-02
+sdpa fwd bh=32 n=8192 d=128 causal=False: 3.067 ms 358.5 TFLOP/s rel_err 2.57e-03
+sdpa bwd bh=32 n=8192 d=128 causal=False: 9.246 ms 297.3 TFLOP/s rel_err dq 2.41e-03 dk 2.90e-03 dv 2.84e-03
+fa3 fwd bh=32 n=8192 d=128 causal=False: 1.493 ms 736.6 TFLOP/s rel_err 2.55e-03
+fa3 bwd bh=32 n=8192 d=128 causal=False: 4.501 ms 610.7 TFLOP/s rel_err dq 2.41e-03 dk 2.90e-03 dv 2.84e-03
+fa3-fp8 fwd bh=32 n=8192 d=128 causal=False: 1.218 ms 902.9 TFLOP/s rel_err 7.15e-02
+sdpa fwd bh=16 n=16384 d=128 causal=False: 6.128 ms 358.9 TFLOP/s rel_err 2.78e-03
+sdpa bwd bh=16 n=16384 d=128 causal=False: 18.124 ms 303.3 TFLOP/s rel_err dq 4.05e-03 dk 3.24e-03 dv 3.66e-03
+fa3 fwd bh=16 n=16384 d=128 causal=False: 3.018 ms 728.6 TFLOP/s rel_err 2.78e-03
+fa3 bwd bh=16 n=16384 d=128 causal=False: 8.939 ms 615.0 TFLOP/s rel_err dq 4.05e-03 dk 3.24e-03 dv 3.66e-03
+fa3-fp8 fwd bh=16 n=16384 d=128 causal=False: 2.359 ms 932.0 TFLOP/s rel_err 5.19e-02
+sdpa fwd bh=256 n=1024 d=128 causal=True: 0.274 ms 250.7 TFLOP/s rel_err 2.41e-03
+sdpa bwd bh=256 n=1024 d=128 causal=True: 1.023 ms 168.0 TFLOP/s rel_err dq 3.19e-03 dk 3.57e-03 dv 2.57e-03
+fa3 fwd bh=256 n=1024 d=128 causal=True: 0.140 ms 489.4 TFLOP/s rel_err 2.41e-03
+fa3 bwd bh=256 n=1024 d=128 causal=True: 0.483 ms 355.6 TFLOP/s rel_err dq 3.19e-03 dk 3.57e-03 dv 2.57e-03
+fa3-fp8 fwd bh=256 n=1024 d=128 causal=True: 0.136 ms 506.6 TFLOP/s rel_err 5.40e-02
+sdpa fwd bh=128 n=2048 d=128 causal=True: 0.485 ms 283.5 TFLOP/s rel_err 1.90e-03
+sdpa bwd bh=128 n=2048 d=128 causal=True: 1.593 ms 215.7 TFLOP/s rel_err dq 4.94e-03 dk 4.26e-03 dv 2.54e-03
+fa3 fwd bh=128 n=2048 d=128 causal=True: 0.225 ms 611.9 TFLOP/s rel_err 1.90e-03
+fa3 bwd bh=128 n=2048 d=128 causal=True: 0.712 ms 482.7 TFLOP/s rel_err dq 4.94e-03 dk 4.26e-03 dv 2.54e-03
+fa3-fp8 fwd bh=128 n=2048 d=128 causal=True: 0.217 ms 632.2 TFLOP/s rel_err 4.43e-02
+sdpa fwd bh=64 n=4096 d=128 causal=True: 0.897 ms 306.3 TFLOP/s rel_err 1.98e-03
+sdpa bwd bh=64 n=4096 d=128 causal=True: 2.714 ms 253.2 TFLOP/s rel_err dq 4.77e-03 dk 5.11e-03 dv 2.00e-03
+fa3 fwd bh=64 n=4096 d=128 causal=True: 0.397 ms 691.8 TFLOP/s rel_err 1.98e-03
+fa3 bwd bh=64 n=4096 d=128 causal=True: 1.255 ms 547.6 TFLOP/s rel_err dq 4.77e-03 dk 5.11e-03 dv 2.00e-03
+fa3-fp8 fwd bh=64 n=4096 d=128 causal=True: 0.352 ms 780.0 TFLOP/s rel_err 3.96e-02
+sdpa fwd bh=32 n=8192 d=128 causal=True: 1.713 ms 320.9 TFLOP/s rel_err 2.17e-03
+sdpa bwd bh=32 n=8192 d=128 causal=True: 4.925 ms 279.0 TFLOP/s rel_err dq 2.40e-03 dk 4.73e-03 dv 3.29e-03
+fa3 fwd bh=32 n=8192 d=128 causal=True: 0.748 ms 734.8 TFLOP/s rel_err 2.17e-03
+fa3 bwd bh=32 n=8192 d=128 causal=True: 2.307 ms 595.8 TFLOP/s rel_err dq 2.40e-03 dk 4.73e-03 dv 3.29e-03
+fa3-fp8 fwd bh=32 n=8192 d=128 causal=True: 0.629 ms 874.5 TFLOP/s rel_err 4.61e-02
+sdpa fwd bh=16 n=16384 d=128 causal=True: 3.361 ms 327.2 TFLOP/s rel_err 2.62e-03
+sdpa bwd bh=16 n=16384 d=128 causal=True: 8.942 ms 307.4 TFLOP/s rel_err dq 3.54e-03 dk 3.61e-03 dv 2.40e-03
+fa3 fwd bh=16 n=16384 d=128 causal=True: 1.465 ms 750.4 TFLOP/s rel_err 2.62e-03
+fa3 bwd bh=16 n=16384 d=128 causal=True: 4.530 ms 606.8 TFLOP/s rel_err dq 3.54e-03 dk 3.61e-03 dv 2.40e-03
+fa3-fp8 fwd bh=16 n=16384 d=128 causal=True: 1.195 ms 919.8 TFLOP/s rel_err 4.61e-02
+BASE_DONE

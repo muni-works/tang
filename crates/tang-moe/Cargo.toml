@@ -14,10 +14,13 @@ include = ["src/**/*", "README.md", "DESIGN.md"]
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# NCCL collectives (src/nccl.rs). cudarc loads libnccl at run time, so this builds without it;
+# only creating a `Comm` needs libnccl.so.2 present.
+nccl = ["cuda", "cudarc/nccl"]
 
 [dependencies]
 libc = "0.2"
-cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [[bin]]
 name = "tang-moe-bench"

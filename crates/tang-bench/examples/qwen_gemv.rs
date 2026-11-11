@@ -16,6 +16,7 @@ fn arg(src: tang_compile::tensor::TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
         view: View {
+            gather: None,
             guard: false,
             forms,
         },
@@ -86,6 +87,7 @@ fn main() {
     let mut p = match rt.kind() {
         BackendKind::Wgpu => g.to_msl_decode(&outs, &opts).program,
         BackendKind::Cuda => g.to_cuda_decode(&outs, &opts).program,
+        k => unimplemented!("qwen_gemv: no decode lowering for {k:?}"),
     };
     if let Ok(f) = std::env::var("GEMV_DUMP") {
         std::fs::write(f, &p.kernels[0].source).unwrap();

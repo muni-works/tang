@@ -1,0 +1,130 @@
+Tue Nov 10 08:27:18 AM UTC 2026
+24eb7f7cc57467e73e04b4d8b4a0dd9ecdf01593
+NVIDIA GeForce RTX 3090, 580.196.07
+65167, 256 MiB, python3
+1050842, 229 MiB, /home/cam/Developer/vcad-seam-sweep/target/debug/deps/vcad_kernel_gpu-01abbdf3541dbf70
+1922707, 234 MiB, /home/cam/Developer/vcad-rs00/target/release/deps/vcad_kernel_gpu-744f3656dac44814
+3561740, 1242 MiB, ./target/release/examples/gpubench
+3657358, 290 MiB, /usr/lib/ffmpeg/8.0/bin/ffmpeg
+3777802, 283 MiB, /usr/lib/ffmpeg/8.0/bin/ffmpeg
+3777792, 283 MiB, /usr/lib/ffmpeg/8.0/bin/ffmpeg
+  regs   1024 words: [p0=32 p1=32 r0=128] 272.63 MB
+  regs   2048 words: [p0=64 p1=32 r0=128] 205.52 MB
+  regs   4096 words: [p0=64 p1=64 r0=64] 138.41 MB
+  regs   8192 words: [p0=128 p1=64 r0=64] 104.86 MB
+  regs  16384 words: [p0=128 p1=128 r0=32] 71.30 MB
+  regs  32768 words: [p0=256 p1=128 r0=32] 54.53 MB
+  regs  65536 words (register file): [p0=256 p1=256 r0=16] 37.75 MB
+## matmul 1024³ on 3090 (M = 12288 words)
+  LP: coords [p0,p1,r0], arrays ["0b101", "0b110", "0b11"], atomic 0b0; skipped: 0 gathered, 0 non-projective
+  primal s=[0.5, 0.5, 0.5] t=[0.0, 0.0, 0.0]  dual x=[0.5, 0.5, 0.5]  σ=1.5000  gap=0.0e0
+  bound 71.13 MB
+  dual tile    [p0=64 p1=64 r0=64]  traffic 138.41 MB (1.95× bound)
+  2-level dual [p0=64 p1=64 r0=64]  traffic 138.41 MB (2.25× bound at regs+smem 61.58 MB); in registers: 0b11
+  schedule_auto[p0=64 p1=64 r0=32]  LP traffic 138.41 MB, staged 138.41 MB (1.95× bound), 1 kernel(s)
+  autotuned    [p0=64 p1=64 r0=32]  LP traffic 138.41 MB, staged 138.41 MB (1.95× bound), 1 kernel(s)
+  race [p0=64 p1=64 r0=32]  0.100 ms  LP traffic 138.41 MB  (split=0;tile=16,16,32;reg=4,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=32 r0=16]  0.101 ms  LP traffic 406.85 MB  (split=0;tile=32,8,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=16 r0=16]  0.101 ms  LP traffic 541.07 MB  (split=0;tile=16,8,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=32 p1=128 r0=16]  0.101 ms  LP traffic 171.97 MB  (split=0;tile=32,8,16;reg=4,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=64 p1=16 r0=16]  0.101 ms  LP traffic 339.74 MB  (split=0;tile=16,16,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=64 r0=16]  0.101 ms  LP traffic 339.74 MB  (split=0;tile=16,16,16;reg=4,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=32 p1=8 r0=16]  0.101 ms  LP traffic 406.85 MB  (split=0;tile=8,8,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=32 p1=64 r0=16]  0.101 ms  LP traffic 205.52 MB  (split=0;tile=16,16,16;reg=4,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=32 r0=16]  0.101 ms  LP traffic 406.85 MB  (split=0;tile=16,8,16;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=64 r0=16]  0.101 ms  LP traffic 339.74 MB  (split=0;tile=32,4,16;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=4 p1=32 r0=16]  0.101 ms  LP traffic 406.85 MB  (split=0;tile=32,4,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=128 r0=16]  0.101 ms  LP traffic 306.18 MB  (split=0;tile=32,4,16;reg=4,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  floor at bound 0.076 ms (memory); at schedule_auto's traffic 0.148 ms (memory)
+  regs   1024 words: [p0=32 p1=32 r0=128] 17246.98 MB
+  regs   2048 words: [p0=64 p1=32 r0=128] 12952.01 MB
+  regs   4096 words: [p0=64 p1=64 r0=64] 8657.04 MB
+  regs   8192 words: [p0=128 p1=64 r0=64] 6509.56 MB
+  regs  16384 words: [p0=128 p1=128 r0=32] 4362.08 MB
+  regs  32768 words: [p0=256 p1=128 r0=32] 3288.33 MB
+  regs  65536 words (register file): [p0=256 p1=256 r0=16] 2214.59 MB
+## matmul 4096³ on 3090 (M = 12288 words)
+  LP: coords [p0,p1,r0], arrays ["0b101", "0b110", "0b11"], atomic 0b0; skipped: 0 gathered, 0 non-projective
+  primal s=[0.5, 0.5, 0.5] t=[0.0, 0.0, 0.0]  dual x=[0.5, 0.5, 0.5]  σ=1.5000  gap=0.0e0
+  bound 4555.45 MB
+  dual tile    [p0=64 p1=64 r0=64]  traffic 8657.04 MB (1.90× bound)
+  2-level dual [p0=64 p1=64 r0=64]  traffic 8657.04 MB (2.19× bound at regs+smem 3945.11 MB); in registers: 0b11
+  schedule_auto[p0=64 p1=64 r0=32]  LP traffic 8657.04 MB, staged 8657.04 MB (1.90× bound), 1 kernel(s)
+  autotuned    [p0=64 p1=64 r0=32]  LP traffic 8657.04 MB, staged 8657.04 MB (1.90× bound), 1 kernel(s)
+
+thread 'main' (1921981) panicked at crates/tang-gpu/src/program.rs:1085:39:
+launch: DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' (1921981) panicked at crates/tang-gpu/src/program.rs:1085:39:
+launch: DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")
+  race [p0=32 p1=16 r0=32]  5.511 ms  LP traffic 17246.98 MB  (split=0;tile=16,8,32;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=64 r0=16]  5.540 ms  LP traffic 21541.95 MB  (split=0;tile=64,4,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=64 r0=32]  5.543 ms  LP traffic 12952.01 MB  (split=0;tile=32,4,32;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=32 r0=32]  5.549 ms  LP traffic 17246.98 MB  (split=0;tile=8,16,32;reg=4,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=64 p1=64 r0=32]  5.551 ms  LP traffic 8657.04 MB  (split=0;tile=16,16,32;reg=4,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=32 p1=16 r0=16]  5.556 ms  LP traffic 25836.91 MB  (split=0;tile=8,8,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=128 r0=16]  5.557 ms  LP traffic 19394.46 MB  (split=0;tile=64,4,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=16 r0=32]  5.558 ms  LP traffic 25836.91 MB  (split=0;tile=16,8,32;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=32 r0=16]  5.559 ms  LP traffic 25836.91 MB  (split=0;tile=32,8,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=16 p1=32 r0=16]  5.559 ms  LP traffic 25836.91 MB  (split=0;tile=8,16,16;reg=4,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=32 p1=32 r0=32]  5.561 ms  LP traffic 17246.98 MB  (split=0;tile=16,8,32;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=8 p1=128 r0=16]  5.566 ms  LP traffic 19394.46 MB  (split=0;tile=64,4,16;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  floor at bound 4.867 ms (memory); at schedule_auto's traffic 9.249 ms (memory)
+  regs   1024 words: [p0=1 p1=1 p2=128 p3=8 p4=1 r0=32 n5_0=64] 169.87 MB
+  regs   2048 words: [p0=1 p1=1 p2=128 p3=16 p4=1 r0=32 n5_0=64] 94.37 MB
+  regs   4096 words: [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64] 56.62 MB
+  regs   8192 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=32 n5_0=64] 37.75 MB
+  regs  16384 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=64 n5_0=64] 37.75 MB
+  regs  32768 words: [p0=1 p1=1 p2=256 p3=64 p4=1 r0=64 n5_0=64] 20.97 MB
+  regs  65536 words (register file): [p0=1 p1=1 p2=512 p3=64 p4=1 r0=64 n5_0=64] 12.58 MB
+## attention fwd 8 heads N=1024 d=64 causal on 3090 (M = 12288 words)
+  LP: coords [p0,p1,p2,p3,p4,r0,n5_0], arrays ["0b1000111", "0b1100001", "0b101001", "0b11111"], atomic 0b1000000; skipped: 0 gathered, 0 non-projective
+  primal s=[0.0, 1.0, 0.0, 1.0] t=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  dual x=[0.0, 0.0, 0.5886, 0.4114, 0.0, 0.5886, 0.4114]  σ=2.0000  gap=0.0e0
+  bound 11.14 MB
+  dual tile    [p0=1 p1=1 p2=48 p3=64 p4=1 r0=48 n5_0=64]  traffic 96.47 MB (8.66× bound)
+  2-level dual [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64]  traffic 56.62 MB (6.80× bound at regs+smem 8.32 MB); in registers: 0b11111
+  schedule_auto[p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 272.63 MB, staged 272.63 MB (24.48× bound), 1 kernel(s)
+  autotuned    [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 272.63 MB, staged 272.63 MB (24.48× bound), 1 kernel(s)
+  race [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 272.63 MB  (split=0;tile=64,4,32;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=32 p3=32 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 207.62 MB  (split=0;tile=16,8,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=128 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 272.63 MB  (split=0;tile=64,4,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=32 p4=1 r0=32 n5_0=64]  0.072 ms  LP traffic 207.62 MB  (split=0;tile=32,4,32;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=8 p3=128 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 272.63 MB  (split=0;tile=64,4,16;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=32 p3=16 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 346.03 MB  (split=0;tile=8,8,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=32 p3=32 p4=1 r0=32 n5_0=64]  0.072 ms  LP traffic 207.62 MB  (split=0;tile=32,8,32;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=64 p3=8 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 320.86 MB  (split=0;tile=8,16,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=64 p3=32 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 106.95 MB  (split=0;tile=16,16,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=32 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 408.94 MB  (split=0;tile=32,4,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=8 p3=16 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 681.57 MB  (split=0;tile=16,8,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=32 p3=8 p4=1 r0=16 n5_0=64]  0.072 ms  LP traffic 402.65 MB  (split=0;tile=8,8,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  floor at bound 0.030 ms (compute); at schedule_auto's traffic 0.291 ms (memory)
+  regs   1024 words: [p0=1 p1=1 p2=128 p3=8 p4=1 r0=32 n5_0=64] 2491.42 MB
+  regs   2048 words: [p0=1 p1=1 p2=128 p3=16 p4=1 r0=32 n5_0=64] 1384.12 MB
+  regs   4096 words: [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64] 830.47 MB
+  regs   8192 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=32 n5_0=64] 553.65 MB
+  regs  16384 words: [p0=1 p1=1 p2=128 p3=64 p4=1 r0=64 n5_0=64] 553.65 MB
+  regs  32768 words: [p0=1 p1=1 p2=256 p3=64 p4=1 r0=64 n5_0=64] 285.21 MB
+  regs  65536 words (register file): [p0=1 p1=1 p2=512 p3=64 p4=1 r0=64 n5_0=64] 150.99 MB
+## attention fwd 8 heads N=4096 d=64 causal on 3090 (M = 12288 words)
+  LP: coords [p0,p1,p2,p3,p4,r0,n5_0], arrays ["0b1000111", "0b1100001", "0b101001", "0b11111"], atomic 0b1000000; skipped: 0 gathered, 0 non-projective
+  primal s=[0.0, 1.0, 0.0, 1.0] t=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  dual x=[0.0, 0.0, 0.5886, 0.4114, 0.0, 0.5886, 0.4114]  σ=2.0000  gap=0.0e0
+  bound 178.91 MB
+  dual tile    [p0=1 p1=1 p2=48 p3=64 p4=1 r0=48 n5_0=64]  traffic 1459.62 MB (8.16× bound)
+  2-level dual [p0=1 p1=1 p2=128 p3=32 p4=1 r0=32 n5_0=64]  traffic 830.47 MB (6.19× bound at regs+smem 134.15 MB); in registers: 0b11111
+  schedule_auto[p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 4311.74 MB, staged 4311.74 MB (24.10× bound), 1 kernel(s)
+  autotuned    [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  LP traffic 4311.74 MB, staged 4311.74 MB (24.10× bound), 1 kernel(s)
+  race [p0=1 p1=1 p2=16 p3=64 p4=1 r0=16 n5_0=64]  0.663 ms  LP traffic 4311.74 MB  (split=0;tile=64,1,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=8 p3=128 p4=1 r0=16 n5_0=64]  0.677 ms  LP traffic 4311.74 MB  (split=0;tile=64,2,16;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=128 p4=1 r0=16 n5_0=64]  0.677 ms  LP traffic 4311.74 MB  (split=0;tile=64,4,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=64 p3=32 p4=1 r0=32 n5_0=64]  0.677 ms  LP traffic 1635.78 MB  (split=0;tile=8,16,32;reg=4,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=128 p4=1 r0=32 n5_0=64]  0.677 ms  LP traffic 2164.26 MB  (split=0;tile=32,8,32;reg=4,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=4 p3=256 p4=1 r0=16 n5_0=64]  0.677 ms  LP traffic 4311.74 MB  (split=0;tile=64,2,16;reg=4,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=64 p3=16 p4=1 r0=16 n5_0=64]  0.677 ms  LP traffic 2726.30 MB  (split=0;tile=8,16,16;reg=2,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=8 p4=1 r0=32 n5_0=64]  0.677 ms  LP traffic 6442.45 MB  (split=0;tile=8,16,32;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=16 p4=1 r0=32 n5_0=64]  0.678 ms  LP traffic 5410.65 MB  (split=0;tile=8,8,32;reg=2,2;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=16 p3=32 p4=1 r0=32 n5_0=64]  0.678 ms  LP traffic 3246.39 MB  (split=0;tile=8,16,32;reg=4,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=32 p3=16 p4=1 r0=16 n5_0=64]  0.678 ms  LP traffic 5410.65 MB  (split=0;tile=16,8,16;reg=1,4;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  race [p0=1 p1=1 p2=8 p3=16 p4=1 r0=16 n5_0=64]  0.678 ms  LP traffic 10779.36 MB  (split=0;tile=16,8,16;reg=1,1;fragment=0;subgroup=0;frag_cfg=0,0,0,0)
+  floor at bound 0.483 ms (compute); at schedule_auto's traffic 4.607 ms (memory)
+EXIT 0

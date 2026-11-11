@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Version of `/node`'s JSON shape. Bumped when a field changes meaning or goes away (new
 /// fields don't bump it).
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// Where tang keeps its state: `~/.cache/tang` (`TANG_CACHE_DIR` overrides).
 pub fn cache_dir() -> Option<PathBuf> {

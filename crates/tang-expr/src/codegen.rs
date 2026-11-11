@@ -162,20 +162,7 @@ fn emit_body(
         writeln!(src).unwrap();
     }
 
-    // Evaluate in topological order (SSA form)
-    for i in 0..=max_id {
-        if !live.contains(&i) {
-            continue;
-        }
-        let node = graph.node(ExprId(i as u32));
-        match node {
-            Node::Var(_) | Node::Lit(_) => continue,
-            _ => {}
-        }
-        let rhs = expr_str(graph, node, lit_suffix, dialect);
-        writeln!(src, "{indent}{decl} t{i} = {rhs};").unwrap();
-    }
-    writeln!(src).unwrap();
+    emit_ssa(src, graph, live, max_id, indent, decl, lit_suffix, dialect);
 
     // Store outputs
     if n_outputs > 0 {
@@ -202,6 +189,34 @@ fn emit_body(
     }
 }
 
+/// The SSA evaluation lines: one `{decl} t{i} = ...;` per live non-leaf
+/// node, in topological order. Inputs are the caller's `x{n}`.
+#[allow(clippy::too_many_arguments)]
+fn emit_ssa(
+    src: &mut String,
+    graph: &ExprGraph,
+    live: &std::collections::HashSet<usize>,
+    max_id: usize,
+    indent: &str,
+    decl: &str,
+    lit_suffix: &str,
+    dialect: Dialect,
+) {
+    for i in 0..=max_id {
+        if !live.contains(&i) {
+            continue;
+        }
+        let node = graph.node(ExprId(i as u32));
+        match node {
+            Node::Var(_) | Node::Lit(_) => continue,
+            _ => {}
+        }
+        let rhs = expr_str(graph, node, lit_suffix, dialect);
+        writeln!(src, "{indent}{decl} t{i} = {rhs};").unwrap();
+    }
+    writeln!(src).unwrap();
+}
+
 /// Generate expression string for a node.
 pub(crate) fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dialect) -> String {
     match node {
@@ -222,6 +237,7 @@ pub(crate) fn expr_str(graph: &ExprGraph, node: Node, suffix: &str, dialect: Dia
         Node::Recip(a) => format!("(1.0{suffix} / {})", ref_str(graph, a, suffix)),
         Node::Sqrt(a) => format!("sqrt({})", ref_str(graph, a, suffix)),
         Node::Sin(a) => format!("sin({})", ref_str(graph, a, suffix)),
+        Node::Floor(a) => format!("floor({})", ref_str(graph, a, suffix)),
         Node::Atan2(y, x) => format!(
             "atan2({}, {})",
             ref_str(graph, y, suffix),
@@ -448,6 +464,227 @@ fn emit_cuda(
     writeln!(src, "}}").unwrap();
 }
 
+/// Arithmetic of a generated row kernel. Buffers stay f32 either way;
+/// `F64` widens every load and evaluates the graph in double (literals at
+/// full precision), rounding only on the per-row stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Real {
+    F32,
+    F64,
+}
+
+/// f64 atomic add by compare-and-swap: valid on every arch NVRTC may
+/// target (native f64 `atomicAdd` needs sm_60).
+const CUDA_ATOMIC_ADD_F64: &str = "__device__ void tang_atomic_add_f64(double* a, double v) {
+    unsigned long long* p = (unsigned long long*)a;
+    unsigned long long old = *p, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(p, assumed, __double_as_longlong(v + __longlong_as_double(assumed)));
+    } while (assumed != old);
+}
+";
+
+/// Where a row kernel's `Var(k)` comes from for row `r`:
+/// `buf[(period > 0 ? r % period : r) * stride + offset]`, `buf` indexing
+/// the kernel's input buffers. Compile-time constants, so a strided column
+/// costs a multiply and a tiled vector a constant modulo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowLoad {
+    pub buf: usize,
+    pub stride: usize,
+    pub offset: usize,
+    pub period: usize,
+}
+
+impl RowLoad {
+    /// Element `r` of `buf`.
+    pub fn each(buf: usize) -> Self {
+        Self {
+            buf,
+            stride: 1,
+            offset: 0,
+            period: 0,
+        }
+    }
+    /// Column `col` of a row-major `[rows, width]` matrix.
+    pub fn col(buf: usize, width: usize, col: usize) -> Self {
+        Self {
+            buf,
+            stride: width,
+            offset: col,
+            period: 0,
+        }
+    }
+    /// Element `i` of `buf`, the same for every row.
+    pub fn bcast(buf: usize, i: usize) -> Self {
+        Self {
+            buf,
+            stride: 0,
+            offset: i,
+            period: 0,
+        }
+    }
+    /// `buf[r % period]`: a vector tiled along flattened rows (a bias over
+    /// the columns of a matrix walked element by element).
+    pub fn tile(buf: usize, period: usize) -> Self {
+        Self {
+            buf,
+            stride: 1,
+            offset: 0,
+            period,
+        }
+    }
+    /// The largest index row `rows - 1` (or any earlier row) reads.
+    pub fn max_index(&self, rows: usize) -> usize {
+        let last = rows.saturating_sub(1);
+        let last = if self.period > 0 {
+            last.min(self.period - 1)
+        } else {
+            last
+        };
+        last * self.stride + self.offset
+    }
+}
+
+/// Where a row kernel stores a per-row output: `buf[r * stride + offset]`
+/// in the kernel's output buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowStore {
+    pub buf: usize,
+    pub stride: usize,
+    pub offset: usize,
+}
+
+impl RowStore {
+    /// Element `r` of `buf`.
+    pub fn each(buf: usize) -> Self {
+        Self {
+            buf,
+            stride: 1,
+            offset: 0,
+        }
+    }
+    /// Column `col` of a row-major `[rows, width]` matrix.
+    pub fn col(buf: usize, width: usize, col: usize) -> Self {
+        Self {
+            buf,
+            stride: width,
+            offset: col,
+        }
+    }
+}
+
+impl ExprGraph {
+    /// A CUDA **row kernel**: one thread per row `r` (grid-stride); the
+    /// graph's `Var(k)` loaded as `loads[k]` says, each `row_outputs[j]`
+    /// stored as its [`RowStore`] says, and each `sum_outputs[j]` summed
+    /// over all rows into `sums[j]` (double: warp shuffle, then one atomic
+    /// per warp; `sums` must start zeroed). Buffers are f32; `real` is the
+    /// arithmetic in between.
+    ///
+    /// Signature: `k0(long long rows, const float* in0, …, float* out0, …,
+    /// double* sums)`, one pointer per distinct `buf` index (inputs and
+    /// outputs must not alias). Launch with 32-multiple blocks.
+    pub fn to_cuda_rows(
+        &self,
+        loads: &[RowLoad],
+        row_outputs: &[(ExprId, RowStore)],
+        sum_outputs: &[ExprId],
+        real: Real,
+    ) -> ComputeKernel {
+        let all: Vec<ExprId> = row_outputs
+            .iter()
+            .map(|o| o.0)
+            .chain(sum_outputs.iter().copied())
+            .collect();
+        let live = self.live_set(&all);
+        let max_id = live.iter().max().copied().unwrap_or(0);
+        let (ty, suffix) = match real {
+            Real::F32 => ("float", "f"),
+            Real::F64 => ("double", ""),
+        };
+        let n_in = loads.iter().map(|l| l.buf + 1).max().unwrap_or(0);
+        let n_out = row_outputs.iter().map(|o| o.1.buf + 1).max().unwrap_or(0);
+        let ns = sum_outputs.len();
+        let mut src = String::with_capacity(4096);
+        writeln!(src, "// Auto-generated by tang-expr (row kernel)").unwrap();
+        if ns > 0 {
+            src.push_str(CUDA_ATOMIC_ADD_F64);
+        }
+        write!(src, "extern \"C\" __global__ void k0(long long rows").unwrap();
+        for b in 0..n_in {
+            write!(src, ",\n    const float* __restrict__ in{b}").unwrap();
+        }
+        for b in 0..n_out {
+            write!(src, ",\n    float* __restrict__ out{b}").unwrap();
+        }
+        writeln!(src, ",\n    double* __restrict__ sums) {{").unwrap();
+        for j in 0..ns {
+            writeln!(src, "    double acc{j} = 0.0;").unwrap();
+        }
+        writeln!(
+            src,
+            "    for (long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x; r < rows; r += (long long)gridDim.x * blockDim.x) {{"
+        )
+        .unwrap();
+        for (k, l) in loads.iter().enumerate() {
+            let row = if l.period > 0 {
+                format!("(r % {}LL)", l.period)
+            } else {
+                "r".to_string()
+            };
+            writeln!(
+                src,
+                "        {ty} x{k} = ({ty})in{}[{row} * {}LL + {}LL];",
+                l.buf, l.stride, l.offset
+            )
+            .unwrap();
+        }
+        emit_ssa(
+            &mut src,
+            self,
+            &live,
+            max_id,
+            "        ",
+            ty,
+            suffix,
+            Dialect::Cuda,
+        );
+        for (out, st) in row_outputs {
+            let v = ref_str(self, *out, suffix);
+            writeln!(
+                src,
+                "        out{}[r * {}LL + {}LL] = (float)({v});",
+                st.buf, st.stride, st.offset
+            )
+            .unwrap();
+        }
+        for (j, out) in sum_outputs.iter().enumerate() {
+            let v = ref_str(self, *out, suffix);
+            writeln!(src, "        acc{j} += (double)({v});").unwrap();
+        }
+        writeln!(src, "    }}").unwrap();
+        for j in 0..ns {
+            writeln!(src, "    for (int o = 16; o > 0; o >>= 1) acc{j} += __shfl_down_sync(0xffffffff, acc{j}, o);").unwrap();
+            writeln!(
+                src,
+                "    if ((threadIdx.x & 31) == 0) tang_atomic_add_f64(&sums[{j}], acc{j});"
+            )
+            .unwrap();
+        }
+        writeln!(src, "}}").unwrap();
+        ComputeKernel {
+            source: src,
+            n_inputs: loads.len(),
+            n_outputs: all.len(),
+            workgroup_size: 256,
+            dialect: Dialect::Cuda,
+            entry_point: "k0",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C dialect
 // ---------------------------------------------------------------------------
@@ -497,6 +734,35 @@ fn emit_c(
 mod tests {
     use super::*;
     use crate::graph::ExprGraph;
+
+    #[test]
+    fn row_kernel_f64_shape() {
+        let mut g = ExprGraph::new();
+        let (x, y) = (g.var(0), g.var(1));
+        let p = g.mul(x, y);
+        let c = g.lit(0.1);
+        let q = g.add(p, c);
+        let loads = [RowLoad::col(0, 3, 2), RowLoad::tile(1, 5)];
+        let k = g.to_cuda_rows(&loads, &[(p, RowStore::col(0, 2, 1))], &[q], Real::F64);
+        let s = &k.source;
+        assert!(s.contains("double x0 = (double)in0[r * 3LL + 2LL];"), "{s}");
+        assert!(
+            s.contains("double x1 = (double)in1[(r % 5LL) * 1LL + 0LL];"),
+            "{s}"
+        );
+        assert!(s.contains("out0[r * 2LL + 1LL] = (float)("), "{s}");
+        assert!(s.contains("tang_atomic_add_f64(&sums[0], acc0)"), "{s}");
+        assert!(
+            s.contains("0.1") && !s.contains("0.1f"),
+            "f64 literals carry no suffix: {s}"
+        );
+        assert_eq!(k.n_outputs, 2);
+        assert_eq!(RowLoad::tile(1, 5).max_index(100), 4);
+        assert_eq!(RowLoad::col(0, 3, 2).max_index(10), 29);
+        // no sums: no atomic helper
+        let k = g.to_cuda_rows(&loads, &[(p, RowStore::each(0))], &[], Real::F32);
+        assert!(!k.source.contains("tang_atomic_add_f64") && k.source.contains("float x0"));
+    }
 
     #[test]
     fn negated_negative_literal_is_not_a_decrement() {

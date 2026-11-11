@@ -1,0 +1,5 @@
+You are a careful technical writer. Below is a short brief about a lighthouse keeper on a remote northern island, and your job is to continue the story in plain, vivid prose.
+The keeper, an older woman named Maren, has tended the light for thirty years. Every evening she climbs the one hundred and twelve iron steps, trims the wick, polishes the great glass lens, and records the weather in a leather logbook that her predecessor left behind.
+One winter night a storm arrives earlier than the forecast promised. The radio fails, the generator coughs, and through the rain she sees the faint lights of a small fishing boat drifting toward the rocks below the cliff.
+She has no way to call the harbour, no boat of her own, and only the lamp, a hand-cranked foghorn and her knowledge of the currents to guide the crew to safety.
+Describe what Maren does over the next hour, what she notices about the sea and the wind, how she signals the boat, and what she writes in the logbook when the night is over. Keep the tone calm and precise.

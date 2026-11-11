@@ -83,6 +83,9 @@ pub enum Node {
     Exp2(ExprId),
     /// Base-2 logarithm.
     Log2(ExprId),
+    /// Floor: the largest integer <= x. Piecewise constant, so its
+    /// derivative is 0. `t mod r` is built from it (see `ExprGraph::modulo`).
+    Floor(ExprId),
     /// Branchless select: returns `a` if `cond > 0`, else `b`.
     Select(ExprId, ExprId, ExprId),
 }

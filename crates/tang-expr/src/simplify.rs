@@ -49,6 +49,10 @@ impl ExprGraph {
                 let sa = self.simplify_inner(a, memo);
                 self.sin(sa)
             }
+            Node::Floor(a) => {
+                let sa = self.simplify_inner(a, memo);
+                self.floor(sa)
+            }
             Node::Atan2(y, x) => {
                 let sy = self.simplify_inner(y, memo);
                 let sx = self.simplify_inner(x, memo);
@@ -178,6 +182,13 @@ impl ExprGraph {
             Node::Sin(a) => {
                 if let Some(v) = self.node(a).as_f64() {
                     self.lit(v.sin())
+                } else {
+                    expr
+                }
+            }
+            Node::Floor(a) => {
+                if let Some(v) = self.node(a).as_f64() {
+                    self.lit(v.floor())
                 } else {
                     expr
                 }

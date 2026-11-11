@@ -249,6 +249,8 @@ fn mean_f64(x: &[f64]) -> f64 {
     sum_f64(x) / x.len() as f64
 }
 
+// the scalar fallback is unreachable on aarch64+neon (not on CI's x86_64)
+#[allow(unreachable_code)]
 fn sum_f32(x: &[f32]) -> f32 {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
@@ -265,6 +267,8 @@ fn sum_f32(x: &[f32]) -> f32 {
     sum_f32_scalar(x)
 }
 
+// the scalar fallback is unreachable on aarch64+neon (not on CI's x86_64)
+#[allow(unreachable_code)]
 fn sum_f64(x: &[f64]) -> f64 {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
@@ -279,6 +283,8 @@ fn sum_f64(x: &[f64]) -> f64 {
     sum_f64_scalar(x)
 }
 
+// the scalar fallback is unreachable on aarch64+neon (not on CI's x86_64)
+#[allow(unreachable_code)]
 fn moments_f32(x: &[f32], mean: f32) -> (f32, f32, f32) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
@@ -293,6 +299,8 @@ fn moments_f32(x: &[f32], mean: f32) -> (f32, f32, f32) {
     moments_f32_scalar(x, mean)
 }
 
+// the scalar fallback is unreachable on aarch64+neon (not on CI's x86_64)
+#[allow(unreachable_code)]
 fn moments_f64(x: &[f64], mean: f64) -> (f64, f64, f64) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {

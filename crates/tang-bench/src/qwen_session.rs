@@ -115,13 +115,41 @@ impl Step {
             prefill_q4: dims.prefill_q4 || prefill_q4(rt),
             ..dims.clone()
         };
-        let dg = step_graph(dims, seq, kctx);
+        let dg = if derived_mode() {
+            // QWEN_DERIVED=1: the step derived from the one prefill graph
+            // (`ir_qwen::prefill`) instead of the hand-written `step_graph`;
+            // its position is the `pos` input, its tokens `tokens`
+            let pg = prefill::prefill_graph(dims);
+            // QWEN_DERIVED_ROWS=last: a window computes only its last
+            // row's logits (as the hand prefill step does)
+            let rows = match std::env::var("QWEN_DERIVED_ROWS").as_deref() {
+                Ok("last") => tang_compile::tensor::step::Rows::Last,
+                _ => tang_compile::tensor::step::Rows::All,
+            };
+            let step = prefill::derived_step_rows(&pg, dims, seq, rows);
+            prefill::as_decode_graph(&pg, &step, dims)
+        } else {
+            step_graph(dims, seq, kctx)
+        };
         let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
         let named = outs.len();
         let options = |outs: &[TensorId]| {
             let mut opts = decode_opts(&dg, outs);
             opts.rows = env("TANG_DECODE_ROWS");
             opts.warps = env("TANG_DECODE_WARPS");
+            // CUDA decode: 8 GEMV rows per warp, 2 warps per block,
+            // amortize each lane's activation loads over more weight words
+            // (10.0 -> 6.7 ms per Qwen3-8B step on the 3090 with the
+            // materialized norms and split-K of `compiled_decode`;
+            // BENCHMARKS.md)
+            if seq == 1 && rt.kind() == BackendKind::Cuda {
+                if opts.rows == 0 {
+                    opts.rows = 8;
+                }
+                if opts.warps == 0 {
+                    opts.warps = 2;
+                }
+            }
             opts.unroll = env("TANG_DECODE_UNROLL");
             opts.mma_shape = env("TANG_MMA_SHAPE");
             opts
@@ -167,7 +195,12 @@ impl Step {
                 .iter()
                 .enumerate()
                 .filter_map(|(k, s)| {
-                    let j = b.dg.inputs.iter().position(|bs| bs.name == s.name)?;
+                    // (same name and shape: a derived window's `tokens` is
+                    // its own)
+                    let j =
+                        b.dg.inputs
+                            .iter()
+                            .position(|bs| bs.name == s.name && bs.shape == s.shape)?;
                     Some(Shared {
                         input: k,
                         from: &b.prog,
@@ -200,6 +233,34 @@ impl Step {
         let t = Instant::now();
         let mut prog = Program::with_shared(rt, program, &refs, &plan, &shared);
         drop(words);
+        // TANG_MEGA=1: the decode step as one persistent kernel
+        // (TANG_MEGA_THREADS per block, TANG_MEGA_PER_SM blocks per SM,
+        // stages of at most TANG_MEGA_DUP blocks replicated per block,
+        // TANG_MEGA_MINB min blocks per SM, TANG_MEGA_MAX_BLOCKS: only kernels
+        // of at most that many blocks fuse (runs between the big ones), TANG_MEGA_PREFETCH KiB of weights
+        // prefetched into L2 at each barrier)
+        #[cfg(feature = "cuda")]
+        if seq == 1 && rt.kind() == BackendKind::Cuda && env("TANG_MEGA") == 1 {
+            let tm = Instant::now();
+            let (launches, phases, grid) = prog.megakernel(
+                rt,
+                &tang_compile::tensor::cuda_mega::MegaOpts {
+                    threads: env("TANG_MEGA_THREADS") as u32,
+                    dup: env("TANG_MEGA_DUP") as u32,
+                    min_blocks: env("TANG_MEGA_MINB") as u32,
+                    prefetch: env("TANG_MEGA_PREFETCH") << 10,
+                    slot_bytes: Vec::new(),
+                    trace: env("TANG_MEGA_TRACE") == 1,
+                },
+                env("TANG_MEGA_PER_SM") as u32,
+                env("TANG_MEGA_MAX_BLOCKS") as u32,
+            );
+            eprintln!(
+                "megakernel: {} kernels as {launches} launches, {phases} phases, grid {grid}, built in {:.1}s",
+                prog.program.kernels.len(),
+                tm.elapsed().as_secs_f64()
+            );
+        }
         prog.capture(rt);
         eprintln!(
             "step seq {seq} (window {kctx}): {} kernels ({} native), lowered in {lowered:.2}s, \
@@ -246,6 +307,43 @@ impl Step {
         l
     }
 
+    /// A step derived from the prefill graph (`QWEN_DERIVED=1`): no
+    /// `state`; tokens and position are inputs, the next token is the
+    /// host's argmax.
+    pub fn is_derived(&self) -> bool {
+        self.dg.inputs.iter().any(|s| s.name == "pos")
+    }
+
+    /// The step's tokens (`seq` of them) at positions `p0..`, before a
+    /// run: `state` (decode) or `chunk` (prefill) for the hand step,
+    /// `tokens` and `pos` for a derived one.
+    pub fn feed(&self, rt: &Runtime, tokens: &[usize], p0: usize) {
+        assert_eq!(tokens.len(), self.dg.seq);
+        if self.is_derived() {
+            let t: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+            self.prog.write(rt, self.tensor("tokens"), &t);
+            self.prog.write(rt, self.tensor("pos"), &[p0 as f32]);
+        } else if self.dg.seq == 1 {
+            self.set_state(rt, tokens[0], p0);
+        } else {
+            self.prog
+                .write(rt, self.tensor("chunk"), &chunk_input(tokens, p0));
+        }
+    }
+
+    /// The greedy next token after a run: `state`'s, or (derived) the
+    /// argmax of the last row's logits.
+    pub fn next_token(&self, rt: &Runtime) -> usize {
+        if !self.is_derived() {
+            return self.state(rt).0;
+        }
+        let l = self.logits(rt);
+        // all new rows, or (QWEN_DERIVED_ROWS=last) the last one
+        let rows = self.dg.g.shape(self.dg.outputs[0])[0].n();
+        let vocab = l.len() / rows;
+        argmax(&l[(rows - 1) * vocab..])
+    }
+
     /// Prefill: `tokens` at positions `p0..`, then `state` holds the next
     /// token and its position.
     pub fn prefill(&self, rt: &Runtime, tokens: &[usize], p0: usize) {
@@ -254,6 +352,11 @@ impl Step {
             .write(rt, self.tensor("chunk"), &chunk_input(tokens, p0));
         self.prog.run(rt);
     }
+}
+
+/// `QWEN_DERIVED=1`: [`Step`]s are derived from the one prefill graph.
+pub fn derived_mode() -> bool {
+    std::env::var("QWEN_DERIVED").as_deref() == Ok("1")
 }
 
 pub fn argmax(v: &[f32]) -> usize {
@@ -442,7 +545,12 @@ pub fn load_inputs<'a>(
     let one = move |s: &InputSpec| -> Vec<f32> {
         let n: usize = s.shape.iter().product();
         let name = &s.name;
-        if name == "state" || name == "chunk" || name.ends_with("cache") {
+        if name == "state"
+            || name == "chunk"
+            || name == "pos"
+            || name == "tokens"
+            || name.ends_with("cache")
+        {
             return Vec::new();
         }
         if name == "rope" {

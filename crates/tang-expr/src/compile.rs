@@ -72,6 +72,7 @@ impl ExprGraph {
                 | Node::Recip(a)
                 | Node::Sqrt(a)
                 | Node::Sin(a)
+                | Node::Floor(a)
                 | Node::Exp2(a)
                 | Node::Log2(a) => {
                     stack.push(a.0 as usize);
@@ -106,6 +107,7 @@ fn eval_node(node: &Node, vals: &[f64], inputs: &[f64]) -> f64 {
         Node::Recip(a) => 1.0 / vals[a.0 as usize],
         Node::Sqrt(a) => vals[a.0 as usize].sqrt(),
         Node::Sin(a) => vals[a.0 as usize].sin(),
+        Node::Floor(a) => vals[a.0 as usize].floor(),
         Node::Atan2(y, x) => vals[y.0 as usize].atan2(vals[x.0 as usize]),
         Node::Exp2(a) => vals[a.0 as usize].exp2(),
         Node::Log2(a) => vals[a.0 as usize].log2(),

@@ -4,6 +4,9 @@
 //! Tensor contractions use tang-compute, nonlinear Jacobians use tang-ad. The export preserves
 //! every GGUF directory entry and untouched byte; Q8/BF16/F32 updates keep their original type.
 mod data;
+pub(crate) use data::Sequence;
+#[cfg(test)]
+mod coder_test;
 mod model;
 mod tape;
 mod weights;
@@ -37,9 +40,24 @@ struct Args {
     check_context: bool,
     prefix_data: Option<PathBuf>,
     eval_windows: usize,
+    /// Recursive depths trained (and evaluated); the engine drafts `TANG_CODER_MTP_K`.
+    depth: usize,
+    /// Soft term weight: CE against the target's `softmax(output · h)` (Coder only).
+    soft: f64,
+    /// Verification-aware per-window depth weights.
+    vat: bool,
+    /// Windows whose gradients are averaged into one optimizer step.
+    windows: usize,
+    /// Linear warmup steps; with `--total`, cosine decay to `lr / 10` at that global step.
+    warmup: usize,
+    total: usize,
+    /// Global step the warmup and cosine start from (a continued run re-warms here).
+    schedule_from: usize,
+    /// Checked after every step: when it exists, checkpoint, export and stop cleanly.
+    stop_file: Option<PathBuf>,
 }
 fn parse(args: &[String]) -> Result<Args> {
-    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --prefix-data DIR --resume DIR --cpu --check-context]";
+    let usage="flash-mtp-train <main.gguf> <mtp.gguf> --data DIR --out DIR [--steps 100 --seq 32 --burn 8 --lr 1e-5 --beta .8 --clip 1 --vocab 0 --seed 42 --eval-every 20 --eval-windows 1 --depth 3 --soft 0 --vat --windows 1 --warmup 0 --total 0 --schedule-from 0 --stop-file PATH --prefix-data DIR --resume DIR --cpu --check-context]";
     let mut it = args.iter();
     let main = it.next().context(usage)?.into();
     let mtp = it.next().context(usage)?.into();
@@ -63,6 +81,14 @@ fn parse(args: &[String]) -> Result<Args> {
         check_context: false,
         prefix_data: None,
         eval_windows: 1,
+        depth: 3,
+        soft: 0.0,
+        vat: false,
+        windows: 1,
+        warmup: 0,
+        total: 0,
+        schedule_from: 0,
+        stop_file: None,
     };
     while let Some(k) = it.next() {
         if k == "--cpu" {
@@ -71,6 +97,10 @@ fn parse(args: &[String]) -> Result<Args> {
         }
         if k == "--check-context" {
             a.check_context = true;
+            continue;
+        }
+        if k == "--vat" {
+            a.vat = true;
             continue;
         }
         if k == "--check-forward" {
@@ -82,6 +112,13 @@ fn parse(args: &[String]) -> Result<Args> {
             "--data" => a.data = v.into(),
             "--prefix-data" => a.prefix_data = Some(v.into()),
             "--eval-windows" => a.eval_windows = v.parse()?,
+            "--depth" => a.depth = v.parse()?,
+            "--soft" => a.soft = v.parse()?,
+            "--windows" => a.windows = v.parse()?,
+            "--warmup" => a.warmup = v.parse()?,
+            "--total" => a.total = v.parse()?,
+            "--schedule-from" => a.schedule_from = v.parse()?,
+            "--stop-file" => a.stop_file = Some(v.into()),
             "--out" => a.out = v.into(),
             "--steps" => a.steps = v.parse()?,
             "--seq" => a.seq = v.parse()?,
@@ -100,8 +137,9 @@ fn parse(args: &[String]) -> Result<Args> {
         !a.data.as_os_str().is_empty() && !a.out.as_os_str().is_empty(),
         "{usage}"
     );
+    ensure!((1..=8).contains(&a.depth), "--depth must be 1..=8");
     ensure!(
-        a.seq >= 4 && a.burn < a.seq - 3,
+        a.seq > a.depth && a.burn < a.seq - a.depth,
         "invalid sequence/burn length"
     );
     ensure!(
@@ -112,7 +150,10 @@ fn parse(args: &[String]) -> Result<Args> {
             && a.beta > 0.0
             && a.beta <= 1.0
             && a.clip > 0.0
-            && a.clip.is_finite(),
+            && a.clip.is_finite()
+            && a.soft >= 0.0
+            && a.soft.is_finite()
+            && a.windows > 0,
         "invalid training hyperparameters"
     );
     Ok(a)
@@ -147,7 +188,10 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         a.out.display()
     );
     let mut w = Weights::open(&a.main, &a.mtp, a.lr, a.vocab)?;
-    let hp = Hparams::from_gguf(&w.mtp)?;
+    let hp = match w.kind {
+        weights::Kind::Coder => Hparams::from_gguf(&w.main)?,
+        weights::Kind::DeepSeek => Hparams::from_gguf(&w.mtp)?,
+    };
     let mut seqs = data::discover(&a.data, hp.hc * hp.n_embd)?;
     if let Some(root) = &a.prefix_data {
         for s in &mut seqs {
@@ -178,6 +222,9 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         return check_context(dev, &mut w, &seqs[valid[0]], &hp, &a);
     }
     if a.check_forward {
+        if w.kind == weights::Kind::Coder {
+            return check_forward_coder(dev, &mut w, &seqs, &valid, &hp, &a);
+        }
         return check_forward(dev, &mut w, &seqs[valid[0]], &hp, &a);
     }
     let mut rng = a.seed;
@@ -188,51 +235,153 @@ fn run<D: ComputeDevice>(dev: &D, a: Args) -> Result<()> {
         rng = restored.1;
     }
     std::fs::create_dir_all(&a.out)?;
-    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
+    let manifest = serde_json::json!({"main":a.main,"mtp":a.mtp,"data":a.data,"prefix_data":a.prefix_data,"eval_windows":a.eval_windows,"eval_every":a.eval_every,"depth":a.depth,"kind":format!("{:?}",w.kind),"context":if a.prefix_data.is_some(){"full-teacher-prefix"}else{"short-window"},"steps":a.steps,"seq":a.seq,"burn":a.burn,"lr":a.lr,"beta":a.beta,"soft":a.soft,"vat":a.vat,"windows":a.windows,"warmup":a.warmup,"total":a.total,"schedule_from":a.schedule_from,"clip":a.clip,"vocab":a.vocab,"seed":a.seed,"resume":a.resume,"start_step":offset,"train":train.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"valid":valid.iter().map(|&i|&seqs[i].path).collect::<Vec<_>>(),"trainable":w.params.keys().collect::<Vec<_>>()});
     std::fs::write(
         a.out.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
-    eprintln!("MTP train: {} train / {} held-out prompts; {} parameters; frozen Q4 routed experts, main embedding/head; {}-row windows, {} burn-in; CPU={} start={offset}",train.len(),valid.len(),w.params.values().map(|p|p.data.numel()).sum::<usize>(),a.seq,a.burn,a.cpu);
+    eprintln!("MTP train: {} train / {} held-out prompts; {} parameters; frozen {} routed experts, main embedding/head; {}-row windows, {} burn-in, {} depths; CPU={} start={offset}",train.len(),valid.len(),w.params.values().map(|p|p.data.numel()).sum::<usize>(),if w.expert_q4{"Q4"}else{"Q8"},a.seq,a.burn,a.depth,a.cpu);
     let mut log = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(a.out.join("metrics.jsonl"))?;
-    evaluate(dev, &mut w, &seqs, &valid, &hp, &a, offset, &mut log)?;
+    let cache = tape::DeviceCache::default();
+    evaluate(
+        dev, &mut w, &seqs, &valid, &hp, &a, offset, &mut log, &cache,
+    )?;
+    let mut deck: Vec<usize> = Vec::new();
+    let mut seen = 0usize;
     for local in 1..=a.steps {
         let step = offset + local;
-        let s = &seqs[train[random(&mut rng) as usize % train.len()]];
-        let start = random(&mut rng) as usize % (s.ids.len() - a.seq + 1);
-        let b = s.batch(start, a.seq)?;
         let now = Instant::now();
-        let mut t = tape::Tape::new(dev);
-        let leaves = w.leafs(&mut t);
-        let logits = model::forward(&mut t, &mut w, &leaves, &b, &hp)?;
-        let (loss, seeds, hits, totals) = model::objective(&t, &w, &logits, &b, a.beta, a.burn)?;
-        ensure!(loss.iter().all(|v| v.is_finite()), "nonfinite loss");
-        let grads = t.backward(&seeds);
-        drop(t);
+        let lr = a.lr_at(step);
+        w.optimizer.lr = lr;
+        let (mut fwd, mut bwd, mut obj) = (0.0, 0.0, 0.0);
+        let mut acc: std::collections::BTreeMap<String, Vec<f32>> = Default::default();
+        let mut loss = vec![0.0; a.depth];
+        let mut kl = vec![0.0; a.depth];
+        let (mut hits, mut totals, mut accepted) =
+            (vec![0; a.depth], vec![0; a.depth], vec![0; a.depth]);
+        let (mut agree, mut rows) = (0, 0);
+        let mut picked = Vec::new();
+        let mut leaves = Default::default();
+        for _ in 0..a.windows {
+            if deck.is_empty() {
+                deck = train.clone();
+                for i in (1..deck.len()).rev() {
+                    deck.swap(i, random(&mut rng) as usize % (i + 1));
+                }
+            }
+            let s = &seqs[deck.pop().unwrap()];
+            let start = random(&mut rng) as usize % (s.ids.len() - a.seq + 1);
+            let b = s.batch(start, a.seq)?;
+            picked.push(serde_json::json!([s.path, start]));
+            let t0 = Instant::now();
+            let mut t = tape::Tape::with_cache(dev, &cache);
+            leaves = w.leafs(&mut t);
+            let logits = model::forward(&mut t, &mut w, &leaves, &b, &hp, a.depth)?;
+            let teacher = target(&mut t, &w, &leaves, &b, &hp)?;
+            let to = Instant::now();
+            let o = model::objective_with(&t, &w, &logits, teacher, &b, a.recipe(), a.burn)?;
+            obj += to.elapsed().as_secs_f64();
+            ensure!(o.ce.iter().all(|v| v.is_finite()), "nonfinite loss");
+            fwd += t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let mut grads = t.backward(&o.seeds);
+            drop(t);
+            for (n, &id) in &leaves {
+                if !w.params.contains_key(n) {
+                    continue;
+                }
+                let Some(g) = grads[id].take() else { continue };
+                let e = acc.entry(n.clone()).or_insert_with(|| vec![0.0; g.len()]);
+                for (x, y) in e.iter_mut().zip(&g) {
+                    *x += y / a.windows as f32;
+                }
+            }
+            bwd += t1.elapsed().as_secs_f64();
+            dev.pool_clear();
+            for d in 0..a.depth {
+                loss[d] += o.ce[d] / a.windows as f64;
+                kl[d] += o.kl[d] / a.windows as f64;
+                hits[d] += o.hits[d];
+                totals[d] += o.totals[d];
+                accepted[d] += o.accepted[d];
+            }
+            agree += o.teacher_agree;
+            rows += o.totals[0];
+        }
+        let leaves: std::collections::BTreeMap<String, tape::Id> = leaves;
+        let mut grads = vec![None; leaves.values().max().map_or(0, |&m| m + 1)];
+        for (n, g) in acc {
+            grads[leaves[&n]] = Some(g);
+        }
+        let t2 = Instant::now();
         let norm = w.update(&leaves, grads, a.clip)?;
-        dev.pool_clear();
-        let metric = serde_json::json!({"kind":"train","step":step,"prompt":s.path,"start":start,"prefix_rows":b.prefix.as_ref().map_or(0,|p|p.pos.len()),"ce":loss,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64()});
+        let upd = t2.elapsed().as_secs_f64();
+        seen += rows;
+        let metric = serde_json::json!({"kind":"train","step":step,"lr":lr,"windows":picked,"rows":rows,"rows_seen":seen,"ce":loss,"kl":kl,"accepted":accepted,"target_agree":agree,"teacher_hits":hits,"teacher_total":totals,"grad_norm":norm,"seconds":now.elapsed().as_secs_f64(),"forward_s":fwd,"backward_s":bwd,"update_s":upd,"objective_s":obj});
         writeln!(log, "{metric}")?;
         log.flush()?;
         eprintln!(
-            "step {step}: CE {:.4}/{:.4}/{:.4}, grad {norm:.3}, {:.2}s",
-            loss[0],
-            loss[1],
-            loss[2],
+            "step {step}: CE {}, grad {norm:.3}, lr {lr:.2e}, {:.2}s (fwd {fwd:.1} of which loss {obj:.1}, bwd {bwd:.1}, upd {upd:.1})",
+            loss.iter()
+                .map(|l| format!("{l:.4}"))
+                .collect::<Vec<_>>()
+                .join("/"),
             now.elapsed().as_secs_f64()
         );
-        if local % a.eval_every == 0 || local == a.steps {
-            evaluate(dev, &mut w, &seqs, &valid, &hp, &a, step, &mut log)?;
+        let stop = a.stop_file.as_ref().is_some_and(|f| f.exists());
+        if local % a.eval_every == 0 || local == a.steps || stop {
+            evaluate(dev, &mut w, &seqs, &valid, &hp, &a, step, &mut log, &cache)?;
             let dir = a.out.join(format!("step-{step:06}"));
             std::fs::create_dir(&dir)?;
             checkpoint(&dir, &w, step, rng)?;
             w.export(&dir.join("mtp.gguf"))?;
         }
+        if stop {
+            eprintln!("stop file found: stopped at step {step}");
+            break;
+        }
     }
     Ok(())
+}
+impl Args {
+    /// Linear warmup over `--warmup` steps, then constant, or cosine to `lr / 10` at
+    /// `--total` when given (a global step, so resumed segments continue one schedule).
+    fn lr_at(&self, step: usize) -> f64 {
+        let step = step.saturating_sub(self.schedule_from);
+        if step <= self.warmup {
+            return self.lr * step as f64 / self.warmup.max(1) as f64;
+        }
+        if self.total == 0 {
+            return self.lr;
+        }
+        let total = self.total.saturating_sub(self.schedule_from);
+        let x = ((step - self.warmup) as f64 / (total.saturating_sub(self.warmup)).max(1) as f64)
+            .min(1.0);
+        self.lr * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * x).cos()))
+    }
+    fn recipe(&self) -> model::Recipe {
+        model::Recipe {
+            beta: self.beta,
+            soft: self.soft,
+            vat: self.vat,
+        }
+    }
+}
+/// Target logits for the soft term and KL/agreement diagnostics (Coder sidecar only).
+fn target<D: ComputeDevice>(
+    t: &mut tape::Tape<D>,
+    w: &Weights,
+    leaves: &std::collections::BTreeMap<String, tape::Id>,
+    b: &data::Batch,
+    hp: &Hparams,
+) -> Result<Option<tape::Id>> {
+    if w.kind != weights::Kind::Coder {
+        return Ok(None);
+    }
+    model::teacher_logits(t, w, leaves, b, hp).map(Some)
 }
 fn prompt_number(p: &Path) -> usize {
     p.file_name()
@@ -250,10 +399,13 @@ fn evaluate<D: ComputeDevice>(
     a: &Args,
     step: usize,
     log: &mut FileLike,
+    cache: &tape::DeviceCache<D>,
 ) -> Result<()> {
-    let mut loss = [0.0; 3];
-    let mut hits = [0; 3];
-    let mut total = [0; 3];
+    let mut loss = vec![0.0; a.depth];
+    let mut kl = vec![0.0; a.depth];
+    let mut accepted = vec![0; a.depth];
+    let mut hits = vec![0; a.depth];
+    let mut total = vec![0; a.depth];
     // Fixed slices per prompt, never random windows from training prompts. Report teacher-token
     // recursive accuracy as a diagnostic; actual greedy draft acceptance is measured by the engine.
     for &i in valid {
@@ -265,11 +417,15 @@ fn evaluate<D: ComputeDevice>(
                 (s.ids.len() - a.seq) * window / (a.eval_windows - 1)
             };
             let b = s.batch(start, a.seq)?;
-            let mut t = tape::Tape::new(dev);
+            let mut t = tape::Tape::with_cache(dev, cache);
             let leaves = w.leafs(&mut t);
-            let lg = model::forward(&mut t, w, &leaves, &b, hp)?;
-            let (l, _, h, n) = model::objective(&t, w, &lg, &b, a.beta, a.burn)?;
-            for d in 0..3 {
+            let lg = model::forward(&mut t, w, &leaves, &b, hp, a.depth)?;
+            let teacher = target(&mut t, w, &leaves, &b, hp)?;
+            let o = model::objective_with(&t, w, &lg, teacher, &b, a.recipe(), a.burn)?;
+            let (l, h, n) = (&o.ce, &o.hits, &o.totals);
+            for d in 0..a.depth {
+                kl[d] += o.kl[d] * n[d] as f64;
+                accepted[d] += o.accepted[d];
                 loss[d] += l[d] * n[d] as f64;
                 hits[d] += h[d];
                 total[d] += n[d];
@@ -283,10 +439,11 @@ fn evaluate<D: ComputeDevice>(
             dev.pool_clear();
         }
     }
-    for d in 0..3 {
+    for d in 0..a.depth {
         loss[d] /= total[d] as f64;
+        kl[d] /= total[d] as f64;
     }
-    let metric = serde_json::json!({"kind":"valid","step":step,"ce":loss,"teacher_hits":hits,"teacher_total":total});
+    let metric = serde_json::json!({"kind":"valid","step":step,"ce":loss,"kl":kl,"accepted":accepted,"teacher_hits":hits,"teacher_total":total});
     writeln!(log, "{metric}")?;
     log.flush()?;
     eprintln!("valid {step}: {metric}");
@@ -388,7 +545,7 @@ fn check_forward<D: ComputeDevice>(
     let b = s.batch(0, 4)?;
     let mut t = tape::Tape::new(dev);
     let leaves = w.leafs(&mut t);
-    let out = model::forward_full(&mut t, w, &leaves, &b, hp)?;
+    let out = model::forward_full(&mut t, w, &leaves, &b, hp, 3)?;
     let main = crate::flash::reference::FlashRef::open(&a.main)?;
     let mut mtp = crate::flash::mtp::Mtp::open(&a.mtp)?;
     mtp.main_head = true;
@@ -451,7 +608,7 @@ fn check_context<D: ComputeDevice>(
     let split = s.batch(4, 8)?;
     let mut t = tape::Tape::new(dev);
     let leaves = w.leafs(&mut t);
-    let out = model::forward_full(&mut t, w, &leaves, &split, hp)?;
+    let out = model::forward_full(&mut t, w, &leaves, &split, hp, a.depth)?;
     let logits: Vec<_> = out.iter().map(|o| o.logits).collect();
     let (_, seeds, _, _) = model::objective(&t, w, &logits, &split, a.beta, 0)?;
     let expected: Vec<_> = out
@@ -474,7 +631,7 @@ fn check_context<D: ComputeDevice>(
     dev.pool_clear();
     let mut t = tape::Tape::new(dev);
     let leaves = w.leafs(&mut t);
-    let out = model::forward_full(&mut t, w, &leaves, &full, hp)?;
+    let out = model::forward_full(&mut t, w, &leaves, &full, hp, a.depth)?;
     let mut full_seeds = Vec::new();
     for (d, o) in out.iter().enumerate() {
         for (label, id, width, expected) in [
@@ -535,5 +692,114 @@ fn check_context<D: ComputeDevice>(
         );
     }
     eprintln!("full-prefix split outputs and gradients: PASS");
+    Ok(())
+}
+
+/// The engine's own MTP drafts dumped with the residuals (`draft.u32`, `flash-coder-dump`):
+/// `(position of h, depth, token, probability bits)` per record. Depth 1 for every row; deeper
+/// only at the chain's row (each window's last kept row).
+pub(crate) fn read_drafts(
+    dir: &Path,
+) -> Result<std::collections::HashMap<(usize, usize), (u32, f32)>> {
+    let bytes = std::fs::read(dir.join("draft.u32")).with_context(|| {
+        format!(
+            "{}: no draft.u32 (dump with flash-coder-dump)",
+            dir.display()
+        )
+    })?;
+    ensure!(
+        bytes.len() % 16 == 0,
+        "{}: partial draft record",
+        dir.display()
+    );
+    Ok(bytes
+        .chunks_exact(16)
+        .map(|b| {
+            let u = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+            ((u(0) as usize, u(1) as usize), (u(2), f32::from_bits(u(3))))
+        })
+        .collect())
+}
+
+/// Forward oracle for the Coder MTP: the trainer cell on dumped rows against the engine's own
+/// draft argmax (and its probability) for the same rows. Deeper depths are compared only where
+/// the engine's earlier drafts equal the teacher tokens the trainer feeds. With `--prefix-data`
+/// the cell sees every earlier teacher K/V, as the engine does; without it, early rows of a
+/// window miss context and agreement drops.
+fn check_forward_coder<D: ComputeDevice>(
+    dev: &D,
+    w: &mut Weights,
+    seqs: &[data::Sequence],
+    valid: &[usize],
+    hp: &Hparams,
+    a: &Args,
+) -> Result<()> {
+    if a.prefix_data.is_none() {
+        eprintln!(
+            "warning: no --prefix-data; windows miss earlier MTP K/V and agreement is approximate"
+        );
+    }
+    let mut agree = vec![0usize; a.depth];
+    let mut total = vec![0usize; a.depth];
+    let mut dprob = vec![0f64; a.depth];
+    for &i in valid.iter().take(4) {
+        let s = &seqs[i];
+        let drafts = read_drafts(&s.path)?;
+        let mut start = 0;
+        for _ in 0..4 {
+            if start + a.seq > s.ids.len() {
+                break;
+            }
+            let b = s.batch(start, a.seq)?;
+            let mut t = tape::Tape::new(dev);
+            let leaves = w.leafs(&mut t);
+            let out = model::forward_full(&mut t, w, &leaves, &b, hp, a.depth)?;
+            let vocab = w.vocab.len();
+            for (d0, o) in out.iter().enumerate() {
+                let d = d0 + 1;
+                for (r, row) in t.data(o.logits).chunks(vocab).enumerate() {
+                    let p = b.pos[r];
+                    let Some(&(want, prob)) = drafts.get(&(p, d)) else {
+                        continue;
+                    };
+                    // The engine chained on its own drafts; compare where they were the teacher's.
+                    if (1..d).any(|j| drafts.get(&(p, j)).map(|x| x.0) != Some(b.tokens[r + j + 1]))
+                    {
+                        continue;
+                    }
+                    let (j, mx) = row
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                        .map(|(j, &m)| (j, m))
+                        .unwrap();
+                    let z: f64 = row.iter().map(|&v| f64::from(v - mx).exp()).sum();
+                    total[d0] += 1;
+                    agree[d0] += usize::from(w.vocab[j] == want);
+                    dprob[d0] += (1.0 / z - f64::from(prob)).abs();
+                }
+            }
+            drop(t);
+            dev.pool_clear();
+            start += a.seq;
+        }
+    }
+    let mut ok = true;
+    for d in 0..a.depth {
+        let rate = agree[d] as f64 / total[d].max(1) as f64;
+        eprintln!(
+            "engine oracle depth {}: argmax {}/{} ({:.4}), mean |Δp| {:.4}",
+            d + 1,
+            agree[d],
+            total[d],
+            rate,
+            dprob[d] / total[d].max(1) as f64
+        );
+        // int8 activations, bf16 K/V and f16 dumps move near-ties; a port error moves most rows.
+        ok &= total[d] == 0 || rate >= if d == 0 { 0.97 } else { 0.9 };
+    }
+    ensure!(total[0] > 0, "no comparable rows");
+    ensure!(ok, "engine MTP oracle parity failed");
+    eprintln!("Coder MTP engine oracle parity: PASS");
     Ok(())
 }

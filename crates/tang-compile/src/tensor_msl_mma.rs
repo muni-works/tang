@@ -83,6 +83,9 @@ pub(super) struct Bilinear {
     pub k_total: usize,
     /// index of the reduce axis in the space
     pub kdim: usize,
+    /// per output, a constant factor on its whole sum (literals in the
+    /// products, e.g. the attention backward's 1/√d); 1 when there are none
+    pub scales: Vec<f64>,
 }
 
 impl TensorGraph {
@@ -131,26 +134,58 @@ impl TensorGraph {
         // body: a sum of products of two leaf reads (several terms when
         // an operand is split, e.g. rope's even/odd halves)
         let nodes = rc.body.nodes_slice();
-        fn products(nodes: &[Node], e: tang_expr::ExprId, out: &mut Vec<(usize, usize)>) -> bool {
+        // (two vars, and the product of any literals among the factors)
+        fn factors(
+            nodes: &[Node],
+            e: tang_expr::ExprId,
+            vars: &mut Vec<usize>,
+            k: &mut f64,
+        ) -> bool {
+            match nodes[e.index() as usize] {
+                Node::Mul(a, b) => factors(nodes, a, vars, k) && factors(nodes, b, vars, k),
+                Node::Var(p) => {
+                    vars.push(p as usize);
+                    true
+                }
+                Node::Lit(b) => {
+                    *k *= f64::from_bits(b);
+                    true
+                }
+                _ => false,
+            }
+        }
+        fn products(
+            nodes: &[Node],
+            e: tang_expr::ExprId,
+            out: &mut Vec<(usize, usize, f64)>,
+        ) -> bool {
             match nodes[e.index() as usize] {
                 Node::Add(a, b) => products(nodes, a, out) && products(nodes, b, out),
-                Node::Mul(x, y) => match (nodes[x.index() as usize], nodes[y.index() as usize]) {
-                    (Node::Var(p), Node::Var(q)) => {
-                        out.push((p as usize, q as usize));
-                        true
+                Node::Mul(..) => {
+                    let (mut vars, mut k) = (Vec::new(), 1.0);
+                    if !factors(nodes, e, &mut vars, &mut k) || vars.len() != 2 {
+                        return false;
                     }
-                    _ => false,
-                },
+                    out.push((vars[0], vars[1], k));
+                    true
+                }
                 _ => false,
             }
         }
         let mut out_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut scales = Vec::new();
         for &o in &rc.body_outs {
             let mut pairs = Vec::new();
             if !products(nodes, o, &mut pairs) || pairs.is_empty() {
                 return None;
             }
-            out_pairs.push(pairs);
+            // one factor for the whole sum
+            let k = pairs[0].2;
+            if pairs.iter().any(|t| t.2 != k) {
+                return None;
+            }
+            scales.push(k);
+            out_pairs.push(pairs.into_iter().map(|(a, b, _)| (a, b)).collect());
         }
         let pts = fixed(rc.points());
         let k_total = rc.red[0].n();
@@ -282,6 +317,7 @@ impl TensorGraph {
             n,
             k_total,
             kdim,
+            scales,
         })
     }
 
@@ -293,6 +329,9 @@ impl TensorGraph {
         let (LDA, LDB, LDC) = (CHUNK + PAD, BLOCK + PAD, BLOCK + PAD);
         let c = self.comp_at(root)?;
         let t = self.bilinear_tile(root, reads)?;
+        if t.scales.iter().any(|&k| k != 1.0) {
+            return None;
+        }
         if t.terms.len() != 1
             || t.outs.len() != 1
             || t.terms[0].map_a.is_some()
@@ -558,6 +597,7 @@ impl TensorGraph {
             points: numel(c.points()) as u32,
             count: (n_tiles * THREADS) as u32,
             workgroup_size: THREADS as u32,
+            writes: Vec::new(),
         })
     }
 }

@@ -1,0 +1,143 @@
+{
+ "hidden": 64,
+ "n_head": 4,
+ "q_lora": 16,
+ "kv_lora": 8,
+ "qk_nope": 12,
+ "v_head": 12,
+ "rope": 0,
+ "idx_heads": 3,
+ "idx_dim": 6,
+ "topk": 16,
+ "kpool": 4,
+ "tail": true,
+ "eps": 1e-05,
+ "B": 1,
+ "S": 130,
+ "shapes": {
+  "q_a_proj_weight": [
+   16,
+   64
+  ],
+  "q_a_layernorm_weight": [
+   16
+  ],
+  "q_b_proj_weight": [
+   48,
+   16
+  ],
+  "kv_a_proj_with_mqa_weight": [
+   8,
+   64
+  ],
+  "kv_a_layernorm_weight": [
+   8
+  ],
+  "kv_b_proj_weight": [
+   96,
+   8
+  ],
+  "o_proj_weight": [
+   64,
+   48
+  ],
+  "indexer_index_kpool_compress_ape": [
+   4,
+   6
+  ],
+  "indexer_index_kpool_compress_gate": [
+   6,
+   64
+  ],
+  "indexer_wq_b_weight": [
+   18,
+   16
+  ],
+  "indexer_wk_weight": [
+   6,
+   64
+  ],
+  "indexer_k_norm_weight": [
+   6
+  ],
+  "indexer_k_norm_bias": [
+   6
+  ],
+  "indexer_weights_proj_weight": [
+   3,
+   64
+  ],
+  "input_x": [
+   1,
+   130,
+   64
+  ],
+  "ref_q_resid": [
+   1,
+   130,
+   16
+  ],
+  "ref_k_pass": [
+   1,
+   130,
+   8
+  ],
+  "ref_topk_indices": [
+   1,
+   130,
+   19
+  ],
+  "ref_attn_out": [
+   1,
+   130,
+   64
+  ],
+  "hf_index_scores": [
+   130,
+   32
+  ]
+ },
+ "padded": {
+  "B": 2,
+  "S": 24,
+  "pad0": 5,
+  "shapes": {
+   "p_topk_indices": [
+    2,
+    24,
+    19
+   ],
+   "p_ref_attn_out": [
+    2,
+    24,
+    64
+   ],
+   "p_input_x": [
+    2,
+    24,
+    64
+   ],
+   "p_mask": [
+    2,
+    24,
+    1
+   ]
+  }
+ },
+ "real_indexer": {
+  "2048": {
+   "n_valid min/max": [
+    1,
+    2048
+   ],
+   "all_visible_up_to_2048+3": true
+  },
+  "2100": {
+   "n_valid min/max": [
+    1,
+    2051
+   ],
+   "all_visible_up_to_2048+3": false
+  }
+ }
+}

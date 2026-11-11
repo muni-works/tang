@@ -1,0 +1,669 @@
+warning: unused import: `MAX_T`
+  --> crates/tang-moe/src/doorbell.rs:32:46
+   |
+32 | use crate::contract::{MoePlan, QAct, HIDDEN, MAX_T, TOPK};
+   |                                              ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `stream`
+   --> crates/tang-moe/src/gpu.rs:476:42
+    |
+476 |             let gpu_ms = p.ev.and_then(|(stream, e0, e1)| {
+    |                                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_stream`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/tang-moe/src/gpu.rs:537:9
+    |
+537 |         unsafe {
+    |         ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `e4m3_to_f32`
+  --> crates/tang-llm/src/flash/deepseek/engine.rs:35:20
+   |
+35 | use super::quant::{e4m3_to_f32, e8m0_to_f32};
+   |                    ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `tang_moe::gpu::Gpu`
+   --> crates/tang-llm/src/flash/glm5/engine.rs:737:13
+    |
+737 |         use tang_moe::gpu::Gpu;
+    |             ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Result` and `ensure`
+  --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:26:14
+   |
+26 | use anyhow::{ensure, Result};
+   |              ^^^^^^  ^^^^^^
+
+warning: unused imports: `ConvState`, `KdaConfig`, and `KdaState`
+  --> crates/tang-llm/src/flash/glm5/serve_glue.rs:27:18
+   |
+27 | use super::kda::{ConvState, KdaConfig, KdaState};
+   |                  ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/cli.rs:1299:9
+     |
+1299 |     let mut row = |e: &mut Coder, name: &str, ids: &[u32], draft: &str| -> Result<f64> {
+     |         ----^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/cli.rs:1697:9
+     |
+1697 |     let mut run = |e: &mut super::coder::Coder,
+     |         ----^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `b`
+    --> crates/tang-llm/src/flash/coder.rs:2396:13
+     |
+2396 |         let b = items.len();
+     |             ^ help: if this is intentional, prefix it with an underscore: `_b`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `at`
+   --> crates/tang-llm/src/flash/deepseek/engine.rs:962:13
+    |
+962 |         let at = At::Dev {
+    |             ^^ help: if this is intentional, prefix it with an underscore: `_at`
+
+warning: unused variable: `p`
+    --> crates/tang-llm/src/flash/deepseek/engine.rs:2218:9
+     |
+2218 |         p: &str,
+     |         ^ help: if this is intentional, prefix it with an underscore: `_p`
+
+warning: unused variable: `h`
+    --> crates/tang-llm/src/flash/deepseek/engine.rs:3456:14
+     |
+3456 |         let (h, hd, win) = (c.n_heads, c.head_dim, c.window_size);
+     |              ^ help: if this is intentional, prefix it with an underscore: `_h`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/engine.rs:2974:17
+     |
+2974 |             let mut run = || unsafe {
+     |                 ----^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `k`
+   --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:685:13
+    |
+685 |             k: &Kernels,
+    |             ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: unused variable: `state`
+   --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:745:13
+    |
+745 |             state: &mut KdaState,
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_state`
+
+warning: unused variable: `cfg`
+   --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:812:13
+    |
+812 |             cfg: &KdaConfig,
+    |             ^^^ help: if this is intentional, prefix it with an underscore: `_cfg`
+
+warning: unused variable: `conv`
+   --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:816:13
+    |
+816 |             conv: &mut ConvState,
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_conv`
+
+warning: unused variable: `state`
+   --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:817:13
+    |
+817 |             state: &mut KdaState,
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_state`
+
+warning: unused variable: `f`
+    --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:1068:17
+     |
+1068 |             let f = std::mem::size_of::<f32>() as u64;
+     |                 ^ help: if this is intentional, prefix it with an underscore: `_f`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:1154:13
+     |
+1154 |         let mut y = DevBuf::zeroed(b * t * ch_dim * 4)?;
+     |             ----^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:1155:13
+     |
+1155 |         let mut o = DevBuf::zeroed(b * t * nh * hd * 4)?;
+     |             ----^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:1157:13
+     |
+1157 |         let mut scr = DevBuf::zeroed(b * nh * 6 * chunk * hd * 4)?;
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/kda_cuda.rs:1272:13
+     |
+1272 |         let mut o = DevBuf::zeroed(b * nh * hd * 4)?;
+     |             ----^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/tang-llm/src/flash/glm5/kda_decode.rs:579:13
+    |
+579 |         let mut tp = self.probe.take();
+    |             ----^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `slots`
+   --> crates/tang-llm/src/flash/glm5/kda_dev.rs:183:9
+    |
+183 |         slots: usize,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_slots`
+
+warning: unused variable: `i`
+    --> crates/tang-llm/src/flash/glm5/mla.rs:1953:25
+     |
+1953 |             if let Some(i) = self.entries.iter().position(|e| e.id == id) {
+     |                         ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2254:18
+     |
+2254 |             let (mut tt, mut hid, mut dl) = (t as i32, self.hid as i32, self.dl as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2254:26
+     |
+2254 |             let (mut tt, mut hid, mut dl) = (t as i32, self.hid as i32, self.dl as i32);
+     |                          ----^^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2254:35
+     |
+2254 |             let (mut tt, mut hid, mut dl) = (t as i32, self.hid as i32, self.dl as i32);
+     |                                   ----^^
+     |                                   |
+     |                                   help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2255:17
+     |
+2255 |             let mut eps = self.eps;
+     |                 ----^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `contiguous`
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2223:27
+     |
+2223 |             let (lat_ptr, contiguous) = {
+     |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_contiguous`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2392:22
+     |
+2392 |                 let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
+     |                      ----^^^^^
+     |                      |
+     |                      help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2392:33
+     |
+2392 |                 let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
+     |                                 ----^^
+     |                                 |
+     |                                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2392:41
+     |
+2392 |                 let (mut kvlen, mut fk, mut npl) = (kv_len as i32, first_key as i32, n_pool as i32);
+     |                                         ----^^^
+     |                                         |
+     |                                         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2393:21
+     |
+2393 |                 let mut hd_ = hd as i32;
+     |                     ----^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2394:21
+     |
+2394 |                 let mut kp_ = kp as i32;
+     |                     ----^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2395:21
+     |
+2395 |                 let mut from_ = from as i32;
+     |                     ----^^^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2516:18
+     |
+2516 |             let (mut tt, mut p0) = (t as i32, pos0 as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2516:26
+     |
+2516 |             let (mut tt, mut p0) = (t as i32, pos0 as i32);
+     |                          ----^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2517:18
+     |
+2517 |             let (mut hid, mut hd_) = (self.hid as i32, hd as i32);
+     |                  ----^^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2517:27
+     |
+2517 |             let (mut hid, mut hd_) = (self.hid as i32, hd as i32);
+     |                           ----^^^
+     |                           |
+     |                           help: remove this `mut`
+
+warning: unused variable: `contiguous`
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2455:42
+     |
+2455 |             let (ck_ptr, cg_ptr, vd_ptr, contiguous) = {
+     |                                          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_contiguous`
+
+warning: unused variable: `valid`
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2573:13
+     |
+2573 |             valid: &[u8],
+     |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_valid`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2745:18
+     |
+2745 |             let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2745:26
+     |
+2745 |             let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
+     |                          ----^^^^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2745:37
+     |
+2745 |             let (mut tt, mut kvlen, mut p0) = (t as i32, kv_len as i32, pos0 as i32);
+     |                                     ----^^
+     |                                     |
+     |                                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2746:18
+     |
+2746 |             let (mut fk, mut npl) = (first_key as i32, n_pool as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2746:26
+     |
+2746 |             let (mut fk, mut npl) = (first_key as i32, n_pool as i32);
+     |                          ----^^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2747:18
+     |
+2747 |             let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+     |                  ----^^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2747:27
+     |
+2747 |             let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+     |                           ----^^^
+     |                           |
+     |                           help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2747:36
+     |
+2747 |             let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+     |                                    ----^^^
+     |                                    |
+     |                                    help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2747:45
+     |
+2747 |             let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+     |                                             ----^^^
+     |                                             |
+     |                                             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2747:54
+     |
+2747 |             let (mut nh_, mut hd_, mut kp_, mut tk_, mut wd_) = (
+     |                                                      ----^^^
+     |                                                      |
+     |                                                      help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2754:17
+     |
+2754 |             let mut ssc = 1.0f32 / (hd as f32).sqrt();
+     |                 ----^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2755:17
+     |
+2755 |             let mut hsc = 1.0f32 / (nh as f32).sqrt();
+     |                 ----^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2870:18
+     |
+2870 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2870:26
+     |
+2870 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                          ----^^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2870:35
+     |
+2870 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                                   ----^^
+     |                                   |
+     |                                   help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2871:18
+     |
+2871 |             let (mut nh, mut dk, mut dv, mut dl, mut wd) = (
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2871:26
+     |
+2871 |             let (mut nh, mut dk, mut dv, mut dl, mut wd) = (
+     |                          ----^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2871:34
+     |
+2871 |             let (mut nh, mut dk, mut dv, mut dl, mut wd) = (
+     |                                  ----^^
+     |                                  |
+     |                                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2871:42
+     |
+2871 |             let (mut nh, mut dk, mut dv, mut dl, mut wd) = (
+     |                                          ----^^
+     |                                          |
+     |                                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2871:50
+     |
+2871 |             let (mut nh, mut dk, mut dv, mut dl, mut wd) = (
+     |                                                  ----^^
+     |                                                  |
+     |                                                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:2878:17
+     |
+2878 |             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3151:18
+     |
+3151 |             let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3151:26
+     |
+3151 |             let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
+     |                          ----^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3151:34
+     |
+3151 |             let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
+     |                                  ----^^
+     |                                  |
+     |                                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3151:42
+     |
+3151 |             let (mut xp, mut wp, mut ni, mut e) = (x, w, n as i32, eps);
+     |                                          ----^
+     |                                          |
+     |                                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3556:18
+     |
+3556 |             let (mut ftt, mut fnh, mut fdk, mut fdl) =
+     |                  ----^^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3556:27
+     |
+3556 |             let (mut ftt, mut fnh, mut fdk, mut fdl) =
+     |                           ----^^^
+     |                           |
+     |                           help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3556:36
+     |
+3556 |             let (mut ftt, mut fnh, mut fdk, mut fdl) =
+     |                                    ----^^^
+     |                                    |
+     |                                    help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3556:45
+     |
+3556 |             let (mut ftt, mut fnh, mut fdk, mut fdl) =
+     |                                             ----^^^
+     |                                             |
+     |                                             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3570:18
+     |
+3570 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3570:26
+     |
+3570 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                          ----^^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3570:35
+     |
+3570 |             let (mut tt, mut nkv, mut p0) = (t as i32, n_kv as i32, pos0 as i32);
+     |                                   ----^^
+     |                                   |
+     |                                   help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3571:18
+     |
+3571 |             let (mut nh, mut dv, mut dl, mut wd) =
+     |                  ----^^
+     |                  |
+     |                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3571:26
+     |
+3571 |             let (mut nh, mut dv, mut dl, mut wd) =
+     |                          ----^^
+     |                          |
+     |                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3571:34
+     |
+3571 |             let (mut nh, mut dv, mut dl, mut wd) =
+     |                                  ----^^
+     |                                  |
+     |                                  help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3571:42
+     |
+3571 |             let (mut nh, mut dv, mut dl, mut wd) =
+     |                                          ----^^
+     |                                          |
+     |                                          help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/tang-llm/src/flash/glm5/mla.rs:3573:17
+     |
+3573 |             let mut scale = 1.0f32 / (self.dk as f32).sqrt();
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: function `decode` is never used
+   --> crates/tang-llm/src/flash/cli.rs:420:4
+    |
+420 | fn decode(
+    |    ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `f` is never read
+   --> crates/tang-llm/src/flash/engine.rs:117:5
+    |
+116 | struct NativeK {
+    |        ------- field in this struct
+117 |     f: [Fun; MAX_T],
+    |     ^
+    |
+    = note: `NativeK` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `m_attn` is never read
+   --> crates/tang-llm/src/flash/engine.rs:431:5
+    |
+414 | struct Kern {
+    |        ---- field in this struct
+...
+431 |     m_attn: Fun,
+    |     ^^^^^^
+
+warning: method `enable_mla_resident` is never used
+   --> crates/tang-llm/src/flash/glm5/engine.rs:605:19
+    |
+177 | impl GpuFfn {
+    | ----------- method in this implementation
+...
+605 |     pub(crate) fn enable_mla_resident(
+    |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: method `decode_fast` is never used
+   --> crates/tang-llm/src/flash/glm5/kda_decode.rs:546:19
+    |
+190 | impl DevLayer {
+    | ------------- method in this implementation
+...
+546 |     pub(super) fn decode_fast(
+    |                   ^^^^^^^^^^^
+
+warning: field `g` is never read
+    --> crates/tang-llm/src/flash/glm5/mla.rs:1831:9
+     |
+1830 |     pub struct MlaCuda {
+     |                ------- field in this struct
+1831 |         g: Gpu,
+     |         ^
+

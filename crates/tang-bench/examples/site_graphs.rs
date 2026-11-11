@@ -21,6 +21,8 @@ fn label(g: &TensorGraph, t: TensorId) -> String {
         Op::Input(i) => INPUTS.get(*i).copied().unwrap_or("cache").into(),
         Op::Iota(_) => "iota".into(),
         Op::Reshape(_) => "reshape".into(),
+        Op::Operator(_) => "operator".into(),
+        Op::Scan(_) => "scan".into(),
     }
 }
 

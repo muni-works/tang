@@ -1,0 +1,295 @@
+{
+ "model": "glm5-next mHC",
+ "hc_mult": 4,
+ "hidden_size": 64,
+ "rms_norm_eps": 1e-05,
+ "hc_eps": 1e-06,
+ "hc_sinkhorn_iters": 20,
+ "layout": "little-endian raw f32; streams [B,S,N,D] contiguous, D fastest; comb [B,S,src,dst] (src-major, dst fastest)",
+ "tensors": [
+  {
+   "name": "fn",
+   "file": "fn.bin",
+   "dtype": "f32",
+   "shape": [
+    24,
+    256
+   ]
+  },
+  {
+   "name": "base",
+   "file": "base.bin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ]
+  },
+  {
+   "name": "scale",
+   "file": "scale.bin",
+   "dtype": "f32",
+   "shape": [
+    3
+   ]
+  },
+  {
+   "name": "c0_streams",
+   "file": "c0_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "c0_y",
+   "file": "c0_y.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    64
+   ]
+  },
+  {
+   "name": "c0_flat_norm",
+   "file": "c0_flat_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    256
+   ]
+  },
+  {
+   "name": "c0_mixes",
+   "file": "c0_mixes.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    24
+   ]
+  },
+  {
+   "name": "c0_post",
+   "file": "c0_post.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    4
+   ]
+  },
+  {
+   "name": "c0_comb",
+   "file": "c0_comb.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    4,
+    4
+   ]
+  },
+  {
+   "name": "c0_collapsed",
+   "file": "c0_collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    64
+   ]
+  },
+  {
+   "name": "c0_out",
+   "file": "c0_out.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "c1_streams",
+   "file": "c1_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "c1_y",
+   "file": "c1_y.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    64
+   ]
+  },
+  {
+   "name": "c1_flat_norm",
+   "file": "c1_flat_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    256
+   ]
+  },
+  {
+   "name": "c1_mixes",
+   "file": "c1_mixes.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    24
+   ]
+  },
+  {
+   "name": "c1_post",
+   "file": "c1_post.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    4
+   ]
+  },
+  {
+   "name": "c1_comb",
+   "file": "c1_comb.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    4,
+    4
+   ]
+  },
+  {
+   "name": "c1_collapsed",
+   "file": "c1_collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    64
+   ]
+  },
+  {
+   "name": "c1_out",
+   "file": "c1_out.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    13,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "c2_streams",
+   "file": "c2_streams.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "c2_y",
+   "file": "c2_y.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    64
+   ]
+  },
+  {
+   "name": "c2_flat_norm",
+   "file": "c2_flat_norm.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    256
+   ]
+  },
+  {
+   "name": "c2_mixes",
+   "file": "c2_mixes.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    24
+   ]
+  },
+  {
+   "name": "c2_post",
+   "file": "c2_post.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    4
+   ]
+  },
+  {
+   "name": "c2_comb",
+   "file": "c2_comb.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    4,
+    4
+   ]
+  },
+  {
+   "name": "c2_collapsed",
+   "file": "c2_collapsed.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    64
+   ]
+  },
+  {
+   "name": "c2_out",
+   "file": "c2_out.bin",
+   "dtype": "f32",
+   "shape": [
+    2,
+    7,
+    4,
+    64
+   ]
+  },
+  {
+   "name": "head_mean",
+   "file": "head_mean.bin",
+   "dtype": "f32",
+   "shape": [
+    1,
+    5,
+    64
+   ]
+  }
+ ]
+}

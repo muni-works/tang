@@ -114,6 +114,9 @@ impl Executable {
                                 inputs[k].iter().map(|&x| bf16_bits(x as f64)).collect();
                             mk(bytes_of(&h))
                         }
+                        f => {
+                            unimplemented!("MSL runtime: block format {f:?} inputs")
+                        }
                     }
                 }
                 None => dev
@@ -208,6 +211,9 @@ impl Executable {
                     .iter()
                     .map(|&h| bf16_from_bits(h) as f32)
                     .collect(),
+                f => {
+                    unimplemented!("MSL runtime: reading block format {f:?}")
+                }
             }
         }
     }

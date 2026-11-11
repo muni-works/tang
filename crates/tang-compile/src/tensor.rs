@@ -45,11 +45,38 @@ pub mod c;
 pub mod cuda;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
+/// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
+#[path = "tensor_cuda_int8.rs"]
+mod cuda_int8;
+#[path = "tensor_cuda_mega.rs"]
+pub mod cuda_mega;
+/// A whole program as one persistent CUDA kernel (no kernel boundaries).
+#[path = "tensor_cuda_scan.rs"]
+pub mod cuda_scan;
+/// Algorithm discovery: online, scan and chunked lifts.
+#[path = "tensor_discover.rs"]
+pub mod discover;
+#[path = "tensor_discover_catalog.rs"]
+pub mod discover_catalog;
+#[cfg(test)]
+#[path = "tensor_gather_tests.rs"]
+mod gather_tests;
+/// GGUF block formats on the CPU: the values a block-format input stands for.
+#[path = "tensor_gguf.rs"]
+pub mod gguf;
 /// Vulkan decode lowering: the decode kernels as GLSL (SPIR-V passthrough).
 #[path = "tensor_glsl_gemv.rs"]
 pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]
 mod grad;
+/// Block-format weights onto the int8 GEMV in any graph.
+#[path = "tensor_int8_sched.rs"]
+pub mod int8_sched;
+#[path = "tensor_io.rs"]
+pub mod io;
+pub use io::{IoReport, KernelIo};
+#[path = "tensor_io_lp.rs"]
+pub mod io_lp;
 #[path = "tensor_memplan.rs"]
 pub mod memplan;
 #[path = "tensor_modq.rs"]
@@ -67,14 +94,32 @@ mod msl_mma;
 pub mod opencl;
 #[path = "tensor_opencl_gemv.rs"]
 pub mod opencl_gemv;
+#[path = "tensor_place.rs"]
+pub mod place;
+pub use place::{Boundary, MemorySchedule, Place, Placed};
 #[path = "tensor_precision.rs"]
 pub mod precision;
+/// The declarative schedule search space and the autotuner's cost model.
+#[path = "tensor_scan.rs"]
+pub mod scan;
+pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
+#[path = "tensor_space.rs"]
+pub mod space;
+/// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
+/// `IndexedGather` operator nodes.
+#[path = "tensor_sparse.rs"]
+pub mod sparse;
+/// Decode as the finite difference of prefill: the `T → T + k` step and
+/// its KV cache, derived from the full-sequence graph.
+#[path = "tensor_step.rs"]
+pub mod step;
 #[path = "tensor_tile.rs"]
 mod tile;
 #[path = "tensor_wgsl.rs"]
 pub mod wgsl;
 pub use grad::BackwardOptions;
 pub use precision::{ErrorBudget, ErrorStats, Format, Precision};
+pub use wgsl::WgslCaps;
 
 // ---------------------------------------------------------------------------
 // Views
@@ -171,6 +216,22 @@ pub struct View {
     /// zero padding as a view. The guard travels with the leaf read through
     /// composition, and a gradient through it scatters only in range.
     pub guard: bool,
+    /// Data-dependent addressing: source coordinate `d` is
+    /// `forms[d] + gather.coefs[d] · round(args[gather.arg])`, the value of a
+    /// sibling arg of the same comp (an integer-valued index tensor read
+    /// through its own affine view). `None` for a plain affine view.
+    pub gather: Option<Gather>,
+}
+
+/// The data-dependent term of a [`View`]: the index is the value of arg
+/// `arg` of the comp that owns the view (at the same point), scaled per
+/// source dim by `coefs`. Referencing a sibling arg rather than a tensor
+/// keeps dependency tracking and node renumbering free: the index tensor is
+/// an ordinary arg. The index arg's own view must be affine (no nesting).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Gather {
+    pub arg: usize,
+    pub coefs: Vec<i64>,
 }
 
 impl View {
@@ -184,7 +245,22 @@ impl View {
         Self {
             forms,
             guard: false,
+            gather: None,
         }
+    }
+
+    /// Source dim `dim` (of `src_rank`) reads `scale · index + forms[dim]`
+    /// where the index is the value of arg `arg`; the other forms are kept.
+    pub fn gather(mut self, dim: usize, arg: usize, scale: i64) -> Self {
+        let mut coefs = vec![0; self.forms.len()];
+        coefs[dim] = scale;
+        self.gather = Some(Gather { arg, coefs });
+        self
+    }
+
+    /// Whether this view addresses its source through an index arg.
+    pub fn is_gather(&self) -> bool {
+        self.gather.is_some()
     }
 
     /// Identity over the first `src_rank` coordinates of a `rank`-dim space.
@@ -196,23 +272,31 @@ impl View {
         self.forms.first().map_or(0, |f| f.coefs.len())
     }
 
-    fn coords(&self, idx: &[usize]) -> Vec<usize> {
-        self.forms.iter().map(|f| f.eval(idx) as usize).collect()
+    /// Signed source coordinates; `index` is the gather arg's value (ignored
+    /// for an affine view).
+    fn coords_signed(&self, idx: &[usize], index: f64) -> Vec<i64> {
+        let g = index.round() as i64;
+        self.forms
+            .iter()
+            .enumerate()
+            .map(|(d, f)| f.eval(idx) + self.gather.as_ref().map_or(0, |ga| ga.coefs[d] * g))
+            .collect()
     }
 
     /// Coordinates in `shape`, or `None` when a guarded read falls outside.
-    fn coords_in(&self, idx: &[usize], shape: &[usize]) -> Option<Vec<usize>> {
-        if !self.guard {
-            return Some(self.coords(idx));
-        }
-        self.forms
+    /// An unguarded read outside the source is a caller bug (affine views
+    /// are range-checked at construction; gathered ones cannot be).
+    fn coords_in(&self, idx: &[usize], shape: &[usize], index: f64) -> Option<Vec<usize>> {
+        let cs = self.coords_signed(idx, index);
+        let inside = cs
             .iter()
             .zip(shape)
-            .map(|(f, &n)| {
-                let c = f.eval(idx);
-                (0..n as i64).contains(&c).then_some(c as usize)
-            })
-            .collect()
+            .all(|(&c, &n)| (0..n as i64).contains(&c));
+        if !inside {
+            assert!(self.guard, "unguarded read {cs:?} outside source {shape:?}");
+            return None;
+        }
+        Some(cs.into_iter().map(|c| c as usize).collect())
     }
 
     /// A view that may read outside its source; out-of-range reads are 0.
@@ -223,7 +307,27 @@ impl View {
 
     /// `self ∘ inner`: this view is over a space whose coordinates are
     /// given by `inner` over a `rank`-dim space.
+    ///
+    /// A gather on either side carries through, its `arg` still indexing
+    /// the args of the comp that owned it: the caller remaps it (see
+    /// [`splice_arg`]). An inner gather scales through `self`'s forms (a
+    /// data-dependent coordinate is still added linearly); both sides
+    /// gathering would nest one index read inside another and panics —
+    /// callers check [`View::is_gather`] first.
     fn compose(&self, inner: &View, rank: usize) -> View {
+        let gather = match (&self.gather, &inner.gather) {
+            (None, None) => None,
+            (Some(g), None) => Some(g.clone()),
+            (None, Some(gi)) => Some(Gather {
+                arg: gi.arg,
+                coefs: self
+                    .forms
+                    .iter()
+                    .map(|f| f.coefs.iter().zip(&gi.coefs).map(|(a, b)| a * b).sum())
+                    .collect(),
+            }),
+            (Some(_), Some(_)) => panic!("nested gather in view composition"),
+        };
         View {
             // one side is always a plain view: either a guarded leaf read
             // pushed through an unguarded consumer, or the reverse
@@ -233,6 +337,7 @@ impl View {
                 .iter()
                 .map(|f| f.compose(&inner.forms, rank))
                 .collect(),
+            gather,
         }
     }
 
@@ -243,8 +348,9 @@ impl View {
     /// `src`. A reshape that splits a source dim across destination dims
     /// (`[s, d] -> [s*d]`) is not affine (it needs `/` and `%`): `None`.
     pub fn through_reshape(&self, dst: &[Dim], src: &[Dim]) -> Option<View> {
-        // a guard bounds the reshape's coords, not the source's
-        if self.guard {
+        // a guard bounds the reshape's coords, not the source's; a gather
+        // would need its coefs re-strided too (not done)
+        if self.guard || self.is_gather() {
             return None;
         }
         let dst: Vec<usize> = dst.iter().map(|d| d.fixed()).collect::<Option<_>>()?;
@@ -279,6 +385,7 @@ impl View {
         (d == dst.len()).then_some(View {
             forms,
             guard: false,
+            gather: None,
         })
     }
 
@@ -312,6 +419,10 @@ pub struct Monoid {
     pub identity: Vec<f64>,
     pub combine: ExprGraph,
     pub outs: Vec<ExprId>,
+    /// Structure of a discovered online lift (state `(R₁, Σ D)`), from
+    /// which the backward derives an elementwise saved-state gradient
+    /// instead of the generic prefix/suffix-scan one.
+    pub saved: Option<std::sync::Arc<discover::SavedBwd>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +451,7 @@ impl Monoid {
             identity,
             combine,
             outs,
+            saved: None,
         }
     }
 
@@ -361,6 +473,49 @@ impl Monoid {
             let sel = |c, t, f| tang_expr::with_graph(|g| g.select(c, t, f));
             let tie = sel(i - j, j, i);
             vec![sel(d, j, sel(-d, i, tie)), sel(d, w, v)]
+        })
+    }
+
+    /// The `k` best `(index, value)` pairs, best first: state and element
+    /// are both `(i₀, v₀, …, iₖ₋₁, vₖ₋₁)` sorted by value descending, the
+    /// smaller index first on a tie (the order k argmax rounds pick in, so
+    /// the result is the same whatever the combine order). An element of
+    /// one pair is `(j, w)` followed by `k − 1` identity pairs
+    /// `(0, -f32::MAX)`. The combine is the merge-path rule: the r-th best
+    /// of two sorted lists `A`, `B` is the best of `Aᵣ`, `Bᵣ` and
+    /// `min(Aᵢ₋₁, Bᵣ₋ᵢ)` for `i` in `1..=r` (k²/2 compare-selects, no
+    /// sort). One reduction replaces k argmax rounds and their masks.
+    pub fn topk(k: usize) -> Self {
+        assert!(k >= 1, "top-k of k >= 1");
+        let mut id = Vec::with_capacity(2 * k);
+        for _ in 0..k {
+            id.push(0.0);
+            id.push(-(f32::MAX as f64));
+        }
+        Self::build(2 * k, id, |a, e| {
+            let sel = |c, t, f| tang_expr::with_graph(|g| g.select(c, t, f));
+            // > 0 when x ranks above y (larger value, then smaller index)
+            let better = |x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                let d = x.1 - y.1;
+                sel(d, ExprId::ONE, sel(-d, -ExprId::ONE, y.0 - x.0))
+            };
+            let pick = |c: ExprId, x: (ExprId, ExprId), y: (ExprId, ExprId)| {
+                (sel(c, x.0, y.0), sel(c, x.1, y.1))
+            };
+            let hi = |x, y| pick(better(x, y), x, y);
+            let lo = |x, y| pick(better(x, y), y, x);
+            let av: Vec<(ExprId, ExprId)> = (0..k).map(|r| (a[2 * r], a[2 * r + 1])).collect();
+            let bv: Vec<(ExprId, ExprId)> = (0..k).map(|r| (e[2 * r], e[2 * r + 1])).collect();
+            let mut out = Vec::with_capacity(2 * k);
+            for r in 0..k {
+                let mut best = hi(av[r], bv[r]);
+                for i in 1..=r {
+                    best = hi(best, lo(av[i - 1], bv[r - i]));
+                }
+                out.push(best.0);
+                out.push(best.1);
+            }
+            out
         })
     }
 
@@ -394,11 +549,31 @@ impl Monoid {
                 _ => MonoidKind::Other,
             };
         }
-        if self.identity[0] == f64::NEG_INFINITY {
+        if self.identity[0] <= -1e30 && self.matches(&Monoid::online_softmax(self.width - 1)) {
             MonoidKind::OnlineSoftmax
         } else {
             MonoidKind::Other
         }
+    }
+
+    /// Same combine as `o` at a few probe points (a tuple monoid with a
+    /// `−∞` first slot is not necessarily an online softmax: the
+    /// discovered lifts have that shape too).
+    fn matches(&self, o: &Monoid) -> bool {
+        if o.width != self.width {
+            return false;
+        }
+        let w = self.width;
+        (0..3).all(|t| {
+            let v: Vec<f64> = (0..2 * w)
+                .map(|i| ((i * 7 + t * 13) % 11) as f64 * 0.37 - 1.3)
+                .collect();
+            let a = self.combine.eval_many::<f64>(&self.outs, &v);
+            let b = o.combine.eval_many::<f64>(&o.outs, &v);
+            a.iter()
+                .zip(&b)
+                .all(|(x, y)| (x - y).abs() <= 1e-12 * (1.0 + y.abs()))
+        })
     }
 }
 
@@ -472,6 +647,20 @@ impl Comp {
     fn space(&self) -> Vec<Dim> {
         self.points().iter().chain(&self.red).copied().collect()
     }
+
+    /// Whether any arg addresses its source through an index arg. Passes
+    /// that drop, reorder or split args leave such comps alone.
+    pub fn has_gather(&self) -> bool {
+        self.args.iter().any(|a| a.view.is_gather())
+    }
+
+    /// Args read as gather indices (by some other arg's view).
+    fn index_args(&self) -> Vec<usize> {
+        self.args
+            .iter()
+            .filter_map(|a| a.view.gather.as_ref().map(|g| g.arg))
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -487,6 +676,63 @@ pub enum Op {
     /// affine (and `backward` can invert them as pick views).
     Reshape(TensorId),
     Comp(Comp),
+    /// An opaque operator: native code forward, a user-supplied adjoint
+    /// backward. See [`Operator`].
+    Operator(OperatorNode),
+    /// A prefix scan over one dim with an associative combine: a tuple
+    /// monoid or the matrix affine monoid. See [`Scan`].
+    Scan(Scan),
+}
+
+/// An opaque operator node: whole-tensor native code with its own
+/// adjoint. Solves, simulations and other steps that are not
+/// comprehensions (a sparse linear solve, a rollout) enter the graph as
+/// one of these; everything around them stays comprehensions.
+///
+/// The reference interpreter materializes every input, calls
+/// [`forward`](Operator::forward) once, and stores the result like any
+/// other buffer. [`TensorGraph::backward`] calls
+/// [`backward`](Operator::backward), which appends the adjoint to the
+/// graph: comprehensions, further operator nodes, or both (`LinearSolve`'s
+/// adjoint is a transposed solve followed by an outer-product
+/// comprehension). Device backends do not lower operator nodes; a graph
+/// containing one runs on the interpreter or splits around it.
+pub trait Operator: Send + Sync + std::panic::RefUnwindSafe {
+    /// Short name for debugging and graph dumps.
+    fn name(&self) -> &str;
+
+    /// The output, row-major, from the inputs (row-major, in
+    /// [`OperatorNode::inputs`] order).
+    fn forward(&self, inputs: &[&[f64]]) -> Vec<f64>;
+
+    /// Append the vector-Jacobian product to `g`: given the forward
+    /// node's inputs, its output and the output cotangent `cot`, return
+    /// each input's cotangent (`None` for inputs that are not
+    /// differentiable, such as an index pattern).
+    fn backward(
+        &self,
+        g: &mut TensorGraph,
+        inputs: &[TensorId],
+        output: TensorId,
+        cot: TensorId,
+    ) -> Result<Vec<Option<TensorId>>, ShapeError>;
+}
+
+/// [`Op::Operator`]: the operator and the tensors it reads.
+#[derive(Clone)]
+pub struct OperatorNode {
+    pub op: std::sync::Arc<dyn Operator>,
+    pub inputs: Vec<TensorId>,
+}
+
+/// [`TNode::segment`]: reduce dim `red` (index into the comp's reduce dims)
+/// only contributes where `key[r] == point coord `point``, `key` a sorted
+/// 1-D tensor read by one of the comp's args as `key[r]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub red: usize,
+    pub key: TensorId,
+    pub point: usize,
 }
 
 #[derive(Clone)]
@@ -510,10 +756,92 @@ pub struct TNode {
     /// for an f16 × f16 → f32 contraction; see
     /// [`TensorGraph::fragment_plan`]. Backends without fragments ignore it.
     pub fragment: bool,
+    /// Schedule: lower this contraction onto integer tensor-core fragments
+    /// (CUDA `mma.sync` m16n8k32 s8) with its weight operand dequantized
+    /// in registers from a block format. See [`IntMma`]. Backends without
+    /// the lowering ignore it (and then reject the block formats).
+    pub int_mma: Option<IntMma>,
+    /// A fact about the data, not a schedule: this 1-D tensor is
+    /// nondecreasing (e.g. MoE pairs sorted by expert). Set by
+    /// [`TensorGraph::set_sorted`]; the backward uses it to give gathered
+    /// contractions a [`Segment`].
+    pub sorted: bool,
+    /// A fact about differentiation, not a schedule: this node is
+    /// [`detach`](TensorGraph::detach)ed — an identity map whose
+    /// cotangent is zero. Rewrite passes keep it a node of its own (they
+    /// never splice it into its readers, nor merge it with an
+    /// undetached twin); schedules may still inline it, so it costs
+    /// nothing at run time.
+    pub detach: bool,
+    /// The reduction's contributing range along one reduce dim is the run
+    /// of a sorted key equal to a point coordinate (a segmented sum). Set by
+    /// the backward of a gather through a [`sorted`](Self::sorted) index;
+    /// the body keeps its `[key == coord]` gate, so lowerings that ignore
+    /// it stay correct and the WGSL point loop binary-searches the run.
+    pub segment: Option<Segment>,
+    /// Schedule: combine a `split` reduction's per-thread partials with
+    /// subgroup operations (WGSL `subgroupAdd`/`subgroupShuffleXor`, MSL
+    /// `simd_sum`/`simd_shuffle_xor`) instead of a workgroup-memory tree:
+    /// one barrier instead of log₂(split). Honoured where the target has
+    /// subgroups ([`WgslCaps::subgroups`](crate::tensor::WgslCaps); always
+    /// on Metal), ignored elsewhere.
+    pub subgroup: bool,
+    /// Schedule: geometry of a fragment-lowered attention kernel —
+    /// `[query rows per SIMD group / 8, keys per tile / 8, value columns
+    /// per threadgroup / 8, SIMD groups per threadgroup]`; 0 = the
+    /// backend's default. Ignored unless `fragment` is set and the node
+    /// has an attention plan.
+    pub frag_cfg: [u8; 4],
+    /// Schedule (decode, CUDA): no kernel of its own. The kernel of node
+    /// `host` evaluates it inline wherever its own tree reads it, and
+    /// also stores it to this node's buffer (a side job of that launch),
+    /// so other readers read the buffer as usual. Set by
+    /// [`TensorGraph::schedule_cokernels`]; passes that rebuild the graph
+    /// drop it.
+    pub host: Option<TensorId>,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
     pub precision: Precision,
+}
+
+/// The integer-MMA schedule of one contraction
+/// `out[p…, r] = Σ_k W[idx(p), r, k] · X[p…, k]`: `W` a graph input stored
+/// Q4_K / Q5_K (its first dim optionally gathered by a per-point index), `X`
+/// a buffer stored [`Format::Q8x32`]. A warp owns 16 rows `r` (the MMA's M)
+/// and 8 consecutive points `p` (its N); consecutive points that gather the
+/// same `W` slice share each A fragment, so a point dim sorted by the index
+/// reads every slice once a tile. The integer dot of a 32-column step is
+/// scaled once in float (weight `d · scale − dmin · min`, activation `d`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntMma {
+    /// How the activation operand reaches the B fragment.
+    pub stage: Stage,
+    /// Warps that split a 16-row tile's reduction (1, 2, 4 or 8), their
+    /// partial sums added through shared memory.
+    pub ksplit: u32,
+    /// [`Stage::Gemv`] only: consecutive positions that share one read of
+    /// the weights (each block dots its weight rows with up to this many
+    /// activation rows; 0 or 1: one). Needs an ungathered weight.
+    pub pos_tile: u32,
+}
+
+/// Activation staging for [`IntMma`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Fragment order: each lane's B fragment is 8 consecutive columns, one
+    /// 8-byte load from global, no shared memory; the A fragment takes the
+    /// same permutation of the 32 columns (a dot product does not care).
+    Fragment,
+    /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
+    /// and `16 + 4·tig..`), on both operands.
+    Mma,
+    /// No MMA: the narrow schedule for few points a weight slice (decode,
+    /// batch 1). Each output `(p, r)` is a dot of one weight row with one
+    /// activation row on `dp4a`, the row's half-super-blocks spread over
+    /// a group of lanes (as many as `k / 128`, at most 32) and summed by
+    /// shuffles; a warp holds `32 / lanes` rows. `ksplit` is ignored.
+    Gemv,
 }
 
 /// Reduce dims the tiled emitter handles: one chunked axis (the largest)
@@ -545,9 +873,18 @@ pub(crate) fn tile_axes(pts: &[usize]) -> (Option<usize>, Option<usize>) {
     (x, x.and_then(|dx| tile::largest_other(pts, dx)))
 }
 
-/// How `merge_reduce_dims` rewrites one arg: `None` leaves it, `Some((d0,
-/// shape))` reads a reshape of its source with dims `d0, d0 + 1` merged.
-type MergePlan = Option<(usize, Vec<Dim>)>;
+/// How `merge_reduce_dims` rewrites one arg.
+#[derive(Clone)]
+enum MergePlan {
+    /// It reads neither dim: left as is.
+    Neither,
+    /// It reads a reshape of its source with dims `d0, d0 + 1` merged.
+    Reshape(usize, Vec<Dim>),
+    /// Source dim `d0` already reads `s·(n_inner·outer + inner)`: the
+    /// same source, read at `s·merged`
+    /// ([`TensorGraph::merge_reduce_dims_scaled`] only).
+    Scaled(usize),
+}
 
 /// `(split, tile, reg)` — one thread mapping for a comp.
 pub type ScheduleCandidate = (u32, (u32, u32, u32), (u32, u32));
@@ -663,6 +1000,21 @@ impl TensorGraph {
     /// Schedule: recompute `t` inside its consumers (`true`) or write it
     /// to a buffer. `schedule_inline` decides this by rule; this is the
     /// manual override, e.g. to fuse a reduction under its epilogue map.
+    pub fn set_subgroup(&mut self, t: TensorId, on: bool) {
+        self.nodes[t.n()].subgroup = on;
+    }
+
+    /// Assert that 1-D `t` is nondecreasing (data, e.g. keys sorted by an
+    /// earlier comp). Gradients of contractions gathered through it then
+    /// reduce over runs found by binary search instead of the whole dim.
+    pub fn set_sorted(&mut self, t: TensorId, sorted: bool) {
+        self.nodes[t.n()].sorted = sorted;
+    }
+
+    pub fn segment(&self, t: TensorId) -> Option<Segment> {
+        self.nodes[t.n()].segment
+    }
+
     pub fn set_inline(&mut self, t: TensorId, inline: bool) {
         self.nodes[t.n()].inline = inline;
     }
@@ -674,6 +1026,13 @@ impl TensorGraph {
     /// [`TensorGraph::eval_emulated`] and the WGSL lowering honour it.
     pub fn set_precision(&mut self, t: TensorId, p: Precision) {
         self.nodes[t.n()].precision = p;
+    }
+
+    /// Schedule: run contraction `t` on integer MMA fragments
+    /// ([`IntMma`]); `None` clears it. The CUDA lowering checks the pattern
+    /// and the operand formats and panics when they do not fit.
+    pub fn set_int_mma(&mut self, t: TensorId, s: Option<IntMma>) {
+        self.nodes[t.n()].int_mma = s;
     }
 
     pub fn precision(&self, t: TensorId) -> Precision {
@@ -692,6 +1051,12 @@ impl TensorGraph {
         // the answer (59 ms for attention's 66-wide state on a 3090)
         if c.width() <= 8 {
             out.push((256, (0, 0, 0), (1, 1)));
+        }
+        // tiles stage affine regions of their operands; a gathered read
+        // has no region to stage (one thread per point, or a split, only)
+        let root = self.comp_at(t.n()).unwrap();
+        if c.has_gather() || root.has_gather() {
+            return out;
         }
         if tileable_red(&c.red) {
             let pts = fixed(c.points());
@@ -730,6 +1095,13 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
+            segment: None,
+            sorted: false,
+            detach: false,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -746,6 +1118,13 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
+            segment: None,
+            sorted: false,
+            detach: false,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -777,9 +1156,46 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
+            segment: None,
+            sorted: false,
+            detach: false,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
+    }
+
+    /// Append an [`Operator`] node reading `inputs`, with output `shape`.
+    pub fn operator<D: Into<Dim> + Copy>(
+        &mut self,
+        op: std::sync::Arc<dyn Operator>,
+        inputs: &[TensorId],
+        shape: &[D],
+    ) -> TensorId {
+        self.nodes.push(TNode {
+            op: Op::Operator(OperatorNode {
+                op,
+                inputs: inputs.to_vec(),
+            }),
+            shape: dims(shape),
+            inline: false,
+            split: 0,
+            tile: (0, 0, 0),
+            reg: (1, 1),
+            fragment: false,
+            int_mma: None,
+            segment: None,
+            sorted: false,
+            detach: false,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            host: None,
+            precision: Precision::default(),
+        });
+        TensorId(self.nodes.len() as u32 - 1)
     }
 
     /// The node whose buffer holds `t`'s bytes: `t` itself, or the source
@@ -796,6 +1212,8 @@ impl TensorGraph {
         match &self.nodes[i].op {
             Op::Comp(c) => c.args.iter().map(|a| a.src.n()).collect(),
             Op::Reshape(src) => vec![src.n()],
+            Op::Operator(o) => o.inputs.iter().map(|t| t.n()).collect(),
+            Op::Scan(sc) => sc.inputs.iter().map(|t| t.n()).collect(),
             Op::Input(_) | Op::Iota(_) => Vec::new(),
         }
     }
@@ -867,9 +1285,28 @@ impl TensorGraph {
                     a.view.rank()
                 ));
             }
+            if let Some(g) = &a.view.gather {
+                let ok = g.coefs.len() == src.len()
+                    && comp
+                        .args
+                        .get(g.arg)
+                        .is_some_and(|ia| ia.view.gather.is_none());
+                if !ok {
+                    return err(format!(
+                        "arg {i}: gather through arg {} must name an affine sibling, {} coefs",
+                        g.arg,
+                        src.len()
+                    ));
+                }
+            }
             let bound: Option<Vec<usize>> = space.iter().map(|d| d.fixed()).collect();
             if let (Some(space), false) = (bound, a.view.guard) {
-                for (f, &n) in a.view.forms.iter().zip(src) {
+                let gathered = |d: usize| a.view.gather.as_ref().is_some_and(|g| g.coefs[d] != 0);
+                for (d, (f, &n)) in a.view.forms.iter().zip(src).enumerate() {
+                    // a data-dependent coordinate cannot be range-checked
+                    if gathered(d) {
+                        continue;
+                    }
                     let (lo, hi) = f.range(&space);
                     if lo < 0 || n.fixed().is_some_and(|n| hi >= n as i64) {
                         return err(format!("arg {i}: view reaches {lo}..={hi}, dim is {n}"));
@@ -901,6 +1338,13 @@ impl TensorGraph {
             tile: (0, 0, 0),
             reg: (1, 1),
             fragment: false,
+            int_mma: None,
+            segment: None,
+            sorted: false,
+            detach: false,
+            subgroup: false,
+            frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -934,6 +1378,44 @@ impl TensorGraph {
             })
             .collect();
         self.comp(&shape, &[], args, None, |v| vec![f(v)])
+    }
+
+    /// `x`, as a constant of [`backward`](Self::backward): the same
+    /// values, no cotangent flows through.
+    ///
+    /// **Implicit differentiation.** Let `λ*` solve `F(λ, θ) = 0`, found
+    /// by any iteration, and `H = ∂F/∂λ`. Take one more Newton step from
+    /// the detached solution with a detached matrix,
+    ///
+    /// `λ' = detach(λ*) − detach(H)⁻¹·F(detach(λ*), θ)`.
+    ///
+    /// Its value is `λ*` (the residual is zero) and its derivative is
+    /// `−H⁻¹·∂F/∂θ`: the implicit function theorem. So the adjoint of a
+    /// converged solve is one linear solve with the same matrix, whatever
+    /// the iteration count, and nothing of the iteration is kept for the
+    /// backward. Exact only at convergence: the gradient's error is of the
+    /// order of the residual.
+    ///
+    /// **Representation.** An identity map with [`TNode::detach`] set.
+    /// The mark is on the node, so it survives every rewrite pass
+    /// (`substitute_maps`, `eliminate_common`, `merge_siblings`,
+    /// `relayout`, `eliminate_dead`, the schedules): passes never splice a
+    /// detached map into its readers or merge it with an undetached twin.
+    /// Schedules may inline it, so it costs no buffer or kernel.
+    ///
+    /// **Higher order.** `detach` is a constant for every `backward`, so
+    /// derivatives of any order through it are zero: a gradient graph that
+    /// reads a detached node (the cotangent of a body that read it) treats
+    /// it as a constant again, and the vjp-of-vjp through it is zero —
+    /// `stop_gradient` semantics, not the implicit function theorem
+    /// applied twice. For second-order implicit derivatives, detach
+    /// inside the step you differentiate twice. tang-compile has no
+    /// forward-mode (jvp) pass; there the same rule (zero tangent) would
+    /// apply.
+    pub fn detach(&mut self, x: TensorId) -> Result<TensorId, ShapeError> {
+        let y = self.map(&[x], |v| v[0])?;
+        self.nodes[y.n()].detach = true;
+        Ok(y)
     }
 
     /// Reduce `axis` of `x` with `m`; the axis is kept as size 1 so the
@@ -1028,12 +1510,54 @@ impl TensorGraph {
         })
     }
 
+    /// `out[i…, j…] = src[…, round(index[i…]), …]`: dim `dim` of `src`
+    /// addressed through `index` (an integer-valued tensor), the other
+    /// source dims kept in order after the index dims. An embedding
+    /// lookup is `gather(table, 0, ids)`. Sugar over a comp with a
+    /// gathered view; `guard` makes out-of-range indices (a `-1` pad) read
+    /// 0 instead of being undefined.
+    pub fn gather(
+        &mut self,
+        src: TensorId,
+        dim: usize,
+        index: TensorId,
+        guard: bool,
+    ) -> Result<TensorId, ShapeError> {
+        let s = self.shape(src).to_vec();
+        let ix = self.shape(index).to_vec();
+        if dim >= s.len() {
+            return err(format!("gather dim {dim} of {s:?}"));
+        }
+        let k = ix.len();
+        let rest: Vec<usize> = (0..s.len()).filter(|&d| d != dim).collect();
+        let out: Vec<Dim> = ix
+            .iter()
+            .copied()
+            .chain(rest.iter().map(|&d| s[d]))
+            .collect();
+        let rank = out.len();
+        let mut picks: Vec<Option<usize>> = vec![None; s.len()];
+        for (j, &d) in rest.iter().enumerate() {
+            picks[d] = Some(k + j);
+        }
+        let mut view = View::pick(rank, &picks).gather(dim, 1, 1);
+        view.guard = guard;
+        let args = vec![
+            Arg { src, view },
+            Arg {
+                src: index,
+                view: View::identity(rank, k),
+            },
+        ];
+        self.comp(&out, &[], args, None, |v| vec![v[0]])
+    }
+
     // -- analysis -----------------------------------------------------------
 
     pub fn comp_at(&self, i: usize) -> Option<&Comp> {
         match &self.nodes[i].op {
             Op::Comp(c) => Some(c),
-            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+            Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => None,
         }
     }
 
@@ -1082,8 +1606,9 @@ impl TensorGraph {
         let mut points: Vec<Option<Form>> = vec![None; pk];
         let mut fallback: Option<Vec<Form>> = None;
         for a in c.args.iter().filter(|a| a.src.n() == p) {
-            // a guarded read is 0 outside: not the accumulator
-            if a.view.guard {
+            // a guarded read is 0 outside: not the accumulator; a gathered
+            // one reads some other point's accumulator
+            if a.view.guard || a.view.is_gather() {
                 return None;
             }
             let (pt, state) = a.view.forms.split_at(pk);
@@ -1307,6 +1832,20 @@ impl TensorGraph {
             });
             reads <= 1 && !transcendental
         };
+        // an operator node reads whole buffers: its inputs stay materialized
+        let mut op_read = vec![false; n];
+        for i in (0..n).filter(|&i| live[i]) {
+            if let Op::Operator(o) = &self.nodes[i].op {
+                for t in &o.inputs {
+                    op_read[t.n()] = true;
+                }
+            }
+            if let Op::Scan(sc) = &self.nodes[i].op {
+                for t in &sc.inputs {
+                    op_read[t.n()] = true;
+                }
+            }
+        }
         // a map read through a guarded view must stay materialized
         let mut guarded = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
@@ -1316,7 +1855,7 @@ impl TensorGraph {
                 }
             }
         }
-        let inline: Vec<bool> = (0..n)
+        let candidate: Vec<bool> = (0..n)
             .map(|i| {
                 self.comp_at(i).is_some_and(|c| {
                     c.red.is_empty()
@@ -1324,9 +1863,18 @@ impl TensorGraph {
                         && !is_output(i)
                         && !reshaped[i]
                         && !guarded[i]
+                        && !op_read[i]
                         && (!cost_aware || recompute[i] == Some(1) || cheap(c))
                 })
             })
+            .collect();
+        let pinned = self.gather_pins(&live, &candidate);
+        // a detached map is never spliced (its reader would differentiate
+        // through it); where it would have been, it is scheduled inline
+        // instead, so it still costs no buffer
+        let spliceable: Vec<bool> = (0..n).map(|i| candidate[i] && !pinned[i]).collect();
+        let inline: Vec<bool> = (0..n)
+            .map(|i| spliceable[i] && !self.nodes[i].detach)
             .collect();
 
         let mut ng = TensorGraph {
@@ -1345,15 +1893,27 @@ impl TensorGraph {
                 Op::Input(k) => Op::Input(*k),
                 Op::Iota(d) => Op::Iota(*d),
                 Op::Reshape(src) => Op::Reshape(TensorId(remap[src.n()].unwrap() as u32)),
+                Op::Operator(o) => Op::Operator(OperatorNode {
+                    op: o.op.clone(),
+                    inputs: o
+                        .inputs
+                        .iter()
+                        .map(|t| TensorId(remap[t.n()].unwrap() as u32))
+                        .collect(),
+                }),
+                Op::Scan(sc) => Op::Scan(Scan {
+                    inputs: sc
+                        .inputs
+                        .iter()
+                        .map(|t| TensorId(remap[t.n()].unwrap() as u32))
+                        .collect(),
+                    ..sc.clone()
+                }),
                 Op::Comp(c) => {
                     let rank = c.rank();
                     let mut body = ExprGraph::new();
                     let mut args: Vec<Arg> = Vec::new();
-                    let vars: Vec<ExprId> = c
-                        .args
-                        .iter()
-                        .map(|a| self.splice(a, rank, &inline, &remap, &mut body, &mut args))
-                        .collect();
+                    let vars = self.splice_args(c, rank, &inline, &remap, &mut body, &mut args);
                     let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
                     Op::Comp(Comp {
                         out: c.out.clone(),
@@ -1369,11 +1929,18 @@ impl TensorGraph {
             ng.nodes.push(TNode {
                 op,
                 shape: node.shape.clone(),
-                inline: node.inline,
+                inline: node.inline || spliceable[i],
                 split: node.split,
                 tile: node.tile,
                 reg: node.reg,
                 fragment: node.fragment,
+                int_mma: node.int_mma,
+                segment: node.segment,
+                sorted: node.sorted,
+                detach: node.detach,
+                subgroup: node.subgroup,
+                frag_cfg: node.frag_cfg,
+                host: None,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -1391,23 +1958,22 @@ impl TensorGraph {
     fn effective(&self, i: usize) -> Option<Comp> {
         let c = self.comp_at(i)?;
         let n = self.nodes.len();
-        let inline: Vec<bool> = (0..n)
+        let candidate: Vec<bool> = (0..n)
             .map(|j| {
                 j != i
+                    && !self.nodes[j].detach
                     && self
                         .comp_at(j)
                         .is_some_and(|c| c.red.is_empty() && c.tuple == 0)
             })
             .collect();
+        let pinned = self.gather_pins(&vec![true; n], &candidate);
+        let inline: Vec<bool> = (0..n).map(|j| candidate[j] && !pinned[j]).collect();
         let remap: Vec<Option<usize>> = (0..n).map(Some).collect();
         let rank = c.rank();
         let mut body = ExprGraph::new();
         let mut args: Vec<Arg> = Vec::new();
-        let vars: Vec<ExprId> = c
-            .args
-            .iter()
-            .map(|a| self.splice(a, rank, &inline, &remap, &mut body, &mut args))
-            .collect();
+        let vars = self.splice_args(c, rank, &inline, &remap, &mut body, &mut args);
         let body_outs = replay(&c.body, &c.body_outs, &vars, &mut body);
         Some(Comp {
             out: c.out.clone(),
@@ -1420,8 +1986,101 @@ impl TensorGraph {
         })
     }
 
+    /// Maps that must stay materialized because of gathers, given the
+    /// substitution candidates:
+    ///
+    /// - an index tensor (read as some gather's index) is a leaf: the
+    ///   address needs a value in memory, not an expression;
+    /// - a map that itself gathers, when it is read through a gathered
+    ///   view (directly, or through a chain of candidate maps): inlining it
+    ///   would make an index read data-dependent, a nested gather.
+    ///
+    /// Everything else fuses: an affine map read through a gather has the
+    /// gather pushed into its args, and a gathering map read affinely
+    /// carries its gather (and its index arg) into the reader.
+    fn gather_pins(&self, live: &[bool], candidate: &[bool]) -> Vec<bool> {
+        let n = self.nodes.len();
+        let mut pinned = vec![false; n];
+        let mut gathered_read = vec![false; n];
+        // readers sit after their producers: one descending sweep
+        for r in (0..n).rev().filter(|&r| live[r]) {
+            let Some(c) = self.comp_at(r) else { continue };
+            for &k in &c.index_args() {
+                pinned[c.args[k].src.n()] = true;
+            }
+            for a in &c.args {
+                if a.view.is_gather() || (candidate[r] && gathered_read[r]) {
+                    gathered_read[a.src.n()] = true;
+                }
+            }
+        }
+        for p in 0..n {
+            if gathered_read[p] && self.comp_at(p).is_some_and(Comp::has_gather) {
+                pinned[p] = true;
+            }
+        }
+        pinned
+    }
+
+    /// Splice every arg of `c` (see [`splice`](Self::splice)): index args
+    /// first, as leaves, so gathered args can name their new positions.
+    fn splice_args(
+        &self,
+        c: &Comp,
+        rank: usize,
+        inline: &[bool],
+        remap: &[Option<usize>],
+        body: &mut ExprGraph,
+        args: &mut Vec<Arg>,
+    ) -> Vec<ExprId> {
+        let resolved = self.resolve_gathers(&c.args, |a| a.clone(), inline, remap, args);
+        resolved
+            .iter()
+            .map(|a| self.splice(a, rank, inline, remap, body, args))
+            .collect()
+    }
+
+    /// `own` (one comp's args) with each view mapped by `view_of` and every
+    /// gather's `arg` renumbered into `args`, where the index args are
+    /// interned as leaves (they are pinned: never inlined).
+    fn resolve_gathers(
+        &self,
+        own: &[Arg],
+        view_of: impl Fn(&Arg) -> Arg,
+        inline: &[bool],
+        remap: &[Option<usize>],
+        args: &mut Vec<Arg>,
+    ) -> Vec<Arg> {
+        let mut leaf_of: HashMap<usize, usize> = HashMap::new();
+        for a in own {
+            let Some(g) = &a.view.gather else { continue };
+            if leaf_of.contains_key(&g.arg) {
+                continue;
+            }
+            let ia = view_of(&own[g.arg]);
+            assert!(!inline[ia.src.n()], "gather index tensors are pinned");
+            let leaf = Arg {
+                src: TensorId(remap[ia.src.n()].unwrap() as u32),
+                view: ia.view,
+            };
+            leaf_of.insert(g.arg, intern_arg(args, leaf));
+        }
+        own.iter()
+            .map(|a| {
+                let mut m = view_of(a);
+                // only `a`'s own gather is renumbered here; one inherited
+                // through `view_of` (the reader's) is already resolved
+                if let (Some(g), Some(own_g)) = (&mut m.view.gather, &a.view.gather) {
+                    g.arg = leaf_of[&own_g.arg];
+                }
+                m
+            })
+            .collect()
+    }
+
     /// Expression for `arg` inside a consumer of iteration rank `rank`:
-    /// either a leaf var or the producer map's body, recursively.
+    /// either a leaf var or the producer map's body, recursively. A gather
+    /// in `arg`'s view already names its index arg's position in `args`.
     fn splice(
         &self,
         arg: &Arg,
@@ -1454,16 +2113,22 @@ impl TensorGraph {
             return body.var(intern_arg(args, leaf) as u16);
         }
         let c = self.comp_at(p).unwrap();
-        let vars: Vec<ExprId> = c
-            .args
+        // the reader's view pushed into each of the map's args; the map's
+        // own gathers (only when the read is affine: see `gather_pins`)
+        // renumbered onto its index args, interned as leaves
+        let composed = self.resolve_gathers(
+            &c.args,
+            |a| Arg {
+                src: a.src,
+                view: a.view.compose(&arg.view, rank),
+            },
+            inline,
+            remap,
+            args,
+        );
+        let vars: Vec<ExprId> = composed
             .iter()
-            .map(|a| {
-                let composed = Arg {
-                    src: a.src,
-                    view: a.view.compose(&arg.view, rank),
-                };
-                self.splice(&composed, rank, inline, remap, body, args)
-            })
+            .map(|a| self.splice(a, rank, inline, remap, body, args))
             .collect();
         replay(&c.body, &c.body_outs, &vars, body)[0]
     }
@@ -1499,6 +2164,11 @@ impl TensorGraph {
     /// exactly the expression `s` of `c`'s body? Returns `s`'s canonical form.
     fn is_row_max_of(&self, c: &Comp, s: ExprId, m_arg: &Arg) -> Option<Canon> {
         let mc = &self.effective(m_arg.src.n())?;
+        // gathers name arg positions, which differ between `c` and `mc`;
+        // the softmax rewrite (which re-interns args) leaves them alone
+        if mc.has_gather() || c.has_gather() || m_arg.view.is_gather() {
+            return None;
+        }
         let n_out = c.points().len();
         let structural = mc.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Max)
             && mc.tuple == 0
@@ -1620,6 +2290,7 @@ impl TensorGraph {
             // slot 0: s, from the max's own body, re-indexed into the fused space
             let m_ext = View {
                 guard: false,
+                gather: None,
                 forms: (0..=m_out)
                     .map(|d| Form::unit(fused_rank, if d == m_out { m_out + e } else { d }))
                     .collect(),
@@ -1644,6 +2315,7 @@ impl TensorGraph {
                 let slot = outs.len() as i64;
                 let inv = View {
                     guard: false,
+                    gather: None,
                     forms: (0..c.rank())
                         .map(|d| match reads.get(d) {
                             Some(Some(j)) => Form::unit(fused_rank, *j),
@@ -1699,6 +2371,7 @@ impl TensorGraph {
                     mem.node,
                     View {
                         guard: false,
+                        gather: None,
                         forms: proj,
                     },
                 ));
@@ -1729,6 +2402,7 @@ impl TensorGraph {
             if !is_output(m_node) {
                 let proj = View {
                     guard: false,
+                    gather: None,
                     forms: (0..m_out)
                         .map(|d| Form::unit(m_out, d))
                         .chain((0..=e).map(|_| Form::zero(m_out)))
@@ -1797,6 +2471,16 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => *src = TensorId(remap[src.n()].unwrap() as u32),
+                Op::Operator(o) => {
+                    for t in &mut o.inputs {
+                        *t = TensorId(remap[t.n()].unwrap() as u32);
+                    }
+                }
+                Op::Scan(sc) => {
+                    for t in &mut sc.inputs {
+                        *t = TensorId(remap[t.n()].unwrap() as u32);
+                    }
+                }
                 Op::Input(_) | Op::Iota(_) => {}
             }
             ng.nodes.push(node);
@@ -1865,7 +2549,14 @@ impl TensorGraph {
                             .comp_at(p)
                             .is_some_and(|pc| pc.red.len() == 1 || tileable_red(&pc.red))
                         && self.epilogue_read(c, p).is_some();
-                    consumer_reduces[p] = c.monoid.is_some() || as_epilogue;
+                    // a fold of partial folds with the same monoid (a
+                    // split-K combine) inlined is the split undone
+                    let refold =
+                        match (&c.monoid, self.comp_at(p).and_then(|pc| pc.monoid.as_ref())) {
+                            (Some(a), Some(b)) => a.width == b.width && a.kind() == b.kind(),
+                            _ => false,
+                        };
+                    consumer_reduces[p] = (c.monoid.is_some() && !refold) || as_epilogue;
                 }
             }
         }
@@ -1968,7 +2659,7 @@ impl TensorGraph {
             let shape_ok = n.shape.iter().all(|d| d.fixed().is_some());
             let comp_ok = match &n.op {
                 Op::Comp(c) => c.red.iter().all(|d| d.fixed().is_some()),
-                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => true,
+                Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => true,
             };
             shape_ok && comp_ok
         })
@@ -2036,6 +2727,14 @@ impl TensorGraph {
         for i in reductions {
             // schedule by the reduction's shape, even when `i` is its epilogue
             let c = self.comp_at(self.tiled_reduction(i).unwrap()).unwrap();
+            // tiles stage affine operand regions: a gathered read gets the
+            // split (or one thread per point), never a tile
+            if c.has_gather() || self.comp_at(i).unwrap().has_gather() {
+                if numel(c.points()) < MANY_POINTS && c.width() <= 8 {
+                    self.nodes[i].split = 256;
+                }
+                continue;
+            }
             let pts = fixed(c.points());
             let (lane_dim, row_dim) = tile_axes(&pts);
             let lanes = lane_dim.map_or(1, |d| pts[d]);
@@ -2054,7 +2753,7 @@ impl TensorGraph {
                 })
                 .unwrap_or_default();
             let by = (256 / lanes).max(1) as u32;
-            if c.red.len() == 1 && (LANES..=128).contains(&lanes) && rows && !shared.is_empty() {
+            if c.red.len() == 1 && (LANES..=256).contains(&lanes) && rows && !shared.is_empty() {
                 // Rows × lanes per workgroup with the shared sub-computation
                 // staged cooperatively. Without one (a plain matmul) the
                 // tile has nothing to share and one thread per point wins.
@@ -2084,6 +2783,8 @@ impl TensorGraph {
                 self.nodes[i].reg = reg;
             } else if pts.iter().product::<usize>() < MANY_POINTS {
                 self.nodes[i].split = 256;
+                // subgroup combine where the target has it (ignored elsewhere)
+                self.nodes[i].subgroup = true;
             }
             if self.nodes[i].tile.0 > 0 {
                 self.unfuse_heavy_epilogue(i);
@@ -2096,10 +2797,25 @@ impl TensorGraph {
     /// over the head dim, `dP = dO·Vᵀ`) whose every reader is a tile, or
     /// a map recomputed in tiles, is inlined: a tile lowering that can
     /// run it as a small GEMM per staged block (CUDA `mma`) recomputes it
-    /// instead of reading it back. For lowerings without nested GEMMs
-    /// this is a scalar loop per element, so only targets with one call
-    /// it (after [`schedule_auto`](Self::schedule_auto)).
+    /// instead of reading it back. The scalar tiled lowering (WGSL, MSL)
+    /// computes it as a dot per element of the shared comp it feeds, once
+    /// per chunk into workgroup memory; see
+    /// [`schedule_nested_contractions_scalar`](Self::schedule_nested_contractions_scalar).
+    /// Applied by the GPU lowerings, after [`schedule_auto`](Self::schedule_auto).
     pub fn schedule_nested_contractions(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, false);
+    }
+
+    /// [`schedule_nested_contractions`](Self::schedule_nested_contractions)
+    /// for the scalar tiled lowering (WGSL, MSL): also nests through a
+    /// tile's epilogue-inlined reduction, and reshapes each tile that
+    /// recomputes a nested contraction to more rows per workgroup.
+    pub fn schedule_nested_contractions_scalar(&mut self, outputs: &[TensorId]) {
+        self.nest_contractions(outputs, true);
+    }
+
+    fn nest_contractions(&mut self, outputs: &[TensorId], scalar: bool) {
+        let mut nested: Vec<usize> = Vec::new();
         let live = self.live(outputs);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
@@ -2109,6 +2825,15 @@ impl TensorGraph {
                 readers[d].push(j);
             }
         }
+        // The scalar lowering also reads through a tile's own reduction,
+        // inlined under its epilogue map (flash backward's dK = (Σ dS·Q)·c).
+        let mut tile = vec![false; n];
+        for j in (0..n).filter(|&j| live[j] && self.nodes[j].tile.0 > 0) {
+            tile[j] = true;
+            if let Some(r) = self.tiled_reduction(j).filter(|_| scalar) {
+                tile[r] = true;
+            }
+        }
         // a map that is inline and read only by tiles (or such maps)
         let mut tiled_map = vec![false; n];
         for j in (0..n).rev().filter(|&j| live[j]) {
@@ -2116,9 +2841,7 @@ impl TensorGraph {
             tiled_map[j] = map
                 && self.nodes[j].inline
                 && !readers[j].is_empty()
-                && readers[j]
-                    .iter()
-                    .all(|&r| self.nodes[r].tile.0 > 0 || tiled_map[r]);
+                && readers[j].iter().all(|&r| tile[r] || tiled_map[r]);
         }
         for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
             let Some(c) = self.comp_at(i) else { continue };
@@ -2127,7 +2850,7 @@ impl TensorGraph {
             if !sum || !short || c.tuple != 0 || c.width() != 1 || readers[i].is_empty() {
                 continue;
             }
-            let direct = |r: usize| self.nodes[r].tile.0 > 0;
+            let direct = |r: usize| tile[r];
             if !readers[i].iter().all(|&r| tiled_map[r] || direct(r)) {
                 continue;
             }
@@ -2143,6 +2866,30 @@ impl TensorGraph {
             self.nodes[i].inline = true;
             self.nodes[i].tile = (0, 0, 0);
             self.nodes[i].split = 0;
+            nested.push(i);
+        }
+        if !scalar {
+            return;
+        }
+        // A tile that recomputes a nested contraction computes it per
+        // chunk for each of its rows: give it rows enough to fill the
+        // workgroup (16 rows × 16 threads of 4 lanes) rather than 4 rows
+        // of 64 lanes, where most threads would idle through the dots.
+        let tiles: Vec<usize> = (0..n)
+            .filter(|&t| live[t] && self.nodes[t].tile.0 > 0)
+            .collect();
+        for t in tiles {
+            let (bx, by, _) = self.nodes[t].tile;
+            let (rx, ry) = self.nodes[t].reg;
+            let (lanes, rows) = (bx * rx.max(1), by * ry.max(1));
+            if rows >= 16 || lanes < 64 || lanes % 4 != 0 {
+                continue;
+            }
+            if !self.inline_closure(t).iter().any(|j| nested.contains(j)) {
+                continue;
+            }
+            self.nodes[t].tile = (lanes / 4, 256 / (lanes / 4), 16);
+            self.nodes[t].reg = (4, 1);
         }
     }
 
@@ -2194,12 +2941,21 @@ impl TensorGraph {
                 }
             } else if let Op::Reshape(src) = &mut g.nodes[i].op {
                 *src = TensorId(redirect[src.n()] as u32);
+            } else if let Op::Operator(o) = &mut g.nodes[i].op {
+                for t in &mut o.inputs {
+                    *t = TensorId(redirect[t.n()] as u32);
+                }
+            } else if let Op::Scan(sc) = &mut g.nodes[i].op {
+                for t in &mut sc.inputs {
+                    *t = TensorId(redirect[t.n()] as u32);
+                }
             }
             let Op::Comp(c) = &g.nodes[i].op else {
                 continue;
             };
             let key = format!(
-                "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                "{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                g.nodes[i].detach,
                 c.out,
                 c.red,
                 c.tuple,
@@ -2211,7 +2967,9 @@ impl TensorGraph {
                             .forms
                             .iter()
                             .map(|f| (f.coefs.clone(), f.offset))
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>(),
+                        a.view.guard,
+                        &a.view.gather,
                     ))
                     .collect::<Vec<_>>(),
                 c.body.nodes_slice(),
@@ -2268,6 +3026,11 @@ impl TensorGraph {
         // which consumer dim each producer point dim is picked from, when
         // the view is a pick
         let picks_of = |view: &View, kp: usize| -> Option<Vec<Option<usize>>> {
+            // a gathered read addresses the producer by data: its layout
+            // is pinned (the gather's coefs name source dims)
+            if view.is_gather() {
+                return None;
+            }
             view.forms[..kp]
                 .iter()
                 .map(|f| {
@@ -2350,6 +3113,7 @@ impl TensorGraph {
                 cm.args[k].view = View {
                     forms,
                     guard: cm.args[k].view.guard,
+                    gather: None,
                 };
             }
         }
@@ -2411,6 +3175,7 @@ impl TensorGraph {
                             })
                             .collect(),
                         guard: a.view.guard,
+                        gather: a.view.gather.clone(),
                     },
                 })
                 .collect();
@@ -2437,6 +3202,13 @@ impl TensorGraph {
                 tile: (0, 0, 0),
                 reg: (1, 1),
                 fragment: false,
+                int_mma: None,
+                segment: None,
+                sorted: false,
+                detach: false,
+                subgroup: false,
+                frag_cfg: [0; 4],
+                host: None,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -2456,6 +3228,7 @@ impl TensorGraph {
                             view: View {
                                 forms,
                                 guard: false,
+                                gather: None,
                             },
                         }
                     })
@@ -2505,6 +3278,9 @@ impl TensorGraph {
         // are reads all the same for a kernel: drop them
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
             let Some(c) = self.comp_at(i) else { continue };
+            if c.has_gather() {
+                continue;
+            }
             let mut used = vec![false; c.args.len()];
             for &o in &c.body_outs {
                 for v in vars_reachable(&c.body, o) {
@@ -2541,7 +3317,7 @@ impl TensorGraph {
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
             let Some(c) = pruned.comp_at(i) else { continue };
             let sum = c.monoid.as_ref().map(Monoid::kind) == Some(MonoidKind::Sum);
-            if !sum || c.tuple != 0 || c.width() != 1 || c.red.is_empty() {
+            if !sum || c.tuple != 0 || c.width() != 1 || c.red.is_empty() || c.has_gather() {
                 continue;
             }
             let k = c.points().len();
@@ -2550,6 +3326,7 @@ impl TensorGraph {
             // they do not read them)
             let point_view = |v: &View| View {
                 guard: v.guard,
+                gather: v.gather.clone(),
                 forms: v
                     .forms
                     .iter()
@@ -2674,6 +3451,26 @@ impl TensorGraph {
     /// which is what the matmul schedules and the tensor-core lowerings
     /// look for. Repeated until nothing merges.
     pub fn merge_reduce_dims(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        self.merge_reduce_dims_with(outputs, false)
+    }
+
+    /// [`merge_reduce_dims`](Self::merge_reduce_dims) that also merges
+    /// through an arg reading both dims in one source dim as
+    /// `s·(n_inner·outer + inner)` — an activation `x[t, 64·g + j]` against
+    /// a grouped weight `w[n, g, j]`, the 4-bit projections of a graph
+    /// written once for decode and prefill. Opt-in: it reshapes the other
+    /// operand (the grouped weight) to a flat `k`, which pins it to
+    /// memory, so a lowering that evaluates that operand where it loads
+    /// it (OpenCL's 4-bit prefill) keeps the plain pass.
+    pub fn merge_reduce_dims_scaled(&self, outputs: &[TensorId]) -> (TensorGraph, Vec<TensorId>) {
+        self.merge_reduce_dims_with(outputs, true)
+    }
+
+    fn merge_reduce_dims_with(
+        &self,
+        outputs: &[TensorId],
+        scaled: bool,
+    ) -> (TensorGraph, Vec<TensorId>) {
         let mut g = self.clone();
         let live = self.live(outputs);
         for i in (0..self.nodes.len()).filter(|&i| live[i]) {
@@ -2689,17 +3486,20 @@ impl TensorGraph {
                         .map(|a| {
                             // a guarded read's bounds are per source dim
                             let reads = a.view.depends_on(outer) || a.view.depends_on(inner);
-                            if a.view.guard && reads {
+                            if (a.view.guard || a.view.is_gather()) && reads {
                                 return None;
                             }
                             // a map over a contraction just as big (P̃ =
                             // exp(S − m)) is recomputed by its readers,
                             // the contraction nested in their tiles; a
                             // reshape would pin it to memory
-                            if reads && g.maps_contraction(a.src.n()) {
+                            let plan = g.merge_plan(a, outer, inner, n_inner, scaled)?;
+                            // (a scaled read reshapes nothing)
+                            let reshapes = matches!(plan, MergePlan::Reshape(..));
+                            if reads && reshapes && g.maps_contraction(a.src.n()) {
                                 return None;
                             }
-                            g.merge_plan(a, outer, inner, n_inner)
+                            Some(plan)
                         })
                         .collect();
                     plan.map(|p| (d, p))
@@ -2710,8 +3510,13 @@ impl TensorGraph {
                 let mut args = Vec::with_capacity(c.args.len());
                 for (a, p) in c.args.iter().zip(plan) {
                     let (src, forms) = match p {
-                        None => (a.src, a.view.forms.clone()),
-                        Some((d0, shape)) => {
+                        MergePlan::Neither => (a.src, a.view.forms.clone()),
+                        MergePlan::Scaled(d0) => {
+                            let mut forms = a.view.forms.clone();
+                            forms[d0].coefs[outer] = forms[d0].coefs[inner];
+                            (a.src, forms)
+                        }
+                        MergePlan::Reshape(d0, shape) => {
                             let src = g.reshape(a.src, &shape).unwrap();
                             let mut forms = a.view.forms.clone();
                             // dims d0, d0+1 become one dim picking `outer`
@@ -2732,6 +3537,7 @@ impl TensorGraph {
                         view: View {
                             forms,
                             guard: a.view.guard,
+                            gather: a.view.gather.clone(),
                         },
                     });
                 }
@@ -2764,24 +3570,31 @@ impl TensorGraph {
             })
     }
 
-    /// How `a` would read with space dims `outer`/`inner` merged: `None`
-    /// if it cannot; `Some(None)` if it reads neither; `Some((d0, shape))`
-    /// if source dims `d0`, `d0+1` pick `outer`, `inner` and `shape` is
-    /// the source's shape with the two merged.
-    #[allow(clippy::type_complexity)]
+    /// How `a` would read with space dims `outer`/`inner` merged, `None`
+    /// if it cannot (see [`MergePlan`]; `Scaled` only when `scaled`).
     fn merge_plan(
         &self,
         a: &Arg,
         outer: usize,
         inner: usize,
         n_inner: usize,
-    ) -> Option<Option<(usize, Vec<Dim>)>> {
+        scaled: bool,
+    ) -> Option<MergePlan> {
         let forms = &a.view.forms;
         let touches: Vec<usize> = (0..forms.len())
             .filter(|&d| forms[d].coefs[outer] != 0 || forms[d].coefs[inner] != 0)
             .collect();
         if touches.is_empty() {
-            return Some(None);
+            return Some(MergePlan::Neither);
+        }
+        if scaled && touches.len() == 1 {
+            let d0 = touches[0];
+            let f = &forms[d0];
+            let s = f.coefs[inner];
+            if s != 0 && f.coefs[outer] == s * n_inner as i64 {
+                return Some(MergePlan::Scaled(d0));
+            }
+            return None;
         }
         let [d0, d1] = touches[..] else { return None };
         if d1 != d0 + 1 {
@@ -2798,7 +3611,57 @@ impl TensorGraph {
         let mut merged = shape.clone();
         merged[d0] = Dim::Fixed(shape[d0].fixed()? * n_inner);
         merged.remove(d1);
-        Some(Some((d0, merged)))
+        Some(MergePlan::Reshape(d0, merged))
+    }
+
+    /// Whether node `a` reads `b`, directly or transitively.
+    fn depends_on(&self, a: usize, b: usize) -> bool {
+        let mut seen = vec![false; self.nodes.len()];
+        let mut stack = self.deps(a);
+        while let Some(i) = stack.pop() {
+            if i == b {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[i], true) {
+                stack.extend(self.deps(i));
+            }
+        }
+        false
+    }
+
+    /// Reads of comp `i` that it recomputes per element: through its
+    /// map args (not outputs, so `schedule_auto` may inline them), the
+    /// `(source, view over i's space)` of every comp read that is larger
+    /// than `i`'s points — an n×n score tile read by an n×d gradient.
+    fn recomputed_reads(&self, i: usize, is_output: &dyn Fn(usize) -> bool) -> Vec<(usize, View)> {
+        let Some(c) = self.comp_at(i) else {
+            return Vec::new();
+        };
+        let rank = c.rank();
+        let pts = numel(c.points());
+        let mut out: Vec<(usize, View)> = Vec::new();
+        // (source, view, reached through a recomputed map)
+        let mut stack: Vec<(usize, View, bool)> = c
+            .args
+            .iter()
+            .map(|a| (a.src.n(), a.view.clone(), false))
+            .collect();
+        while let Some((p, v, via)) = stack.pop() {
+            let Some(pc) = self.comp_at(p) else { continue };
+            if numel(&self.nodes[p].shape) <= pts {
+                continue;
+            }
+            let map = pc.monoid.is_none() && pc.red.is_empty() && pc.tuple == 0 && !is_output(p);
+            if map {
+                for a in &pc.args {
+                    stack.push((a.src.n(), a.view.compose(&v, rank), true));
+                }
+            }
+            if (map || via) && !out.contains(&(p, v.clone())) {
+                out.push((p, v));
+            }
+        }
+        out
     }
 
     /// Sibling reductions — the same points, reduce dims and monoid,
@@ -2838,29 +3701,38 @@ impl TensorGraph {
         };
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
-        for i in (0..n).filter(|&i| live[i] && !is_output(i)) {
+        // members that fit neither rule above, by shape key: they may
+        // still share a recomputed read (see `recomputed_reads`)
+        let mut loose: Vec<(String, usize)> = Vec::new();
+        for i in (0..n).filter(|&i| live[i]) {
             let Some(c) = self.comp_at(i) else { continue };
             let Some(m) = &c.monoid else { continue };
-            let readers = &consumers[i];
-            // the same readers, or a shared recomputed operand (then a
-            // reader that is not a comp, a reshape, reads the member's
-            // slot of the merged reduction through a copy)
-            let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
-            if c.tuple != 0
-                || c.width() != 1
-                || readers.is_empty()
-                || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
-            {
+            if c.tuple != 0 || c.width() != 1 || c.has_gather() {
                 continue;
             }
-            let key = format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+            let readers = &consumers[i];
+            let base = format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                 self.nodes[i].precision,
                 c.out,
                 c.red,
                 m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 m.combine.nodes_slice(),
                 m.outs,
+            );
+            // the same readers, or a shared recomputed operand (then a
+            // reader that is not a comp, a reshape, reads the member's
+            // slot of the merged reduction through a copy)
+            let shared = c.args.iter().map(|a| a.src.n()).find(|&p| recomputed(p));
+            if is_output(i)
+                || readers.is_empty()
+                || (shared.is_none() && readers.iter().any(|&r| self.comp_at(r).is_none()))
+            {
+                loose.push((base, i));
+                continue;
+            }
+            let key = format!(
+                "{base}|{}",
                 match shared {
                     Some(p) => format!("via {p}"),
                     None => format!("{readers:?}"),
@@ -2871,6 +3743,66 @@ impl TensorGraph {
                 Vec::new()
             });
             g.push(i);
+        }
+        // Groups of one may still merge with a loose member, and loose
+        // members with each other, when they recompute a common read: the
+        // flash backward's dV = Σᵢ P̃ᵀ·dO and dK = Σᵢ dSᵀ·Q both evaluate
+        // S = Q·Kᵀ (and exp(S − m)) at the same (j, i). Merged, one tile
+        // recomputes that tile once for both.
+        for key in &order {
+            if let [i] = groups[key][..] {
+                let c = self.comp_at(i).unwrap();
+                let m = c.monoid.as_ref().unwrap();
+                let base = format!(
+                    "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    self.nodes[i].precision,
+                    c.out,
+                    c.red,
+                    m.identity.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    m.combine.nodes_slice(),
+                    m.outs,
+                );
+                loose.push((base, i));
+            }
+        }
+        loose.sort_by_key(|&(_, i)| i);
+        let reads: HashMap<usize, Vec<(usize, View)>> = loose
+            .iter()
+            .map(|&(_, i)| (i, self.recomputed_reads(i, &is_output)))
+            .collect();
+        let mut taken: Vec<bool> = vec![false; loose.len()];
+        for a in 0..loose.len() {
+            if taken[a] || reads[&loose[a].1].is_empty() {
+                continue;
+            }
+            let mut members = vec![loose[a].1];
+            for b in a + 1..loose.len() {
+                if taken[b] || loose[b].0 != loose[a].0 || members.len() == MAX_GROUP {
+                    continue;
+                }
+                let rb = &reads[&loose[b].1];
+                let independent = members
+                    .iter()
+                    .all(|&m| !self.depends_on(m, loose[b].1) && !self.depends_on(loose[b].1, m));
+                if independent && reads[&loose[a].1].iter().any(|r| rb.contains(r)) {
+                    taken[b] = true;
+                    members.push(loose[b].1);
+                }
+            }
+            if members.len() < 2 {
+                continue;
+            }
+            taken[a] = true;
+            // drop the singleton groups these came from
+            for key in &order {
+                let g = groups.get_mut(key).unwrap();
+                if g.len() == 1 && members.contains(&g[0]) {
+                    g.clear();
+                }
+            }
+            let key = format!("shared {members:?}");
+            order.push(key.clone());
+            groups.insert(key, members);
         }
         let mut g = self.clone();
         // member -> (merged node, slot)
@@ -2907,6 +3839,13 @@ impl TensorGraph {
                     // siblings group by precision: all members share it
                     precision: self.nodes[members[0]].precision,
                     fragment: false,
+                    int_mma: None,
+                    segment: None,
+                    sorted: false,
+                    detach: false,
+                    subgroup: false,
+                    frag_cfg: [0; 4],
+                    host: None,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
@@ -2923,12 +3862,13 @@ impl TensorGraph {
                             identity,
                             combine,
                             outs,
+                            saved: None,
                         }),
                     }),
                 });
                 for (j, &i) in members.iter().enumerate() {
                     slot_of[i] = Some((merged, j));
-                    if consumers[i].iter().all(|&r| self.comp_at(r).is_some()) {
+                    if !is_output(i) && consumers[i].iter().all(|&r| self.comp_at(r).is_some()) {
                         continue;
                     }
                     let c = self.comp_at(i).unwrap();
@@ -2965,6 +3905,218 @@ impl TensorGraph {
                     }
                 }
             }
+        }
+        g.eliminate_dead(outputs)
+    }
+
+    /// Schedule (split-K): cut the (outermost) reduce axis of comp `t`
+    /// (length `K`) into `parts` contiguous chunks computed in parallel, then fold
+    /// the chunks' partial states with the monoid's own combine. `t` is
+    /// rewritten in place to the combine, so every reader is unchanged:
+    ///
+    /// - partial `[parts, points…, tuple…]`: the original body and monoid
+    ///   over `K / parts` keys, the chunk index a new (leading) point axis,
+    ///   so one launch has `parts`× the points — the parallelism a long
+    ///   reduction over few points (batch-1 decode attention, a long-K
+    ///   GEMV/GEMM) lacks;
+    /// - combine: a reduction over the chunk axis whose body reads one
+    ///   partial state and whose monoid is `t`'s. That is legal for any
+    ///   monoid because partial states and elements are the same width
+    ///   and the combine is associative: for a sum it adds, for online
+    ///   softmax it is the rescale-and-add of `(m, l, acc)`.
+    ///
+    /// Nothing here knows about attention. Returns the rewritten graph
+    /// (topologically ordered) and `outputs` in it.
+    pub fn split_reduction(
+        &self,
+        outputs: &[TensorId],
+        t: TensorId,
+        parts: usize,
+    ) -> Result<(TensorGraph, Vec<TensorId>), ShapeError> {
+        let mut g = self.clone();
+        g.split_reduction_in_place(t, parts)?;
+        Ok(g.eliminate_dead(outputs))
+    }
+
+    /// [`TensorGraph::split_reduction`] without the reordering: the
+    /// partial is pushed after `t`, which now reads it.
+    fn split_reduction_in_place(
+        &mut self,
+        t: TensorId,
+        parts: usize,
+    ) -> Result<TensorId, ShapeError> {
+        let Some(c) = self.comp_at(t.n()).cloned() else {
+            return err("split_reduction: not a comp");
+        };
+        let Some(m) = c.monoid.clone() else {
+            return err("split_reduction: not a reduction");
+        };
+        // several reduce axes (a grouped 4-bit GEMV's groups × 64): the
+        // outermost one is cut, the inner ones stay in the partial
+        if c.red.is_empty() || c.tuple > 1 {
+            return err("split_reduction: a reduce axis, at most one tuple dim");
+        }
+        let total = c.red[0].n();
+        if parts < 2 || total % parts != 0 {
+            return err(format!(
+                "split_reduction: {total} keys do not split into {parts}"
+            ));
+        }
+        let per = total / parts;
+        let k = c.points().len();
+        let w = c.width();
+        // partial space (p, points…, r): the original reduce coordinate is
+        // p·per + r
+        let args = c
+            .args
+            .iter()
+            .map(|a| Arg {
+                src: a.src,
+                view: View {
+                    forms: a
+                        .view
+                        .forms
+                        .iter()
+                        .map(|f| Form {
+                            coefs: std::iter::once(f.coefs[k] * per as i64)
+                                .chain(f.coefs.iter().copied())
+                                .collect(),
+                            offset: f.offset,
+                        })
+                        .collect(),
+                    guard: a.view.guard,
+                    gather: a.view.gather.clone(),
+                },
+            })
+            .collect();
+        let mut out: Vec<Dim> = vec![Dim::Fixed(parts)];
+        out.extend_from_slice(&c.out);
+        let mut red = vec![Dim::Fixed(per)];
+        red.extend_from_slice(&c.red[1..]);
+        let partial = self.push_comp(Comp {
+            out,
+            tuple: c.tuple,
+            red,
+            args,
+            body: c.body.clone(),
+            body_outs: c.body_outs.clone(),
+            monoid: Some(m.clone()),
+        })?;
+        self.nodes[partial.n()].precision = self.nodes[t.n()].precision;
+        // combine space (points…, p): read slot s of partial state p
+        let args = (0..w)
+            .map(|s| {
+                let mut forms = vec![Form::unit(k + 1, k)];
+                forms.extend((0..k).map(|d| Form::unit(k + 1, d)));
+                if c.tuple == 1 {
+                    forms.push(Form::constant(k + 1, s as i64));
+                }
+                Arg {
+                    src: partial,
+                    view: View {
+                        forms,
+                        guard: false,
+                        gather: None,
+                    },
+                }
+            })
+            .collect();
+        let mut body = ExprGraph::new();
+        let body_outs: Vec<ExprId> = (0..w).map(|v| body.var(v as u16)).collect();
+        let node = &mut self.nodes[t.n()];
+        node.op = Op::Comp(Comp {
+            out: c.out.clone(),
+            tuple: c.tuple,
+            red: vec![Dim::Fixed(parts)],
+            args,
+            body,
+            body_outs,
+            monoid: Some(m),
+        });
+        node.inline = false;
+        node.split = 0;
+        node.tile = (0, 0, 0);
+        node.reg = (1, 1);
+        node.fragment = false;
+        Ok(partial)
+    }
+
+    /// Split-K factors worth trying for comp `t`: powers of two that
+    /// divide its reduce axis, leave at least `min_chunk` keys per chunk,
+    /// and do not take the grid past `max_points` (points × parts). `[]`
+    /// when `t` is not a single-axis reduction. An autotuner times each
+    /// (and the unsplit kernel) per sequence length.
+    pub fn split_k_candidates(
+        &self,
+        t: TensorId,
+        min_chunk: usize,
+        max_points: usize,
+    ) -> Vec<usize> {
+        let Some(c) = self.comp_at(t.n()) else {
+            return vec![];
+        };
+        if c.monoid.is_none() || c.red.len() != 1 || c.tuple > 1 {
+            return vec![];
+        }
+        let (Some(total), Some(pts)) = (
+            c.red[0].fixed(),
+            c.points()
+                .iter()
+                .map(|d| d.fixed())
+                .product::<Option<usize>>(),
+        ) else {
+            return vec![];
+        };
+        (1..)
+            .map(|e| 1usize << e)
+            .take_while(|&p| total / p >= min_chunk && pts * p <= max_points)
+            .filter(|&p| total % p == 0)
+            .collect()
+    }
+
+    /// Split-K by rule, for when nothing is tuned: every live single-axis
+    /// reduction of fewer than `target_points` points over a reduce axis of
+    /// at least 1024 is split into the smallest power of
+    /// two that brings points × parts to `target_points`, keeping at least
+    /// 64 keys per chunk. Decode attention and long-K GEMVs qualify; a
+    /// prefill or a square matmul has the points already. The autotuned
+    /// path times [`split_k_candidates`](Self::split_k_candidates) instead.
+    pub fn schedule_split_k(
+        &self,
+        outputs: &[TensorId],
+        target_points: usize,
+    ) -> (TensorGraph, Vec<TensorId>) {
+        let mut g = self.clone();
+        let live = self.live(outputs);
+        let mut any = false;
+        for i in (0..self.nodes.len()).filter(|&i| live[i]) {
+            let Some(c) = self.comp_at(i) else { continue };
+            let (Some(red), Some(pts)) = (
+                c.red.first().and_then(|d| d.fixed()),
+                c.points()
+                    .iter()
+                    .map(|d| d.fixed())
+                    .product::<Option<usize>>(),
+            ) else {
+                continue;
+            };
+            if c.red.len() != 1 || pts >= target_points || red < 1024 {
+                continue;
+            }
+            let pick = self
+                .split_k_candidates(TensorId(i as u32), 64, usize::MAX)
+                .into_iter()
+                .find(|&p| pts * p >= target_points)
+                .or_else(|| {
+                    self.split_k_candidates(TensorId(i as u32), 64, usize::MAX)
+                        .pop()
+                });
+            if let Some(p) = pick {
+                any |= g.split_reduction_in_place(TensorId(i as u32), p).is_ok();
+            }
+        }
+        if !any {
+            return (g, outputs.to_vec());
         }
         g.eliminate_dead(outputs)
     }
@@ -3010,6 +4162,7 @@ impl TensorGraph {
                         src: a.src,
                         view: View {
                             guard: false,
+                            gather: a.view.gather.clone(),
                             forms: a
                                 .view
                                 .forms
@@ -3068,6 +4221,7 @@ impl TensorGraph {
         let rank = shape.len() - 1;
         let slot_view = |s: usize| View {
             guard: false,
+            gather: None,
             forms: (0..rank)
                 .map(|d| Form::unit(rank, d))
                 .chain([Form::constant(rank, s as i64)])
@@ -3124,6 +4278,27 @@ impl TensorGraph {
 
     fn eval_with(&self, inputs: &[Vec<f64>], outputs: &[TensorId], emulate: bool) -> Vec<Vec<f64>> {
         let live = self.live(outputs);
+        // block-scaled inputs: the scales depend on the whole buffer
+        let scaled: Vec<Vec<f64>>;
+        let inputs = if emulate
+            && self
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, Op::Input(_)) && n.precision.storage.is_fp8())
+        {
+            let mut v = inputs.to_vec();
+            for n in &self.nodes {
+                if let Op::Input(k) = n.op {
+                    if n.precision.storage.is_fp8() {
+                        n.precision.storage.round_buf(&mut v[k]);
+                    }
+                }
+            }
+            scaled = v;
+            &scaled[..]
+        } else {
+            inputs
+        };
         let mut ev = Evaluator {
             g: self,
             emulate,
@@ -3134,14 +4309,44 @@ impl TensorGraph {
                 .iter()
                 .map(|n| match &n.op {
                     Op::Comp(c) => Some(Compiled {
-                        body: c.body.compile_many(&c.body_outs),
-                        combine: c.monoid.as_ref().map(|m| m.combine.compile_many(&m.outs)),
+                        body: Prog::new(&c.body, &c.body_outs),
+                        combine: c.monoid.as_ref().map(|m| Prog::new(&m.combine, &m.outs)),
+                        direct: c
+                            .args
+                            .iter()
+                            .map(|a| direct_read(self, a, c.rank(), emulate))
+                            .collect(),
                     }),
-                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) => None,
+                    Op::Input(_) | Op::Iota(_) | Op::Reshape(_) | Op::Operator(_) | Op::Scan(_) => {
+                        None
+                    }
                 })
                 .collect(),
         };
         for i in (0..self.nodes.len()).filter(|&i| live[i] && !self.nodes[i].inline) {
+            if let Op::Operator(o) = &self.nodes[i].op {
+                let ins: Vec<std::borrow::Cow<[f64]>> =
+                    o.inputs.iter().map(|t| ev.tensor_ref(*t)).collect();
+                let refs: Vec<&[f64]> = ins.iter().map(|v| &v[..]).collect();
+                let out = o.op.forward(&refs);
+                assert_eq!(
+                    out.len(),
+                    numel(&self.nodes[i].shape),
+                    "operator `{}` returned the wrong number of values",
+                    o.op.name()
+                );
+                ev.bufs[i] = out;
+                continue;
+            }
+            if let Op::Scan(sc) = &self.nodes[i].op {
+                let ins: Vec<std::borrow::Cow<[f64]>> =
+                    sc.inputs.iter().map(|t| ev.tensor_ref(*t)).collect();
+                let refs: Vec<&[f64]> = ins.iter().map(|v| &v[..]).collect();
+                let shapes: Vec<Vec<usize>> =
+                    sc.inputs.iter().map(|t| fixed(self.shape(*t))).collect();
+                ev.bufs[i] = sc.eval(&refs, &shapes, &fixed(&self.nodes[i].shape));
+                continue;
+            }
             if let Some(c) = self.comp_at(i) {
                 let w = c.width();
                 let pts = fixed(c.points());
@@ -3149,40 +4354,63 @@ impl TensorGraph {
                 let mut buf = vec![0.0; n * w];
                 // points are independent: evaluate them on all cores (the
                 // result does not depend on the split)
+                // a thread per ~32k scalar ops of work: spawning costs tens
+                // of microseconds, so small or cheap comps use fewer threads
+                let per_elem = ev.compiled[i]
+                    .as_ref()
+                    .map_or(1, |k| k.body.ops.len() + c.args.len());
+                let work = n
+                    .saturating_mul(numel(&c.red).max(1))
+                    .saturating_mul(per_elem);
                 let threads = std::thread::available_parallelism()
                     .map_or(1, |t| t.get())
-                    .min(n.div_ceil(256))
+                    .min(work.div_ceil(1 << 15))
+                    .min(n)
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
-                std::thread::scope(|sc| {
-                    for (t, chunk) in buf.chunks_mut(per * w).enumerate() {
-                        let pts = &pts;
-                        sc.spawn(move || {
-                            let start = t * per;
-                            for (p, idx) in
-                                indices(pts).skip(start).take(chunk.len() / w).enumerate()
-                            {
-                                ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w]);
-                            }
-                        });
+                if threads == 1 {
+                    // one chunk: run it here. This is also the only path on targets that
+                    // cannot spawn threads (wasm32), where available_parallelism errs to 1.
+                    let mut sc = Scratch::default();
+                    let mut idx = vec![0; pts.len()];
+                    for p in 0..n {
+                        if p > 0 {
+                            odometer(&mut idx, &pts);
+                        }
+                        ev_ref.point(i, &idx, &mut buf[p * w..(p + 1) * w], &mut sc);
                     }
-                });
+                } else {
+                    std::thread::scope(|sc| {
+                        for (t, chunk) in buf.chunks_mut(per * w).enumerate() {
+                            let pts = &pts;
+                            sc.spawn(move || {
+                                let start = t * per;
+                                let mut scr = Scratch::default();
+                                let mut idx = vec![0; pts.len()];
+                                let mut rest = start;
+                                for d in (0..pts.len()).rev() {
+                                    idx[d] = rest % pts[d];
+                                    rest /= pts[d];
+                                }
+                                for p in 0..chunk.len() / w {
+                                    if p > 0 {
+                                        odometer(&mut idx, pts);
+                                    }
+                                    ev_ref.point(i, &idx, &mut chunk[p * w..(p + 1) * w], &mut scr);
+                                }
+                            });
+                        }
+                    });
+                }
                 if emulate {
-                    let f = self.nodes[i].precision.storage;
-                    buf.iter_mut().for_each(|v| *v = f.round(*v));
+                    self.nodes[i].precision.storage.round_buf(&mut buf);
+                    self.nodes[i].precision.storage.round_blocks(&mut buf);
                 }
                 ev.bufs[i] = buf;
             }
         }
-        outputs
-            .iter()
-            .map(|o| {
-                indices(&fixed(&self.nodes[o.n()].shape))
-                    .map(|idx| ev.read(*o, &idx))
-                    .collect()
-            })
-            .collect()
+        outputs.iter().map(|o| ev.tensor(*o)).collect()
     }
 }
 
@@ -3236,9 +4464,226 @@ fn intern_arg(args: &mut Vec<Arg>, a: Arg) -> usize {
     })
 }
 
+/// A scalar body as a flat program over dense slots, evaluated into a
+/// caller-owned scratch buffer (no allocation per call). Same arithmetic,
+/// node for node, as `tang_expr`'s `compile_many`.
+struct Prog {
+    ops: Vec<POp>,
+    outs: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum POp {
+    Var(u16),
+    Lit(f64),
+    Add(u32, u32),
+    Mul(u32, u32),
+    Neg(u32),
+    Recip(u32),
+    Sqrt(u32),
+    Sin(u32),
+    Floor(u32),
+    Atan2(u32, u32),
+    Exp2(u32),
+    Log2(u32),
+    Select(u32, u32, u32),
+}
+
+impl Prog {
+    fn new(g: &ExprGraph, outs: &[ExprId]) -> Self {
+        let nodes = g.nodes_slice();
+        let n = outs
+            .iter()
+            .map(|o| o.index() as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut live = vec![false; n];
+        let mut stack: Vec<usize> = outs.iter().map(|o| o.index() as usize).collect();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut live[i], true) {
+                continue;
+            }
+            let kids: &[ExprId] = match &nodes[i] {
+                Node::Var(_) | Node::Lit(_) => &[],
+                Node::Add(a, b) | Node::Mul(a, b) | Node::Atan2(a, b) => &[*a, *b],
+                Node::Neg(a)
+                | Node::Recip(a)
+                | Node::Sqrt(a)
+                | Node::Sin(a)
+                | Node::Floor(a)
+                | Node::Exp2(a)
+                | Node::Log2(a) => std::slice::from_ref(a),
+                Node::Select(c, a, b) => &[*c, *a, *b],
+            };
+            stack.extend(kids.iter().map(|k| k.index() as usize));
+        }
+        let mut slot = vec![0u32; n];
+        let mut ops = Vec::new();
+        for i in (0..n).filter(|&i| live[i]) {
+            let m = |e: &ExprId| slot[e.index() as usize];
+            let op = match &nodes[i] {
+                Node::Var(v) => POp::Var(*v),
+                Node::Lit(bits) => POp::Lit(f64::from_bits(*bits)),
+                Node::Add(a, b) => POp::Add(m(a), m(b)),
+                Node::Mul(a, b) => POp::Mul(m(a), m(b)),
+                Node::Neg(a) => POp::Neg(m(a)),
+                Node::Recip(a) => POp::Recip(m(a)),
+                Node::Sqrt(a) => POp::Sqrt(m(a)),
+                Node::Sin(a) => POp::Sin(m(a)),
+                Node::Floor(a) => POp::Floor(m(a)),
+                Node::Atan2(y, x) => POp::Atan2(m(y), m(x)),
+                Node::Exp2(a) => POp::Exp2(m(a)),
+                Node::Log2(a) => POp::Log2(m(a)),
+                Node::Select(c, a, b) => POp::Select(m(c), m(a), m(b)),
+            };
+            slot[i] = ops.len() as u32;
+            ops.push(op);
+        }
+        Self {
+            outs: outs.iter().map(|o| slot[o.index() as usize]).collect(),
+            ops,
+        }
+    }
+
+    #[inline]
+    fn eval(&self, inputs: &[f64], outputs: &mut [f64], v: &mut Vec<f64>) {
+        v.clear();
+        for op in &self.ops {
+            let x = match *op {
+                POp::Var(i) => inputs[i as usize],
+                POp::Lit(x) => x,
+                POp::Add(a, b) => v[a as usize] + v[b as usize],
+                POp::Mul(a, b) => v[a as usize] * v[b as usize],
+                POp::Neg(a) => -v[a as usize],
+                POp::Recip(a) => 1.0 / v[a as usize],
+                POp::Sqrt(a) => v[a as usize].sqrt(),
+                POp::Sin(a) => v[a as usize].sin(),
+                POp::Floor(a) => v[a as usize].floor(),
+                POp::Atan2(y, x) => v[y as usize].atan2(v[x as usize]),
+                POp::Exp2(a) => v[a as usize].exp2(),
+                POp::Log2(a) => v[a as usize].log2(),
+                POp::Select(c, a, b) => {
+                    if v[c as usize] > 0.0 {
+                        v[a as usize]
+                    } else {
+                        v[b as usize]
+                    }
+                }
+            };
+            v.push(x);
+        }
+        for (o, &s) in outputs.iter_mut().zip(&self.outs) {
+            *o = v[s as usize];
+        }
+    }
+}
+
+/// Per-thread buffers for [`Evaluator::point`].
+#[derive(Default)]
+struct Scratch {
+    arg_vals: Vec<f64>,
+    idx: Vec<usize>,
+    elem: Vec<f64>,
+    pair: Vec<f64>,
+    prog: Vec<f64>,
+    cprog: Vec<f64>,
+}
+
 struct Compiled {
-    body: tang_expr::compile::CompiledMany,
-    combine: Option<tang_expr::compile::CompiledMany>,
+    body: Prog,
+    combine: Option<Prog>,
+    /// Per arg: a precomputed flat-address read, when the arg reads a
+    /// plain buffer (see [`direct_read`]).
+    direct: Vec<Option<Direct>>,
+}
+
+/// Where a [`Direct`] read finds its buffer.
+#[derive(Clone, Copy)]
+enum DirectSrc {
+    Input(usize),
+    Buf(usize),
+}
+
+/// An arg read as `buf[base + Σ_k lin[k]·idx[k] + gather·round(index)]`:
+/// the composition of its affine view with the source's row-major strides.
+struct Direct {
+    src: DirectSrc,
+    base: i64,
+    lin: Vec<i64>,
+    gather: i64,
+    /// `Some` for a guarded view: reads outside any source dim are 0.
+    guard: Option<Vec<GuardDim>>,
+}
+
+/// The [`Direct`] plan for `a`, or `None` when the read needs the general
+/// path: a guarded view, a source that is not a plain one-value-per-point
+/// buffer (an iota, a reshape, an inlined or tuple comp), or emulation
+/// (which rounds input reads).
+fn direct_read(g: &TensorGraph, a: &Arg, rank: usize, emulate: bool) -> Option<Direct> {
+    if emulate {
+        return None;
+    }
+    // a reshape reads its storage's bytes row-major under its own shape
+    let node = &g.nodes[a.src.n()];
+    let store = g.storage(a.src);
+    let snode = &g.nodes[store.n()];
+    let src = match &snode.op {
+        Op::Input(k) => DirectSrc::Input(*k),
+        Op::Operator(_) | Op::Scan(_) => DirectSrc::Buf(store.n()),
+        Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => DirectSrc::Buf(store.n()),
+        _ => return None,
+    };
+    let shape = node
+        .shape
+        .iter()
+        .map(|d| d.fixed())
+        .collect::<Option<Vec<_>>>()?;
+    let mut strides = vec![0i64; shape.len()];
+    let mut st = 1i64;
+    for d in (0..shape.len()).rev() {
+        strides[d] = st;
+        st *= shape[d] as i64;
+    }
+    let mut base = 0;
+    let mut lin = vec![0i64; rank];
+    for (d, f) in a.view.forms.iter().enumerate() {
+        base += strides[d] * f.offset;
+        for (k, &c) in f.coefs.iter().enumerate() {
+            lin[k] += strides[d] * c;
+        }
+    }
+    let gather = a.view.gather.as_ref().map_or(0, |ga| {
+        ga.coefs.iter().zip(&strides).map(|(c, s)| c * s).sum()
+    });
+    // a guarded view checks each source coordinate against its extent
+    let guard = a.view.guard.then(|| {
+        a.view
+            .forms
+            .iter()
+            .enumerate()
+            .map(|(d, f)| GuardDim {
+                offset: f.offset,
+                coefs: f.coefs.clone(),
+                gather: a.view.gather.as_ref().map_or(0, |ga| ga.coefs[d]),
+                extent: shape[d] as i64,
+            })
+            .collect()
+    });
+    Some(Direct {
+        src,
+        base,
+        lin,
+        gather,
+        guard,
+    })
+}
+
+/// One source dim of a guarded [`Direct`] read.
+struct GuardDim {
+    offset: i64,
+    coefs: Vec<i64>,
+    gather: i64,
+    extent: i64,
 }
 
 struct Evaluator<'a> {
@@ -3251,19 +4696,46 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    /// All of `t`, row-major: a copy of its buffer when it has a plain
+    /// one, else read point by point.
+    fn tensor(&self, t: TensorId) -> Vec<f64> {
+        self.tensor_ref(t).into_owned()
+    }
+
+    /// [`tensor`](Self::tensor), borrowing the buffer when there is one.
+    fn tensor_ref(&self, t: TensorId) -> std::borrow::Cow<'_, [f64]> {
+        let node = &self.g.nodes[t.n()];
+        let store = self.g.storage(t);
+        let snode = &self.g.nodes[store.n()];
+        match &snode.op {
+            Op::Input(k) if !self.emulate => return self.inputs[*k][..].into(),
+            Op::Operator(_) | Op::Scan(_) => return self.bufs[store.n()][..].into(),
+            Op::Comp(c) if !snode.inline && c.tuple == 0 && c.width() == 1 => {
+                return self.bufs[store.n()][..].into()
+            }
+            _ => {}
+        }
+        indices(&fixed(&node.shape))
+            .map(|idx| self.read(t, &idx))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     /// Value of `t` at full-shape coordinates `idx`.
     fn read(&self, t: TensorId, idx: &[usize]) -> f64 {
         let node = &self.g.nodes[t.n()];
         match &node.op {
             Op::Input(k) => {
                 let v = self.inputs[*k][flat_index(&fixed(&node.shape), idx)];
-                if self.emulate {
+                // block-scaled inputs are rounded whole up front
+                if self.emulate && !node.precision.storage.is_fp8() {
                     node.precision.storage.round(v)
                 } else {
                     v
                 }
             }
             Op::Iota(d) => idx[*d] as f64,
+            Op::Operator(_) | Op::Scan(_) => self.bufs[t.n()][flat_index(&fixed(&node.shape), idx)],
             Op::Reshape(src) => {
                 let flat = flat_index(&fixed(&node.shape), idx);
                 let src_shape = fixed(&self.g.nodes[src.n()].shape);
@@ -3280,7 +4752,7 @@ impl Evaluator<'_> {
                 let slot = flat_index(&fixed(&c.out[c.points().len()..]), tup);
                 if node.inline {
                     let mut vals = vec![0.0; c.width()];
-                    self.point(t.n(), pt, &mut vals);
+                    self.point(t.n(), pt, &mut vals, &mut Scratch::default());
                     return vals[slot];
                 }
                 let w = c.width();
@@ -3289,43 +4761,138 @@ impl Evaluator<'_> {
         }
     }
 
-    fn point(&self, i: usize, out_idx: &[usize], vals: &mut [f64]) {
+    fn point(&self, i: usize, out_idx: &[usize], vals: &mut [f64], sc: &mut Scratch) {
         let c = self.g.comp_at(i).unwrap();
         let k = self.compiled[i].as_ref().unwrap();
         let w = c.width();
-        let mut arg_vals = vec![0.0; c.args.len()];
-        let mut idx = out_idx.to_vec();
+        let Scratch {
+            arg_vals,
+            idx,
+            elem,
+            pair,
+            prog,
+            cprog,
+        } = sc;
+        arg_vals.clear();
+        arg_vals.resize(c.args.len(), 0.0);
+        idx.clear();
+        idx.extend_from_slice(out_idx);
         let base = idx.len();
         idx.extend(std::iter::repeat_n(0, c.red.len()));
         let mut body_at = |idx: &[usize], elem: &mut [f64]| {
-            for (j, a) in c.args.iter().enumerate() {
-                let shape = fixed(&self.g.nodes[a.src.n()].shape);
-                arg_vals[j] = match a.view.coords_in(idx, &shape) {
-                    Some(at) => self.read(a.src, &at),
-                    None => 0.0,
-                };
+            // affine args first: gathered args read their index from them
+            for gathered in [false, true] {
+                for (j, a) in c.args.iter().enumerate() {
+                    if a.view.is_gather() != gathered {
+                        continue;
+                    }
+                    let index = a.view.gather.as_ref().map_or(0.0, |g| arg_vals[g.arg]);
+                    if let Some(d) = &k.direct[j] {
+                        let gi = index.round() as i64;
+                        if let Some(dims) = &d.guard {
+                            let outside = dims.iter().any(|gd| {
+                                let mut c = gd.offset + gd.gather * gi;
+                                for (l, &x) in gd.coefs.iter().zip(idx) {
+                                    c += l * x as i64;
+                                }
+                                c < 0 || c >= gd.extent
+                            });
+                            if outside {
+                                arg_vals[j] = 0.0;
+                                continue;
+                            }
+                        }
+                        let mut at = d.base + d.gather * gi;
+                        for (l, &x) in d.lin.iter().zip(idx) {
+                            at += l * x as i64;
+                        }
+                        let buf = match d.src {
+                            DirectSrc::Input(n) => &self.inputs[n],
+                            DirectSrc::Buf(n) => &self.bufs[n],
+                        };
+                        arg_vals[j] = buf[at as usize];
+                        continue;
+                    }
+                    let shape = fixed(&self.g.nodes[a.src.n()].shape);
+                    arg_vals[j] = match a.view.coords_in(idx, &shape, index) {
+                        Some(at) => self.read(a.src, &at),
+                        None => 0.0,
+                    };
+                }
             }
-            (k.body)(&arg_vals, elem);
+            k.body.eval(arg_vals, elem, prog);
         };
         let Some(m) = &c.monoid else {
-            body_at(&idx, vals);
+            body_at(idx, vals);
             return;
         };
         vals.copy_from_slice(&m.identity);
         let combine = k.combine.as_ref().unwrap();
-        let mut elem = vec![0.0; w];
-        let mut pair = vec![0.0; 2 * w];
-        for red_idx in indices(&fixed(&c.red)) {
-            idx[base..].copy_from_slice(&red_idx);
-            body_at(&idx, &mut elem);
+        elem.clear();
+        elem.resize(w, 0.0);
+        pair.clear();
+        pair.resize(2 * w, 0.0);
+        // softmax weights rounded to the operand format (an online-softmax
+        // reduction on a tile that feeds exp(s − m) to the tensor cores):
+        // the element's weight is rounded before it scales g₁…gₖ
+        let operand = self.g.nodes[i].precision.operand;
+        let round_weights =
+            self.emulate && operand != Format::F32 && m.kind() == MonoidKind::OnlineSoftmax;
+        let red = fixed(&c.red);
+        let n_red: usize = red.iter().product();
+        for step in 0..n_red {
+            if step > 0 {
+                // odometer over the reduce dims, last fastest
+                for d in (0..red.len()).rev() {
+                    idx[base + d] += 1;
+                    if idx[base + d] < red[d] {
+                        break;
+                    }
+                    idx[base + d] = 0;
+                }
+            }
+            body_at(idx, elem);
+            if round_weights {
+                // m' = max(m, s); accᵢ' = accᵢ·exp(m − m') + gᵢ·round(exp(s − m'))
+                let mx = vals[0].max(elem[0]);
+                if mx == f64::NEG_INFINITY {
+                    continue;
+                }
+                let sa = if vals[0] == f64::NEG_INFINITY {
+                    0.0
+                } else {
+                    (vals[0] - mx).exp()
+                };
+                let se = precision::round_weight(operand, (elem[0] - mx).exp());
+                vals[0] = mx;
+                for t in 1..w {
+                    vals[t] = vals[t] * sa + elem[t] * se;
+                }
+                if self.emulate {
+                    let f = self.g.nodes[i].precision.accum;
+                    vals.iter_mut().for_each(|v| *v = f.round(*v));
+                }
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
-            pair[w..].copy_from_slice(&elem);
-            combine(&pair, vals);
+            pair[w..].copy_from_slice(elem);
+            combine.eval(pair, vals, cprog);
             if self.emulate {
                 let f = self.g.nodes[i].precision.accum;
                 vals.iter_mut().for_each(|v| *v = f.round(*v));
             }
         }
+    }
+}
+
+/// Advance row-major coordinates `idx` in `shape` by one (last dim fastest).
+fn odometer(idx: &mut [usize], shape: &[usize]) {
+    for d in (0..shape.len()).rev() {
+        idx[d] += 1;
+        if idx[d] < shape[d] {
+            return;
+        }
+        idx[d] = 0;
     }
 }
 
@@ -3365,6 +4932,7 @@ pub(super) fn replay(
             Node::Recip(a) => dst.recip(m(a)),
             Node::Sqrt(a) => dst.sqrt(m(a)),
             Node::Sin(a) => dst.sin(m(a)),
+            Node::Floor(a) => dst.floor(m(a)),
             Node::Atan2(a, b) => dst.atan2(m(a), m(b)),
             Node::Exp2(a) => dst.exp2(m(a)),
             Node::Log2(a) => dst.log2(m(a)),
@@ -3564,6 +5132,142 @@ mod tests {
         );
     }
 
+    /// Split-K, one launch: decode attention (1 query row, 64 keys), a
+    /// long-K matmul and an argmax all split into 2…16 chunks and fold
+    /// back with their own monoid; readers of the split node are untouched.
+    #[test]
+    fn split_reduction_folds_partials_with_the_monoid() {
+        let (nk, d, dv) = (64, 4, 4);
+        let mut g = TensorGraph::new();
+        let q = g.input(&[1, d]);
+        let k = g.input(&[nk, d]);
+        let v = g.input(&[nk, dv]);
+        let y = naive_attention(&mut g, q, k, v, false);
+        let (g, outs) = g.stabilize_softmax(&[y]);
+        let (g, outs) = g.substitute_maps(&outs);
+        let fused = (0..g.nodes().len())
+            .find(|&i| matches!(&g.nodes()[i].op, Op::Comp(c) if c.tuple == 1))
+            .map(TensorId::from_index)
+            .unwrap();
+        let inputs = [
+            ramp(d, 0.3, -1.0),
+            ramp(nk * d, 0.07, -2.0),
+            ramp(nk * dv, 0.1, -2.0),
+        ];
+        let want = g.eval(&inputs, &outs).remove(0);
+        assert_eq!(g.split_k_candidates(fused, 8, 1 << 20), vec![2, 4, 8]);
+        for p in [2, 4, 8, 16] {
+            let (sg, so) = g.split_reduction(&outs, fused, p).unwrap();
+            assert_eq!(sg.count_comps(&so), g.count_comps(&outs) + 1);
+            close(&sg.eval(&inputs, &so).remove(0), &want);
+        }
+        assert!(g.split_reduction(&outs, fused, 3).is_err());
+
+        // a long-K matmul: [2, 96] · [96, 3]
+        let mut g = TensorGraph::new();
+        let a = g.input(&[2, 96]);
+        let b = g.input(&[96, 3]);
+        let c = g.matmul(a, b).unwrap();
+        let data = [ramp(192, 0.01, -1.0), ramp(288, 0.02, -2.0)];
+        let want = g.eval(&data, &[c]).remove(0);
+        for p in [2, 3, 8, 32] {
+            let (sg, so) = g.split_reduction(&[c], c, p).unwrap();
+            close(&sg.eval(&data, &so).remove(0), &want);
+        }
+
+        // argmax: a tuple monoid whose tie rule must survive the split
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 16]);
+        let i = g.iota(&[2, 16], 1);
+        let rank = 2;
+        let am = g
+            .comp_tuple(
+                &[2, 2],
+                &[16],
+                vec![
+                    Arg {
+                        src: i,
+                        view: View::pick(rank, &[Some(0), Some(1)]),
+                    },
+                    Arg {
+                        src: x,
+                        view: View::pick(rank, &[Some(0), Some(1)]),
+                    },
+                ],
+                Some(Monoid::argmax()),
+                |v| vec![v[0], v[1]],
+            )
+            .unwrap();
+        let data = vec![(0..32).map(|j| ((j * 7) % 5) as f64).collect::<Vec<_>>()];
+        let want = g.eval(&data, &[am]).remove(0);
+        let (sg, so) = g.split_reduction(&[am], am, 4).unwrap();
+        close(&sg.eval(&data, &so).remove(0), &want);
+
+        // top-k: k argmax rounds in one tuple reduction, ties to the smaller
+        // index, the same result split or not
+        for k in [1usize, 3, 5] {
+            let mut g = TensorGraph::new();
+            let x = g.input(&[2, 16]);
+            let i = g.iota(&[2, 16], 1);
+            let tk = g
+                .comp_tuple(
+                    &[2, 2 * k],
+                    &[16],
+                    vec![
+                        Arg {
+                            src: i,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                        Arg {
+                            src: x,
+                            view: View::pick(2, &[Some(0), Some(1)]),
+                        },
+                    ],
+                    Some(Monoid::topk(k)),
+                    |v| {
+                        let mut o = vec![v[0], v[1]];
+                        for _ in 1..k {
+                            o.push(ExprId::ZERO);
+                            o.push(ExprId::from_f64(-(f32::MAX as f64)));
+                        }
+                        o
+                    },
+                )
+                .unwrap();
+            let data = vec![(0..32)
+                .map(|j| ((j * 7) % 5) as f64 + 0.01 * (j % 3) as f64)
+                .collect::<Vec<_>>()];
+            let got = g.eval(&data, &[tk]).remove(0);
+            for row in 0..2 {
+                let mut idx: Vec<usize> = (0..16).collect();
+                let v = &data[0][row * 16..row * 16 + 16];
+                idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap().then(a.cmp(&b)));
+                for r in 0..k {
+                    assert_eq!(
+                        got[row * 2 * k + 2 * r] as usize,
+                        idx[r],
+                        "k {k} row {row} rank {r}"
+                    );
+                    assert_eq!(got[row * 2 * k + 2 * r + 1], v[idx[r]]);
+                }
+            }
+            let (sg, so) = g.split_reduction(&[tk], tk, 4).unwrap();
+            close(&sg.eval(&data, &so).remove(0), &got);
+        }
+
+        // the rule: a 2-point, 4096-long sum splits to fill 64 points
+        let mut g = TensorGraph::new();
+        let x = g.input(&[2, 4096]);
+        let s = g.reduce(x, 1, Monoid::sum()).unwrap();
+        let (sg, so) = g.schedule_split_k(&[s], 64);
+        assert_eq!(sg.count_comps(&so), 2);
+        let data = vec![ramp(8192, 0.001, -1.0)];
+        close(&sg.eval(&data, &so)[0], &g.eval(&data, &[s])[0]);
+        // ... and leaves a reduction with enough points alone
+        let (sg, so) = g.schedule_split_k(&[s], 2);
+        assert_eq!(sg.count_comps(&so), 1);
+    }
+
     #[test]
     fn maps_substitute_through_affine_reshapes() {
         // m = 2x read as [4, 2, 4] by a comp: the reshape is a merge seen
@@ -3736,6 +5440,56 @@ mod tests {
         close(&mg.eval(&inputs, &outs)[0], &want);
     }
 
+    /// `y[t, n] = Σ_{g,j} x[t, 64·g + j] · w[n, g, j]`: the plain pass
+    /// keeps the two reduce dims (the activation reads both through one
+    /// dim); the scaled one makes it one flat `k`, same values.
+    #[test]
+    fn merge_reduce_dims_scaled_flattens_a_grouped_read() {
+        let (t, n, groups, gs) = (3, 5, 2, 8);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[t, groups * gs]);
+        let w = g.input(&[n, groups, gs]);
+        let r = 4; // (t, n, g, j)
+        let xf = Form {
+            coefs: vec![0, 0, gs as i64, 1],
+            offset: 0,
+        };
+        let y = g
+            .comp(
+                &[t, n],
+                &[groups, gs],
+                vec![
+                    Arg {
+                        src: x,
+                        view: View {
+                            forms: vec![Form::unit(r, 0), xf],
+                            guard: false,
+                            gather: None,
+                        },
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(r, &[Some(1), Some(2), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let inputs = [
+            ramp(t * groups * gs, 0.01, -0.3),
+            ramp(n * groups * gs, 0.02, 0.1),
+        ];
+        let want = g.eval(&inputs, &[y]).remove(0);
+        let (pg, pouts) = g.merge_reduce_dims(&[y]);
+        assert_eq!(pg.comp_at(pouts[0].n()).unwrap().red.len(), 2);
+        let (mg, outs) = g.merge_reduce_dims_scaled(&[y]);
+        let c = mg.comp_at(outs[0].n()).unwrap();
+        assert_eq!(c.red, vec![Dim::Fixed(groups * gs)]);
+        assert_eq!(c.args[0].view.forms[1], Form::unit(3, 2));
+        close(&mg.eval(&inputs, &outs)[0], &want);
+    }
+
     #[test]
     fn merge_siblings_fuses_gate_and_up_with_their_activation() {
         // swiglu: silu(x·wg) * (x·wu) — two reductions over the same
@@ -3831,6 +5585,7 @@ mod tests {
                     src: r,
                     view: View {
                         guard: false,
+                        gather: None,
                         forms: vec![
                             Form::unit(2, 0),
                             Form {
@@ -3889,6 +5644,7 @@ mod tests {
         causal: bool,
     ) -> TensorId {
         let n = g.shape(q)[0];
+        let nk = g.shape(k)[0];
         let dv = g.shape(v)[1];
         let kt = g.transpose(k, &[1, 0]).unwrap();
         let mut s = g.matmul(q, kt).unwrap(); // [n, n]
@@ -3897,7 +5653,7 @@ mod tests {
             s = g.map(&[s, mask], |v| v[0] + v[1]).unwrap();
         }
         let m = g.reduce(s, 1, Monoid::max()).unwrap(); // [n, 1]
-        let mb = g.broadcast(m, &[n, n]).unwrap();
+        let mb = g.broadcast(m, &[n, nk]).unwrap();
         let p = g.map(&[s, mb], |v| (v[0] - v[1]).exp()).unwrap(); // [n, n]
         let l = g.reduce(p, 1, Monoid::sum()).unwrap(); // [n, 1]
         let o = g.matmul(p, v).unwrap(); // [n, dv]
@@ -4075,6 +5831,7 @@ mod tests {
         let (co, k) = (g.shape(w)[0].n(), g.shape(w)[2].n());
         // space: (o, t, c, k)
         let xv = View {
+            gather: None,
             forms: vec![
                 Form::unit(4, 2),
                 Form {
@@ -4238,6 +5995,85 @@ mod tests {
     }
 
     #[test]
+    fn guard_on_a_var_the_address_cancels_is_not_staged() {
+        // a stride-4 transposed conv's backward under a contraction:
+        // y[o, b, x] = Σ_r w[o, r] · Σ_q a[b, x + q − 2, r − 4q + 2] · h[same].
+        // The flat address 4x + r − 6 has no q, but the padding depends on
+        // it, so the tile's load loop (no q in scope) cannot apply it.
+        let mut g = TensorGraph::new();
+        let a = g.input(&[2, 16, 4]);
+        let h = g.input(&[16, 4]);
+        let w = g.input(&[9, 16]);
+        // space: (b, x, r, q)
+        let taps = |lead: Vec<Form>| View {
+            gather: None,
+            forms: lead
+                .into_iter()
+                .chain([
+                    Form {
+                        coefs: vec![0, 1, 0, 1],
+                        offset: -2,
+                    },
+                    Form {
+                        coefs: vec![0, 0, 1, -4],
+                        offset: 2,
+                    },
+                ])
+                .collect(),
+            guard: true,
+        };
+        let inner = g
+            .comp(
+                &[2, 16, 16],
+                &[5],
+                vec![
+                    Arg {
+                        src: a,
+                        view: taps(vec![Form::unit(4, 0)]),
+                    },
+                    Arg {
+                        src: h,
+                        view: taps(vec![]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        // space: (o, b, x, r)
+        let y = g
+            .comp(
+                &[9, 2, 16],
+                &[16],
+                vec![
+                    Arg {
+                        src: inner,
+                        view: View::pick(4, &[Some(1), Some(2), Some(3)]),
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(4, &[Some(0), Some(3)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        g.set_inline(inner, true);
+        g.set_schedule(y, 0, (16, 16, 32), (1, 1));
+        let src = &g.to_wgsl(&[y]).kernels[0].source;
+        assert!(src.contains("var<workgroup> stage_"), "not tiled:\n{src}");
+        let loads: Vec<&str> = src
+            .lines()
+            .filter(|l| l.trim_start().starts_with("stage_"))
+            .collect();
+        assert!(!loads.is_empty());
+        for l in loads {
+            assert!(!l.contains("i32(q"), "load reads a reduce var:\n{l}");
+        }
+    }
+
+    #[test]
     fn guarded_read_of_a_map_stays_materialized() {
         // y = conv(snake(x)): snake(0) ≠ 0 in general, so the map is not
         // spliced through the guarded read (it would pad with f(0))
@@ -4263,6 +6099,7 @@ mod tests {
         let mut g = TensorGraph::new();
         let x = g.input(&[t]);
         let pv = View {
+            gather: None,
             forms: vec![Form {
                 coefs: vec![1],
                 offset: -2,

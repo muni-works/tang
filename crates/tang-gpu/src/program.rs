@@ -127,6 +127,19 @@ impl Runtime {
         CudaDevice::new_capturable(0).map(Self::Cuda)
     }
 
+    /// A runtime on an existing cudarc context and stream, shared with the
+    /// caller ([`CudaDevice::from_stream`]). `None` without nvrtc.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_from_stream(
+        ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::from_stream(ctx, stream).map(Self::Cuda)
+    }
+
     /// The first OpenCL GPU, if a driver and a device are present.
     #[cfg(feature = "opencl")]
     pub fn opencl() -> Option<Self> {
@@ -180,15 +193,21 @@ impl Runtime {
         }
     }
 
-    /// `g`'s program for this backend. wgpu: WGSL, or native MSL tiles
-    /// with `TANG_NATIVE=1` on Metal. CUDA: `to_cuda` (tensor cores on).
+    /// `g`'s program for this backend. wgpu: WGSL with the device's caps
+    /// (subgroups, native f16), `fragment` nodes as Metal simdgroup-matrix
+    /// kernels under MSL passthrough, or native MSL tiles for everything
+    /// with `TANG_NATIVE=1`. CUDA: `to_cuda` (tensor cores on).
     pub fn lower(&self, g: &TensorGraph, outputs: &[TensorId]) -> WgslProgram {
         match self {
             Self::Wgpu { device, .. } => {
+                let caps = device.wgsl_caps();
                 if device.msl_passthrough && std::env::var("TANG_NATIVE").is_ok() {
-                    g.to_msl_mma(outputs)
+                    g.to_msl_mma_caps(outputs, caps)
+                } else if device.msl_passthrough {
+                    // `fragment` nodes run their simdgroup-matrix kernel
+                    g.to_wgsl_fragments(outputs, caps)
                 } else {
-                    g.to_wgsl(outputs)
+                    g.to_wgsl_caps(outputs, caps)
                 }
             }
             #[cfg(feature = "cuda")]
@@ -199,6 +218,18 @@ impl Runtime {
     }
 
     /// Submit pending work and wait for it.
+    /// `cuProfilerStart` / `cuProfilerStop`: a window for `ncu --profile-from-start off`.
+    #[cfg(feature = "cuda")]
+    pub fn profiler(&self, on: bool) {
+        unsafe {
+            if on {
+                cudarc::driver::sys::cuProfilerStart();
+            } else {
+                cudarc::driver::sys::cuProfilerStop();
+            }
+        }
+    }
+
     pub fn sync(&self) {
         match self {
             Self::Wgpu { device, cache } => {
@@ -256,12 +287,20 @@ impl From<&MemoryPlan> for BufferPlan {
 /// f32 words a buffer needs (f16 and bf16 pack two per word, element
 /// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
 /// buffers share the layout).
+///
+/// Block formats (Q4K, Q5K, Q8x32) are passed in and read back as their
+/// raw device words, except that reading a Q8x32 buffer dequantizes it.
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
-    match b.format {
-        Format::F16 | Format::BF16 => b.len.div_ceil(2),
-        _ => b.len,
+    b.format.words(b.len).max(1)
+}
+
+/// Host length of an input: elements, or raw words for a block format.
+fn host_len(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
+    if b.format.is_block() {
+        words(b)
+    } else {
+        b.len
     }
-    .max(1)
 }
 
 fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, shared: &[usize]) {
@@ -276,7 +315,7 @@ fn check_plan(program: &WgslProgram, inputs: &[&[f32]], plan: &BufferPlan, share
         assert!(words(b) <= plan.slot_len[plan.slot[i]], "slot too small");
         if let Some(k) = b.input.filter(|k| !shared.contains(k)) {
             assert!(
-                inputs[k].is_empty() || inputs[k].len() == b.len,
+                inputs[k].is_empty() || inputs[k].len() == host_len(b),
                 "input {k} has wrong length"
             );
         }
@@ -311,6 +350,9 @@ enum Storage {
         functions: Vec<cudarc::driver::CudaFunction>,
         /// One captured run ([`Program::capture`]).
         graph: Option<cudarc::driver::CudaGraph>,
+        /// The program as launches of kernels and persistent segments
+        /// ([`Program::megakernel`]): `run` launches these instead.
+        fused: Option<Vec<Item>>,
     },
     #[cfg(feature = "opencl")]
     OpenCl {
@@ -319,6 +361,26 @@ enum Storage {
         /// One kernel object per kernel, arguments bound at construction.
         kernels: ClKernels,
     },
+}
+
+/// One launch of a fused program ([`Program::megakernel`]).
+#[cfg(feature = "cuda")]
+enum Item {
+    Kernel(usize),
+    Mega(MegaRun),
+}
+
+/// A run of kernels fused into one persistent kernel.
+#[cfg(feature = "cuda")]
+struct MegaRun {
+    function: cudarc::driver::CudaFunction,
+    /// Device pointer per slot.
+    table: cudarc::driver::CudaSlice<u64>,
+    /// Grid barrier state (two words, left zero by every launch).
+    sync: cudarc::driver::CudaSlice<u32>,
+    grid: u32,
+    threads: u32,
+    smem: u32,
 }
 
 /// A lowered program with its buffers on one backend; reusable across runs.
@@ -443,6 +505,7 @@ impl Program {
                     slots,
                     functions,
                     graph: None,
+                    fused: None,
                 };
                 Self::assemble(program, storage, plan)
             }
@@ -536,6 +599,10 @@ impl Program {
                 Format::F16 => GpuBuffer::from_u32_slice(device, &pack_f16(inputs[k])),
                 Format::F32 => GpuBuffer::from_slice(device, inputs[k]),
                 Format::BF16 => unreachable!("bf16 is interpreter-only"),
+                Format::Q4K | Format::Q5K | Format::Q8x32 => {
+                    panic!("block formats run only on the CUDA int8 lowering")
+                }
+                _ => unreachable!("bf16 and fp8 are not wgpu formats"),
             };
             if fresh.len() == plan.slot_len[s] {
                 slots[s] = fresh;
@@ -543,6 +610,10 @@ impl Program {
                 write_wgpu(device, &slots[s], b.format, inputs[k]);
             }
         }
+        assert!(
+            program.kernels.iter().all(|k| k.writes.is_empty()),
+            "multi-output kernels run on CUDA only"
+        );
         let p = Self::assemble(program, Storage::Wgpu(slots), plan);
         for (i, a) in p.args.iter().enumerate() {
             let (out, reads) = a.split_last().unwrap();
@@ -569,10 +640,12 @@ impl Program {
             .kernels
             .iter()
             .map(|k| {
+                // reads, `out`, then a multi-output kernel's further outputs
                 k.reads
                     .iter()
-                    .chain(std::iter::once(&k.node))
-                    .map(|&t| p.slot_of(t))
+                    .copied()
+                    .chain(k.outputs())
+                    .map(|t| p.slot_of(t))
                     .collect()
             })
             .collect();
@@ -612,6 +685,19 @@ impl Program {
         match &self.storage {
             Storage::Wgpu(s) => Some(&s[self.slot_of(t)]),
             #[cfg(any(feature = "cuda", feature = "opencl"))]
+            _ => None,
+        }
+    }
+
+    /// The CUDA buffer holding `t` (packed words of [`Self::format`]; f32
+    /// for the default format), so a caller sharing the context
+    /// ([`Runtime::cuda_from_stream`]) can copy device-to-device into or
+    /// out of the program on its stream instead of round-tripping the host.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_slice(&self, t: TensorId) -> Option<&cudarc::driver::CudaSlice<f32>> {
+        match &self.storage {
+            Storage::Cuda { slots, .. } => Some(&slots[self.slot_of(t)]),
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
@@ -715,6 +801,29 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn launch_all(&self, d: &CudaDevice) {
+        if let Storage::Cuda {
+            fused: Some(items), ..
+        } = &self.storage
+        {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            for it in items {
+                match it {
+                    Item::Kernel(i) => self.run_cuda(d, *i),
+                    Item::Mega(m) => {
+                        let cfg = LaunchConfig {
+                            grid_dim: (m.grid, 1, 1),
+                            block_dim: (m.threads, 1, 1),
+                            shared_mem_bytes: m.smem,
+                        };
+                        let mut launch = d.stream.launch_builder(&m.function);
+                        launch.arg(&m.table);
+                        launch.arg(&m.sync);
+                        unsafe { launch.launch(cfg) }.expect("megakernel launch");
+                    }
+                }
+            }
+            return;
+        }
         for &i in &self.order {
             self.run_cuda(d, i);
         }
@@ -736,6 +845,174 @@ impl Program {
     /// [`run_kernel`](Self::run_kernel) on a bare wgpu device.
     pub fn dispatch_kernel(&self, device: &GpuDevice, cache: &mut KernelCache, i: usize) {
         self.run_wgpu(device, cache, i);
+    }
+
+    /// Fuse the whole program into one persistent kernel
+    /// (`tang_compile::tensor::cuda_mega`): every kernel a stage over its
+    /// own grid, independent kernels sharing a phase, a grid barrier
+    /// between phases (knobs: `MegaOpts`; slot sizes are filled in here),
+    /// `per_sm` blocks per SM (0: as many as fit). With `max_blocks > 0`
+    /// only kernels of at most that many blocks fuse, in maximal runs
+    /// between the bigger ones (which keep their own launch and
+    /// occupancy): a kernel boundary is then a per-edge choice, launch or
+    /// grid barrier. Returns `(launches, phases, largest grid)`. Later [`run`](Self::run)s (and a
+    /// [`capture`](Self::capture) after this) launch it instead of the
+    /// kernels. CUDA only.
+    #[cfg(feature = "cuda")]
+    pub fn megakernel(
+        &mut self,
+        rt: &Runtime,
+        opts: &tang_compile::tensor::cuda_mega::MegaOpts,
+        per_sm: u32,
+        max_blocks: u32,
+    ) -> (usize, usize, u32) {
+        use cudarc::driver::DevicePtr;
+        use tang_compile::tensor::cuda_mega::{megakernel, Mega, MegaStage};
+        let mut opts = opts.clone();
+        if opts.threads == 0 {
+            opts.threads = 256;
+        }
+        let threads = opts.threads;
+        let Runtime::Cuda(d) = rt else {
+            panic!("megakernel needs the CUDA runtime")
+        };
+        let Storage::Cuda { slots, .. } = &self.storage else {
+            unreachable!()
+        };
+        opts.slot_bytes = slots.iter().map(|s| 4 * s.len()).collect();
+        let stage = |i: usize| {
+            let k = &self.program.kernels[i];
+            MegaStage {
+                source: &k.source,
+                threads: k.workgroup_size,
+                blocks: k.count.div_ceil(k.workgroup_size),
+                count: k.points,
+                args: self.args[i].clone(),
+            }
+        };
+        // segments: maximal runs of fusible kernels (at most `max_blocks`
+        // blocks, a block size dividing `threads`, no dynamic smem); a run
+        // of one stays a launch
+        let fusible = |i: usize| {
+            let k = &self.program.kernels[i];
+            let blocks = k.count.div_ceil(k.workgroup_size);
+            (max_blocks == 0 || blocks <= max_blocks)
+                && threads.is_multiple_of(k.workgroup_size)
+                && threads / k.workgroup_size <= 15
+                && crate::cuda::dynamic_smem(&k.source) == 0
+                // the megakernel's stages write one buffer (the last arg)
+                && k.writes.is_empty()
+        };
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        for &i in &self.order {
+            match runs.last_mut() {
+                Some(r) if fusible(i) && fusible(*r.last().unwrap()) => r.push(i),
+                _ => runs.push(vec![i]),
+            }
+        }
+        let megas: Vec<Option<Mega>> = runs
+            .iter()
+            .map(|r| {
+                (r.len() > 1)
+                    .then(|| megakernel(&r.iter().map(|&i| stage(i)).collect::<Vec<_>>(), &opts))
+            })
+            .collect();
+        if let Ok(p) = std::env::var("TANG_MEGA_DUMP") {
+            if let Some(m) = megas.iter().flatten().max_by_key(|m| m.phases.len()) {
+                std::fs::write(p, &m.source).ok();
+            }
+        }
+        crate::cuda::precompile(megas.iter().flatten().map(|m| m.source.as_str()), d.arch);
+        let sms = d
+            .ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("SM count") as u32;
+        let Storage::Cuda {
+            slots,
+            fused,
+            graph,
+            ..
+        } = &mut self.storage
+        else {
+            unreachable!()
+        };
+        let mut items = Vec::new();
+        let (mut phases, mut grid) = (0, 0);
+        for (r, m) in runs.iter().zip(megas) {
+            let Some(mega) = m else {
+                items.push(Item::Kernel(r[0]));
+                continue;
+            };
+            let function = d.function(&mega.source);
+            let fit = function
+                .occupancy_max_active_blocks_per_multiprocessor(threads, mega.smem as usize, None)
+                .expect("occupancy");
+            assert!(fit > 0, "megakernel does not fit on an SM");
+            let g = sms * if per_sm == 0 { fit } else { per_sm.min(fit) };
+            let ptrs: Vec<u64> = mega
+                .table
+                .iter()
+                .map(|&s| {
+                    let (p, _sync) = slots[s].device_ptr(&d.stream);
+                    p
+                })
+                .collect();
+            let table = d.stream.clone_htod(&ptrs).expect("pointer table");
+            let sync = d
+                .stream
+                .alloc_zeros::<u32>(2 + 2 * (mega.phases.len() + 1))
+                .expect("barrier state");
+            phases += mega.phases.len();
+            grid = grid.max(g);
+            items.push(Item::Mega(MegaRun {
+                function,
+                table,
+                sync,
+                grid: g,
+                threads,
+                smem: mega.smem,
+            }));
+        }
+        let launches = items.len();
+        *graph = None;
+        *fused = Some(items);
+        (launches, phases, grid)
+    }
+
+    /// Kernel indices in launch order.
+    pub fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// With `MegaOpts::trace`: nanoseconds of each phase of the last run
+    /// (block 0's view).
+    #[cfg(feature = "cuda")]
+    pub fn mega_trace(&self, rt: &Runtime) -> Vec<f64> {
+        let (
+            Runtime::Cuda(d),
+            Storage::Cuda {
+                fused: Some(items), ..
+            },
+        ) = (rt, &self.storage)
+        else {
+            return Vec::new();
+        };
+        let Some(m) = items.iter().find_map(|it| match it {
+            Item::Mega(m) => Some(m),
+            Item::Kernel(_) => None,
+        }) else {
+            return Vec::new();
+        };
+        let words = d.stream.clone_dtoh(&m.sync).expect("read trace");
+        let t: Vec<u64> = words[2..]
+            .chunks(2)
+            .map(|c| c[0] as u64 | (c[1] as u64) << 32)
+            .collect();
+        t.windows(2)
+            .map(|w| w[1].wrapping_sub(w[0]) as f64)
+            .collect()
     }
 
     /// Record one run as a CUDA graph; later [`run`](Self::run)s replay
@@ -900,7 +1177,9 @@ impl Program {
     /// Overwrite `t` (usually an input) from the host.
     pub fn write(&self, rt: &Runtime, t: TensorId, data: &[f32]) {
         let b = &self.program.buffers[self.buffer_index(t)];
-        assert_eq!(data.len(), b.len, "write length");
+        // a block format (GGUF weights) is written as its raw words
+        let want = if b.format.is_block() { words(b) } else { b.len };
+        assert_eq!(data.len(), want, "write length");
         let s = self.slot_of(t);
         match (rt, &self.storage) {
             (Runtime::Wgpu { device, cache }, Storage::Wgpu(slots)) => {
@@ -981,6 +1260,44 @@ impl Program {
         }
     }
 
+    /// Exchange the buffers behind `a` and `b` (same length and format,
+    /// neither sharing its slot with another tensor): a step's `p′`
+    /// becomes the next step's `p` with no copy. Drops a
+    /// [`capture`](Self::capture); not available once
+    /// [`megakernel`](Self::megakernel) has baked the buffers in, nor on
+    /// OpenCL, whose kernel arguments are bound at construction (use
+    /// [`copy`](Self::copy)).
+    pub fn swap(&mut self, a: TensorId, b: TensorId) {
+        let (ia, ib) = (self.buffer_index(a), self.buffer_index(b));
+        if ia == ib {
+            return;
+        }
+        let (ba, bb) = (&self.program.buffers[ia], &self.program.buffers[ib]);
+        assert_eq!((ba.len, ba.format), (bb.len, bb.format), "swap shape");
+        let (sa, sb) = (self.slot[ia], self.slot[ib]);
+        let tenants = |s: usize| self.slot.iter().filter(|&&x| x == s).count();
+        assert_eq!((tenants(sa), tenants(sb)), (1, 1), "swap of a shared slot");
+        match &mut self.storage {
+            Storage::Wgpu(slots) => {
+                slots.swap(sa, sb);
+                self.recording = None;
+            }
+            #[cfg(feature = "cuda")]
+            Storage::Cuda {
+                slots,
+                graph,
+                fused,
+                ..
+            } => {
+                assert!(fused.is_none(), "swap after megakernel");
+                slots.swap(sa, sb);
+                *graph = None;
+            }
+            #[cfg(feature = "opencl")]
+            Storage::OpenCl { .. } => unimplemented!("swap on OpenCL"),
+        }
+    }
+
     /// Milliseconds per run of the whole program: the minimum over five
     /// batches of `iters` (a shared GPU only ever adds time).
     pub fn time(&self, rt: &Runtime, iters: usize) -> f64 {
@@ -1033,6 +1350,112 @@ impl Program {
             }
         })
     }
+    /// GPU-clock times (ms) of `n` launches of kernel `i` after `warmup`
+    /// untimed ones: wgpu timestamp queries around each compute pass, CUDA
+    /// events around each launch, OpenCL profiling events. Unlike
+    /// [`time_kernel`](Self::time_kernel) nothing host-side (submission,
+    /// polling, a busy CPU) lands in the number. `None` where the backend
+    /// has no GPU timer (a wgpu adapter without `TIMESTAMP_QUERY`). The
+    /// kernel's inputs must already be computed.
+    pub fn kernel_samples(
+        &self,
+        rt: &Runtime,
+        i: usize,
+        warmup: usize,
+        n: usize,
+    ) -> Option<Vec<f64>> {
+        self.gpu_samples(rt, &[i], warmup, n)
+    }
+
+    /// [`kernel_samples`](Self::kernel_samples) for one whole run (every
+    /// kernel in plan order, gaps between them included).
+    pub fn program_samples(&self, rt: &Runtime, warmup: usize, n: usize) -> Option<Vec<f64>> {
+        let order = self.order.clone();
+        self.gpu_samples(rt, &order, warmup, n)
+    }
+
+    fn gpu_samples(&self, rt: &Runtime, ks: &[usize], warmup: usize, n: usize) -> Option<Vec<f64>> {
+        match rt {
+            Runtime::Wgpu { device, cache } => {
+                if !device.timestamps {
+                    return None;
+                }
+                #[allow(irrefutable_let_patterns)]
+                let Storage::Wgpu(slots) = &self.storage
+                else {
+                    panic!("program and runtime are on different backends")
+                };
+                let mut cache = cache.borrow_mut();
+                cache.flush(device);
+                #[allow(irrefutable_let_patterns)]
+                let passes: Vec<_> = ks
+                    .iter()
+                    .map(|&i| {
+                        let k = &self.program.kernels[i];
+                        let bufs: Vec<&GpuBuffer> =
+                            self.args[i].iter().map(|&s| &slots[s]).collect();
+                        let (pipe, layout) = cache.pipeline(
+                            device,
+                            &k.source,
+                            bufs.len(),
+                            &[bufs.len() - 1],
+                            k.workgroup_size,
+                        );
+                        let bind = cache.bind(device, &layout, &bufs, &[k.points, 0, 0, 0]);
+                        let groups = k.count.div_ceil(k.workgroup_size);
+                        (pipe, bind, groups.min(65535), groups.div_ceil(65535))
+                    })
+                    .collect();
+                Some(wgpu_pass_times(device, &passes, warmup, n))
+            }
+            #[cfg(feature = "cuda")]
+            Runtime::Cuda(dev) => {
+                use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                for _ in 0..warmup {
+                    for &i in ks {
+                        self.run_cuda(dev, i);
+                    }
+                }
+                let evs: Vec<_> = (0..n)
+                    .map(|_| {
+                        let a = dev
+                            .stream
+                            .record_event(Some(CU_EVENT_DEFAULT))
+                            .expect("event");
+                        for &i in ks {
+                            self.run_cuda(dev, i);
+                        }
+                        let b = dev
+                            .stream
+                            .record_event(Some(CU_EVENT_DEFAULT))
+                            .expect("event");
+                        (a, b)
+                    })
+                    .collect();
+                dev.sync();
+                Some(
+                    evs.iter()
+                        .map(|(a, b)| a.elapsed_ms(b).expect("elapsed") as f64)
+                        .collect(),
+                )
+            }
+            #[cfg(feature = "opencl")]
+            Runtime::OpenCl(d) => {
+                for _ in 0..warmup {
+                    for &i in ks {
+                        self.run_opencl(d, i, false);
+                    }
+                }
+                d.sync();
+                Some(
+                    (0..n)
+                        .map(|_| ks.iter().map(|&i| self.run_opencl(d, i, true)).sum())
+                        .collect(),
+                )
+            }
+        }
+    }
+
     /// Lower `g` and tune it for `rt`: per kernel, the backend-native
     /// lowering is timed against the portable one and the faster kept.
     ///
@@ -1073,19 +1496,75 @@ impl Program {
             }
             #[cfg(feature = "cuda")]
             Runtime::Cuda(_) => {
-                use tang_compile::tensor::cuda::MMA_SHAPES;
+                use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
                 // variant 0: every kernel transpiled; 1 + v: the
-                // tensor-core tiles in block shape MMA_SHAPES[v]
-                let variants: Vec<WgslProgram> = std::iter::once(None)
-                    .chain((0..MMA_SHAPES.len()).map(Some))
-                    .map(|v| g.to_cuda_variant(outputs, v))
-                    .collect();
+                // tensor-core tiles in block shape MMA_SHAPES[v]; on
+                // Hopper, then every pairing of a wgmma tile shape
+                // (SM90_MMA_SHAPES) with a flash shape (SM90_FLASH_SHAPES)
+                let n = MMA_SHAPES.len()
+                    + if matches!(rt, Runtime::Cuda(d) if d.arch == "sm_90a") {
+                        SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
+                    } else {
+                        0
+                    };
+                let sm = match rt {
+                    Runtime::Cuda(d) => d
+                        .arch
+                        .trim_start_matches("sm_")
+                        .trim_end_matches('a')
+                        .parse()
+                        .unwrap_or(0),
+                    #[allow(unreachable_patterns)]
+                    _ => 0,
+                };
+                let variants: Vec<WgslProgram> =
+                    tang_compile::tensor::cuda::with_cuda_sm(sm, || {
+                        std::iter::once(None)
+                            .chain((0..n).map(Some))
+                            .map(|v| g.to_cuda_variant(outputs, v))
+                            .collect()
+                    });
                 Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, cache)
             }
             // one lowering on OpenCL
             #[cfg(feature = "opencl")]
             Runtime::OpenCl(_) => (Self::compile(rt, g, outputs, inputs), TuneReport::default()),
         }
+    }
+
+    /// [`tuned`](Self::tuned) on CUDA for a graph scheduled by `TensorGraph::place`:
+    /// the variants keep that placement's `nest` decision.
+    #[cfg(feature = "cuda")]
+    pub fn tuned_placed(
+        rt: &Runtime,
+        g: &TensorGraph,
+        outputs: &[TensorId],
+        inputs: &[&[f32]],
+        nest: bool,
+    ) -> (Self, TuneReport) {
+        use tang_compile::tensor::cuda::{MMA_SHAPES, SM90_FLASH_SHAPES, SM90_MMA_SHAPES};
+        let Runtime::Cuda(d) = rt else {
+            panic!("tuned_placed needs the CUDA runtime");
+        };
+        let n = MMA_SHAPES.len()
+            + if d.arch == "sm_90a" {
+                SM90_MMA_SHAPES.len() * SM90_FLASH_SHAPES.len()
+            } else {
+                0
+            };
+        let sm = d
+            .arch
+            .trim_start_matches("sm_")
+            .trim_end_matches('a')
+            .parse()
+            .unwrap_or(0);
+        let variants: Vec<WgslProgram> = tang_compile::tensor::cuda::with_cuda_sm(sm, || {
+            std::iter::once(None)
+                .chain((0..n).map(Some))
+                .map(|v| g.to_cuda_placed(outputs, nest, v))
+                .collect()
+        });
+        Self::tune_variants(rt, variants, "tang-cuda-tuning", inputs, None)
     }
 
     /// Pick a variant per kernel. `variants[0]` is the portable lowering,
@@ -1210,6 +1689,121 @@ impl Program {
     }
 }
 
+/// `warmup + n` back-to-back compute passes, each running `passes` (one
+/// dispatch per entry); the last `n` are bracketed by timestamp writes.
+/// Returns their GPU times in ms. Passes go in submissions of at most
+/// [`PASSES_PER_SUBMIT`]: wgpu's Metal backend opens a command buffer per
+/// pass and a Metal queue has 64, so thousands of passes in one encoder
+/// would wait forever for a buffer that is only freed once submitted.
+fn wgpu_pass_times(
+    device: &GpuDevice,
+    passes: &[(wgpu::ComputePipeline, wgpu::BindGroup, u32, u32)],
+    warmup: usize,
+    n: usize,
+) -> Vec<f64> {
+    const PASSES_PER_SUBMIT: usize = 32;
+    // one query set holds at most 4096 timestamps: chunk long runs
+    const PER_SET: usize = 2048;
+    let period = device.queue.get_timestamp_period() as f64;
+    let new_enc = || {
+        device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+    };
+    let record = |enc: &mut wgpu::CommandEncoder, tw: Option<wgpu::ComputePassTimestampWrites>| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tang-gpu timed"),
+            timestamp_writes: tw,
+        });
+        for (pipe, bind, x, y) in passes {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(*x, *y, 1);
+        }
+    };
+    let mut left = warmup;
+    while left > 0 {
+        let m = left.min(PASSES_PER_SUBMIT);
+        left -= m;
+        let mut enc = new_enc();
+        for _ in 0..m {
+            record(&mut enc, None);
+        }
+        device.queue.submit(std::iter::once(enc.finish()));
+        // short waits: wgpu gives up on one long one
+        if device.device.poll(wgpu::PollType::Wait).is_err() {
+            return Vec::new();
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let m = left.min(PER_SET);
+        left -= m;
+        let qs = device.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("tang-gpu timer"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2 * m as u32,
+        });
+        let bytes = (2 * m * 8) as u64;
+        let resolve = device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tang-gpu timer resolve"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tang-gpu timer read"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut r = 0;
+        while r < m {
+            let mut enc = new_enc();
+            let stop = (r + PASSES_PER_SUBMIT).min(m);
+            for q in r..stop {
+                record(
+                    &mut enc,
+                    Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &qs,
+                        beginning_of_pass_write_index: Some(2 * q as u32),
+                        end_of_pass_write_index: Some(2 * q as u32 + 1),
+                    }),
+                );
+            }
+            r = stop;
+            if r == m {
+                enc.resolve_query_set(&qs, 0..2 * m as u32, &resolve, 0);
+                enc.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+            }
+            device.queue.submit(std::iter::once(enc.finish()));
+            if device.device.poll(wgpu::PollType::Wait).is_err() {
+                return Vec::new();
+            }
+        }
+        let slice = read.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.is_ok());
+        });
+        if device.device.poll(wgpu::PollType::Wait).is_err() || rx.try_recv() != Ok(true) {
+            // a kernel that faulted or hung: no times, so it never wins
+            return Vec::new();
+        }
+        {
+            let data = slice.get_mapped_range();
+            let ticks: &[u64] = bytemuck::cast_slice(&data);
+            for q in 0..m {
+                let dt = ticks[2 * q + 1].saturating_sub(ticks[2 * q]) as f64;
+                out.push(dt * period * 1e-6);
+            }
+        }
+        read.unmap();
+    }
+    out
+}
+
 fn time_with(rt: &Runtime, iters: usize, f: impl Fn()) -> f64 {
     for _ in 0..3 {
         f();
@@ -1265,8 +1859,16 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
         Format::BF16 => bf16_bits(x as f64) as u32,
         _ => f16_bits(x as f64) as u32,
     };
+    if format.is_fp8() {
+        let x: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+        return tang_compile::tensor::precision::pack_fp8(format, &x)
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+    }
     match format {
         Format::F32 => std::borrow::Cow::Borrowed(data),
+        f if f.is_block() => std::borrow::Cow::Borrowed(data),
         _ => data
             .chunks(2)
             .map(|p| f32::from_bits(bits(p[0]) | p.get(1).map_or(0, |&x| bits(x) << 16)))
@@ -1279,8 +1881,23 @@ fn pack_words(format: Format, data: &[f32]) -> std::borrow::Cow<'_, [f32]> {
 fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
     match format {
         Format::F32 => words[..n].to_vec(),
+        Format::Q8x32 => {
+            let bytes: &[u8] = bytemuck::cast_slice(words);
+            let sc: &[f32] = bytemuck::cast_slice(&bytes[n..n + n / 32 * 8]);
+            (0..n)
+                .map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2])
+                .collect()
+        }
+        Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
         Format::F16 => unpack_f16(words, n),
-        Format::BF16 => words
+        f if f.is_fp8() => {
+            let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();
+            tang_compile::tensor::precision::unpack_fp8(f, &w, n)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect()
+        }
+        _ => words
             .iter()
             .flat_map(|w| {
                 let b = w.to_bits();
@@ -1381,6 +1998,139 @@ mod tests {
         assert_eq!(q.read(&rt, c), first);
     }
 
+    #[test]
+    fn swap_ping_pongs_an_input_and_an_output() {
+        let Ok(rt) = Runtime::select() else { return };
+        let mut g = TensorGraph::new();
+        let p = g.input(&[8]);
+        let x = g.input(&[8]);
+        let y = g.map(&[p, x], |v| v[0] * v[1]).unwrap();
+        let p0: Vec<f32> = (0..8).map(|i| i as f32 * 0.5 - 1.0).collect();
+        let x0: Vec<f32> = (0..8).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let mut prog = Program::compile(&rt, &g, &[y], &[&p0, &x0]);
+        // a recorded run holds the old bindings: the swap drops it
+        if rt.wgpu_parts().is_some() {
+            prog.capture(&rt);
+        }
+        prog.run(&rt);
+        prog.swap(prog.input(0), y);
+        let want: Vec<f32> = p0.iter().zip(&x0).map(|(p, x)| p * x).collect();
+        assert_eq!(prog.read(&rt, prog.input(0)), want);
+        assert_eq!(prog.read(&rt, y), p0);
+        prog.run(&rt);
+        let want: Vec<f32> = want.iter().zip(&x0).map(|(p, x)| p * x).collect();
+        assert_eq!(prog.read(&rt, y), want);
+    }
+
+    /// CUDA: a chain of kernels fused into persistent segments
+    /// (`Program::megakernel`), whole and split at big kernels, gives the
+    /// same bits as launching them one by one, and stays correct across
+    /// runs (the barrier state resets itself).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_shared_context_runs_on_callers_stream() {
+        use cudarc::driver::CudaContext;
+        if !CudaDevice::has_nvrtc() {
+            return;
+        }
+        let Ok(ctx) = std::panic::catch_unwind(|| CudaContext::new(0)).map(|r| r.ok()) else {
+            return;
+        };
+        let Some(ctx) = ctx else { return };
+        // the caller's context and stream, as phyz-gpu would own them
+        let stream = ctx.new_stream().unwrap();
+        let rt = Runtime::cuda_from_stream(ctx.clone(), stream.clone()).unwrap();
+        let d = rt.cuda_device().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&d.ctx, &ctx));
+        assert!(std::sync::Arc::ptr_eq(&d.stream, &stream));
+        let mut g = TensorGraph::new();
+        let a = g.input(&[16, 8]);
+        let b = g.input(&[8, 4]);
+        let out = g.matmul(a, b).unwrap();
+        let va: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
+        let vb: Vec<f32> = (0..32).map(|i| 1.0 - i as f32 * 0.03).collect();
+        let p = Program::compile(&rt, &g, &[out], &[&va, &vb]);
+        p.run(&rt);
+        // the caller takes the result device-to-device on its own stream
+        let res = p.cuda_slice(out).unwrap();
+        let copy = stream.clone_dtod(&res.slice(0..64)).unwrap();
+        let got = stream.clone_dtoh(&copy).unwrap();
+        assert_eq!(got, p.read(&rt, out));
+        for i in 0..16 {
+            for j in 0..4 {
+                let want: f32 = (0..8).map(|k| va[i * 8 + k] * vb[k * 4 + j]).sum();
+                assert!((got[i * 4 + j] - want).abs() < 1e-4, "{i},{j}");
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_megakernel_matches_launches() {
+        use tang_compile::tensor::cuda_mega::MegaOpts;
+        let Some(rt) = Runtime::cuda() else { return };
+        let mut g = TensorGraph::new();
+        let a = g.input(&[64, 32]);
+        let b = g.input(&[32, 48]);
+        let c = g.input(&[48, 40]);
+        let ab = g.matmul(a, b).unwrap();
+        let abc = g.matmul(ab, c).unwrap();
+        let ct = g.transpose(c, &[1, 0]).unwrap();
+        let out = g.matmul(abc, ct).unwrap();
+        let (g, outs) = g.substitute_maps(&[out]);
+        let fill = |n: usize, k: f32| {
+            (0..n)
+                .map(|i| (i as f32 * k).sin() * 0.5)
+                .collect::<Vec<f32>>()
+        };
+        let (va, vb, vc) = (
+            fill(64 * 32, 0.37),
+            fill(32 * 48, 0.11),
+            fill(48 * 40, 0.73),
+        );
+        // the decode lowering: warp kernels, the kind a megakernel fuses
+        let lower = || {
+            let dp = g.to_cuda_decode(
+                &outs,
+                &tang_compile::tensor::cuda_gemv::DecodeOpts::default(),
+            );
+            Program::new(&rt, dp.program, &[&va, &vb, &vc])
+        };
+        let want = {
+            let p = lower();
+            p.run(&rt);
+            p.read(&rt, outs[0])
+        };
+        // all fused; then cap at the smallest grid, so only that kernel is
+        // small enough and nothing fuses (a run of one stays a launch). The
+        // cap comes from the lowering, so grid changes there don't break it.
+        let grids: Vec<u32> = {
+            let p = lower();
+            p.program
+                .kernels
+                .iter()
+                .map(|k| k.count.div_ceil(k.workgroup_size))
+                .collect()
+        };
+        let smallest = *grids.iter().min().unwrap();
+        assert!(grids.len() >= 2, "grids {grids:?}");
+        assert_eq!(
+            grids.iter().filter(|&&b| b == smallest).count(),
+            1,
+            "grids {grids:?}"
+        );
+        for (max_blocks, fused) in [(0, 1), (smallest, grids.len())] {
+            let mut p = lower();
+            let (launches, phases, _) = p.megakernel(&rt, &MegaOpts::default(), 0, max_blocks);
+            assert_eq!(launches, fused, "max_blocks {max_blocks}");
+            assert_eq!(phases > 0, fused == 1);
+            for _ in 0..3 {
+                p.run(&rt);
+                assert_eq!(p.read(&rt, outs[0]), want, "max_blocks {max_blocks}");
+            }
+        }
+    }
+
     /// CUDA: f16 and bf16 storage (inputs, an intermediate and the
     /// output, with a half accumulator) matches the emulator.
     #[cfg(feature = "cuda")]
@@ -1406,6 +2156,7 @@ mod tests {
             let full = Precision {
                 storage: f,
                 accum: f,
+                operand: Format::F32,
             };
             for t in [a, b] {
                 g.set_precision(t, Precision::storage(f));

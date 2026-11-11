@@ -1,0 +1,27 @@
+torch 2.8.0+cu128 NVIDIA GeForce RTX 3090
+block fwd seq=128 fp32 eager: 0.797 ms
+block fwd+bwd seq=128 fp32 eager: 5.021 ms
+block fwd seq=128 tf32 eager: 0.912 ms
+block fwd+bwd seq=128 tf32 eager: 5.899 ms
+/usr/local/lib/python3.12/dist-packages/torch/_inductor/compile_fx.py:282: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+block fwd seq=128 fp32 compile: 0.396 ms
+block fwd+bwd seq=128 fp32 compile: 2.148 ms
+block fwd seq=128 tf32 compile: 0.410 ms
+block fwd+bwd seq=128 tf32 compile: 2.949 ms
+block fwd seq=128 fp32 graph: 0.271 ms
+block fwd+bwd seq=128 fp32 graph: 0.747 ms
+block fwd seq=128 tf32 graph: 0.163 ms
+block fwd+bwd seq=128 tf32 graph: 0.488 ms
+block fwd seq=512 fp32 eager: 0.799 ms
+block fwd+bwd seq=512 fp32 eager: 4.209 ms
+block fwd seq=512 tf32 eager: 0.841 ms
+block fwd+bwd seq=512 tf32 eager: 4.400 ms
+block fwd seq=512 fp32 compile: 0.464 ms
+block fwd+bwd seq=512 fp32 compile: 3.490 ms
+block fwd seq=512 tf32 compile: 0.407 ms
+block fwd+bwd seq=512 tf32 compile: 3.201 ms
+block fwd seq=512 fp32 graph: 0.592 ms
+block fwd+bwd seq=512 fp32 graph: 1.639 ms
+block fwd seq=512 tf32 graph: 0.401 ms
+block fwd+bwd seq=512 tf32 graph: 1.154 ms

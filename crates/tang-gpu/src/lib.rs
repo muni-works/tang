@@ -63,6 +63,7 @@
 //!     .fit(&device, &mut cache, &mut model, &mut loader);
 //! ```
 
+pub mod autotune;
 pub mod backward;
 pub mod buffer;
 /// CPU runtime: `to_c` compiled by the system compiler and `dlopen`ed.

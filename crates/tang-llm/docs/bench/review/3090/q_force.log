@@ -1,0 +1,6 @@
+dims: QwenDims { d_model: 4096, heads: 32, kv_heads: 8, head_dim: 128, ff: 12288, vocab: 151936, layers: 36, ctx: 4352, eps: 1e-6, theta: 1000000.0, kv_f16: true, vocab_chunks: 1, prefill_q4: false }
+runtime: NVIDIA GeForce RTX 3090 (CUDA sm_86)
+checkpoint read in 0.0s
+step seq 1 (window 4352): 584 kernels (584 native), lowered in 0.28s, compiled + bound in 0.04s, 5255 MB allocated (0 inputs shared)
+weights uploaded in 7.1s
+teacher-forced 277 tokens; on-device argmax equals the logits' argmax at 257/257

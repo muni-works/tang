@@ -71,6 +71,8 @@ impl ExprGraph {
                     let ga = self.mul(g, cos);
                     self.accumulate(&mut adj, a, ga);
                 }
+                // floor is piecewise constant: no gradient flows through it.
+                Node::Floor(_) => {}
                 Node::Atan2(y, x) => {
                     // ∂/∂y = x / (x² + y²), ∂/∂x = -y / (x² + y²)
                     let xx = self.mul(x, x);

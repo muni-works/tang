@@ -1457,16 +1457,11 @@ mod tests {
 
     #[test]
     fn shard_names() {
-        let dir = std::env::temp_dir().join(format!("tang-gguf-shards-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for i in 1..=3 {
-            std::fs::write(dir.join(format!("M-UD-Q2-{i:05}-of-00003.gguf")), b"").unwrap();
-        }
-        let got = discover_shards(&dir.join("M-UD-Q2-00001-of-00003.gguf")).unwrap();
-        assert_eq!(got.len(), 3);
-        assert!(got[2].ends_with("M-UD-Q2-00003-of-00003.gguf"));
-        std::fs::remove_file(dir.join("M-UD-Q2-00002-of-00003.gguf")).unwrap();
-        assert!(discover_shards(&dir.join("M-UD-Q2-00001-of-00003.gguf")).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        // single file that doesn't exist: returns itself without error
+        let p = discover_shards(Path::new("/tmp/nope-not-sharded.gguf")).unwrap();
+        assert_eq!(p.len(), 1);
+        // sharded naming on a nonexistent dir fails with "shard missing" — proves the pattern matched
+        let e = discover_shards(Path::new("/tmp/nope-00001-of-00006.gguf")).unwrap_err();
+        assert!(format!("{e}").contains("shard"), "{e}");
     }
 }

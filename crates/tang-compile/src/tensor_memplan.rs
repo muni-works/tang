@@ -27,10 +27,7 @@ use super::{Format, TensorGraph, TensorId};
 
 /// Bytes per element word: every slot is a run of 32-bit words.
 fn words(len: usize, format: Format) -> usize {
-    match format {
-        Format::F32 => len.max(1),
-        Format::F16 | Format::BF16 => len.div_ceil(2).max(1),
-    }
+    format.words(len).max(1)
 }
 
 /// Byte counts of a plan. Persistent: graph inputs (weights, optimizer
@@ -171,6 +168,17 @@ impl TensorGraph {
             .iter()
             .map(|k| buf_of(k.node).expect("kernel output buffer"))
             .collect();
+        // a multi-output kernel's further outputs (`WgslKernel::writes`)
+        let kernel_extra: Vec<Vec<usize>> = prog
+            .kernels
+            .iter()
+            .map(|k| {
+                k.writes
+                    .iter()
+                    .map(|&t| buf_of(t).expect("kernel output buffer"))
+                    .collect()
+            })
+            .collect();
 
         // donations that could be legal at all, by kernel
         let mut donation: Vec<Option<usize>> = vec![None; nk];
@@ -241,7 +249,11 @@ impl TensorGraph {
         let output_bufs: Vec<usize> = outputs.iter().filter_map(|&t| buf_of(t)).collect();
         let mut last_use = vec![None::<usize>; nb];
         for (p, &k) in order.iter().enumerate() {
-            for &b in kernel_reads[k].iter().chain([&kernel_out[k]]) {
+            for &b in kernel_reads[k]
+                .iter()
+                .chain([&kernel_out[k]])
+                .chain(&kernel_extra[k])
+            {
                 last_use[b] = Some(last_use[b].map_or(p, |l: usize| l.max(p)));
             }
         }
@@ -283,36 +295,38 @@ impl TensorGraph {
         }
         for (p, &k) in order.iter().enumerate() {
             let ob = kernel_out[k];
-            if slot[ob] == usize::MAX {
-                if let Some(db) = donation[k] {
-                    slot[ob] = slot[db];
-                    inplace.push((prog.buffers[ob].node, prog.buffers[db].node));
-                    inplace_words += w[ob];
-                } else {
-                    let need = w[ob];
-                    let fit = free
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, &s)| slot_words[s] >= need)
-                        .min_by_key(|&(_, &s)| slot_words[s])
-                        .map(|(i, _)| i);
-                    let pick = fit.or_else(|| {
-                        free.iter()
+            for (e, &ob) in std::iter::once(&ob).chain(&kernel_extra[k]).enumerate() {
+                if slot[ob] == usize::MAX {
+                    if let (0, Some(db)) = (e, donation[k]) {
+                        slot[ob] = slot[db];
+                        inplace.push((prog.buffers[ob].node, prog.buffers[db].node));
+                        inplace_words += w[ob];
+                    } else {
+                        let need = w[ob];
+                        let fit = free
+                            .iter()
                             .enumerate()
-                            .max_by_key(|&(_, &s)| slot_words[s])
-                            .map(|(i, _)| i)
-                    });
-                    let s = match pick {
-                        Some(i) => free.swap_remove(i),
-                        None => {
-                            slot_words.push(0);
-                            slot_input.push(None);
-                            slot_words.len() - 1
-                        }
-                    };
-                    slot_words[s] = slot_words[s].max(need);
-                    slot[ob] = s;
-                    live_words += need;
+                            .filter(|&(_, &s)| slot_words[s] >= need)
+                            .min_by_key(|&(_, &s)| slot_words[s])
+                            .map(|(i, _)| i);
+                        let pick = fit.or_else(|| {
+                            free.iter()
+                                .enumerate()
+                                .max_by_key(|&(_, &s)| slot_words[s])
+                                .map(|(i, _)| i)
+                        });
+                        let s = match pick {
+                            Some(i) => free.swap_remove(i),
+                            None => {
+                                slot_words.push(0);
+                                slot_input.push(None);
+                                slot_words.len() - 1
+                            }
+                        };
+                        slot_words[s] = slot_words[s].max(need);
+                        slot[ob] = s;
+                        live_words += need;
+                    }
                 }
             }
             peak = peak.max(live_words);

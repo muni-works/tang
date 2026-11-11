@@ -1,0 +1,107 @@
+{
+ "title": "H200 attn_bwd",
+ "kernels": [
+  {
+   "kernel": "main0@16384x256",
+   "launches": 1440,
+   "us": 5981.915888888908,
+   "total_ms": 8613.958880000027,
+   "mb": 30.92030667873303,
+   "floor_us": 6.4417305580693816,
+   "light": 0.001076867458139048,
+   "grid": "16384",
+   "block": "256",
+   "cls": "latency"
+  },
+  {
+   "kernel": "main0@1024x256",
+   "launches": 160,
+   "us": 11462.019718750003,
+   "total_ms": 1833.9231550000004,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "1024",
+   "block": "256",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@1024x128",
+   "launches": 160,
+   "us": 2118.0905125000018,
+   "total_ms": 338.89448200000027,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "1024",
+   "block": "128",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@512x128",
+   "launches": 160,
+   "us": 1199.963475,
+   "total_ms": 191.994156,
+   "mb": 149.23720436363638,
+   "floor_us": 31.091084242424245,
+   "light": 0.025910025505088183,
+   "grid": "512",
+   "block": "128",
+   "cls": "latency"
+  },
+  {
+   "kernel": "main0@32768x128",
+   "launches": 320,
+   "us": 390.3937000000001,
+   "total_ms": 124.92598400000003,
+   "mb": null,
+   "floor_us": null,
+   "light": null,
+   "grid": "32768",
+   "block": "128",
+   "cls": "?"
+  },
+  {
+   "kernel": "main0@512x256",
+   "launches": 160,
+   "us": 575.1936375000002,
+   "total_ms": 92.03098200000004,
+   "mb": 93.90409671111111,
+   "floor_us": 19.56335348148148,
+   "light": 0.03401176961294443,
+   "grid": "512",
+   "block": "256",
+   "cls": "latency"
+  },
+  {
+   "kernel": "main0@128x256",
+   "launches": 480,
+   "us": 14.413818749999997,
+   "total_ms": 6.918632999999999,
+   "mb": 1.9918023111111112,
+   "floor_us": 0.41495881481481484,
+   "light": 0.028788957458953403,
+   "grid": "128",
+   "block": "256",
+   "cls": "latency"
+  },
+  {
+   "kernel": "main0@32768x32",
+   "launches": 160,
+   "us": 21.5139,
+   "total_ms": 3.4422240000000004,
+   "mb": 70.14137173333333,
+   "floor_us": 14.612785777777777,
+   "light": 0.6792253277080296,
+   "grid": "32768",
+   "block": "32",
+   "cls": "traffic"
+  }
+ ],
+ "kernel_ms": 11206.088496000028,
+ "span_ms": 12471.93495,
+ "idle_ms": 1265.846454,
+ "launches": 3040,
+ "floor_mb": null,
+ "step_ms": null
+}

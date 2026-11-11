@@ -45,6 +45,10 @@ use tang_compile::tensor::wgsl::WgslProgram;
 use tang_compile::tensor::{Arg, Form, Monoid, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 
+/// The same model as one full-sequence graph, its step derived.
+#[path = "ir_qwen_prefill.rs"]
+pub mod prefill;
+
 /// Quantization group: one scale and bias per 64 weights of a row.
 pub const GROUP: usize = 64;
 
@@ -148,16 +152,20 @@ impl DecodeGraph {
             .unwrap_or_else(|| panic!("no input {name}"))
     }
 
-    /// `(output, input)` pairs written in place: `state` and the caches.
+    /// `(output, input)` pairs written in place: `state` (when the graph
+    /// has one; a derived step does not) and the caches.
     pub fn inplace(&self) -> Vec<(TensorId, usize)> {
-        let mut v = vec![(self.outputs[1], self.input("state"))];
-        for l in 0..(self.outputs.len() - 2) / 2 {
+        let state = self.inputs.iter().position(|s| s.name == "state");
+        let base = if state.is_some() { 2 } else { 1 };
+        let mut v: Vec<(TensorId, usize)> =
+            state.map(|k| (self.outputs[1], k)).into_iter().collect();
+        for l in 0..(self.outputs.len() - base) / 2 {
             v.push((
-                self.outputs[2 + 2 * l],
+                self.outputs[base + 2 * l],
                 self.input(&format!("model.layers.{l}.k_cache")),
             ));
             v.push((
-                self.outputs[3 + 2 * l],
+                self.outputs[base + 1 + 2 * l],
                 self.input(&format!("model.layers.{l}.v_cache")),
             ));
         }
@@ -185,6 +193,7 @@ fn arg(src: TensorId, forms: Vec<Form>) -> Arg {
     Arg {
         src,
         view: View {
+            gather: None,
             guard: false,
             forms,
         },
@@ -547,7 +556,14 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         let kn = b.input(p("k_norm"), &[hd], None);
         let kv = dims.kv_f16.then_some(Packing::F16);
         let k_cache = b.input(p("k_cache"), &[kvh, ctx, 2, half], kv);
-        let v_cache = b.input(p("v_cache"), &[kvh, hd, ctx], kv);
+        // V cache key-major ([kvh, ctx, hd], like K) under the fused
+        // attention, whose threads walk the head dim: one contiguous row
+        // per key. Otherwise [kvh, hd, ctx]: the P·V warps walk the keys
+        let vt = std::env::var("TANG_FUSED_ATTN").as_deref() == Ok("1");
+        let vc_shape = if vt { [kvh, ctx, hd] } else { [kvh, hd, ctx] };
+        // (d, j) of a V-cache coordinate pair -> its two view slots
+        let vdj = |d: Form, j: Form| if vt { [j, d] } else { [d, j] };
+        let v_cache = b.input(p("v_cache"), &vc_shape, kv);
 
         let normed = b.rms_norm(x, seq, 0, d, ln1, eps);
         let normed = Rows {
@@ -654,7 +670,6 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
         // j − p0 — a runtime offset, so a sum over the chunk with one live
         // term (`pick`) that the lowering runs as a one-iteration loop
         let kc_shape = [kvh, ctx, 2, half];
-        let vc_shape = [kvh, hd, ctx];
         let (k_val, v_val) = if seq == 1 {
             (
                 arg(
@@ -663,7 +678,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 ),
                 arg(
                     qkv,
-                    vec![Form::zero(3), form(3, &[(0, hd as i64), (1, 1)], v_off)],
+                    vec![
+                        Form::zero(3),
+                        form(3, &[(0, hd as i64), (if vt { 2 } else { 1 }, 1)], v_off),
+                    ],
                 ),
             )
         } else {
@@ -686,8 +704,12 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     },
                 )
                 .unwrap();
-            let sp = [kvh, hd, ctx, seq];
-            let (j, t) = (b.g.iota(&sp, 2), b.g.iota(&sp, 3));
+            let sp = if vt {
+                [kvh, ctx, hd, seq]
+            } else {
+                [kvh, hd, ctx, seq]
+            };
+            let (j, t) = (b.g.iota(&sp, if vt { 1 } else { 2 }), b.g.iota(&sp, 3));
             let vp =
                 b.g.comp(
                     &vc_shape,
@@ -695,7 +717,10 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                     vec![
                         arg(
                             qkv,
-                            vec![unit(4, 3), form(4, &[(0, hd as i64), (1, 1)], v_off)],
+                            vec![
+                                unit(4, 3),
+                                form(4, &[(0, hd as i64), (if vt { 2 } else { 1 }, 1)], v_off),
+                            ],
                         ),
                         arg(j, ident(4)),
                         arg(t, ident(4)),
@@ -725,7 +750,7 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 |v| vec![in_step(lenv(v[3]), v[2], v[0], v[1])],
             )
             .unwrap();
-        let jv_iota = b.g.iota(&vc_shape, 2);
+        let jv_iota = b.g.iota(&vc_shape, if vt { 1 } else { 2 });
         let v_new =
             b.g.comp(
                 &vc_shape,
@@ -784,43 +809,78 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
             }
             a
         };
-        let m =
-            b.g.comp(
-                &[seq, kvh, per],
-                &[kctx],
-                s_args(None),
-                Some(Monoid::max()),
-                |v| {
-                    let c = visible(v[3], v[1], v[2]);
-                    vec![select(c, v[0], lit(-1e30))]
-                },
-            )
-            .unwrap();
-        let lsum =
-            b.g.comp(
-                &[seq, kvh, per],
-                &[kctx],
-                s_args(Some(m)),
-                Some(Monoid::sum()),
-                |v| {
-                    let c = visible(v[3], v[1], v[2]);
-                    vec![select(c, (v[0] - v[4]).exp(), lit(0.0))]
-                },
-            )
-            .unwrap();
+        // (m, l): the max and the sum of exp(s − m), as two reductions, or
+        // (TANG_ONLINE_ML=1, decode) one online-softmax reduction with
+        // state (m, l) — one pass over the scores instead of two
+        let online = seq == 1 && std::env::var("TANG_ONLINE_ML").as_deref() == Ok("1");
+        let (m, lsum, m_slot, l_slot) = if online {
+            let mut mono = Monoid::online_softmax(1);
+            // a finite identity: two empty states combine to (−1e30, 0),
+            // not −inf − −inf
+            mono.identity[0] = -1e30;
+            let ml =
+                b.g.comp_tuple(
+                    &[seq, kvh, per, 2],
+                    &[kctx],
+                    s_args(None),
+                    Some(mono),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, v[0], lit(-1e30)), select(c, lit(1.0), lit(0.0))]
+                    },
+                )
+                .unwrap();
+            (ml, ml, Some(0), Some(1))
+        } else {
+            let m =
+                b.g.comp(
+                    &[seq, kvh, per],
+                    &[kctx],
+                    s_args(None),
+                    Some(Monoid::max()),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, v[0], lit(-1e30))]
+                    },
+                )
+                .unwrap();
+            let lsum =
+                b.g.comp(
+                    &[seq, kvh, per],
+                    &[kctx],
+                    s_args(Some(m)),
+                    Some(Monoid::sum()),
+                    |v| {
+                        let c = visible(v[3], v[1], v[2]);
+                        vec![select(c, (v[0] - v[4]).exp(), lit(0.0))]
+                    },
+                )
+                .unwrap();
+            (m, lsum, None, None)
+        };
         // attn[t, kvh, r, c] = Σ_j p·v / l: space (t, kvh, r, c, j)
         let sp = [seq, kvh, per, hd, kctx];
         let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
         let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
+        let at = |slot: Option<i64>| {
+            let mut f = mlv.clone();
+            if let Some(k) = slot {
+                f.push(Form::constant(5, k));
+            }
+            f
+        };
         let attn =
             b.g.comp(
                 &[seq, kvh, per, hd],
                 &[kctx],
                 vec![
                     arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
-                    arg(m, mlv.clone()),
-                    arg(lsum, mlv),
-                    arg(v_new, vec![unit(5, 1), unit(5, 3), unit(5, 4)]),
+                    arg(m, at(m_slot)),
+                    arg(lsum, at(l_slot)),
+                    arg(v_new, {
+                        let [a, c] = vdj(unit(5, 3), unit(5, 4));
+                        vec![unit(5, 1), a, c]
+                    }),
                     arg(to, ident(5)),
                     arg(jo, ident(5)),
                     len_at(5),
@@ -833,6 +893,60 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
                 },
             )
             .unwrap();
+        // TANG_FUSED_ATTN=1 (decode): attention as one online-softmax
+        // reduction over the keys per output (t, kvh, r, c) — state
+        // (m, Σp·v_c, Σp), element (s, v_c, 1) — then acc / l. The scores
+        // stay a reduction the fold reads; the decode lowering computes
+        // them once per key and shares them across c
+        // (`shared_reduction`)
+        let attn = if seq == 1 && std::env::var("TANG_FUSED_ATTN").as_deref() == Ok("1") {
+            let mut mono = Monoid::online_softmax(2);
+            mono.identity[0] = -1e30;
+            let state =
+                b.g.comp_tuple(
+                    &[seq, kvh, per, hd, 3],
+                    &[kctx],
+                    vec![
+                        arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
+                        arg(v_new, {
+                            let [a, c] = vdj(unit(5, 3), unit(5, 4));
+                            vec![unit(5, 1), a, c]
+                        }),
+                        arg(to, ident(5)),
+                        arg(jo, ident(5)),
+                        len_at(5),
+                    ],
+                    Some(mono),
+                    |v| {
+                        let c = visible(v[4], v[2], v[3]);
+                        vec![
+                            select(c, v[0], lit(-1e30)),
+                            select(c, v[1], lit(0.0)),
+                            select(c, lit(1.0), lit(0.0)),
+                        ]
+                    },
+                )
+                .unwrap();
+            let sl = |k: i64| {
+                vec![
+                    unit(4, 0),
+                    unit(4, 1),
+                    unit(4, 2),
+                    unit(4, 3),
+                    Form::constant(4, k),
+                ]
+            };
+            b.g.comp(
+                &[seq, kvh, per, hd],
+                &[],
+                vec![arg(state, sl(1)), arg(state, sl(2))],
+                None,
+                |v| vec![v[0] / v[1]],
+            )
+            .unwrap()
+        } else {
+            attn
+        };
         let attn = b.g.reshape(attn, &[seq, q_rows]).unwrap();
         let attn = Rows {
             src: attn,
@@ -971,6 +1085,63 @@ pub fn step_graph(dims: &QwenDims, seq: usize, kctx: usize) -> DecodeGraph {
 /// stored f16 when `half_tiles` (CUDA's m16n8k16 tiles; Metal's
 /// simdgroup tile stages f32). Returns the graph and its outputs:
 /// `dg.outputs` (same order), then `dg.keep`, then `dg.logit_chunks`.
+/// Schedule (decode): split-K every reduction that reads a 4-bit weight
+/// (directly or through its dequantization map) whose output has fewer
+/// than `target` points, into the smallest power-of-two number of chunks
+/// that reaches `target` (dividing its outermost reduce axis, at most
+/// 16): a GEMV over few rows (q|k|v: 6144, o: 4096) otherwise has too
+/// few warps in flight for its long K.
+pub fn split_gemvs(
+    mut g: TensorGraph,
+    mut outs: Vec<TensorId>,
+    dg: &DecodeGraph,
+    target: usize,
+) -> (TensorGraph, Vec<TensorId>) {
+    use tang_compile::tensor::Op;
+    let u4: Vec<usize> = dg
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.packing == Some(Packing::U4))
+        .map(|(k, _)| k)
+        .collect();
+    // (node, parts) of the next GEMV to split; the graph is dead-code
+    // free here and after each split, and a split node becomes the
+    // combine (which reads no weight)
+    let next = |g: &TensorGraph| -> Option<(usize, usize)> {
+        let is_u4 = |j: usize| matches!(g.nodes()[j].op, Op::Input(k) if u4.contains(&k));
+        let weight = |j: usize| {
+            is_u4(j)
+                || g.comp_at(j).is_some_and(|c| {
+                    c.monoid.is_none() && c.args.iter().any(|a| is_u4(a.src.index()))
+                })
+        };
+        (0..g.nodes().len()).find_map(|i| {
+            let c = g.comp_at(i)?;
+            if c.monoid.is_none() || c.tuple > 1 || !c.args.iter().any(|a| weight(a.src.index())) {
+                return None;
+            }
+            let points: usize = g.nodes()[i].shape.iter().map(|d| d.n()).product();
+            let r0 = c.red[0].n();
+            let mut p = 1;
+            while points * p < target && p < 16 && r0 % (p * 2) == 0 && r0 / (p * 2) >= 2 {
+                p *= 2;
+            }
+            (p > 1).then_some((i, p))
+        })
+    };
+    while let Some((t, p)) = next(&g) {
+        match g.split_reduction(&outs, TensorId::from_index(t), p) {
+            Ok((g2, o2)) => {
+                g = g2;
+                outs = o2;
+            }
+            Err(_) => break,
+        }
+    }
+    (g, outs)
+}
+
 pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<TensorId>) {
     let all: Vec<TensorId> = dg
         .outputs
@@ -981,6 +1152,14 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .collect();
     let (g, outs) = dg.g.substitute_maps(&all);
     let (g, outs) = g.eliminate_common(&outs);
+    // decode: split-K over the cache axis — attention's reductions over
+    // the `kctx` keys run as P partial chunks plus a combine with each
+    // one's own monoid (`TANG_DECODE_SPLIT=P`, off by default)
+    let (g, outs) = if dg.seq == 1 {
+        split_cache_axis(g, outs, dg.kctx, decode_split(dg.kctx))
+    } else {
+        (g, outs)
+    };
     // gate|up as one tuple-valued matmul: CUDA's tiles take it; Metal's
     // simdgroup tile takes one output, so a prefill there keeps them apart
     let (g, outs) = if dg.seq > 1 && !half_tiles {
@@ -988,11 +1167,127 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         g.merge_siblings(&outs)
     };
-    let (mut g, outs) = if dg.seq > 1 {
+    // (scaled: a derived window's projections read `x[t, 64·g + j]`; the
+    // OpenCL 4-bit prefill evaluates the grouped weight where it loads it,
+    // so its reduce dims stay apart)
+    let (mut g, mut outs) = if dg.seq > 1 && !dg.q4 {
+        g.merge_reduce_dims_scaled(&outs)
+    } else if dg.seq > 1 {
         g.merge_reduce_dims(&outs)
     } else {
         (g, outs)
     };
+    // decode split-K of the 4-bit GEMVs (see `split_gemvs`)
+    if dg.seq == 1 {
+        // CUDA default: 16384 (q|k|v and o split 4 ways, down 4)
+        let target = std::env::var("TANG_SPLIT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if half_tiles { 16384 } else { 0 });
+        if target > 0 {
+            (g, outs) = split_gemvs(g, outs, dg, target);
+        }
+        // a reduction to a few points over a long axis (the argmax over
+        // the vocabulary: one block, 32 us on the 3090) split into up to
+        // 128 chunks (CUDA default; TANG_SPLIT_WIDE=0 keeps it whole)
+        if half_tiles && std::env::var("TANG_SPLIT_WIDE").as_deref() != Ok("0") {
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find_map(|i| {
+                    let c = g.comp_at(i)?;
+                    let n: usize = g.nodes()[i].shape.iter().map(|d| d.n()).product();
+                    if c.monoid.is_none()
+                        || c.tuple > 1
+                        || c.red.len() != 1
+                        || n > 64
+                        || c.red[0].n() < 65536
+                    {
+                        return None;
+                    }
+                    let k = c.red[0].n();
+                    let p = (1..=7)
+                        .rev()
+                        .map(|e| 1usize << e)
+                        .find(|&p| k % p == 0 && k / p >= 512)?;
+                    Some((i, p))
+                })
+            };
+            while let Some((t, p)) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), p) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // TANG_SPLIT_ATTN=P: the reductions over the KV cache (keys >=
+        // 4096, no weight read) split-K into P chunks
+        let attn: usize = std::env::var("TANG_SPLIT_ATTN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // TANG_ATTN_SPLIT=P: online-softmax reductions over at least 1024
+        // keys (fused attention) split-KV into P chunks; the combine is the
+        // monoid's rescale-and-add
+        let kv_split: usize = std::env::var("TANG_ATTN_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if kv_split > 1 {
+            use tang_compile::tensor::MonoidKind;
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find(|&i| {
+                    g.comp_at(i).is_some_and(|c| {
+                        c.monoid.as_ref().map(|m| m.kind()) == Some(MonoidKind::OnlineSoftmax)
+                            && c.red.len() == 1
+                            && c.red[0].n() >= 1024
+                            && c.red[0].n() % kv_split == 0
+                    })
+                })
+            };
+            while let Some(t) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), kv_split) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // TANG_SPLIT_ATTN_MIN_POINTS: only reductions with at least this
+        // many points (1024: P.V, not the softmax statistics)
+        let min_pts: usize = std::env::var("TANG_SPLIT_ATTN_MIN_POINTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if attn > 1 {
+            let next = |g: &TensorGraph| {
+                (0..g.nodes().len()).find(|&i| {
+                    g.comp_at(i).is_some_and(|c| {
+                        c.monoid.is_some()
+                            && c.tuple <= 1
+                            && c.red.len() == 1
+                            && c.red[0].n() >= 4096
+                            && c.red[0].n() % attn == 0
+                            && (min_pts..65536).contains(
+                                &g.nodes()[i].shape.iter().map(|d| d.n()).product::<usize>(),
+                            )
+                    })
+                })
+            };
+            while let Some(t) = next(&g) {
+                match g.split_reduction(&outs, TensorId::from_index(t), attn) {
+                    Ok((g2, o2)) => {
+                        g = g2;
+                        outs = o2;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
     g.schedule_inline(&outs);
     g.schedule_epilogues(&outs);
     // the norms feeding a 4-bit GEMV and the roped key of a cache update
@@ -1005,7 +1300,20 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
         .map(|(k, _)| k)
         .collect();
     let caches = outs[1..dg.outputs.len()].to_vec();
-    g.schedule_decode_maps(&outs, &u4, &caches);
+    // the norms recomputed inside every GEMV lane (TANG_DECODE_MAPS=1),
+    // or materialized once by a small map kernel (=0). CUDA decode
+    // defaults to materialized: with 8 GEMV rows per warp the lanes are
+    // bound by their loads, and recomputing the norm doubles the
+    // activation bytes each one streams (7.80 -> 7.22 ms per Qwen3-8B
+    // step on the 3090)
+    let maps = match std::env::var("TANG_DECODE_MAPS").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => !(half_tiles && dg.seq == 1),
+    };
+    if maps {
+        g.schedule_decode_maps(&outs, &u4, &caches);
+    }
     if dg.q4 {
         // a prefill over packed weights: the dequantization maps are
         // evaluated where the matmul loads the packed words, and the
@@ -1047,6 +1355,163 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             g.set_inline(TensorId::from_index(i), true);
         }
     }
+    // a sum reduction read by an online-softmax reduction is recomputed in
+    // it (the shared producer of `shared_reduction`: attention's scores)
+    if dg.seq == 1 {
+        use tang_compile::tensor::MonoidKind;
+        let n = g.nodes().len();
+        for i in 0..n {
+            let Some(c) = g.comp_at(i) else { continue };
+            if c.monoid.as_ref().map(|m| m.kind()) != Some(MonoidKind::OnlineSoftmax) {
+                continue;
+            }
+            let prods: Vec<usize> = c
+                .args
+                .iter()
+                .map(|a| a.src.index())
+                .filter(|&p| {
+                    g.comp_at(p)
+                        .and_then(|pc| pc.monoid.as_ref())
+                        .map(|m| m.kind())
+                        == Some(MonoidKind::Sum)
+                })
+                .collect();
+            for p in prods {
+                g.set_inline(TensorId::from_index(p), true);
+            }
+            g.set_inline(TensorId::from_index(i), false);
+        }
+    }
+    // CUDA decode, opt-in (TANG_SPLIT_FUSE=1): a split reduction's partial
+    // read only by its combine (a sum over the parts) is inlined there and
+    // the two run as one kernel (`split_fused`: the warp that finishes a
+    // group's last part sums them). Correct, but slower on the 3090 (the
+    // per-warp fence and arrival counter cost more than the combine launch
+    // in a CUDA graph: 6.86 vs 6.71 ms at 64), and a partial that lowers
+    // with a block split (few groups: the tiny model) has no fused form
+    if dg.seq == 1 && half_tiles && std::env::var("TANG_SPLIT_FUSE").as_deref() == Ok("1") {
+        use tang_compile::tensor::MonoidKind;
+        let n = g.nodes().len();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if let Some(c) = g.comp_at(i) {
+                for a in &c.args {
+                    readers[a.src.index()].push(i);
+                }
+            }
+        }
+        for ci in 0..n {
+            let Some(c) = g.comp_at(ci) else { continue };
+            if c.monoid.as_ref().map(|m| m.kind()) != Some(MonoidKind::Sum)
+                || c.red.len() != 1
+                || c.args.len() != 1
+                || c.tuple != 0
+            {
+                continue;
+            }
+            let p = c.args[0].src.index();
+            let Some(pc) = g.comp_at(p) else { continue };
+            let parts = c.red[0].n();
+            let split_shaped = pc.monoid.is_some()
+                && pc.tuple == 0
+                && pc.out.first().map(|d| d.n()) == Some(parts)
+                && pc.out.len() == c.out.len() + 1;
+            if split_shaped
+                && !g.nodes()[p].inline
+                && readers[p] == [ci]
+                && !outs.iter().any(|o| o.index() == p)
+            {
+                g.set_inline(TensorId::from_index(p), true);
+            }
+        }
+    }
+    // CUDA decode: a small Sum/Max reduction (RMSNorm's sum of squares,
+    // per-head q/k-norm statistics) read only by maps that are kernels of
+    // their own is recomputed inside each of them, staged once per block
+    // in shared memory (`staged_map`), instead of launched on its own
+    if dg.seq == 1 && half_tiles && std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+        use tang_compile::tensor::{numel, MonoidKind};
+        let n = g.nodes().len();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if let Some(c) = g.comp_at(i) {
+                for a in &c.args {
+                    readers[a.src.index()].push(i);
+                }
+            }
+        }
+        let protected: Vec<usize> = outs.iter().map(|t| t.index()).collect();
+        let cache_nodes: Vec<usize> = caches
+            .iter()
+            .flat_map(|t| [t.index(), g.storage(*t).index()])
+            .collect();
+        // a map read only by in-place cache updates (the roped key) is
+        // evaluated in them
+        for (i, rd) in readers.iter().enumerate() {
+            let Some(c) = g.comp_at(i) else { continue };
+            if c.monoid.is_none()
+                && c.tuple == 0
+                && !g.nodes()[i].inline
+                && !protected.contains(&i)
+                && !rd.is_empty()
+                && rd.iter().all(|r| cache_nodes.contains(r))
+            {
+                g.set_inline(TensorId::from_index(i), true);
+            }
+        }
+        // the non-inline comps a value reaches through inline maps
+        fn finals(g: &TensorGraph, readers: &[Vec<usize>], i: usize, out: &mut Vec<usize>) -> bool {
+            for &r in &readers[i] {
+                let Some(rc) = g.comp_at(r) else { return false };
+                if rc.monoid.is_some() {
+                    return false;
+                }
+                if g.nodes()[r].inline {
+                    if !finals(g, readers, r, out) {
+                        return false;
+                    }
+                } else if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+            true
+        }
+        for p in 0..n {
+            let Some(pc) = g.comp_at(p) else { continue };
+            let kind = pc.monoid.as_ref().map(|m| m.kind());
+            if !matches!(kind, Some(MonoidKind::Sum | MonoidKind::Max))
+                || g.nodes()[p].inline
+                || protected.contains(&p)
+                || pc.body_outs.len() != 1
+                || pc.tuple != 0
+                || numel(&pc.out) > 1024
+            {
+                continue;
+            }
+            let mut fs = Vec::new();
+            if readers[p].is_empty() || !finals(&g, &readers, p, &mut fs) {
+                continue;
+            }
+            // recomputed per consumer block: bounded work (the norms'
+            // statistics, not softmax's max over the keys)
+            let work = numel(&pc.out) * numel(&pc.red);
+            // (an in-place cache update visits one row of its longest dim)
+            let blocks = |f: usize| {
+                let out = &g.comp_at(f).unwrap().out;
+                let n = numel(out);
+                let n = if cache_nodes.contains(&f) {
+                    n / out.iter().map(|d| d.n()).max().unwrap_or(1)
+                } else {
+                    n
+                };
+                n.div_ceil(256)
+            };
+            if work > 1 << 16 || fs.iter().any(|&f| work * blocks(f) > 1 << 21) {
+                continue;
+            }
+            g.set_inline(TensorId::from_index(p), true);
+        }
+    }
     if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
         // prefill: the dequantized weights stored f16, so the matmuls run
         // on f16 tensor cores (the f32 activations are converted while
@@ -1065,6 +1530,44 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
                 g.set_precision(TensorId::from_index(i), Precision::storage(Format::F16));
             }
         }
+    }
+    (g, outs)
+}
+
+/// Split-K parts for a decode step over `kctx` cache rows:
+/// `$TANG_DECODE_SPLIT` (default 1 = off). The chunks are sized off
+/// `kctx`, not the runtime length, so at short contexts most are empty
+/// and the split costs more than it gives (3090: −10% at 1k–16k with
+/// ctx 33k, +11% at 32k).
+pub fn decode_split(_kctx: usize) -> usize {
+    std::env::var("TANG_DECODE_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Every live reduction over exactly `kctx` keys (the cache axis) split
+/// into `parts` chunks ([`TensorGraph::split_reduction`]).
+pub fn split_cache_axis(
+    mut g: TensorGraph,
+    mut outs: Vec<TensorId>,
+    kctx: usize,
+    parts: usize,
+) -> (TensorGraph, Vec<TensorId>) {
+    if parts < 2 || !kctx.is_multiple_of(parts) {
+        return (g, outs);
+    }
+    loop {
+        // (eliminate_common and split_reduction leave no dead nodes)
+        let next = (0..g.nodes().len()).find(|&i| {
+            g.comp_at(i).is_some_and(|c| {
+                c.monoid.is_some() && c.red.len() == 1 && c.red[0].fixed() == Some(kctx)
+            })
+        });
+        let Some(i) = next else { break };
+        (g, outs) = g
+            .split_reduction(&outs, TensorId::from_index(i), parts)
+            .expect("split_reduction");
     }
     (g, outs)
 }
@@ -1111,16 +1614,14 @@ pub fn plan_slots(
         program.buffers.iter().position(|b| b.node == t).unwrap()
     };
     let words = |b: usize| {
+        // the buffer's words in its format (f32, f16, or a block format:
+        // GGUF weights, Q8x32 activations)
         let spec = &program.buffers[b];
-        match spec.format {
-            tang_compile::tensor::Format::F32 => spec.len,
-            _ => spec.len.div_ceil(2),
-        }
-        .max(1)
+        spec.format.words(spec.len).max(1)
     };
     let mut last = vec![0usize; nb];
     for (p, k) in program.kernels.iter().enumerate() {
-        for &t in k.reads.iter().chain([&k.node]) {
+        for t in k.reads.iter().copied().chain(k.outputs()) {
             last[buf_of(t)] = p;
         }
     }
@@ -1147,32 +1648,34 @@ pub fn plan_slots(
     }
     let mut free: Vec<usize> = Vec::new();
     for (p, k) in program.kernels.iter().enumerate() {
-        let b = buf_of(k.node);
-        if slot[b] == usize::MAX {
-            let w = words(b);
-            // an exact fit, else a new slot when the best fit would waste
-            // more than half of it (it is someone else's exact fit later)
-            let pick = free.iter().position(|&s| slot_words[s] == w).or_else(|| {
-                free.iter()
-                    .enumerate()
-                    .filter(|(_, &s)| slot_words[s] >= w && slot_words[s] <= 2 * w)
-                    .min_by_key(|(_, &s)| slot_words[s])
-                    .map(|(i, _)| i)
-            });
-            slot[b] = match pick {
-                Some(i) => free.swap_remove(i),
-                None => {
-                    slot_words.push(w);
-                    slot_words.len() - 1
-                }
-            };
+        for b in k.outputs().map(buf_of) {
+            if slot[b] == usize::MAX {
+                let w = words(b);
+                // an exact fit, else a new slot when the best fit would waste
+                // more than half of it (it is someone else's exact fit later)
+                let pick = free.iter().position(|&s| slot_words[s] == w).or_else(|| {
+                    free.iter()
+                        .enumerate()
+                        .filter(|(_, &s)| slot_words[s] >= w && slot_words[s] <= 2 * w)
+                        .min_by_key(|(_, &s)| slot_words[s])
+                        .map(|(i, _)| i)
+                });
+                slot[b] = match pick {
+                    Some(i) => free.swap_remove(i),
+                    None => {
+                        slot_words.push(w);
+                        slot_words.len() - 1
+                    }
+                };
+            }
         }
         // buffers whose last use is this kernel free their slots
         let mut dying: Vec<usize> = k
             .reads
             .iter()
-            .chain([&k.node])
-            .map(|&t| buf_of(t))
+            .copied()
+            .chain(k.outputs())
+            .map(buf_of)
             .filter(|&x| last[x] == p && program.buffers[x].input.is_none())
             .collect();
         dying.sort_unstable();
@@ -1358,7 +1861,9 @@ mod tests {
         ] {
             let transpiled = p.native.iter().filter(|n| !**n).count();
             assert!(p.native.iter().filter(|n| **n).count() >= 10 * dims.layers);
-            assert!(transpiled <= dims.layers + 2, "{transpiled} transpiled");
+            // (the norms CUDA decode keeps materialized are plain maps,
+            // transpiled: two per layer)
+            assert!(transpiled <= 3 * dims.layers + 3, "{transpiled} transpiled");
             // packed weights are sized in words
             let k = dg.input("model.layers.0.qkv.q");
             let q = p

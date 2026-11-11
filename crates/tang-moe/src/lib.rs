@@ -34,6 +34,8 @@ pub mod doorbell;
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod kernels;
+#[cfg(feature = "nccl")]
+pub mod nccl;
 
 pub use arena::{ArenaOptions, Backing, HostArena};
 #[cfg(feature = "cuda")]

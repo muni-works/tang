@@ -35,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          sudo apt-get install -y libssl-dev pkg-config liblzma-dev
       - name: Clippy (workspace lib/tests/bins, excluding wasm crates)
         run: >
           cargo clippy --workspace --lib --tests --bins
@@ -57,7 +57,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          sudo apt-get install -y libssl-dev pkg-config liblzma-dev
       - name: Build (workspace, excluding wasm crates)
         run: >
           cargo build --workspace
