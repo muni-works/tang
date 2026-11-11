@@ -1913,6 +1913,52 @@ impl Lowering<'_> {
                         })
                         .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
                         .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                    // then the token and row tiles together, by the bytes
+                    // all groups load per reduce element (L2 traffic):
+                    // each group loads every leaf once per register point
+                    // it depends on; a 4-bit row re-read by k/t1 groups
+                    // vs k f32 activations re-read by rows/t2 groups.
+                    // 8×4 at k=8 is 8.5 B per weight element, 2×16 is 4
+                    // (H200: window time tracks it). TANG_WIN_JOINT=0 off
+                    if let Some((d2, _)) = reg2 {
+                        if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
+                            let bytes = |l: &Leaf| match l.pack {
+                                Some(Packing::U4) => 0.5,
+                                Some(Packing::Bf16 | Packing::F16) => 2.0,
+                                None => 4.0,
+                            };
+                            let traffic = |a: usize, b: usize| -> f64 {
+                                let groups = (pts[d1] / a * (pts[d2] / b)) as f64;
+                                groups
+                                    * leaves
+                                        .iter()
+                                        // (per-group scales, constant along
+                                        // the innermost reduce dim, amortize)
+                                        .filter(|l| l.addr.coefs[rank - 1] != 0)
+                                        .map(|l| {
+                                            let mut n = bytes(l);
+                                            if l.addr.coefs[d1] != 0 {
+                                                n *= a as f64;
+                                            }
+                                            if l.addr.coefs[d2] != 0 {
+                                                n *= b as f64;
+                                            }
+                                            n
+                                        })
+                                        .sum::<f64>()
+                            };
+                            let best = [8usize, 4, 2]
+                                .into_iter()
+                                .filter(|&a| pts[d1].is_multiple_of(a))
+                                .flat_map(|a| [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b)))
+                                .filter(|&(a, b)| pts[d2].is_multiple_of(b) && a * b <= cap)
+                                .min_by(|x, y| traffic(x.0, x.1).total_cmp(&traffic(y.0, y.1)));
+                            if let Some((a, b)) = best {
+                                reg = Some((d1, a));
+                                reg2 = Some((d2, b));
+                            }
+                        }
+                    }
                 }
             }
         }

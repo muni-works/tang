@@ -888,6 +888,11 @@ mod tests {
                         })
                 })
                 .count();
+            if let Ok(dir) = std::env::var("TANG_DUMP_WIN") {
+                for (j, kn) in dp.program.kernels.iter().enumerate() {
+                    std::fs::write(format!("{dir}/w{k}_{j}.cu"), &kn.source).unwrap();
+                }
+            }
             let words: Vec<Vec<f32>> = ins
                 .iter()
                 .zip(&dg.inputs)
