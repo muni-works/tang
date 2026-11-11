@@ -402,6 +402,196 @@ extern "C" __global__ void vq_gemv(const unsigned* __restrict__ codes,
     )
 }
 
+/// Weights per f16 scale/bias pair in the packed affine format (one warp
+/// lane per two weights).
+pub const AFF_GROUP: usize = 64;
+
+/// A `rows × cols` matrix in the packed affine format the GPTQ study
+/// picked (`g3g64h`: 3-bit codes, f16 scale and bias per 64 weights,
+/// behind the same block-Hadamard rotation as [`VqMatrix`], so 3.5 bits
+/// per weight). `bits` is 3 or 4; 4 is the MLX-style baseline the decode
+/// bench times against.
+#[derive(Clone, Debug)]
+pub struct AffineMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub bits: usize,
+    /// Codes, `bits` each, row-major, as one little-endian bit stream in
+    /// u32 words (code `i` starts at bit `bits · i`), plus one pad word.
+    pub codes: Vec<u32>,
+    /// f16 bits, one per `AFF_GROUP` weights, row-major.
+    pub scales: Vec<u16>,
+    /// f16 bits (the group's minimum), one per `AFF_GROUP` weights.
+    pub biases: Vec<u16>,
+    /// ±1 per input column (the rotation's random signs); empty: none.
+    pub signs: Vec<f32>,
+}
+
+impl AffineMatrix {
+    /// Pack codes (each `< 2^bits`, row-major, already in the rotated basis)
+    /// with their group scales and biases: how GPTQ output (bench/lowbit's
+    /// `gptq_affine`) is loaded.
+    pub fn from_codes(
+        rows: usize,
+        cols: usize,
+        bits: usize,
+        q: &[u8],
+        scales: Vec<u16>,
+        biases: Vec<u16>,
+        signs: Vec<f32>,
+    ) -> Self {
+        assert!(bits == 3 || bits == 4);
+        assert!(q.len() == rows * cols && cols % AFF_GROUP == 0 && cols % VQ_HB == 0);
+        assert!(scales.len() == rows * cols / AFF_GROUP && biases.len() == scales.len());
+        assert!(signs.is_empty() || signs.len() == cols);
+        let mut codes = vec![0u32; (q.len() * bits).div_ceil(32) + 1];
+        for (i, &c) in q.iter().enumerate() {
+            assert!((c as usize) < 1 << bits);
+            let (word, bit) = (i * bits / 32, i * bits % 32);
+            let both = (c as u64) << bit;
+            codes[word] |= both as u32;
+            codes[word + 1] |= (both >> 32) as u32;
+        }
+        AffineMatrix {
+            rows,
+            cols,
+            bits,
+            codes,
+            scales,
+            biases,
+            signs,
+        }
+    }
+
+    /// Round-to-nearest encode of `w` (`rows × cols`): rotate (when `seed`
+    /// is given), then per group min/max affine codes with f16 params.
+    pub fn encode(w: &[f64], rows: usize, cols: usize, bits: usize, seed: Option<u64>) -> Self {
+        let signs = seed.map(|s| vq_signs(cols, s)).unwrap_or_default();
+        let mut v = w.to_vec();
+        if !signs.is_empty() {
+            let s64: Vec<f64> = signs.iter().map(|&x| x as f64).collect();
+            rotate(&mut v, cols, VQ_HB, &s64, false);
+        }
+        let qmax = ((1 << bits) - 1) as f64;
+        let (mut q, mut scales, mut biases) = (Vec::new(), Vec::new(), Vec::new());
+        for g in v.chunks(AFF_GROUP) {
+            let lo = g.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let (sc, b) = (h16(((hi - lo) / qmax).max(1e-8)), h16(lo));
+            let (scf, bf) = (f16v(sc), f16v(b));
+            q.extend(
+                g.iter()
+                    .map(|x| ((x - bf) / scf).round().clamp(0.0, qmax) as u8),
+            );
+            scales.push(sc);
+            biases.push(b);
+        }
+        Self::from_codes(rows, cols, bits, &q, scales, biases, signs)
+    }
+
+    /// Stored bits per weight (codes + scales + biases; signs are a seed).
+    pub fn bits_per_weight(&self) -> f64 {
+        8.0 * self.bytes() as f64 / (self.rows * self.cols) as f64
+    }
+
+    /// Bytes a decode step streams for this matrix.
+    pub fn bytes(&self) -> usize {
+        self.codes.len() * 4 + (self.scales.len() + self.biases.len()) * 2
+    }
+
+    /// Code `i` (row-major).
+    pub fn code(&self, i: usize) -> usize {
+        let (word, bit) = (i * self.bits / 32, i * self.bits % 32);
+        let both = self.codes[word] as u64 | (self.codes[word + 1] as u64) << 32;
+        ((both >> bit) & ((1u64 << self.bits) - 1)) as usize
+    }
+
+    /// Dequantize to the original (un-rotated) basis: the reference.
+    pub fn dequant(&self) -> Vec<f64> {
+        let mut w: Vec<f64> = (0..self.rows * self.cols)
+            .map(|e| {
+                let g = e / AFF_GROUP;
+                self.code(e) as f64 * f16v(self.scales[g]) + f16v(self.biases[g])
+            })
+            .collect();
+        if !self.signs.is_empty() {
+            let s64: Vec<f64> = self.signs.iter().map(|&x| x as f64).collect();
+            rotate(&mut w, self.cols, VQ_HB, &s64, true);
+        }
+        w
+    }
+
+    /// The decode kernel on CPU, shaped like the GPU one: rotate `x` once;
+    /// per row, per group, `scale · Σ q x' + bias · Σ x'`, f32 throughout.
+    pub fn gemv(&self, x: &[f32]) -> Vec<f32> {
+        let xr = if self.signs.is_empty() {
+            x.to_vec()
+        } else {
+            rotate_x(x, &self.signs)
+        };
+        let gpr = self.cols / AFF_GROUP;
+        (0..self.rows)
+            .map(|r| {
+                let mut acc = 0.0f32;
+                for g in 0..gpr {
+                    let (mut qx, mut sx) = (0.0f32, 0.0f32);
+                    for t in 0..AFF_GROUP {
+                        let col = g * AFF_GROUP + t;
+                        qx += self.code(r * self.cols + col) as f32 * xr[col];
+                        sx += xr[col];
+                    }
+                    let gi = r * gpr + g;
+                    acc += qx * f16v(self.scales[gi]) as f32 + sx * f16v(self.biases[gi]) as f32;
+                }
+                acc
+            })
+            .collect()
+    }
+}
+
+/// CUDA source for the decode GEMV of an [`AffineMatrix`] with `bits`-bit
+/// codes: `aff{bits}_gemv`, one warp per row; per 64-wide group, lane `j`
+/// reads its two codes (`2·bits` contiguous bits) from a 64-bit window,
+/// accumulates `scale · (q0 x0 + q1 x1) + bias · (x0 + x1)` against a
+/// float2 of `x'`, and the warp reduces once per row. `x'` comes from
+/// `vq_rotate` (same Hadamard block). Launch:
+/// `aff{bits}_gemv<<<ceil(rows/8), 256>>>(codes, scales, biases, xr, y, rows, cols)`.
+pub fn affine_cuda_src(bits: usize) -> String {
+    assert!(bits == 3 || bits == 4);
+    format!(
+        r#"#include <cuda_fp16.h>
+extern "C" __global__ void aff{bits}_gemv(const unsigned* __restrict__ codes,
+                                     const __half* __restrict__ scales,
+                                     const __half* __restrict__ biases,
+                                     const float* __restrict__ xr, float* __restrict__ y,
+                                     int rows, int cols) {{
+  int lane = threadIdx.x & 31, r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  int groups = cols / {group};
+  const float2* x2 = reinterpret_cast<const float2*>(xr);
+  float acc = 0.f;
+  for (int g = 0; g < groups; ++g) {{
+    size_t i = (size_t)r * cols + (size_t)g * {group} + 2 * lane;
+    size_t bit = i * {bits};
+    unsigned long long w = (unsigned long long)codes[bit >> 5] |
+                           ((unsigned long long)codes[(bit >> 5) + 1] << 32);
+    unsigned c = (unsigned)(w >> (bit & 31));
+    float q0 = (float)(c & {mask}), q1 = (float)((c >> {bits}) & {mask});
+    float2 v = x2[g * {half} + lane];
+    size_t gi = (size_t)r * groups + g;
+    acc += __half2float(scales[gi]) * (q0 * v.x + q1 * v.y) + __half2float(biases[gi]) * (v.x + v.y);
+  }}
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) y[r] = acc;
+}}
+"#,
+        bits = bits,
+        group = AFF_GROUP,
+        half = AFF_GROUP / 2,
+        mask = (1 << bits) - 1
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,12 +807,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn affine_packs_3_bits_at_3_5_bpw() {
+        let w = weights(8, 4096);
+        let m = AffineMatrix::encode(&w, 8, 4096, 3, Some(5));
+        assert!(
+            (m.bits_per_weight() - 3.5).abs() < 1e-2,
+            "{}",
+            m.bits_per_weight()
+        );
+        assert!((0..8 * 4096).all(|i| m.code(i) < 8));
+        let q: Vec<u8> = (0..8 * 4096).map(|i| m.code(i) as u8).collect();
+        let n =
+            AffineMatrix::from_codes(8, 4096, 3, &q, m.scales.clone(), m.biases.clone(), vec![]);
+        assert_eq!(n.codes, m.codes);
+        let fmt = LowBit::Affine { bits: 3, group: 64 }.bits_per_weight(1);
+        assert!((fmt - 3.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn affine_gemv_matches_dequant_reference() {
+        for (bits, seed) in [(3, Some(11)), (4, Some(11)), (3, None)] {
+            let (rows, cols) = (24, 512);
+            let w = weights(rows, cols);
+            let m = AffineMatrix::encode(&w, rows, cols, bits, seed);
+            let deq = m.dequant();
+            let rel = mse(&deq, &w) / (w.iter().map(|x| x * x).sum::<f64>() / w.len() as f64);
+            assert!(
+                rel < if bits == 3 { 0.15 } else { 0.05 },
+                "bits {bits} rel {rel}"
+            );
+            let x: Vec<f32> = (0..cols)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect();
+            let y = m.gemv(&x);
+            for r in 0..rows {
+                let want: f64 = (0..cols).map(|c| deq[r * cols + c] * x[c] as f64).sum();
+                let scale: f64 = (0..cols)
+                    .map(|c| (deq[r * cols + c] * x[c] as f64).abs())
+                    .sum();
+                assert!(
+                    (y[r] as f64 - want).abs() < 1e-5 * scale.max(1.0),
+                    "bits {bits} row {r}: {} vs {want}",
+                    y[r]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn affine_rotation_tames_outlier_columns() {
+        // the outlier columns in `weights` blow up per-group ranges;
+        // rotating first spreads them, so 3-bit error drops
+        let w = weights(16, 1024);
+        let plain = AffineMatrix::encode(&w, 16, 1024, 3, None).dequant();
+        let rot = AffineMatrix::encode(&w, 16, 1024, 3, Some(9)).dequant();
+        assert!(mse(&rot, &w) < 0.8 * mse(&plain, &w));
+    }
+
+    #[test]
+    fn affine_cuda_src_names_kernels() {
+        assert!(affine_cuda_src(3).contains("aff3_gemv") && affine_cuda_src(3).contains("& 7)"));
+        assert!(affine_cuda_src(4).contains("aff4_gemv") && affine_cuda_src(4).contains("& 15)"));
+    }
+
     /// Writes the kernel source for bench/lowbit/vq_bench.cu:
     /// `VQ_CU_OUT=vq.cu cargo test -p tang-compile --lib vq_cuda_src_dump -- --ignored`
     #[test]
     #[ignore]
     fn vq_cuda_src_dump() {
         let out = std::env::var("VQ_CU_OUT").unwrap_or_else(|_| "vq.cu".into());
-        std::fs::write(out, vq_cuda_src()).unwrap();
+        let src = vq_cuda_src()
+            + &affine_cuda_src(3).replace("#include <cuda_fp16.h>\n", "")
+            + &affine_cuda_src(4).replace("#include <cuda_fp16.h>\n", "");
+        std::fs::write(out, src).unwrap();
     }
 }
