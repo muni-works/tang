@@ -559,6 +559,22 @@ fn run<D: ComputeDevice>(
     Ok(())
 }
 
+/// Bytes of host RAM available (`MemAvailable`), 0 when unknown.
+#[cfg(feature = "cuda")]
+fn mem_available() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<f64>()
+                .ok()
+        })
+        .map_or(0.0, |kb| kb * 1024.0)
+}
+
 /// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
 /// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR] [--batch N]`: the Flash engine (`flash::serve`):
 /// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
@@ -580,10 +596,15 @@ fn serve_flash(args: &[String]) -> Result<()> {
         suffix: true,
         warm_dir: None,
         batch: 0,
+        // Host RAM for saved prefix states: TANG_FLASH_SNAP_GB, else a third of what's
+        // available, 12..64 GB (under batching evicted slots spill here).
         snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .map_or(12e9, |g| g * 1e9) as usize,
+            .map_or_else(
+                || (mem_available() / 3.0).clamp(12e9, 64e9),
+                |g| g * 1e9,
+            ) as usize,
         dump: None,
     };
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
@@ -643,6 +664,11 @@ fn serve_flash(args: &[String]) -> Result<()> {
         dtype: Dtype::Q4,
         hardware: probe(Backend::Cuda),
     };
+    // Under batching every session's last turn boundary (and each evicted slot) is a saved
+    // state: keep a few per slot unless `--snapshots` says otherwise.
+    if s.batch > 1 && !args.iter().any(|a| a == "--snapshots") {
+        s.snapshots = s.snapshots.max(4 * s.batch);
+    }
     tang_llm::server::serve(opts, move |_name: &str| FlashServe::load(&s))
 }
 

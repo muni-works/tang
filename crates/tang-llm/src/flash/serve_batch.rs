@@ -21,7 +21,7 @@
 //!   the rows the streams leave (batch module up to its width, else `MAX_T`), the budget picked
 //!   from a measured step-cost table, none at full load. `TANG_SERVE_SPEC=off|auto|<rows>`.
 
-use super::{FlashServe, Memo};
+use super::{FlashServe, Hit, Memo};
 use crate::batch::prefill::{prefill_plan, Policy, Waiting};
 use crate::chat::{Chunk, Detok, Parser, Piece};
 use crate::engine::{Finish, Outcome, Request, Usage};
@@ -49,6 +49,8 @@ pub(super) struct Stream {
     /// Where to save prefix states (`FlashServe::marks`) still ahead, and whether to pin each.
     marks: Vec<(usize, bool)>,
     reused: usize,
+    /// Where `reused` came from.
+    hit: Hit,
     /// The sampled token not yet fed to the slot.
     pending: Option<u32>,
     /// MTP drafts for the next window (the engine's chain for this slot, with the head's
@@ -89,30 +91,46 @@ impl FlashServe {
             && !(key.is_some() && self.slots.iter().any(|s| s.busy && s.key.as_deref() == key))
     }
 
-    /// A slot for prompt `ids`: a parked one whose tokens it extends (the longest), else a
-    /// fresh one, evicting the least recently used parked slot when none is free.
-    fn take_slot(&mut self, ids: &[u32], key: Option<&str>) -> Result<(usize, usize)> {
+    /// A slot for prompt `ids`, the tokens already in it, and where they came from:
+    ///
+    /// 1. a parked slot whose tokens the prompt extends (the longest);
+    /// 2. a saved prefix state (RAM or disk) that reaches further, restored into the parked
+    ///    slot that shares the most of the prompt when that slot already holds the state's
+    ///    tokens (only the GDN/conv state is copied up: [`Hit::Rewound`]), else into a fresh
+    ///    slot (state and K/V rows: [`Hit::Host`]);
+    /// 3. a fresh slot.
+    ///
+    /// A fresh slot when all are allocated evicts the least recently used parked one, first
+    /// saving it as a prefix state in host RAM (only its K/V rows past the longest saved state
+    /// it extends are copied down), so a session that comes back after its slot was taken
+    /// restores instead of prefilling. `TANG_SERVE_CACHE=off` reuses nothing (a baseline);
+    /// `TANG_SERVE_SPILL=0` keeps the old policy (no spill, no rewind).
+    fn take_slot(&mut self, ids: &[u32], key: Option<&str>) -> Result<(usize, usize, Hit)> {
         self.clock += 1;
+        let off = std::env::var("TANG_SERVE_CACHE").is_ok_and(|v| v == "off");
+        let spill = !off && std::env::var("TANG_SERVE_SPILL").map_or(true, |v| v != "0");
         let best = self
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| !s.busy)
+            .filter(|(_, s)| !s.busy && !off)
             .filter_map(|(i, s)| {
                 let t = self.e.slot_tokens(s.id);
                 (t.len() < ids.len() && ids.starts_with(t)).then_some((i, t.len()))
             })
-            .max_by_key(|&(_, n)| n);
+            // Longest; on a tie, the request's own session's slot.
+            .max_by_key(|&(i, n)| (n, key.is_some() && self.slots[i].key.as_deref() == key));
         let parked = best.map_or(0, |b| b.1);
         // A saved prefix state (the end of a tools block or system prompt, from any session,
-        // in RAM or on disk) that reaches further: restore it into a fresh slot.
+        // in RAM or on disk) that reaches further: restore it.
         let limit = ids.len() - 1;
         let mut snap = (0..self.snaps.len())
+            .filter(|_| !off)
             .filter(|&i| {
                 self.snaps[i].tokens.len() <= limit && ids.starts_with(&self.snaps[i].tokens)
             })
             .max_by_key(|&i| self.snaps[i].tokens.len());
-        if snap.is_none() && parked == 0 {
+        if snap.is_none() && parked == 0 && !off {
             if let Some(sn) = self.load_disk(ids, limit).filter(|s| !s.tokens.is_empty()) {
                 eprintln!(
                     "tang-llm: read the prefix state at {} from disk",
@@ -129,32 +147,69 @@ impl FlashServe {
                 s.busy = true;
                 s.key = key.map(String::from);
                 s.used = self.clock;
-                return Ok((s.id, n));
+                return Ok((s.id, n, Hit::Parked));
+            }
+        }
+        // The chosen state's parts, by value: spilling below may reorder `self.snaps`.
+        let chosen = snap.filter(|_| snap_len > parked).map(|i| {
+            self.snaps[i].used = self.clock;
+            self.snaps[i].at = crate::retention::now();
+            let sn = &self.snaps[i];
+            (sn.tokens.clone(), sn.state.clone(), sn.pos.clone())
+        });
+        // Parked slots by how much of the prompt they share.
+        let common: Vec<(usize, usize, usize)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.busy)
+            .map(|(i, s)| {
+                let t = self.e.slot_tokens(s.id);
+                let c = t.iter().zip(ids).take_while(|(a, b)| a == b).count();
+                (i, c, t.len())
+            })
+            .collect();
+        // Rewind: a parked slot that already holds the state's tokens keeps its K/V rows.
+        if let (true, Some((toks, state, _))) = (spill, &chosen) {
+            if let Some(&(i, _, _)) = common
+                .iter()
+                .filter(|&&(_, c, _)| c >= toks.len())
+                .max_by_key(|&&(_, c, _)| c)
+            {
+                let id = self.slots[i].id;
+                match self.e.restore_running_at(id, state, toks) {
+                    Ok(()) => {
+                        let s = &mut self.slots[i];
+                        s.busy = true;
+                        s.key = key.map(String::from);
+                        s.used = self.clock;
+                        return Ok((id, toks.len(), Hit::Rewound));
+                    }
+                    // Its tokens are no longer known: drop the slot.
+                    Err(e) => {
+                        eprintln!("tang-llm: rewinding slot {id} to {}: {e}", toks.len());
+                        self.slots.remove(i);
+                        self.e.free_slot(id);
+                    }
+                }
             }
         }
         // No parked slot extends: say how close the nearest one came, so a client changing early tokens
         // (or a template re-rendering an earlier turn) shows up in the log.
-        if let Some((id, common, len)) = self
-            .slots
-            .iter()
-            .filter(|s| !s.busy)
-            .map(|s| {
-                let t = self.e.slot_tokens(s.id);
-                let common = t.iter().zip(ids).take_while(|(a, b)| a == b).count();
-                (s.id, common, t.len())
-            })
-            .max_by_key(|&(_, c, _)| c)
-        {
-            eprintln!(
-                "tang-llm: prefix miss: prompt {} tokens; nearest parked slot {id} has {len}, \
-                 diverging at token {common}",
-                ids.len()
-            );
+        if let Some(&(i, c, len)) = common.iter().max_by_key(|&&(_, c, _)| c) {
+            if chosen.is_none() && !off {
+                eprintln!(
+                    "tang-llm: prefix miss: prompt {} tokens; nearest parked slot {} has {len}, \
+                     diverging at token {c}",
+                    ids.len(),
+                    self.slots.get(i).map_or(0, |s| s.id)
+                );
+            }
         }
         let id = match self.e.alloc_slot() {
             Ok(id) => id,
             Err(_) => {
-                // All allocated: drop the least recently used parked slot.
+                // All allocated: drop the least recently used parked slot, saving it first.
                 let (i, _) = self
                     .slots
                     .iter()
@@ -163,6 +218,24 @@ impl FlashServe {
                     .min_by_key(|(_, s)| s.used)
                     .ok_or_else(|| anyhow::anyhow!("every slot is running"))?;
                 let old = self.slots.remove(i);
+                let n = self.e.slot_tokens(old.id).len();
+                if spill && n > 0 {
+                    let t = Instant::now();
+                    match self.snapshot_at(old.id, false) {
+                        Ok(()) => {
+                            self.cache.spills += 1;
+                            self.cache.spilled_tokens += n as u64;
+                            if std::env::var("TANG_SNAP_TIMES").is_ok_and(|v| v == "1") {
+                                eprintln!(
+                                    "tang-llm: spilled slot {} ({n} tokens) to host RAM in {:.0} ms",
+                                    old.id,
+                                    t.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("tang-llm: spilling slot {}: {e}", old.id),
+                    }
+                }
                 self.e.free_slot(old.id);
                 self.e.alloc_slot()?
             }
@@ -173,23 +246,20 @@ impl FlashServe {
             key: key.map(String::from),
             used: self.clock,
         });
-        if let Some(i) = snap.filter(|_| snap_len > parked) {
-            self.snaps[i].used = self.clock;
-            self.snaps[i].at = crate::retention::now();
-            let (sn, e) = (&self.snaps[i], &mut self.e);
-            let restored = sn
-                .pos
+        if let Some((toks, state, pos)) = chosen {
+            let e = &mut self.e;
+            let restored = pos
                 .iter()
                 .try_for_each(|p| e.restore_positional_at(id, p, 0))
-                .and_then(|()| e.restore_running_at(id, &sn.state, &sn.tokens));
+                .and_then(|()| e.restore_running_at(id, &state, &toks));
             match restored {
-                Ok(()) => return Ok((id, snap_len)),
+                Ok(()) => return Ok((id, toks.len(), Hit::Host)),
                 // A state from another configuration (say, saved without the MTP layer):
                 // prefill instead.
-                Err(e) => eprintln!("tang-llm: prefix state at {snap_len} not restored: {e}"),
+                Err(e) => eprintln!("tang-llm: prefix state at {} not restored: {e}", toks.len()),
             }
         }
-        Ok((id, 0))
+        Ok((id, 0, Hit::Miss))
     }
 
     pub(super) fn batch_admit(&mut self, req: &Request) -> Result<Inflight> {
@@ -209,7 +279,8 @@ impl FlashServe {
             seed: (req.sampling.seed ^ (req.sampling.seed >> 32)) as u32,
             presence,
         };
-        let (slot, reused) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        let (slot, reused, hit) = self.take_slot(&ids, req.cache_key.as_deref())?;
+        self.cache.note(hit, ids.len(), reused);
         // An engine without per-row sampling refuses a sampled request: release the slot.
         if let Err(e) = self.e.set_slot_sampling(slot, samp) {
             if let Some(sl) = self.slots.iter_mut().find(|x| x.id == slot) {
@@ -230,6 +301,7 @@ impl FlashServe {
             done_prompt: reused,
             marks,
             reused,
+            hit,
             ids,
             pending: None,
             drafts: Vec::new(),
@@ -679,10 +751,11 @@ impl FlashServe {
         let decode_s = s.decode_from.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let prefilled = s.ids.len() - s.reused;
         eprintln!(
-            "tang-llm: batch req: slot {} prompt {} (reused {}, prefilled {} in {:.0} ms, state saves {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls",
+            "tang-llm: batch req: slot {} prompt {} (reused {} {}, prefilled {} in {:.0} ms, state saves {:.0} ms) | ttft {:.0} ms | decode {} tokens in {:.2} s = {:.1} tok/s, {} windows, drafts {}/{} accepted | {} tool calls | {}",
             s.slot,
             s.ids.len(),
             s.reused,
+            s.hit.name(),
             prefilled,
             s.prefill_s * 1e3,
             s.snap_s * 1e3,
@@ -693,7 +766,8 @@ impl FlashServe {
             s.windows,
             s.accepted,
             s.drafted,
-            s.calls.len()
+            s.calls.len(),
+            self.cache.line()
         );
         Ok(Outcome::Done(
             finish,
