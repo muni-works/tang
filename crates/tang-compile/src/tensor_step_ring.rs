@@ -41,6 +41,11 @@ fn lit(v: f64) -> ExprId {
     ExprId::from_f64(v)
 }
 
+/// A windowed position: `p`, or [`FUTURE`] before position 0.
+pub(super) fn before_start(p: ExprId) -> ExprId {
+    sel(p + lit(0.5), p, lit(FUTURE))
+}
+
 impl CacheSlot {
     /// Rows of this cache's sequence axis at `capacity`.
     pub fn rows(&self, capacity: usize) -> usize {
@@ -347,7 +352,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::super::{Form, Monoid, TensorGraph};
-    use super::super::{derive_step, StepGraph, StepInput, StepSpec};
+    use super::super::{
+        derive_step, derive_step_with, Rows, StepGraph, StepInput, StepOptions, StepSpec,
+    };
     use super::*;
 
     const T: Dim = Dim::Sym("T");
@@ -571,6 +578,8 @@ mod tests {
         pos: usize,
         /// seed rings one position stale
         stale: bool,
+        /// outputs: the last new row only
+        last: bool,
     }
 
     /// Prefill `p0`, then chained derived steps `ks`, each against a
@@ -607,7 +616,24 @@ mod tests {
         let mut pos = p0;
         let mut worst = 0.0f64;
         for &k in ks {
-            let st = step(g, out, k);
+            let st = if skew.last {
+                derive_step_with(
+                    g,
+                    &[out],
+                    &StepSpec {
+                        seq: "T",
+                        new: k,
+                        capacity: CAP,
+                    },
+                    &StepOptions {
+                        rows: Rows::Last,
+                        batch: None,
+                    },
+                )
+                .unwrap()
+            } else {
+                step(g, out, k)
+            };
             if caches.is_empty() {
                 let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
                 let at = if skew.stale { pos - 1 } else { pos };
@@ -643,7 +669,16 @@ mod tests {
             rids.extend(st.caches.iter().map(|c| c.node));
             let want = g.bind(&[("T", grown)]).unwrap().eval(&pre(grown), &rids);
             let os = concrete(g.shape(out), grown);
-            worst = worst.max(max_err(&got[0], &rows(&want[0], &os, 0, pos, grown)));
+            worst = worst.max(max_err(
+                &got[0],
+                &rows(
+                    &want[0],
+                    &os,
+                    0,
+                    if skew.last { grown - 1 } else { pos },
+                    grown,
+                ),
+            ));
             for (ci, c) in st.caches.iter().enumerate() {
                 let ws = concrete(g.shape(c.node), grown);
                 let exp = seed_cache(c, &ws, &want[1 + ci], grown, CAP);
@@ -885,5 +920,272 @@ mod tests {
             let e = check(&g, o, 3, ks, Skew::default());
             assert!(e < 1e-12, "{ks:?}: {e:e}");
         }
+    }
+
+    #[test]
+    fn rings_with_last_row_outputs() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[T, fx(4)]);
+        let h = linear(&mut g, x, 4, 4);
+        let y = conv(&mut g, h, 4, 4);
+        let a = window_attn(&mut g, y, 4, 3);
+        let o = linear(&mut g, a, 4, 4);
+        let last = Skew {
+            last: true,
+            ..Skew::default()
+        };
+        for p0 in [1, 5] {
+            for ks in CHAINS {
+                let e = check(&g, o, p0, ks, last);
+                assert!(e < 1e-12, "{p0} {ks:?}: {e:e}");
+            }
+        }
+        eprintln!("conv + window attention, Rows::Last: exact");
+    }
+
+    const B: Dim = Dim::Sym("B");
+
+    /// `[B, T, …]` versions of the toys: linear, conv(4), window attention.
+    fn batched_model(w: usize) -> (TensorGraph, TensorId) {
+        let d = 4;
+        let mut g = TensorGraph::new();
+        let x = g.input(&[B, T, fx(d)]);
+        let lin = |g: &mut TensorGraph, x: TensorId| {
+            let wt = g.input(&[fx(d), fx(d)]);
+            g.comp(
+                &[B, T, fx(d)],
+                &[fx(d)],
+                vec![
+                    arg(x, vec![u(4, 0), u(4, 1), u(4, 3)], false),
+                    arg(wt, vec![u(4, 2), u(4, 3)], false),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap()
+        };
+        let h = lin(&mut g, x);
+        let cw = g.input(&[fx(d), fx(4)]);
+        let mut tf = Form::zero(4);
+        tf.coefs[1] = 1;
+        tf.coefs[3] = 1;
+        tf.offset = -3;
+        let y = g
+            .comp(
+                &[B, T, fx(d)],
+                &[fx(4)],
+                vec![
+                    arg(h, vec![u(4, 0), tf, u(4, 2)], true),
+                    arg(cw, vec![u(4, 2), u(4, 3)], false),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let (q, k, v) = (lin(&mut g, y), lin(&mut g, y), lin(&mut g, y));
+        let s = g
+            .comp(
+                &[B, T, T],
+                &[fx(d)],
+                vec![
+                    arg(q, vec![u(4, 0), u(4, 1), u(4, 3)], false),
+                    arg(k, vec![u(4, 0), u(4, 2), u(4, 3)], false),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        // masked reduce over j (last space dim) in space (b, t, [c,] j)
+        let red = |g: &mut TensorGraph,
+                   out: &[Dim],
+                   mut args: Vec<Arg>,
+                   m: Monoid,
+                   idv: f64,
+                   f: &dyn Fn(&[ExprId]) -> ExprId| {
+            let mut sp = out.to_vec();
+            sp.push(T);
+            let r = sp.len();
+            let (ti, ji) = (g.iota(&sp, 1), g.iota(&sp, r - 1));
+            let na = args.len();
+            args.push(arg(ti, id(r), false));
+            args.push(arg(ji, id(r), false));
+            let wf = w as f64;
+            g.comp(out, &[T], args, Some(m), |v| {
+                let (t, j) = (v[na], v[na + 1]);
+                vec![sel(
+                    t - j + lit(0.5),
+                    sel(j - t + lit(wf - 0.5), f(v), lit(idv)),
+                    lit(idv),
+                )]
+            })
+            .unwrap()
+        };
+        let s3 = |r: usize| arg(s, vec![u(r, 0), u(r, 1), u(r, r - 1)], false);
+        let mx = red(
+            &mut g,
+            &[B, T],
+            vec![s3(3)],
+            Monoid::max(),
+            f64::NEG_INFINITY,
+            &|v| v[0],
+        );
+        let m3 = |r: usize| arg(mx, vec![u(r, 0), u(r, 1)], false);
+        let den = red(
+            &mut g,
+            &[B, T],
+            vec![s3(3), m3(3)],
+            Monoid::sum(),
+            0.0,
+            &|v| (v[0] - v[1]).exp(),
+        );
+        let num = red(
+            &mut g,
+            &[B, T, fx(d)],
+            vec![s3(4), m3(4), arg(v, vec![u(4, 0), u(4, 3), u(4, 2)], false)],
+            Monoid::sum(),
+            0.0,
+            &|v| (v[0] - v[1]).exp() * v[2],
+        );
+        let o = g
+            .comp(
+                &[B, T, fx(d)],
+                &[],
+                vec![
+                    arg(num, id(3), false),
+                    arg(den, vec![u(3, 0), u(3, 1)], false),
+                ],
+                None,
+                |v| vec![v[0] / v[1]],
+            )
+            .unwrap();
+        (g, o)
+    }
+
+    /// Sessions at lengths 2, 6 and 5 (one shorter than its rings) stepped
+    /// together equal each stepped alone, bit for bit, outputs and ring
+    /// buffers, and match each grown session's prefill.
+    #[test]
+    fn batched_rings_step_together_bit_for_bit() {
+        let (g, o) = batched_model(3);
+        let ps = [2usize, 6, 5];
+        let ks = [4usize, 1, 2, 1];
+        let nb = ps.len();
+        let tmax = 16;
+        let mut shapes: Vec<(usize, Vec<Dim>)> = g
+            .nodes()
+            .iter()
+            .filter_map(|nd| match nd.op {
+                Op::Input(i) => Some((i, nd.shape.clone())),
+                _ => None,
+            })
+            .collect();
+        shapes.sort_by_key(|x| x.0);
+        let d = 4;
+        let xs: Vec<Vec<f64>> = (0..nb).map(|b| rand(tmax * d, 50 + b as u64)).collect();
+        let ws: Vec<Vec<f64>> = shapes
+            .iter()
+            .map(|(i, sh)| {
+                let n = sh.iter().map(|x| x.fixed().unwrap_or(1)).product();
+                rand(n, 9 + *i as u64)
+            })
+            .collect();
+        let c1 = |sh: &[Dim], t: usize| -> Vec<usize> {
+            sh.iter()
+                .map(|&x| {
+                    if x == T {
+                        t
+                    } else if x == B {
+                        1
+                    } else {
+                        x.n()
+                    }
+                })
+                .collect()
+        };
+        let prefill = |b: usize, t: usize, ids: &[TensorId]| {
+            let mut ins = ws.clone();
+            ins[0] = xs[b][..t * d].to_vec();
+            g.bind(&[("B", 1), ("T", t)]).unwrap().eval(&ins, ids)
+        };
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut pos = ps;
+        let mut caches: Vec<Vec<Vec<f64>>> = vec![Vec::new(); nb];
+        let mut worst = 0.0f64;
+        let mut rings = Vec::new();
+        for &k in &ks {
+            let st = derive_step_with(
+                &g,
+                &[o],
+                &StepSpec {
+                    seq: "T",
+                    new: k,
+                    capacity: CAP,
+                },
+                &StepOptions {
+                    rows: Rows::All,
+                    batch: Some("B"),
+                },
+            )
+            .unwrap();
+            rings = st.caches.iter().map(|c| c.ring).collect();
+            if caches[0].is_empty() {
+                let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+                for b in 0..nb {
+                    let vals = prefill(b, pos[b], &nodes);
+                    caches[b] = st
+                        .caches
+                        .iter()
+                        .zip(vals)
+                        .map(|(c, v)| seed_cache(c, &c1(g.shape(c.node), pos[b]), &v, pos[b], CAP))
+                        .collect();
+                }
+            }
+            let mut ids = st.outputs.clone();
+            ids.extend(st.caches.iter().map(|c| c.updated));
+            let ins = |sess: &[usize]| -> Vec<Vec<f64>> {
+                st.inputs
+                    .iter()
+                    .map(|si| match *si {
+                        StepInput::Pos => sess.iter().map(|&b| pos[b] as f64).collect(),
+                        StepInput::New(_) => sess
+                            .iter()
+                            .flat_map(|&b| xs[b][pos[b] * d..(pos[b] + k) * d].to_vec())
+                            .collect(),
+                        StepInput::Same(i) => ws[i].clone(),
+                        StepInput::Cache(c) => {
+                            sess.iter().flat_map(|&b| caches[b][c].clone()).collect()
+                        }
+                    })
+                    .collect()
+            };
+            let all: Vec<usize> = (0..nb).collect();
+            let together = st.graph.bind(&[("B", nb)]).unwrap().eval(&ins(&all), &ids);
+            let one = st.graph.bind(&[("B", 1)]).unwrap();
+            let mut next = Vec::new();
+            for b in 0..nb {
+                let alone = one.eval(&ins(&[b]), &ids);
+                for (t, a) in together.iter().zip(&alone) {
+                    let per = t.len() / nb;
+                    assert_eq!(bits(&t[b * per..(b + 1) * per]), bits(a), "session {b}");
+                }
+                let grown = pos[b] + k;
+                let want = prefill(b, grown, &[o]);
+                let sh = c1(g.shape(o), grown);
+                worst = worst.max(max_err(&alone[0], &rows(&want[0], &sh, 1, pos[b], grown)));
+                next.push(alone[1..].to_vec());
+            }
+            for (b, n) in next.into_iter().enumerate() {
+                caches[b] = n;
+            }
+            for p in pos.iter_mut() {
+                *p += k;
+            }
+        }
+        eprintln!(
+            "batched sessions {ps:?}, steps {ks:?}: rings {rings:?}; together == alone bit for \
+             bit; vs prefill {worst:.2e}"
+        );
+        assert!(rings.iter().all(|r| r.is_some()));
+        assert!(worst < 1e-12, "{worst:e}");
     }
 }

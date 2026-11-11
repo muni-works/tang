@@ -660,8 +660,11 @@ impl Deriver<'_> {
                 let off = match smodes[*dim] {
                     Some(Mode::New) => Some(0.0),
                     Some(Mode::Last) => Some((self.spec.new - 1) as f64),
+                    // ring caches (tensor_step_ring.rs)
+                    Some(Mode::Win(s)) => Some(-(s as f64)),
                     _ => None,
                 };
+                let win = matches!(smodes[*dim], Some(Mode::Win(_)));
                 if let Some(off) = off {
                     let ishape = self.step_shape(&src_shape, &smodes);
                     let it = self.sg.iota(&ishape, *dim);
@@ -684,7 +687,10 @@ impl Deriver<'_> {
                             pos,
                         ],
                         None,
-                        move |v| vec![v[0] + v[1] + ExprId::from_f64(off)],
+                        move |v| {
+                            let p = v[0] + v[1] + ExprId::from_f64(off);
+                            vec![if win { ring::before_start(p) } else { p }]
+                        },
                     )?;
                     args.push(Arg {
                         src: map,
