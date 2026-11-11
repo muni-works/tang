@@ -63,10 +63,14 @@ use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::{err, Arg, Comp, Dim, Form, Op, ShapeError, TensorGraph, TensorId, View};
 
+/// A prefill graph with a batch dim of independent sessions in front.
+#[path = "tensor_step_batch.rs"]
+mod batch;
 /// Carried states: scans along the sequence and reductions over it into no
 /// sequence axis (the cache is the monoid / scan state).
 #[path = "tensor_step_scan.rs"]
 mod scan;
+pub use batch::batch_graph;
 
 #[path = "tensor_step_ring.rs"]
 mod ring;
@@ -428,11 +432,12 @@ impl Deriver<'_> {
                 let stax = self.t_axes(src.n());
                 let smodes = match (tax.as_slice(), stax.as_slice()) {
                     ([], []) => vec![None; g.nodes[src.n()].shape.len()],
-                    // the sequence is the outer dim on both sides: row-major,
-                    // its rows are the same bytes whatever the inner dims
-                    ([0], [0]) => {
+                    // the sequence at the same place on both sides behind the
+                    // same outer dims (none, or a batch dim): row-major, its
+                    // rows are the same bytes whatever the inner dims
+                    ([a], [sa]) if a == sa && node.shape[..*a] == g.nodes[src.n()].shape[..*a] => {
                         let mut m = vec![None; g.nodes[src.n()].shape.len()];
-                        m[0] = modes[0];
+                        m[*a] = modes[*a];
                         m
                     }
                     _ => return err("step: reshape that moves the sequence dim"),

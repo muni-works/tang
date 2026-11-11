@@ -481,4 +481,169 @@ mod tests {
     fn glm_derives() {
         check(&glm(), &[Rows::All, Rows::Last]);
     }
+
+    /// Three sessions at lengths 3, 6 and 5 on a batch dim added by
+    /// `batch_graph`, stepped together (steps of 4 then 1, `p0 = [B]`):
+    /// equal to each session stepped alone, bit for bit (logits and every
+    /// cache buffer, NaN tails included), and to the unbatched prefill of
+    /// each grown session.
+    fn ragged(m: &Model) {
+        use tang_compile::tensor::step::batch_graph;
+        let (bg, bouts) = batch_graph(&m.g, &[m.logits], "T", "B").unwrap();
+        let w = weights(m);
+        let ps = [3usize, 6, 5];
+        let ks = [4usize, 1];
+        let nb = ps.len();
+        let vocab = vocab(m);
+        let toks: Vec<Vec<f64>> = (0..nb)
+            .map(|b| {
+                (0..12)
+                    .map(|i| ((37 * i + 5 + 11 * b) % vocab) as f64)
+                    .collect()
+            })
+            .collect();
+        let ins = |t: &[f64]| -> Vec<Vec<f64>> {
+            m.inputs
+                .iter()
+                .map(|(n, _)| {
+                    if n == "tokens" {
+                        t.to_vec()
+                    } else {
+                        w[n].clone()
+                    }
+                })
+                .collect()
+        };
+        let opts = StepOptions {
+            rows: Rows::All,
+            batch: Some("B"),
+        };
+        let shape1 = |t: TensorId, len: usize| -> Vec<usize> {
+            bg.shape(t)
+                .iter()
+                .map(|&d| match d {
+                    Dim::Sym("T") => len,
+                    Dim::Sym("B") => 1,
+                    d => d.n(),
+                })
+                .collect()
+        };
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut pos = ps;
+        let mut caches: Vec<Vec<Vec<f64>>> = Vec::new();
+        let mut worst = 0.0f64;
+        let mut ncache = 0;
+        for &k in &ks {
+            let st = derive_step_with(&bg, &bouts, &spec(m, k), &opts)
+                .unwrap_or_else(|e| panic!("{} batched: {}", m.name, e.0));
+            ncache = st.caches.len();
+            if caches.is_empty() {
+                let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+                for (b, &p) in ps.iter().enumerate() {
+                    let v = bg
+                        .bind(&[("B", 1), ("T", p)])
+                        .unwrap()
+                        .eval(&ins(&toks[b][..p]), &nodes);
+                    caches.push(
+                        st.caches
+                            .iter()
+                            .zip(v)
+                            .map(|(c, v)| {
+                                let sh = shape1(c.node, p);
+                                if !c.state {
+                                    return seed_cache(c, &sh, &v, p, m.cap);
+                                }
+                                if !bg.shape(c.node).contains(&T) {
+                                    return v;
+                                }
+                                let outer: usize = sh[..c.axis].iter().product();
+                                let inner: usize = sh[c.axis + 1..].iter().product();
+                                (0..outer)
+                                    .flat_map(|o| {
+                                        let s0 = (o * p + p - 1) * inner;
+                                        v[s0..s0 + inner].to_vec()
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            let mut ids = st.outputs.clone();
+            ids.extend(st.caches.iter().map(|c| c.updated));
+            let inputs_for = |sess: &[usize]| -> Vec<Vec<f64>> {
+                st.inputs
+                    .iter()
+                    .map(|&x| match x {
+                        StepInput::Pos => sess.iter().map(|&b| pos[b] as f64).collect(),
+                        StepInput::New(_) => sess
+                            .iter()
+                            .flat_map(|&b| toks[b][pos[b]..pos[b] + k].to_vec())
+                            .collect(),
+                        StepInput::Same(i) => w[&m.inputs[i].0].clone(),
+                        StepInput::Cache(c) => {
+                            sess.iter().flat_map(|&b| caches[b][c].clone()).collect()
+                        }
+                    })
+                    .collect()
+            };
+            let all: Vec<usize> = (0..nb).collect();
+            let together = st
+                .graph
+                .bind(&[("B", nb)])
+                .unwrap()
+                .eval(&inputs_for(&all), &ids);
+            let one = st.graph.bind(&[("B", 1)]).unwrap();
+            let mut next = Vec::new();
+            for b in 0..nb {
+                let alone = one.eval(&inputs_for(&[b]), &ids);
+                for (t, a) in together.iter().zip(&alone) {
+                    let per = t.len() / nb;
+                    assert_eq!(
+                        bits(&t[b * per..(b + 1) * per]),
+                        bits(a),
+                        "{} session {b}",
+                        m.name
+                    );
+                }
+                let grown = pos[b] + k;
+                let want =
+                    m.g.bind(&[("T", grown)])
+                        .unwrap()
+                        .eval(&ins(&toks[b][..grown]), &[m.logits]);
+                worst = worst.max(rel(&alone[0], &want[0][pos[b] * vocab..grown * vocab]));
+                next.push(alone[1..].to_vec());
+            }
+            caches = next;
+            for p in pos.iter_mut() {
+                *p += k;
+            }
+        }
+        eprintln!(
+            "{} batched: sessions {ps:?}, steps {ks:?}, {ncache} caches: together == alone bit \
+             for bit; vs unbatched prefill max rel err {worst:.2e}",
+            m.name
+        );
+        assert!(worst < 1e-10, "{} batched: {worst:e}", m.name);
+    }
+
+    #[test]
+    fn qwen3_ragged() {
+        ragged(&qwen());
+    }
+
+    #[test]
+    fn coder_next_ragged() {
+        ragged(&coder());
+    }
+
+    #[test]
+    fn deepseek_ragged() {
+        ragged(&deepseek());
+    }
+
+    #[test]
+    fn glm_ragged() {
+        ragged(&glm());
+    }
 }

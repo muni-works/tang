@@ -684,7 +684,7 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
                 select(j - end + lit(kpf) - lit(0.5), lit(1.0), lit(0.0)),
                 lit(0.0),
             );
-            m = m + select(val + lit(1e29), inside, lit(0.0));
+            m += select(val + lit(1e29), inside, lit(0.0));
         }
         m
     });
