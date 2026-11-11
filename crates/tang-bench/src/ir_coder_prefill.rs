@@ -570,6 +570,25 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
         .unwrap();
     // attn[t, g, r, c] = Σ_j p·v / l: space (t, g, r, c, j)
     let sp = [T, Dim::Fixed(kvh), Dim::Fixed(per), Dim::Fixed(hd), T];
+    // `TANG_CODER_VT=1`: V read through a transposed copy `[kvh·hd, T]`, so
+    // the derived step caches it with positions innermost and P·V streams
+    // each head dim's cached values contiguously (batched decode at long
+    // context: P·V was ~half the step, its V loads strided by kvh·hd)
+    let vt_arg = if std::env::var("TANG_CODER_VT").as_deref() == Ok("1") {
+        let vt = b
+            .g
+            .comp(
+                &[Dim::Fixed(kvh * hd), T],
+                &[],
+                vec![arg(v, vec![unit(2, 1), unit(2, 0)])],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        arg(vt, vec![form(5, &[(1, hd as i64), (3, 1)], 0), unit(5, 4)])
+    } else {
+        arg(v, vec![unit(5, 4), form(5, &[(1, hd as i64), (3, 1)], 0)])
+    };
     let (to, jo) = (b.g.iota(&sp, 0), b.g.iota(&sp, 4));
     let mlv = vec![unit(5, 0), unit(5, 1), unit(5, 2)];
     let attn =
@@ -580,7 +599,7 @@ fn attention(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> (TensorId, T
                 arg(scores, vec![unit(5, 0), unit(5, 1), unit(5, 2), unit(5, 4)]),
                 arg(m, mlv.clone()),
                 arg(lsum, mlv),
-                arg(v, vec![unit(5, 4), form(5, &[(1, hd as i64), (3, 1)], 0)]),
+                vt_arg.clone(),
                 arg(to, ident(5)),
                 arg(jo, ident(5)),
             ],
