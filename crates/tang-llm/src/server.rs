@@ -507,6 +507,8 @@ where
     });
     ready_rx.recv()??;
 
+    let advert_node = node.clone();
+    let advert_keyed = opts.key.is_some();
     let app = App { node };
     let health_app = app.clone();
     let mut api = Router::new()
@@ -536,7 +538,14 @@ where
         .build()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&opts.addr).await?;
-        eprintln!("tang-llm: listening on http://{}", listener.local_addr()?);
+        let local = listener.local_addr()?;
+        eprintln!("tang-llm: listening on http://{local}");
+        let _advert = crate::advertise::start(
+            &local.to_string(),
+            &advert_node.id,
+            &(advert_node.hardware)(),
+            advert_keyed,
+        );
         axum::serve(listener, router).await?;
         anyhow::Ok(())
     })

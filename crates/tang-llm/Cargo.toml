@@ -54,6 +54,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
+# Bonjour advertisement of a node reachable beyond loopback (src/advertise.rs).
+mdns-sd = "0.11"
 tang-moe = { workspace = true, optional = true }
 tang-expr = { workspace = true }
 tang = { workspace = true }
