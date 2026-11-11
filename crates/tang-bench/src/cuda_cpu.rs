@@ -48,8 +48,6 @@ struct int4 { int x, y, z, w; };
 #define __restrict__ __restrict
 #define __noinline__
 template <class T> static inline T __ldg(const T* p) { return *p; }
-static inline float2 make_float2(float x, float y) { return {x, y}; }
-static inline float4 make_float4(float x, float y, float z, float w) { return {x, y, z, w}; }
 static inline int __dp4a(int a, int b, int c) {
     for (int i = 0; i < 4; i++) c += (int)(signed char)(a >> (8 * i)) * (int)(signed char)(b >> (8 * i));
     return c;
@@ -280,7 +278,7 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         writeln!(
             cpp,
             "    std::fwrite(B[{j}].data(), 4, {}, o);",
-            p.buffers[j].len
+            p.buffers[j].format.words(p.buffers[j].len).max(1)
         )
         .unwrap();
     }
@@ -347,7 +345,9 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
     let got = outs
         .iter()
         .map(|&t| {
-            let n = p.buffers[bi(t)].len;
+            let b = &p.buffers[bi(t)];
+            // a block-format output comes back as its raw words
+            let n = b.format.words(b.len).max(1);
             (&mut words).take(n).collect()
         })
         .collect();
