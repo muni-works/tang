@@ -59,7 +59,16 @@ fn main() {
     let pos: Vec<f32> = vec![0.0; nb];
     let toks: Vec<f32> = (0..nb).map(|b| (151 + 7 * b) as f32).collect();
     let mut sides = Vec::new();
-    for ro in [plain, test] {
+    for (side, ro) in [plain, test].into_iter().enumerate() {
+        // `B_ENV="K=V,K2=V2"`: env set for side B's lowering only (a control)
+        if side == 1 {
+            if let Ok(e) = std::env::var("B_ENV") {
+                for kv in e.split(',').filter(|s| !s.is_empty()) {
+                    let (k, v) = kv.split_once('=').unwrap();
+                    std::env::set_var(k, v);
+                }
+            }
+        }
         let low = lower_real_step_with(&pg, &st, &tys, &ro);
         let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
         let res = low.residual.clone();

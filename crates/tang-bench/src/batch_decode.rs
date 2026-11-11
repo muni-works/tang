@@ -461,6 +461,17 @@ mod tests {
     /// CPU. The grouping is a permutation of the same dot products.
     #[test]
     fn grouped_real_lowering_matches_ungrouped() {
+        grouped_real(8, 4, 4);
+    }
+
+    /// coder-next's routing width: 512 experts, top-10.
+    #[test]
+    fn grouped_real_lowering_matches_ungrouped_512() {
+        grouped_real(512, 10, 1);
+        grouped_real(512, 10, 4);
+    }
+
+    fn grouped_real(n_expert: usize, n_used: usize, nb: usize) {
         use crate::ir_coder_prefill::*;
         use crate::ir_coder_real::*;
         use tang_compile::tensor::int8_sched::BlockOpts;
@@ -479,8 +490,8 @@ mod tests {
             ssm_d_state: 32,
             ssm_k_heads: 2,
             ssm_v_heads: 4,
-            n_expert: 8,
-            n_expert_used: 4,
+            n_expert,
+            n_expert_used: n_used,
             n_ff_exp: 256,
             n_ff_shexp: 256,
         };
@@ -499,7 +510,6 @@ mod tests {
             })
             .collect();
         let st = derived_step_batched(&pg, 8).unwrap();
-        let nb = 4;
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut rnd = move || {
             seed ^= seed << 13;
