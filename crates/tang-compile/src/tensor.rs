@@ -43,6 +43,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
+#[path = "tensor_cuda_delta.rs"]
+mod cuda_delta;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
@@ -53,6 +55,8 @@ pub mod cuda_mega;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
+#[path = "tensor_cuda_split.rs"]
+mod cuda_split;
 /// Algorithm discovery: online, scan and chunked lifts.
 #[path = "tensor_discover.rs"]
 pub mod discover;
@@ -105,7 +109,7 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
-pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
+pub use scan::{DeltaForm, DeltaStep, Scan, ScanKind, Semiring};
 /// Multi-GPU decode: placements, collectives and per-rank programs.
 #[path = "tensor_shard.rs"]
 pub mod shard;
