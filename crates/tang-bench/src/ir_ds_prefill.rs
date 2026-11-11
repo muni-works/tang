@@ -908,11 +908,7 @@ pub(crate) fn moe_graph(
         b.g.comp_tuple(
             &[T, fx(2 * ka)],
             &[fx(ne)],
-            vec![
-                arg(sc, ident(2)),
-                bias_arg,
-                arg(ei, ident(2)),
-            ],
+            vec![arg(sc, ident(2)), bias_arg, arg(ei, ident(2))],
             Some(Monoid::topk(ka)),
             |v| {
                 let mut o = vec![v[2], v[0] + v[1]];
@@ -1092,12 +1088,15 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         // rows) replace the `image_token_id` embedding
         let rows = b.input("image_rows".into(), &[T, fx(d)]);
         let mask = b.input("image_mask".into(), &[T]);
-        e = b
-            .g
-            .comp(
+        e =
+            b.g.comp(
                 &[T, fx(d)],
                 &[],
-                vec![arg(e, ident(2)), arg(rows, ident(2)), arg(mask, vec![unit(2, 0)])],
+                vec![
+                    arg(e, ident(2)),
+                    arg(rows, ident(2)),
+                    arg(mask, vec![unit(2, 0)]),
+                ],
                 None,
                 |v| vec![select(v[2] - lit(0.5), v[1], v[0])],
             )
@@ -2374,7 +2373,14 @@ pub(crate) mod tests {
 
         fn moe(&self, l: usize, x: &[f64], mask: Option<&[f64]>) -> Vec<f64> {
             let dm = self.dm;
-            self.moe_at_vl(&format!("layers.{l}"), l, x, dm.n_experts, dm.n_active, mask)
+            self.moe_at_vl(
+                &format!("layers.{l}"),
+                l,
+                x,
+                dm.n_experts,
+                dm.n_active,
+                mask,
+            )
         }
 
         /// The MoE under `p` (`ne` experts, top `k`); `l` names the layer
@@ -2660,7 +2666,13 @@ pub(crate) mod tests {
         dm: &DsDims,
         p0: usize,
         k: usize,
-    ) -> (StepGraph, Vec<Vec<f64>>, Vec<TensorId>, Vec<Vec<f64>>, Vec<usize>) {
+    ) -> (
+        StepGraph,
+        Vec<Vec<f64>>,
+        Vec<TensorId>,
+        Vec<Vec<f64>>,
+        Vec<usize>,
+    ) {
         let pg = prefill_graph(dm);
         let (w, all) = setup(dm, &pg, p0 + k);
         let st = derived_step(&pg, dm, k).unwrap();

@@ -266,6 +266,13 @@ impl Resident {
 }
 
 /// `TANG_GLM5_RESIDENT=0`: force the host-staged decode.
+/// `TANG_GLM5_RES_ROWS=1` (default off): batched serving decodes take the
+/// device-resident rows window ([`Glm5Engine::window_rows_resident`]) instead of
+/// `window_batch`'s host-staged one.
+fn rows_env() -> bool {
+    std::env::var("TANG_GLM5_RES_ROWS").is_ok_and(|v| v == "1")
+}
+
 fn resident_env() -> bool {
     !std::env::var("TANG_GLM5_RESIDENT").is_ok_and(|v| v == "0")
 }
@@ -643,38 +650,7 @@ impl Glm5Engine {
         }
         let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident window: {e}");
         let mut res = g.resident.take().unwrap();
-        // (re)size the window buffers
-        if res.win.as_ref().is_none_or(|w| w.cap < t) {
-            let cap = t.max(4);
-            let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
-            let mut ck = Vec::with_capacity(hp.n_layer);
-            let mut ck_bytes = Vec::with_capacity(hp.n_layer);
-            for l in 0..hp.n_layer {
-                match g.kda_l[l].as_ref().filter(|_| hp.is_kda[l]) {
-                    Some(k) => {
-                        let b: usize = k.state_regions(0).iter().map(|r| r.1).sum();
-                        ck.push(Some(DevBuf::alloc(b * (cap - 1)).map_err(ge)?));
-                        ck_bytes.push(b);
-                    }
-                    None => {
-                        ck.push(None);
-                        ck_bytes.push(0);
-                    }
-                }
-            }
-            res.win = Some(WinBufs {
-                cap,
-                kx: f4(cap * n)?,
-                ky: f4(cap * n)?,
-                fx: f4(cap * n)?,
-                fy: f4(cap * n)?,
-                hn: f4(cap * n)?,
-                ids: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
-                wtok: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
-                ck,
-                ck_bytes,
-            });
-        }
+        ensure_win(&mut res, g, &hp, t, true)?;
         let mut f = g.mhc_f.take().unwrap();
         let s = std::mem::ManuallyDrop::new(tang_moe::gpu::Stream(f.stream().0));
         let dsa = &mut self.dsa[slot];
@@ -909,6 +885,244 @@ impl Glm5Engine {
         self.last_h.clear();
         self.last_h.extend_from_slice(&hn);
         Ok(Some((all, ids, hn)))
+    }
+
+    /// Can a batched decode over `slots` take [`Self::window_rows_resident`]? The
+    /// [`Self::resident_ready`] conditions without its slot-0 / single-slot rule, every
+    /// slot below the engine's slot count and the mHC / KDA scratch wide enough.
+    fn rows_ready(&self, slots: &[usize]) -> bool {
+        if !rows_env() || self.dump.is_some() || slots.iter().any(|&s| s >= self.n_slots) {
+            return false;
+        }
+        if self.kda_dbg.is_some() || self.moe_dbg.is_some() || self.mla_dbg.is_some() {
+            return false;
+        }
+        let Some(g) = self.gpu.as_ref() else {
+            return false;
+        };
+        let t = slots.len();
+        if g.devs.len() != 1
+            || !g.devs[0].1.fast
+            || g.mhc_f.as_ref().is_none_or(|f| f.max_t() < t)
+            || t > g.max_t
+        {
+            return false;
+        }
+        let hp = &self.m.hp;
+        (0..hp.n_layer).all(|l| {
+            g.mhc_g[l].is_some()
+                && g.has_ffn(l)
+                && if hp.is_kda[l] {
+                    g.kda_l[l]
+                        .as_ref()
+                        .is_some_and(|k| k.resident_ok() && k.pf2_on())
+                } else {
+                    g.mla_k[l].is_some() && g.mla_p[l].is_some()
+                }
+        })
+    }
+
+    /// The batched serving decode, device-resident: row `i` is token `rows[i].1` of
+    /// sequence `rows[i].0` (distinct slots), each at its own position. One stream, one
+    /// H2D (the embeddings), one sync and a `4·t`-byte read (the greedy ids). Per token
+    /// stage as [`Self::window_batch`]: mHC, the KDA projections / o_proj, the FFN (T = t)
+    /// and the head run once over all rows; the KDA core runs one launch pair for all rows
+    /// ([`super::kda_dev::DevLayer::rows_enqueue_slots`]); each DSA layer attends row `i`
+    /// over slot `rows[i].0`'s device caches (t = 1 per row, async, no host round trip).
+    /// Returns the greedy next token per row, or `None` when a stage is not resident
+    /// (`TANG_GLM5_RES_ROWS=0` also forces `None`: the caller runs `window_batch`).
+    pub fn window_rows_resident(&mut self, rows: &[(usize, u32)]) -> Result<Option<Vec<u32>>> {
+        let t = rows.len();
+        let slots: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        for (i, &s) in slots.iter().enumerate() {
+            ensure!(!slots[..i].contains(&s), "slot {s} twice in one batch");
+        }
+        if t == 0 || !self.rows_ready(&slots) {
+            return Ok(None);
+        }
+        let hp = self.m.hp.clone();
+        let (n, hc, nv) = (hp.n_embd, hp.hc, hp.n_vocab);
+        // every row's KDA slot state must be the live device copy (as kda_rows does)
+        for l in (0..hp.n_layer).filter(|&l| hp.is_kda[l]) {
+            let cfg = self.kda_weights(l)?.1.clone();
+            let g = self.gpu.as_mut().unwrap();
+            for &s in &slots {
+                if !g.kda_dev_fresh[s][l] {
+                    let st = self.kda[s][l]
+                        .take()
+                        .unwrap_or_else(|| (ConvState::zeros(&cfg, 1), KdaState::zeros(&cfg, 1)));
+                    g.kda_l[l].as_ref().unwrap().seed_at(s, &st.0, &st.1)?;
+                    self.kda[s][l] = Some(st);
+                    g.kda_dev_fresh[s][l] = true;
+                }
+            }
+        }
+        self.drop_step_graph();
+        let pos: Vec<usize> = slots.iter().map(|&s| self.slot_tokens(s).len()).collect();
+        let mut mla_w: Vec<Option<std::sync::Arc<MlaWeights>>> = vec![None; hp.n_layer];
+        for l in 0..hp.n_layer {
+            if !hp.is_kda[l] {
+                mla_w[l] = Some(self.mla_weights(l)?);
+            }
+        }
+        let norm_w = if self.gpu.as_ref().is_some_and(|g| g.resident.is_none()) {
+            Some(self.m.vec("output_norm.weight")?)
+        } else {
+            None
+        };
+        let embd = self.m.g.info("token_embd.weight")?;
+        let mut r = vec![0f32; t * hc * n];
+        for (i, &(_, tk)) in rows.iter().enumerate() {
+            ensure!((tk as usize) < nv, "token {tk} out of range");
+            let e = self.m.g.rows(embd, tk as usize, 1)?;
+            for c in 0..hc {
+                r[(i * hc + c) * n..(i * hc + c + 1) * n].copy_from_slice(&e);
+            }
+        }
+        let g = self.gpu.as_mut().context("resident rows without a GPU")?;
+        g.devs[0]
+            .0
+            .bind()
+            .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+        if let Some(w) = norm_w {
+            let own = g.head_dev.is_none();
+            g.resident = Some(Resident::new(&g.devs[0].0, &self.m.g, &w, own)?);
+        }
+        let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident rows: {e}");
+        let mut res = g.resident.take().unwrap();
+        if let Err(e) = ensure_win(&mut res, g, &hp, t, false) {
+            g.resident = Some(res);
+            return Err(e);
+        }
+        let mut f = g.mhc_f.take().unwrap();
+        let s = std::mem::ManuallyDrop::new(tang_moe::gpu::Stream(f.stream().0));
+        let dsa = &mut self.dsa;
+        let out = (|| -> Result<Vec<u32>> {
+            res.dev_tp = None;
+            if !res.wwarm.contains(&t) {
+                // a new row count may grow shared scratch (the FFN pool): captured graphs
+                // that could point at the old buffers go
+                GRAPH_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                res.wgraphs.clear();
+                res.whole = [None, None];
+                res.whole_cap = 0;
+            }
+            let rb = n * 4;
+            use tang_moe::gpu::copy_d2d_async as d2d;
+            f.begin_async(&r)?;
+            for it in plan(&hp) {
+                let t0 = prof_on().then(|| {
+                    let _ = s.sync();
+                    std::time::Instant::now()
+                });
+                match it {
+                    Item::PreAttn(l) => {
+                        let dst = if hp.is_kda[l] {
+                            g.kda_l[l].as_ref().context("kda not resident")?.x_ptr()
+                        } else {
+                            res.win.as_ref().unwrap().kx.ptr
+                        };
+                        f.pre_dev(g.mhc_g[l].as_ref().context("mhc not resident")?, l, 0, dst)?;
+                    }
+                    Item::Kda(l) => {
+                        let k = g.kda_l[l].as_mut().context("kda not resident")?;
+                        k.rows_enqueue_slots(&s, &slots)?;
+                        f.post_dev(k.y_ptr())?;
+                    }
+                    Item::Dsa(l) => {
+                        let wb = res.win.as_ref().unwrap();
+                        let (cu, p) = (
+                            g.mla_k[l].as_ref().unwrap(),
+                            g.mla_p[l].as_ref().context("mla not resident")?,
+                        );
+                        let w = mla_w[l].as_ref().unwrap();
+                        let (dl, idd) = (w.kv_lora, w.idx_dim);
+                        let (xp, yp) = (p.x_ptr(1)?, wb.ky.ptr);
+                        for (i, &slot) in slots.iter().enumerate() {
+                            let pos0 = pos[i];
+                            cu.set_seq(slot as u64);
+                            if !cu.rows_fit(pos0 + 1) {
+                                res.whole = [None, None];
+                                res.whole_cap = 0;
+                            }
+                            let c = &mut dsa[slot][l];
+                            ensure!(
+                                c.lat16.len() == pos0 * dl,
+                                "slot {slot}: latent cache out of step"
+                            );
+                            let kv_len = pos0 + 1;
+                            if !cu.rows_fit(kv_len) {
+                                if let Some(from) = c.stale_from.take().filter(|&fr| fr < pos0) {
+                                    cu.refresh_mirrors(
+                                        from,
+                                        pos0 - from,
+                                        &mut c.lat16,
+                                        &mut c.idx_k,
+                                        &mut c.idx_g,
+                                        &mut c.valid,
+                                    )
+                                    .map_err(|e| anyhow::anyhow!("glm5 dsa mirror refresh: {e}"))?;
+                                }
+                            }
+                            c.lat16.resize(kv_len * dl, 0);
+                            c.idx_k.resize(kv_len * idd, 0.0);
+                            c.idx_g.resize(kv_len * idd, 0.0);
+                            c.valid.resize(kv_len, 0);
+                            c.stale_from = Some(c.stale_from.map_or(pos0, |s| s.min(pos0)));
+                            d2d(xp, wb.kx.ptr + (i * rb) as u64, rb, &s).map_err(ge)?;
+                            let y = p.window_dev(
+                                cu, w, 1, pos0, &c.lat16, &c.idx_k, &c.idx_g, &c.valid, &s,
+                            )?;
+                            d2d(yp + (i * rb) as u64, y, rb, &s).map_err(ge)?;
+                        }
+                        cu.set_seq(0);
+                        f.post_dev(yp)?;
+                    }
+                    Item::PreFfn(_) | Item::Ffn(_) | Item::Head => {
+                        wexec(
+                            it,
+                            &mut f,
+                            g,
+                            &res,
+                            &mut [],
+                            &mla_w,
+                            &hp,
+                            0,
+                            t,
+                            &s,
+                            Pass::Eager,
+                        )?;
+                    }
+                }
+                if let Some(t0) = t0 {
+                    s.sync().map_err(ge)?;
+                    let k = match it {
+                        Item::PreAttn(_) | Item::PreFfn(_) => "rows.mhc",
+                        Item::Kda(_) => "rows.kda",
+                        Item::Dsa(_) => "rows.dsa",
+                        Item::Ffn(_) => "rows.moe",
+                        Item::Head => "rows.head",
+                    };
+                    prof_add(k, t0.elapsed().as_secs_f64());
+                }
+            }
+            if !res.wwarm.contains(&t) {
+                res.wwarm.push(t);
+            }
+            s.sync().map_err(ge)?;
+            res.win.as_ref().unwrap().ids.read::<u32>(0, t).map_err(ge)
+        })();
+        if out.is_err() {
+            let _ = f.set_window(0);
+        }
+        g.mhc_f = Some(f);
+        g.resident = Some(res);
+        let ids = out?;
+        for &(s, tk) in rows {
+            self.slot_tokens_mut(s).push(tk);
+        }
+        self.last_h.clear();
+        Ok(Some(ids))
     }
 
     /// After a [`Self::window_resident`] of `t` rows: keep only the first `keep` (1..=t).
@@ -1331,6 +1545,54 @@ pub(crate) fn prof_report() -> String {
         .iter()
         .map(|(k, s, c)| format!("prof {k}: {:.2} ms total, {c} calls\n", s * 1e3))
         .collect()
+}
+
+/// (Re)size the resident window buffers to hold `t` rows (shared by the slot-0 window and
+/// the batched rows window). `want_ck`: also the per-KDA-layer rewind checkpoints the
+/// slot-0 window needs (`cap - 1` slot states per layer — GBs at a serving batch's cap, so
+/// the rows window, which never rewinds, leaves them out).
+fn ensure_win(
+    res: &mut Resident,
+    g: &GpuFfn,
+    hp: &super::super::Hparams,
+    t: usize,
+    want_ck: bool,
+) -> Result<()> {
+    let ge = |e: tang_moe::gpu::Error| anyhow::anyhow!("glm5 resident window: {e}");
+    let n = hp.n_embd;
+    let refit = |w: &WinBufs| w.cap < t || (want_ck && w.ck.is_empty());
+    if res.win.as_ref().is_none_or(refit) {
+        let cap = t.max(4).max(res.win.as_ref().map_or(0, |w| w.cap));
+        let f4 = |k: usize| DevBuf::zeroed_elems::<f32>(k).map_err(ge);
+        let mut ck = Vec::with_capacity(hp.n_layer);
+        let mut ck_bytes = Vec::with_capacity(hp.n_layer);
+        for l in (0..hp.n_layer).filter(|_| want_ck) {
+            match g.kda_l[l].as_ref().filter(|_| hp.is_kda[l]) {
+                Some(k) => {
+                    let b: usize = k.state_regions(0).iter().map(|r| r.1).sum();
+                    ck.push(Some(DevBuf::alloc(b * (cap - 1)).map_err(ge)?));
+                    ck_bytes.push(b);
+                }
+                None => {
+                    ck.push(None);
+                    ck_bytes.push(0);
+                }
+            }
+        }
+        res.win = Some(WinBufs {
+            cap,
+            kx: f4(cap * n)?,
+            ky: f4(cap * n)?,
+            fx: f4(cap * n)?,
+            fy: f4(cap * n)?,
+            hn: f4(cap * n)?,
+            ids: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
+            wtok: DevBuf::zeroed_elems::<u32>(cap).map_err(ge)?,
+            ck,
+            ck_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// One [`Item`] of [`Glm5Engine::window_resident`] (t rows) on `s`. `Pass` as for

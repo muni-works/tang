@@ -795,7 +795,11 @@ fn uniform(rng: &mut u64) -> f64 {
 
 impl SpecSampler {
     pub fn new(temp: f64, top_p: f64, seed: u64) -> Self {
-        Self { temp, top_p, rng: seed }
+        Self {
+            temp,
+            top_p,
+            rng: seed,
+        }
     }
 
     pub fn greedy(&self) -> bool {
@@ -809,7 +813,10 @@ impl SpecSampler {
             return vec![(argmax(logits) as usize, 1.0)];
         }
         let mx = logits.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let w: Vec<f64> = logits.iter().map(|&l| ((l - mx) / self.temp).exp()).collect();
+        let w: Vec<f64> = logits
+            .iter()
+            .map(|&l| ((l - mx) / self.temp).exp())
+            .collect();
         let z: f64 = w.iter().sum();
         let mut idx: Vec<usize> = (0..w.len()).collect();
         idx.sort_by(|a, b| w[*b].partial_cmp(&w[*a]).unwrap().then(a.cmp(b)));
@@ -940,7 +947,10 @@ pub fn generate_spark_sampled(
                 new.push(s.verify(row, None).0 as u32);
                 break;
             }
-            let (t, ok) = s.verify(row, Some((&q[kk * vocab..(kk + 1) * vocab], toks[kk + 1] as usize)));
+            let (t, ok) = s.verify(
+                row,
+                Some((&q[kk * vocab..(kk + 1) * vocab], toks[kk + 1] as usize)),
+            );
             new.push(t as u32);
             if !ok {
                 break;
@@ -1357,7 +1367,8 @@ pub(crate) mod tests {
         let (greedy, _) = generate_spark(&mut v, &mut d, first, n, 1, None);
         let (mut v, mut d, first) = start();
         let mut s0 = SpecSampler::new(0.0, 1.0, 7);
-        let (g0, _) = generate_spark_sampled(&mut v, &mut d, &w, &mut s0, first, n, dm.dspark_block + 1);
+        let (g0, _) =
+            generate_spark_sampled(&mut v, &mut d, &w, &mut s0, first, n, dm.dspark_block + 1);
         assert_eq!(g0, greedy, "temperature 0");
         // the distribution of a verify row's token under rejection sampling
         let (mut v, d, first) = start();
@@ -1406,7 +1417,8 @@ pub(crate) mod tests {
         // an end-to-end sampled run, and the drafter still matches its graph
         let (mut v, mut d, first) = start();
         let mut s = SpecSampler::new(0.8, 0.9, 3);
-        let (out, st) = generate_spark_sampled(&mut v, &mut d, &w, &mut s, first, n, dm.dspark_block + 1);
+        let (out, st) =
+            generate_spark_sampled(&mut v, &mut d, &w, &mut s, first, n, dm.dspark_block + 1);
         assert_eq!(out.len(), n);
         eprintln!(
             "sampled k={}: {out:?}, {:.2} tokens/window, acceptance {:.0}% ({}/{})",

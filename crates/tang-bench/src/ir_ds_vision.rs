@@ -309,7 +309,11 @@ pub fn pil_resize(im: &Rgb8, w: usize, h: usize) -> Rgb8 {
                 }
             }
         }
-        cur = Rgb8 { w, h: cur.h, px: out };
+        cur = Rgb8 {
+            w,
+            h: cur.h,
+            px: out,
+        };
     }
     if h != cur.h {
         let cs = coeffs(cur.h, h);
@@ -325,7 +329,11 @@ pub fn pil_resize(im: &Rgb8, w: usize, h: usize) -> Rgb8 {
                 }
             }
         }
-        cur = Rgb8 { w: cur.w, h, px: out };
+        cur = Rgb8 {
+            w: cur.w,
+            h,
+            px: out,
+        };
     }
     cur
 }
@@ -348,14 +356,26 @@ pub fn pil_pad(im: &Rgb8, w: usize, h: usize) -> Rgb8 {
     if im_ratio == dest_ratio {
         return pil_resize(im, w, h);
     }
-    let mut out = Rgb8 { w, h, px: vec![127; w * h * 3] };
+    let mut out = Rgb8 {
+        w,
+        h,
+        px: vec![127; w * h * 3],
+    };
     let (src, x0, y0) = if im_ratio > dest_ratio {
         let nh = round_half_even(im.h as f64 / im.w as f64 * w as f64) as usize;
-        let src = if nh != h { pil_resize(im, w, nh) } else { im.clone() };
+        let src = if nh != h {
+            pil_resize(im, w, nh)
+        } else {
+            im.clone()
+        };
         (src, 0, round_half_even((h as f64 - nh as f64) * 0.5))
     } else {
         let nw = round_half_even(im.w as f64 / im.h as f64 * h as f64) as usize;
-        let src = if nw != w { pil_resize(im, nw, h) } else { im.clone() };
+        let src = if nw != w {
+            pil_resize(im, nw, h)
+        } else {
+            im.clone()
+        };
         (src, round_half_even((w as f64 - nw as f64) * 0.5), 0)
     };
     // paste, clipped to the canvas
@@ -394,7 +414,9 @@ pub struct ImageInput {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Rgb8, String> {
-    let im = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgb8();
+    let im = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())?
+        .to_rgb8();
     Ok(Rgb8 {
         w: im.width() as usize,
         h: im.height() as usize,
@@ -510,7 +532,8 @@ pub fn expand_prompt(
         let pl = it.next().unwrap();
         out.starts.push(out.ids.len());
         let ty = image_token_types(pl.n_llm_h, pl.n_llm_w);
-        out.ids.extend(std::iter::repeat_n(image_token_id, ty.len()));
+        out.ids
+            .extend(std::iter::repeat_n(image_token_id, ty.len()));
         out.types.extend(ty);
     }
     Ok(out)
@@ -655,7 +678,9 @@ impl EncoderGraph {
     /// `[out, keep…]`: what a device lowering should materialize. The
     /// aligner output is first.
     pub fn lower_outputs(&self) -> Vec<TensorId> {
-        std::iter::once(self.out).chain(self.keep.iter().copied()).collect()
+        std::iter::once(self.out)
+            .chain(self.keep.iter().copied())
+            .collect()
     }
 }
 
@@ -731,9 +756,13 @@ impl E {
         let (r, n) = (self.n(x, 0), self.n(x, 1));
         let ss = self
             .g
-            .comp(&[fx(r)], &[fx(n)], vec![arg(x, ident(2))], Some(Monoid::sum()), |v| {
-                vec![v[0] * v[0]]
-            })
+            .comp(
+                &[fx(r)],
+                &[fx(n)],
+                vec![arg(x, ident(2))],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[0]],
+            )
             .unwrap();
         self.g
             .comp(
@@ -752,7 +781,14 @@ impl E {
 
     /// Half-split RoPE of the `heads` 64-wide heads at column `base` of
     /// `qkv` (`[N, ·]`), angles `[N, hd/2]`: `[N, heads·hd]`.
-    fn rope(&mut self, qkv: TensorId, base: usize, heads: usize, hd: usize, ang: TensorId) -> TensorId {
+    fn rope(
+        &mut self,
+        qkv: TensorId,
+        base: usize,
+        heads: usize,
+        hd: usize,
+        ang: TensorId,
+    ) -> TensorId {
         let n = self.n(qkv, 0);
         let half = hd / 2;
         let sp = [fx(n), fx(heads), fx(2), fx(half)];
@@ -760,7 +796,10 @@ impl E {
         let col = |o: usize| {
             arg(
                 qkv,
-                vec![unit(4, 0), form(4, &[(1, hd as i64), (3, 1)], (base + o) as i64)],
+                vec![
+                    unit(4, 0),
+                    form(4, &[(1, hd as i64), (3, 1)], (base + o) as i64),
+                ],
             )
         };
         let r = self
@@ -831,7 +870,10 @@ impl E {
             .comp(
                 &[fx(heads), fx(n), fx(n)],
                 &[],
-                vec![arg(s, ident(3)), arg(m, vec![unit(3, 0), unit(3, 1), konst(3, 0)])],
+                vec![
+                    arg(s, ident(3)),
+                    arg(m, vec![unit(3, 0), unit(3, 1), konst(3, 0)]),
+                ],
                 None,
                 |v| vec![(v[0] - v[1]).exp()],
             )
@@ -880,7 +922,6 @@ impl E {
             .unwrap();
         self.g.reshape(y, &[fx(n), fx(heads * hd)]).unwrap()
     }
-
 }
 
 /// `|x|` as a select.
@@ -984,7 +1025,10 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
     };
     let patches = e.input("patches".into(), &[n, vd.patch_len()]);
     let ang = e.input("rope_angles".into(), &[n, vd.rope_dim()]);
-    let pw = e.input("vision.patch_embed.proj.weight".into(), &[c, vd.patch_len()]);
+    let pw = e.input(
+        "vision.patch_embed.proj.weight".into(),
+        &[c, vd.patch_len()],
+    );
     let pb = e.input("vision.patch_embed.proj.bias".into(), &[c]);
     let mut x = e.linear(patches, pw, Some(pb));
     // the residual stream, layer by layer: lowered as extra outputs so it
@@ -1011,9 +1055,8 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         keep.push(x);
         let xn = e.rms(x, n2, vd.eps);
         let gu = e.linear(xn, w1, None);
-        let act = e
-            .g
-            .comp(
+        let act =
+            e.g.comp(
                 &[fx(n), fx(inter)],
                 &[],
                 vec![
@@ -1036,9 +1079,8 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
     let (bh, bw) = (n_h.div_ceil(r), n_w.div_ceil(r));
     let x3 = e.g.reshape(vit, &[fx(n_h), fx(n_w), fx(c)]).unwrap();
     let ri = r as i64;
-    let unf = e
-        .g
-        .comp(
+    let unf =
+        e.g.comp(
             &[fx(bh), fx(bw), fx(c), fx(r), fx(r)],
             &[],
             vec![Arg {
@@ -1081,7 +1123,11 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
 /// checkpoint tensors (every graph input past `patches` and `rope_angles`)
 /// stored as bf16 — exact, the checkpoint is bf16 — so matmul tiles run on
 /// bf16 fragments (and Hopper wgmma), activations rounded while staging.
-pub fn prefill_schedule(g: &TensorGraph, outs: &[TensorId], bf16: Bf16) -> (TensorGraph, Vec<TensorId>) {
+pub fn prefill_schedule(
+    g: &TensorGraph,
+    outs: &[TensorId],
+    bf16: Bf16,
+) -> (TensorGraph, Vec<TensorId>) {
     use tang_compile::tensor::Op;
     let (g, o) = g.stabilize_softmax(outs);
     let (g, o) = g.substitute_maps(&o);
@@ -1246,16 +1292,18 @@ pub(crate) mod tests {
     fn lin(x: &[f64], k: usize, w: &[f64], b: Option<&[f64]>) -> Vec<f64> {
         let n = w.len() / k;
         let mut y = vec![0.0; x.len() / k * n];
-        y.par_chunks_mut(n).zip(x.par_chunks(k)).for_each(|(yr, xr)| {
-            for (j, o) in yr.iter_mut().enumerate() {
-                let wr = &w[j * k..(j + 1) * k];
-                let mut s = 0.0;
-                for i in 0..k {
-                    s += xr[i] * wr[i];
+        y.par_chunks_mut(n)
+            .zip(x.par_chunks(k))
+            .for_each(|(yr, xr)| {
+                for (j, o) in yr.iter_mut().enumerate() {
+                    let wr = &w[j * k..(j + 1) * k];
+                    let mut s = 0.0;
+                    for i in 0..k {
+                        s += xr[i] * wr[i];
+                    }
+                    *o = s + b.map_or(0.0, |b| b[j]);
                 }
-                *o = s + b.map_or(0.0, |b| b[j]);
-            }
-        });
+            });
         y
     }
 
@@ -1264,7 +1312,10 @@ pub(crate) mod tests {
             .flat_map(|r| {
                 let ms = r.iter().map(|v| v * v).sum::<f64>() / n as f64;
                 let s = 1.0 / (ms + eps).sqrt();
-                r.iter().zip(w).map(move |(v, w)| w * (v * s)).collect::<Vec<_>>()
+                r.iter()
+                    .zip(w)
+                    .map(move |(v, w)| w * (v * s))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -1287,7 +1338,9 @@ pub(crate) mod tests {
             .flat_map(|i| {
                 let (ph, pw) = ((i / nw) as f64, (i % nw) as f64);
                 let inv = &inv;
-                inv.iter().map(move |f| ph * f).chain(inv.iter().map(move |f| pw * f))
+                inv.iter()
+                    .map(move |f| ph * f)
+                    .chain(inv.iter().map(move |f| pw * f))
             })
             .collect();
         let mut x = lin(
@@ -1387,12 +1440,22 @@ pub(crate) mod tests {
                 }
             }
         }
-        let y = lin(&unf, c * r * r, &w("aligner.w1.weight"), Some(&w("aligner.w1.bias")));
+        let y = lin(
+            &unf,
+            c * r * r,
+            &w("aligner.w1.weight"),
+            Some(&w("aligner.w1.bias")),
+        );
         let y: Vec<f64> = y
             .iter()
             .map(|&v| 0.5 * v * (1.0 + libm::erf(v / std::f64::consts::SQRT_2)))
             .collect();
-        let out = lin(&y, vd.llm_dim, &w("aligner.w2.weight"), Some(&w("aligner.w2.bias")));
+        let out = lin(
+            &y,
+            vd.llm_dim,
+            &w("aligner.w2.weight"),
+            Some(&w("aligner.w2.bias")),
+        );
         (vit, out)
     }
 
@@ -1409,7 +1472,9 @@ pub(crate) mod tests {
                 });
                 let v = (0..n)
                     .map(|_| {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
                         let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
                         if s.name.contains("norm") {
                             1.0 + 0.4 * (u - 0.5)
@@ -1441,9 +1506,13 @@ pub(crate) mod tests {
         let n = 4001;
         let x = g.input(&[n]);
         let y = g
-            .comp(&[n], &[], vec![arg(x, ident(1))], None, |v| vec![erf_expr(v[0])])
+            .comp(&[n], &[], vec![arg(x, ident(1))], None, |v| {
+                vec![erf_expr(v[0])]
+            })
             .unwrap();
-        let xs: Vec<f64> = (0..n).map(|i| -10.0 + 20.0 * i as f64 / (n - 1) as f64).collect();
+        let xs: Vec<f64> = (0..n)
+            .map(|i| -10.0 + 20.0 * i as f64 / (n - 1) as f64)
+            .collect();
         let got = g.eval(&[xs.clone()], &[y]).remove(0);
         let worst = xs
             .iter()
@@ -1473,11 +1542,17 @@ pub(crate) mod tests {
         // values from image_processor.plan_image_grid (python, by hand):
         // 640x480: 307200 px ≥ min; best 644 x 490 → 46 x 35 patches → 16 x 12
         let p = plan_image_grid(640, 480, &vd);
-        assert_eq!((p.best_w, p.best_h, p.n_vit_w, p.n_vit_h), (644, 490, 46, 35));
+        assert_eq!(
+            (p.best_w, p.best_h, p.n_vit_w, p.n_vit_h),
+            (644, 490, 46, 35)
+        );
         assert_eq!((p.n_llm_w, p.n_llm_h, p.span()), (16, 12, 12 * 17 + 2));
         // small: scaled up to 544² → 546 x 546, 39² patches, 13² tokens
         let p = plan_image_grid(100, 100, &vd);
-        assert_eq!((p.best_w, p.n_vit_w, p.n_llm_w, p.span()), (546, 39, 13, 184));
+        assert_eq!(
+            (p.best_w, p.n_vit_w, p.n_llm_w, p.span()),
+            (546, 39, 13, 184)
+        );
         // huge: shrunk under 1024 tokens
         let p = plan_image_grid(4000, 3000, &vd);
         assert!(p.span() <= 1024, "{p:?}");
@@ -1488,7 +1563,11 @@ pub(crate) mod tests {
     fn resize_is_identity_and_flat_stays_flat() {
         let im = gradient(31, 17);
         assert_eq!(pil_resize(&im, 31, 17).px, im.px);
-        let flat = Rgb8 { w: 9, h: 5, px: vec![200; 9 * 5 * 3] };
+        let flat = Rgb8 {
+            w: 9,
+            h: 5,
+            px: vec![200; 9 * 5 * 3],
+        };
         let r = pil_resize(&flat, 23, 11);
         assert!(r.px.iter().all(|&v| v == 200));
         let pad = pil_pad(&flat, 20, 20);
@@ -1498,11 +1577,22 @@ pub(crate) mod tests {
 
     #[test]
     fn splice_fills_spans_in_reading_order() {
-        let plans = [ImagePlan { n_vit_h: 6, n_vit_w: 3, n_llm_h: 2, n_llm_w: 1, best_h: 0, best_w: 0 }];
+        let plans = [ImagePlan {
+            n_vit_h: 6,
+            n_vit_w: 3,
+            n_llm_h: 2,
+            n_llm_w: 1,
+            best_h: 0,
+            best_w: 0,
+        }];
         let pr = expand_prompt(&[5, 7, 9], &plans, 7).unwrap();
         assert_eq!(pr.ids, vec![5, 7, 7, 7, 7, 7, 7, 9]);
         assert_eq!(pr.types, vec![TEXT, 0, 1, 2, 1, 2, 3, TEXT]);
-        let dl = Delims { start: vec![10.0], newline: vec![20.0], end: vec![30.0] };
+        let dl = Delims {
+            start: vec![10.0],
+            newline: vec![20.0],
+            end: vec![30.0],
+        };
         let emb = [1.0, 2.0];
         let (rows, mask) = splice_rows(&pr, &[&emb], &dl, 1);
         assert_eq!(rows, vec![0.0, 10.0, 1.0, 20.0, 2.0, 20.0, 30.0, 0.0]);
@@ -1537,8 +1627,17 @@ pub(crate) mod tests {
         let im = gradient(13, 9);
         let mut img = preprocess_rgb(&im, &vd);
         // the tiny plan: force an odd grid so the aligner pads
-        img.plan = ImagePlan { n_vit_h: 7, n_vit_w: 5, n_llm_h: 3, n_llm_w: 2, best_h: 14, best_w: 10 };
-        img.patches = (0..35 * vd.patch_len()).map(|i| ((i * 37 % 101) as f64 - 50.0) / 50.0).collect();
+        img.plan = ImagePlan {
+            n_vit_h: 7,
+            n_vit_w: 5,
+            n_llm_h: 3,
+            n_llm_w: 2,
+            best_h: 14,
+            best_w: 10,
+        };
+        img.patches = (0..35 * vd.patch_len())
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) / 50.0)
+            .collect();
         let eg = encoder_graph(&vd, 7, 5);
         let w = tiny_weights(&eg);
         let ins = encoder_inputs(&eg, &vd, &img, |n| w[n].clone());
@@ -1555,30 +1654,51 @@ pub(crate) mod tests {
     fn vl_prefill_matches_reference_tiny() {
         use crate::ir_ds_prefill::tests::{tiny_engram, weights, with_hashes_masked, Bugs, Ref};
         use crate::ir_ds_prefill::{prefill_graph, DsDims, SEQ};
-        let dm = DsDims { vision: true, ..DsDims::tiny_full() };
+        let dm = DsDims {
+            vision: true,
+            ..DsDims::tiny_full()
+        };
         let pg = prefill_graph(&dm);
         let mut w = weights(&pg, &dm);
         // bias_vl must differ from bias for the check to see it
         for (k, v) in w.iter_mut() {
             if k.ends_with("gate.bias_vl") {
-                v.iter_mut().enumerate().for_each(|(i, x)| *x = (i % 3) as f64 * 0.7 - 0.7);
+                v.iter_mut()
+                    .enumerate()
+                    .for_each(|(i, x)| *x = (i % 3) as f64 * 0.7 - 0.7);
             }
         }
         let t = 9;
         let toks: Vec<f64> = (0..t).map(|i| ((37 * i + 5) % dm.vocab) as f64).collect();
         let mask: Vec<f64> = (0..t).map(|i| (2..6).contains(&i) as u8 as f64).collect();
         let rows: Vec<f64> = (0..t * dm.dim)
-            .map(|i| if mask[i / dm.dim] > 0.5 { ((i * 13 % 29) as f64 - 14.0) / 20.0 } else { 0.0 })
+            .map(|i| {
+                if mask[i / dm.dim] > 0.5 {
+                    ((i * 13 % 29) as f64 - 14.0) / 20.0
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let meta = tiny_engram(&dm);
         let dead: Vec<bool> = mask.iter().map(|&m| m > 0.5).collect();
         with_hashes_masked(&dm, &meta, &mut w, &toks, &dead);
-        let want = Ref { dm: &dm, w: &w, bugs: Bugs::default(), load: None }
-            .forward_vl(&toks, Some((&rows, &mask)))
-            .0;
-        let text_only = Ref { dm: &dm, w: &w, bugs: Bugs::default(), load: None }
-            .forward_vl(&toks, None)
-            .0;
+        let want = Ref {
+            dm: &dm,
+            w: &w,
+            bugs: Bugs::default(),
+            load: None,
+        }
+        .forward_vl(&toks, Some((&rows, &mask)))
+        .0;
+        let text_only = Ref {
+            dm: &dm,
+            w: &w,
+            bugs: Bugs::default(),
+            load: None,
+        }
+        .forward_vl(&toks, None)
+        .0;
         let ins: Vec<Vec<f64>> = pg
             .inputs
             .iter()
@@ -1594,7 +1714,10 @@ pub(crate) mod tests {
         let got = g.eval(&ins, &[pg.logits]).remove(0);
         let e = rel(&got, &want);
         assert!(e < 1e-11, "vl prefill {e:e}");
-        assert!(rel(&text_only, &want) > 1e-3, "the image must change the logits");
+        assert!(
+            rel(&text_only, &want) > 1e-3,
+            "the image must change the logits"
+        );
     }
 
     // ------------------------------------------------ real checkpoint
@@ -1630,8 +1753,13 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn real_encoder_matches_reference() {
-        let Some((st, _, mut vd)) = real() else { return eprintln!("no checkpoint") };
-        if let Some(l) = std::env::var("VISION_LAYERS").ok().and_then(|v| v.parse().ok()) {
+        let Some((st, _, mut vd)) = real() else {
+            return eprintln!("no checkpoint");
+        };
+        if let Some(l) = std::env::var("VISION_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             vd.n_layers = l;
         }
         let (path, bytes) = test_image();
@@ -1644,12 +1772,20 @@ pub(crate) mod tests {
             t0.elapsed()
         );
         if let Ok(d) = std::env::var("VISION_DUMP") {
-            let b: Vec<u8> = img.patches.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect();
+            let b: Vec<u8> = img
+                .patches
+                .iter()
+                .flat_map(|&v| (v as f32).to_le_bytes())
+                .collect();
             std::fs::write(&d, b).unwrap();
         }
         let ws: std::sync::Mutex<HashMap<String, Vec<f64>>> = Default::default();
         let w = |n: &str| -> Vec<f64> {
-            ws.lock().unwrap().entry(n.into()).or_insert_with(|| st.f64(n).unwrap()).clone()
+            ws.lock()
+                .unwrap()
+                .entry(n.into())
+                .or_insert_with(|| st.f64(n).unwrap())
+                .clone()
         };
         let t0 = std::time::Instant::now();
         let (vit, out) = reference(&vd, &img, &w);
@@ -1684,10 +1820,19 @@ pub(crate) mod tests {
         use crate::ir_ds_prefill::{derived_step, prefill_graph, DsDims, SEQ};
         use crate::ir_ds_real::{dims_from_config, RealRun, PROMPT};
         use tang_compile::tensor::step::{seed_cache, StepInput};
-        let Some(mut run) = RealRun::from_env() else { return eprintln!("no checkpoint") };
+        let Some(mut run) = RealRun::from_env() else {
+            return eprintln!("no checkpoint");
+        };
         let vd0 = VisionDims::from_config(&run.cfg).unwrap();
-        let budget: usize = std::env::var("VISION_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let vd = VisionDims { max_tokens: budget, min_pixels: 0, ..vd0.clone() };
+        let budget: usize = std::env::var("VISION_SPAN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let vd = VisionDims {
+            max_tokens: budget,
+            min_pixels: 0,
+            ..vd0.clone()
+        };
         run.vocab_ids.push(vd.image_token_id);
         run.vocab_ids.sort_unstable();
         run.vocab_ids.dedup();
@@ -1697,7 +1842,9 @@ pub(crate) mod tests {
         // the encoder (graph, checked against the reference)
         let w = |n: &str| run.st.f64(n).unwrap();
         let eg = encoder_graph(&vd, pl.n_vit_h, pl.n_vit_w);
-        let emb = eg.g.eval(&encoder_inputs(&eg, &vd, &img, w), &[eg.out]).remove(0);
+        let emb =
+            eg.g.eval(&encoder_inputs(&eg, &vd, &img, w), &[eg.out])
+                .remove(0);
         let (_, emb_ref) = reference(&vd, &img, &w);
         let e_enc = rel(&emb, &emb_ref);
         eprintln!("encoder: plan {pl:?}, span {}, rel {e_enc:.2e}", pl.span());
@@ -1717,10 +1864,19 @@ pub(crate) mod tests {
         let t_all = pr.ids.len();
         let t_pre = t_all - 1;
         let toks = run.rows_of(&pr.ids);
-        let mut dm0 = dims_from_config(&run.cfg, &run.layer_ids, run.vocab_ids.len(), 0, t_all.max(8));
+        let mut dm0 = dims_from_config(
+            &run.cfg,
+            &run.layer_ids,
+            run.vocab_ids.len(),
+            0,
+            t_all.max(8),
+        );
         dm0.vision = true;
         crate::ir_ds_real::clamp_index_topk(&mut dm0);
-        assert!(dm0.engram_layers.is_empty(), "pick DS_REAL_LAYERS without Engram (1, 14)");
+        assert!(
+            dm0.engram_layers.is_empty(),
+            "pick DS_REAL_LAYERS without Engram (1, 14)"
+        );
         let pg0 = prefill_graph(&dm0);
         let mut wd = run.dense_inputs(&pg0.inputs, &dm0).unwrap();
         let used = std::cell::RefCell::new(vec![std::collections::BTreeSet::new(); dm0.n_layers]);
@@ -1729,14 +1885,27 @@ pub(crate) mod tests {
             run.expert(l, e)
         };
         let t0 = std::time::Instant::now();
-        let want = Ref { dm: &dm0, w: &wd, bugs: Bugs::default(), load: Some(&load) }
-            .forward_vl(&toks, Some((&rows, &mask)))
-            .0;
-        let text_only = Ref { dm: &dm0, w: &wd, bugs: Bugs::default(), load: Some(&load) }
-            .forward_vl(&toks, None)
-            .0;
-        let used: Vec<Vec<usize>> =
-            used.into_inner().into_iter().map(|s| s.into_iter().collect()).collect();
+        let want = Ref {
+            dm: &dm0,
+            w: &wd,
+            bugs: Bugs::default(),
+            load: Some(&load),
+        }
+        .forward_vl(&toks, Some((&rows, &mask)))
+        .0;
+        let text_only = Ref {
+            dm: &dm0,
+            w: &wd,
+            bugs: Bugs::default(),
+            load: Some(&load),
+        }
+        .forward_vl(&toks, None)
+        .0;
+        let used: Vec<Vec<usize>> = used
+            .into_inner()
+            .into_iter()
+            .map(|s| s.into_iter().collect())
+            .collect();
         eprintln!(
             "reference: {t_all} tokens (image span {}) in {:.1?}; experts per layer {:?}",
             pl.span(),
@@ -1744,7 +1913,10 @@ pub(crate) mod tests {
             used.iter().map(|u| u.len()).collect::<Vec<_>>()
         );
         let nrows = used.iter().map(|u| u.len()).max().unwrap();
-        let dm = DsDims { expert_rows: nrows, ..dm0.clone() };
+        let dm = DsDims {
+            expert_rows: nrows,
+            ..dm0.clone()
+        };
         let pg = prefill_graph(&dm);
         for (l, u) in used.iter().enumerate() {
             run.expert_tables(l, u, nrows, &dm, &mut wd);
@@ -1779,12 +1951,11 @@ pub(crate) mod tests {
             .iter()
             .zip(&got[1..])
             .map(|(c, val)| {
-                let shape: Vec<usize> = pg
-                    .g
-                    .shape(c.node)
-                    .iter()
-                    .map(|dd| if *dd == Dim::Sym(SEQ) { t_pre } else { dd.n() })
-                    .collect();
+                let shape: Vec<usize> =
+                    pg.g.shape(c.node)
+                        .iter()
+                        .map(|dd| if *dd == Dim::Sym(SEQ) { t_pre } else { dd.n() })
+                        .collect();
                 seed_cache(c, &shape, val, t_pre, dm.ctx)
             })
             .collect();
@@ -1816,9 +1987,22 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn encoder_lowering_kernels() {
-        let nl = std::env::var("VISION_LOWER_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        let vd = VisionDims { n_layers: nl, ..VisionDims::tiny(1) };
-        let vd = VisionDims { dim: 1024, n_heads: 16, inter: 2816, patch: 14, llm_dim: 5120, ..vd };
+        let nl = std::env::var("VISION_LOWER_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let vd = VisionDims {
+            n_layers: nl,
+            ..VisionDims::tiny(1)
+        };
+        let vd = VisionDims {
+            dim: 1024,
+            n_heads: 16,
+            inter: 2816,
+            patch: 14,
+            llm_dim: 5120,
+            ..vd
+        };
         let eg = encoder_graph(&vd, 39, 39);
         let (g, o) = eg.g.eliminate_common(&eg.lower_outputs());
         let kinds = |g: &TensorGraph| {
@@ -1827,7 +2011,11 @@ pub(crate) mod tests {
                 if let tang_compile::tensor::Op::Comp(cp) = &n.op {
                     if let Some(m) = &cp.monoid {
                         let k = format!("{:?}", m.kind());
-                        let k = if k == "OnlineSoftmax" { format!("{k} out {:?} red {:?}", cp.out, cp.red) } else { k };
+                        let k = if k == "OnlineSoftmax" {
+                            format!("{k} out {:?} red {:?}", cp.out, cp.red)
+                        } else {
+                            k
+                        };
                         *c.entry(format!("{k}/w{}", m.width)).or_default() += 1;
                     }
                 }
@@ -1845,8 +2033,15 @@ pub(crate) mod tests {
         {
             // the reference: the training block's forward (flash there)
             let dims = crate::ir_block::BlockDims {
-                seq: 256, kv_len: 256, rope: true, bias: true, d_model: 576,
-                n_heads: 9, n_kv_heads: 3, head_dim: 64, ff_dim: 1536,
+                seq: 256,
+                kv_len: 256,
+                rope: true,
+                bias: true,
+                d_model: 576,
+                n_heads: 9,
+                n_kv_heads: 3,
+                head_dim: 64,
+                ff_dim: 1536,
             };
             let (bg, bo) = crate::ir_block::transformer_block(&dims);
             eprintln!("block before: {:?}", kinds(&bg));
@@ -1864,9 +2059,24 @@ pub(crate) mod tests {
         };
         let (p, _) = lower_prefill(&g, &o, bf);
         for (i, k) in p.kernels.iter().enumerate() {
-            let t = k.source.lines().find(|l| l.contains("//")).unwrap_or("").trim();
-            eprintln!("k{i:<3} pts {:<9} wg {:<4} n {:<6} {}", k.points, k.workgroup_size, k.count, t.trim_start_matches("// Auto-generated by tang-compile: "));
-            if std::env::var("VISION_LOWER_SRC").ok().and_then(|v| v.parse::<usize>().ok()) == Some(i) {
+            let t = k
+                .source
+                .lines()
+                .find(|l| l.contains("//"))
+                .unwrap_or("")
+                .trim();
+            eprintln!(
+                "k{i:<3} pts {:<9} wg {:<4} n {:<6} {}",
+                k.points,
+                k.workgroup_size,
+                k.count,
+                t.trim_start_matches("// Auto-generated by tang-compile: ")
+            );
+            if std::env::var("VISION_LOWER_SRC")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(i)
+            {
                 eprintln!("{}", k.source);
             }
         }
