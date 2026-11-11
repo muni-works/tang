@@ -244,4 +244,69 @@ mod tests {
         let pg = prefill_graph(&GlmDims::tiny());
         eprintln!("glm full tiny: {:?}", try_step(&pg, 1, 24).err());
     }
+
+    /// The DS tiny step through the CUDA decode lowering (no device): kernel
+    /// count, and loop bounds of the attention kernels (window rows `S + k`
+    /// vs capacity). With `--features cuda`, every kernel through nvrtc.
+    #[test]
+    fn ds_step_cuda_decode_lowering() {
+        use crate::ir_ds_prefill::*;
+        use tang_compile::tensor::cuda_gemv::DecodeOpts;
+        let dm = DsDims::tiny();
+        let pg = prefill_graph(&dm);
+        let st = derive_step(
+            &pg.g,
+            &[pg.logits],
+            &StepSpec {
+                seq: "T",
+                new: 1,
+                capacity: dm.ctx,
+            },
+        )
+        .unwrap();
+        let mut outs = st.outputs.clone();
+        outs.extend(st.caches.iter().map(|c| c.updated));
+        let (g, outs) = st.graph.substitute_maps(&outs);
+        let (g, outs) = g.eliminate_common(&outs);
+        let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+        let ks = &dp.program.kernels;
+        let native = dp.native.iter().filter(|&&n| n).count();
+        eprintln!(
+            "ds tiny step (k = 1): {} kernels, {native} native CUDA",
+            ks.len()
+        );
+        // kernels whose node reduces over a sequence-derived extent
+        let (mut win, mut cap) = (0, 0);
+        for k in ks.iter() {
+            let Some(c) = g.comp_at(k.node.index()) else {
+                continue;
+            };
+            for d in &c.red {
+                match d.n() {
+                    n if n == dm.window => win += 1,
+                    n if n == dm.ctx => cap += 1,
+                    _ => {}
+                }
+            }
+        }
+        eprintln!(
+            "  reductions over S + k = {} rows: {win}; over capacity {}: {cap}",
+            dm.window, dm.ctx
+        );
+        #[cfg(feature = "cuda")]
+        {
+            // the decode program holds CUDA for every kernel (transpiled ones too)
+            let srcs: Vec<String> = ks.iter().map(|k| k.source.clone()).collect();
+            let mut ok = 0;
+            for s in &srcs {
+                if !tang_gpu::cuda::ptx(s, "sm_86").is_empty() {
+                    ok += 1;
+                }
+            }
+            eprintln!(
+                "  nvrtc: {ok}/{} kernels compiled to PTX (sm_86)",
+                srcs.len()
+            );
+        }
+    }
 }
