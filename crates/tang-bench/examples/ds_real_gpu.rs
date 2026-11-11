@@ -18,7 +18,8 @@
 //! DS41_DIR=/workspace/ds41-l02 DS_NATIVE=1 ds_real_gpu
 //! ```
 //!
-//! Exits 1 when the device disagrees by more than 1e-3 of the output scale.
+//! Exits 1 when the device disagrees by more than 1e-3 of the output scale
+//! (native: 2e-2 of it, or a different top-1 logit).
 use std::time::Instant;
 
 use tang_bench::ir_ds_prefill::{derived_step, prefill_graph, DsDims, SEQ};
@@ -145,7 +146,9 @@ fn main() {
         );
         prog.run(&rt);
         let (mut worst, mut worst_pure) = (0.0f64, 0.0f64);
-        for ((o, e), p) in ns.outs.iter().zip(&emu).zip(&want) {
+        let mut top1 = true;
+        let argmax = |r: &[f64]| (0..r.len()).max_by(|&a, &b| r[a].total_cmp(&r[b])).unwrap();
+        for (j, ((o, e), p)) in ns.outs.iter().zip(&emu).zip(&want).enumerate() {
             let got: Vec<f64> = prog.read(&rt, *o).iter().map(|&x| x as f64).collect();
             let keep = |x: &[f64]| -> Vec<f64> {
                 x.iter()
@@ -155,11 +158,18 @@ fn main() {
                     .collect()
             };
             let (g, e, p) = (keep(&got), keep(e), keep(p));
+            if j == 0 {
+                top1 = argmax(&g[..dm.vocab]) == argmax(&p[..dm.vocab]);
+            }
             worst = worst.max(rel(&g, &e));
             worst_pure = worst_pure.max(rel(&g, &p));
         }
         let ms = prog.time(&rt, iters);
-        let ok = worst < 1e-3;
+        // Q8x32 codes flip where the device's f32 activation and the
+        // interpreter's f64 one straddle a rounding boundary: noise of the
+        // quantization's own size (emulated vs pure ~9e-3), so the same gate
+        // as native_step_matches_interpreter: 2e-2 and the same top-1.
+        let ok = worst < 2e-2 && top1;
         println!(
             "deepseek-v4.1 real size, layers {:?}, step at position {t_pre}: {nk} kernels ({native} native), \
              GPU vs emulated interpreter rel err {worst:.2e} (vs pure f64 step {worst_pure:.2e}), \
