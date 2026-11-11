@@ -901,7 +901,10 @@ fn model(args: &[String]) {
     #[cfg(feature = "cuda")]
     if args.iter().any(|a| a == "--tune") {
         use tang_bench::autotune;
-        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let reps: usize = std::env::var("TUNE_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
         let pos: Vec<usize> = opt("--bench")
             .unwrap_or_else(|| "128,4096".into())
             .split(',')
