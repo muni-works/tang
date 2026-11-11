@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "cram-codec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "brotli",
  "crc32fast",
@@ -6163,7 +6163,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tang"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "approx",
  "bytemuck",
@@ -6184,7 +6184,7 @@ dependencies = [
 
 [[package]]
 name = "tang-3dgs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "bytemuck",
@@ -6249,7 +6249,7 @@ dependencies = [
 
 [[package]]
 name = "tang-compile"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "half",
  "naga",
@@ -6260,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "tang-compute"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "cram-codec",
@@ -6290,7 +6290,7 @@ dependencies = [
 
 [[package]]
 name = "tang-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "bytemuck",
@@ -6346,7 +6346,7 @@ dependencies = [
 
 [[package]]
 name = "tang-la"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "approx",
  "faer 0.24.0",

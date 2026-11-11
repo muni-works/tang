@@ -66,11 +66,11 @@ authors = ["Cam Pedersen <cam@campedersen.com>"]
 # (scripts/publish.sh).
 
 [workspace.dependencies]
-tang = { version = "0.2", path = "crates/tang" }
-tang-la = { version = "0.1", path = "crates/tang-la" }
+tang = { version = "0.2.2", path = "crates/tang" }
+tang-la = { version = "0.1.2", path = "crates/tang-la" }
 tang-ad = { version = "0.1", path = "crates/tang-ad" }
 tang-sparse = { version = "0.1.1", path = "crates/tang-sparse" }
-tang-gpu = { version = "0.2", path = "crates/tang-gpu" }
+tang-gpu = { version = "0.3", path = "crates/tang-gpu" }
 tang-tensor = { version = "0.1", path = "crates/tang-tensor" }
 tang-optim = { version = "0.2", path = "crates/tang-optim" }
 tang-train = { version = "0.1", path = "crates/tang-train" }
@@ -80,8 +80,8 @@ tang-expr = { version = "0.2.1", path = "crates/tang-expr" }
 tang-mesh = { version = "0.1", path = "crates/tang-mesh" }
 tang-infer = { version = "0.1", path = "crates/tang-infer" }
 tang-onnx = { version = "0.1", path = "crates/tang-onnx" }
-tang-compile = { version = "0.1.2", path = "crates/tang-compile" }
-tang-compute = { version = "0.2", path = "crates/tang-compute" }
+tang-compile = { version = "0.2", path = "crates/tang-compile" }
+tang-compute = { version = "0.3", path = "crates/tang-compute" }
 tang-3dgs = { version = "0.1", path = "crates/tang-3dgs" }
 tang-holo = { version = "0.1", path = "crates/tang-holo" }
 tang-sheffer = { version = "0.1", path = "crates/tang-sheffer" }
