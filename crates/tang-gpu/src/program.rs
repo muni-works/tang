@@ -597,6 +597,10 @@ impl Program {
                 write_wgpu(device, &slots[s], b.format, inputs[k]);
             }
         }
+        assert!(
+            program.kernels.iter().all(|k| k.writes.is_empty()),
+            "multi-output kernels run on CUDA only"
+        );
         let p = Self::assemble(program, Storage::Wgpu(slots), plan);
         for (i, a) in p.args.iter().enumerate() {
             let (out, reads) = a.split_last().unwrap();
@@ -623,10 +627,12 @@ impl Program {
             .kernels
             .iter()
             .map(|k| {
+                // reads, `out`, then a multi-output kernel's further outputs
                 k.reads
                     .iter()
-                    .chain(std::iter::once(&k.node))
-                    .map(|&t| p.slot_of(t))
+                    .copied()
+                    .chain(k.outputs())
+                    .map(|t| p.slot_of(t))
                     .collect()
             })
             .collect();
@@ -868,6 +874,8 @@ impl Program {
                 && threads.is_multiple_of(k.workgroup_size)
                 && threads / k.workgroup_size <= 15
                 && crate::cuda::dynamic_smem(&k.source) == 0
+                // the megakernel's stages write one buffer (the last arg)
+                && k.writes.is_empty()
         };
         let mut runs: Vec<Vec<usize>> = Vec::new();
         for &i in &self.order {
