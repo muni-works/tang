@@ -1157,10 +1157,19 @@ extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out,
 // then ds_rms(nw), into lat[e]. Bit for bit the per-position ring_write + pool + round + rms.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst, const float* sst, const float* kv,
                                                                  const float* sc, float* lat, DsW nw, const int* P,
-                                                                 int r, int hd, float eps) { DS_PDL_ENTRY
+                                                                 int r, int hd, float eps, const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, p0 = P[0], pe = p0 + e;
     float* out = lat + (long long)e * hd;
+    if (rt) {
+        // row e alone: its own slot's partial groups, its position, its kv/score row
+        p0 = rt[e].pos;
+        pe = p0;
+        kst = (const float*)rt[e].kst;
+        sst = (const float*)rt[e].sst;
+        kv += (long long)e * hd;
+        sc += (long long)e * hd;
+    }
     for (int c = threadIdx.x; c < hd; c += blockDim.x) {
         float mx = -DS_INF;
         for (int j = 0; j < r; j++) {
@@ -1203,10 +1212,19 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst
 // The rows a batch of t leaves in two rings of r slots (slot (P[0] + e) % r): only each slot's
 // last write, so the batch's rows never race.
 extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, const float* b, int t, int hd, int r,
-                                         const int* P) { DS_PDL_ENTRY
+                                         const int* P, const RowP* rt) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * hd) return;
     int e = i / hd, c = i % hd;
+    if (rt) {
+        // each row its own sequence: it writes its slot's ring at its position
+        ra = (float*)rt[e].kst;
+        rb = (float*)rt[e].sst;
+        long long o = (long long)(rt[e].pos % r) * hd + c;
+        ra[o] = a[i];
+        rb[o] = b[i];
+        return;
+    }
     if (e + r < t) return;
     long long o = (long long)((P[0] + e) % r) * hd + c;
     ra[o] = a[i];
@@ -1219,9 +1237,18 @@ extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, c
 // ds_fp4_qdq, into cache row (P[0] + e) / r, by the batch's last row for that cache row.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int hd, float* ckv, float* ik, int ihd,
                                                                  DsW kn, float* idxk, const float2* tab, int rd,
-                                                                 const int* P, int r, int t, float eps) { DS_PDL_ENTRY
+                                                                 const int* P, int r, int t, float eps,
+                                                                 const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, job = blockIdx.y, p0 = P[0];
+    // row e alone (rt): its position, its slot's caches; it always writes its cache row
+    int el = e;
+    if (rt) {
+        p0 = rt[e].pos;
+        el = 0;
+        ckv = (float*)rt[e].ckv;
+        idxk = (float*)rt[e].idxk;
+    }
     int n = job ? ihd : hd, blk = job ? 32 : 16;
     float* x = job ? ik + (long long)e * ihd : lat + (long long)e * hd;
     if (job) {
@@ -1240,7 +1267,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int 
         for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] = bf(wget(kn, 0, i) * (x[i] * rs));
         __syncthreads();
     }
-    int half = rd / 2, pos = max(p0 + e + 1 - r, 0);
+    int half = rd / 2, pos = max(p0 + el + 1 - r, 0);
     float* tp = x + (n - rd);
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float2 cs = tab[(long long)pos * half + j];
@@ -1258,8 +1285,8 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int 
         for (int i = 0; i < blk; i++) p[i] = bf(round_fp4(fminf(fmaxf(p[i] / s, -6.f), 6.f)) * s);
     }
     __syncthreads();
-    if (e != t - 1 && (p0 + e + 1) % r != 0) return;
-    float* dst = (job ? idxk : ckv) + (long long)((p0 + e) / r) * n;
+    if (!rt && e != t - 1 && (p0 + e + 1) % r != 0) return;
+    float* dst = (job ? idxk : ckv) + (long long)((p0 + el) / r) * n;
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = x[i];
 }
 
@@ -2194,6 +2221,17 @@ DS_MOE_KP(2, 3)
 DS_WO_KS(2)
 DS_WO_KS(3)
 
+// One row of a batched rows step (engine.rs `RowP`): its position and its sequence slot's
+// buffers for this layer (window ring, compressor partial groups, compressed KV, indexer
+// keys). A kernel given a non-null table treats row e as its own one-token sequence.
+#ifndef DS_ROWP
+#define DS_ROWP
+struct RowP {
+    unsigned long long ring, kst, sst, ckv, idxk;
+    int pos, pad;
+};
+#endif
+
 // The q/kv epilogue of the decode attention, block (token, part) of 1024 threads (as ds_rms):
 // part 0 rms(qr) in place (bit for bit ds_rms) and its K-split codes/scales for wq_b (as
 // ds_ks_quant); part 1 rms(kv) (ds_rms), rope at P[0] + token (dg_rope), fp8 qdq
@@ -2201,9 +2239,10 @@ DS_WO_KS(3)
 extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn, unsigned char* qc, float* qsc,
                                                                 float* kv, DsW kn, const float2* tab, int rd,
                                                                 const int* P, float* ring, int win, float* all,
-                                                                float eps) { DS_PDL_ENTRY
+                                                                float eps, const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int ti = blockIdx.x, isq = blockIdx.y == 0;
+    if (rt) ring = (float*)rt[ti].ring;
     DsW w = isq ? qn : kn;
     int n = w.cols;
     float* r = (isq ? qr : kv) + (long long)ti * n;
@@ -2234,7 +2273,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn
         }
         return;
     }
-    int half = rd / 2, pos = P[0] + ti;
+    int half = rd / 2, pos = rt ? rt[ti].pos : P[0] + ti;
     float* tp = r + (n - rd);
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float2 cs = tab[(long long)pos * half + j];

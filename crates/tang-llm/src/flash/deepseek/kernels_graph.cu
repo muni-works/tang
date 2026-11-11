@@ -34,17 +34,25 @@ __device__ __forceinline__ float dg_bf(float x) {
     return __uint_as_float(b & 0xffff0000u);
 }
 
+// prow != 0: P is a rows step's RowP table (engine.rs, 48 bytes a row: five u64 buffer
+// pointers, then pos): row y is its own sequence at its own position.
+__device__ __forceinline__ int dg_rowpos(const int* P, int y) { return P[y * 12 + 10]; }
+__device__ __forceinline__ const float* dg_rowptr(const int* P, int y, int f) {
+    return (const float*)((const unsigned long long*)P)[y * 6 + f];
+}
+
 // As ds_rope: row r at P[0] + add + r * pstride, or (fixed_r > 0) every row at the
 // compressed group's position P[0] + add + 1 - fixed_r.
 extern "C" __global__ void dg_rope(float* v, const float2* tab, int rows, int per_row, int d, int rd, const int* P,
-                                   int add, int pstride, int fixed_r, int inverse) { DS_PDL_ENTRY
+                                   int add, int pstride, int fixed_r, int inverse, int prow) { DS_PDL_ENTRY
     int half = rd / 2;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)rows * per_row * half) return;
     int j = i % half;
     long long vec = i / half;
     int r = vec / per_row;
-    int pos = fixed_r > 0 ? max(P[0] + add + 1 - fixed_r, 0) : P[0] + add + r * pstride;
+    int p0 = prow ? dg_rowpos(P, r) : P[0] + r * pstride;
+    int pos = fixed_r > 0 ? max((prow ? p0 : P[0]) + add + 1 - fixed_r, 0) : p0 + add;
     float2 cs = tab[(long long)pos * half + j];
     float s = inverse ? -cs.y : cs.y;
     float* t = v + vec * d + (d - rd);
@@ -56,7 +64,7 @@ extern "C" __global__ void dg_rope(float* v, const float2* tab, int rows, int pe
 // As ds_win_idx modes 1 (decode) and 3 (verify window) at sp = P[0]; with src, also its [t][k]
 // rows into columns n.. (as ds_idx_cat), so the whole index row in one launch.
 extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mode, const int* P, int win,
-                                      const int* src, int k) { DS_PDL_ENTRY
+                                      const int* src, int k, int prow) { DS_PDL_ENTRY
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (src && e >= t * n && e < t * (n + k)) {
         int f = e - t * n;
@@ -64,8 +72,8 @@ extern "C" __global__ void dg_win_idx(int* out, int t, int stride, int n, int mo
         return;
     }
     if (e >= t * n) return;
-    int sp = P[0];
     int row = e / n, j = e % n, v;
+    int sp = prow ? dg_rowpos(P, row) : P[0];
     if (mode == 1) {
         int i = (sp % win + 1 + j) % win;
         v = i > sp ? -1 : i;
@@ -98,14 +106,17 @@ __device__ __forceinline__ int dg_width(const int* P, int add, int r) { return (
 // launch's).
 // Row blockIdx.y of a batch: q [y][nh][ihd], w [y][nh], score [y][sst], position add + y.
 extern "C" __global__ void dg_index_score(const float* q, const float* ik, const float* w, float* score, const int* P,
-                                          int add, int r, int nh, int ihd, int sst) { DS_PDL_ENTRY
+                                          int add, int r, int nh, int ihd, int sst, int prow) { DS_PDL_ENTRY
     int y = blockIdx.y;
     q += (long long)y * nh * ihd;
     w += y * nh;
     score += (long long)y * sst;
-    add += y;
+    // prow: row y's own keys (RowP.idxk of the key layer's table) and position
+    if (prow) ik = dg_rowptr(P, y, 4);
+    else add += y;
+    int width = prow ? (dg_rowpos(P, y) + add + 1) / r : dg_width(P, add, r);
     int j = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
-    if (j >= dg_width(P, add, r)) return;
+    if (j >= width) return;
     const float* kj = ik + (long long)j * ihd;
     float s = 0.f;
     for (int h = 0; h < nh; h++) {
@@ -120,13 +131,14 @@ extern "C" __global__ void dg_index_score(const float* q, const float* ik, const
 
 // As ds_mask_scores (no causal part), row blockIdx.y of a batch.
 extern "C" __global__ void dg_mask_scores(float* score, const unsigned char* cand, const int* P, int add, int r,
-                                          int sst, int cst) { DS_PDL_ENTRY
+                                          int sst, int cst, int prow) { DS_PDL_ENTRY
     int y = blockIdx.y;
     score += (long long)y * sst;
     cand += (long long)y * cst;
-    add += y;
+    if (!prow) add += y;
+    int width = prow ? (dg_rowpos(P, y) + add + 1) / r : dg_width(P, add, r);
     int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= dg_width(P, add, r)) return;
+    if (j >= width) return;
     if (!cand[j]) score[j] = -DG_INF;
 }
 
@@ -209,14 +221,14 @@ __device__ void dg_select_row(const float* v, int n, int k, int* sel) {
 
 // As ds_candidates (decode: no causal prefix), block per row of a batch (position add + row).
 extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel, unsigned char* out, const int* P,
-                                         int add, int r, int bs, int kb, int sst, int nbs, int ost) { DS_PDL_ENTRY
+                                         int add, int r, int bs, int kb, int sst, int nbs, int ost, int prow) { DS_PDL_ENTRY
     int y = blockIdx.x;
     score += (long long)y * sst;
     s += (long long)y * nbs;
     sel += (long long)y * nbs;
     out += (long long)y * ost;
-    add += y;
-    int width = dg_width(P, add, r);
+    if (!prow) add += y;
+    int width = prow ? (dg_rowpos(P, y) + add + 1) / r : dg_width(P, add, r);
     int nb = (width + bs - 1) / bs;
     int len = width;
     int last = len >= 1 ? (len - 1) / bs : -1;
@@ -242,13 +254,13 @@ extern "C" __global__ void dg_candidates(const float* score, float* s, int* sel,
 // As ds_topk, block per row of a batch (position add + row; no causal prefix): the min(kmax, width) largest, ascending, as
 // idx + offset, then -1 up to kmax (holes ds_sparse_attn skips exactly).
 extern "C" __global__ void dg_topk(const float* score, int* sel, int* out, const int* P, int add, int r, int kmax,
-                                   int offset, int sst) { DS_PDL_ENTRY
+                                   int offset, int sst, int prow) { DS_PDL_ENTRY
     int y = blockIdx.x;
     score += (long long)y * sst;
     sel += (long long)y * kmax;
     out += (long long)y * kmax;
-    add += y;
-    int width = dg_width(P, add, r);
+    if (!prow) add += y;
+    int width = prow ? (dg_rowpos(P, y) + add + 1) / r : dg_width(P, add, r);
     int k = min(kmax, width);
     dg_select_row(score, width, k, sel);
     for (int q = threadIdx.x; q < kmax; q += blockDim.x) out[q] = q < k ? sel[q] + offset : -1;

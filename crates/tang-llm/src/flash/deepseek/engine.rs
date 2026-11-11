@@ -71,6 +71,12 @@ fn rows_graph() -> bool {
     std::env::var("DS_ROWS_GRAPH").map_or(true, |v| v != "0")
 }
 
+/// `DS_ROWS_TAB=0`: a rows step's per-row kernels run row by row instead of once over all
+/// rows through the step's [`RowP`] table (A/B).
+fn rows_tab() -> bool {
+    std::env::var("DS_ROWS_TAB").map_or(true, |v| v != "0")
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -305,6 +311,9 @@ pub struct GpuModel {
     /// Set while [`Self::forward_rows`] runs: one decode row per sequence slot. The block
     /// splits only its attention per row (that row's slot caches, position and selection).
     segs: Option<Vec<Seg>>,
+    /// The rows step's `[layer][row]` [`RowP`] table and its row count (`DS_ROWS_TAB=0`:
+    /// none, the per-row kernels run row by row).
+    rowtab: Option<(Buf, usize)>,
     /// The slot whose engram history the CPU model holds (always `cur` between calls).
     hash_held: usize,
     qk: RefCell<HashMap<usize, Rc<DevBuf>>>,
@@ -476,11 +485,28 @@ impl SeqState {
 /// around the row's attention.
 struct Seg {
     slot: usize,
+    /// The row's index in the whole step (its row of the step's [`RowP`] tables).
+    row: usize,
     p: Buf,
     topk: Option<(Buf, usize)>,
     cand: Option<(Buf, usize)>,
     sh_ckv: usize,
     sh_idxk: usize,
+}
+
+/// kernels.cu's `RowP`: one row of a rows step for one layer (its position, its slot's
+/// buffers), so a per-row kernel runs once over all rows. Staged per step as
+/// `[layer][row]` ([`GpuModel::forward_rows`]).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RowP {
+    ring: u64,
+    kst: u64,
+    sst: u64,
+    ckv: u64,
+    idxk: u64,
+    pos: i32,
+    pad: i32,
 }
 
 /// As [`super::forward::Snapshot`], on the device: views of the model's one snapshot store
@@ -554,6 +580,7 @@ impl GpuModel {
             seqs: vec![seq0],
             cur: 0,
             segs: None,
+            rowtab: None,
             hash_held: 0,
             qk: RefCell::new(HashMap::new()),
             defer_sh: Cell::new(false),
@@ -968,7 +995,7 @@ impl GpuModel {
                         B256,
                         0,
                         &self.s,
-                        args![x.ptr, tab, r, pr, di, rdi, p, a, ps, fx, inv],
+                        args![x.ptr, tab, r, pr, di, rdi, p, a, ps, fx, inv, 0i32],
                     )
                 }
             }
@@ -1133,7 +1160,53 @@ impl GpuModel {
         } else {
             None
         };
-        for (i, sg) in segs.iter_mut().enumerate() {
+        // this layer's rows of the step's RowP table: one launch per kernel for all rows
+        let rt = self.rowtab.map(|(tb, nrows)| {
+            tb.ptr + ((lid * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64
+        });
+        if let Some(rt) = rt {
+            let (pp, zero) = (self.p.ptr, 0u64);
+            unsafe {
+                self.k.go(
+                    "ds_qkv_post",
+                    (t as u32, 2, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, zero, wi, zero, eps, rt],
+                )?
+            };
+            if let (Some((kvc, Some(sc))), Some(lat)) = (comp, lat) {
+                let nw = self.dw(&norm)?.v;
+                let (ri, hdi, ti) = (r as i32, hd as i32, t as i32);
+                unsafe {
+                    self.k.go(
+                        "ds_comp_pool",
+                        (t as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![zero, zero, kvc.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps, rt],
+                    )?;
+                    self.k.go(
+                        "ds_ring_last2",
+                        blocks(t * hd, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![zero, kvc.ptr, zero, sc.ptr, ti, hdi, ri, pp, rt],
+                    )?;
+                }
+                for i in 0..t {
+                    self.jrows
+                        .push((lid, 0, kvc.at(i * hd * 4), sc.at(i * hd * 4)));
+                }
+            }
+            if is_kv {
+                segs.iter_mut().for_each(|sg| sg.sh_ckv = lid);
+            }
+        }
+        for (i, sg) in segs.iter_mut().enumerate().filter(|_| rt.is_none()) {
             self.seg_in(sg);
             let ring = self.seqs[self.cur].win[lid].ptr;
             let (pp, zero) = (self.p.ptr, 0u64);
@@ -1146,7 +1219,9 @@ impl GpuModel {
                     (1024, 1, 1),
                     0,
                     &self.s,
-                    args![qri.ptr, qn, qci, qsi, kvi.ptr, kn, tab, rdi, pp, ring, wi, zero, eps],
+                    args![
+                        qri.ptr, qn, qci, qsi, kvi.ptr, kn, tab, rdi, pp, ring, wi, zero, eps, zero
+                    ],
                 )?
             };
             if let (Some((kvc, Some(sc))), Some(lat)) = (comp, lat) {
@@ -1165,7 +1240,7 @@ impl GpuModel {
                         (1024, 1, 1),
                         0,
                         &self.s,
-                        args![kst, sst, kvr.ptr, scr.ptr, lr.ptr, nw, pp, ri, hdi, eps],
+                        args![kst, sst, kvr.ptr, scr.ptr, lr.ptr, nw, pp, ri, hdi, eps, 0u64],
                     )?;
                     self.k.go(
                         "ds_ring_last2",
@@ -1173,7 +1248,7 @@ impl GpuModel {
                         B256,
                         0,
                         &self.s,
-                        args![kst, kvr.ptr, sst, scr.ptr, one, hdi, ri, pp],
+                        args![kst, kvr.ptr, sst, scr.ptr, one, hdi, ri, pp, 0u64],
                     )?;
                 }
                 self.jrows.push((lid, 0, kvr, scr));
@@ -1209,10 +1284,147 @@ impl GpuModel {
         let src_l = c.candidate_source_layer;
         let makes_cand = r > 0 && lid as i64 == src_l;
         let eats_cand = is_idx && src_l >= 0 && (src_l as usize) < lid;
+        if let (Some(rt), Some(l)) = (rt, lat) {
+            let (kn2, ikp) = match key {
+                Some(k) => (
+                    self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
+                    k.ptr,
+                ),
+                None => (self.dw(&norm)?.v, 0),
+            };
+            if key.is_some() {
+                segs.iter_mut().for_each(|sg| sg.sh_idxk = lid);
+            }
+            let (hdi, ihdi, ri, ti) = (hd as i32, ihd as i32, r as i32, t as i32);
+            let (pp, tb, zero) = (self.p.ptr, self.tabs[lid].ptr, 0u64);
+            unsafe {
+                self.k.go(
+                    "ds_comp_post",
+                    (t as u32, 1 + key.is_some() as u32, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![l.ptr, hdi, zero, ikp, ihdi, kn2, zero, tb, rdi, pp, ri, ti, eps, rt],
+                )?
+            };
+        }
+        // the indexer over all rows at once: each row's position and its slot's keys from the
+        // table (the key layer's rows), its candidate mask row, its top-k row
+        let mut idx_done = false;
+        let cand_rows = |segs: &[Seg]| -> Option<(Buf, usize)> {
+            let (c0, st) = segs[0].cand?;
+            segs.iter()
+                .enumerate()
+                .all(|(i, sg)| {
+                    sg.cand
+                        .is_some_and(|(cb, s2)| s2 == st && cb.ptr == c0.ptr + (i * st) as u64)
+                })
+                .then_some((c0, st))
+        };
+        if let (Some(rt), Some((qi, wts))) = (rt, iq) {
+            let cin = if eats_cand { cand_rows(segs) } else { None };
+            if !eats_cand || cin.is_some() {
+                let (tb, nrows) = self.rowtab.unwrap();
+                let kl = segs[0].sh_idxk;
+                let rtk =
+                    tb.ptr + ((kl * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64;
+                let s = self.span("indexer");
+                let (ti, nhi, ihdi, rdi2, zero, one) = (
+                    t as i32,
+                    nh as i32,
+                    ihd as i32,
+                    c.rope_head_dim as i32,
+                    0i32,
+                    1i32,
+                );
+                let tabp = self.tabs[lid].ptr;
+                let half = c.rope_head_dim / 2;
+                unsafe {
+                    self.gk.go(
+                        "dg_rope",
+                        blocks(t * nh * half, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![qi.ptr, tabp, ti, nhi, ihdi, rdi2, rt, zero, zero, zero, zero, one],
+                    )?
+                };
+                self.k.fp4_qdq(&self.s, qi.ptr, t * nh * ihd, 32, false)?;
+                let score = self.fbuf(t * wmax)?;
+                let (ri, wi2) = (r as i32, wmax as i32);
+                let sg_ = blocks(wmax * 32, 256);
+                unsafe {
+                    self.gk.go(
+                        "dg_index_score",
+                        (sg_.0, t as u32, 1),
+                        B256,
+                        0,
+                        &self.s,
+                        args![qi.ptr, 0u64, wts.ptr, score.ptr, rtk, zero, ri, nhi, ihdi, wi2, one],
+                    )?
+                };
+                let cout = if makes_cand {
+                    let cb = self.bytes(t * wmax)?;
+                    let (bs, kb) = (c.candidate_block_size, c.candidate_topk_blocks);
+                    let nb = wmax.div_ceil(bs);
+                    let (sc, sel) = (self.fbuf(t * nb)?, self.fbuf(t * nb)?);
+                    let (bsi, kbi, nbi) = (bs as i32, kb as i32, nb as i32);
+                    unsafe {
+                        self.gk.go(
+                            "dg_candidates",
+                            (t as u32, 1, 1),
+                            SEL,
+                            0,
+                            &self.s,
+                            args![
+                                score.ptr, sc.ptr, sel.ptr, cb.ptr, rt, zero, ri, bsi, kbi, wi2,
+                                nbi, wi2, one
+                            ],
+                        )?
+                    };
+                    Some(cb)
+                } else if let Some((cb, st)) = cin {
+                    let (mg, sti) = (blocks(wmax, 256), st as i32);
+                    unsafe {
+                        self.gk.go(
+                            "dg_mask_scores",
+                            (mg.0, t as u32, 1),
+                            B256,
+                            0,
+                            &self.s,
+                            args![score.ptr, cb.ptr, rt, zero, ri, wi2, sti, one],
+                        )?
+                    };
+                    None
+                } else {
+                    None
+                };
+                let (tk, sel) = (self.fbuf(t * kmax)?, self.fbuf(t * kmax)?);
+                let (ki, oi) = (kmax as i32, win as i32);
+                unsafe {
+                    self.gk.go(
+                        "dg_topk",
+                        (t as u32, 1, 1),
+                        SEL,
+                        0,
+                        &self.s,
+                        args![score.ptr, sel.ptr, tk.ptr, rt, zero, ri, ki, oi, wi2, one],
+                    )?
+                };
+                self.end(s);
+                for (i, sg) in segs.iter_mut().enumerate() {
+                    sg.topk = Some((tk.at(i * kmax * 4), kmax));
+                    if let Some(cb) = cout {
+                        sg.cand = Some((cb.at(i * wmax), wmax));
+                    }
+                }
+                idx_done = true;
+            }
+        }
         for (i, sg) in segs.iter_mut().enumerate() {
             self.seg_in(sg);
             let pp = self.p.ptr;
-            if let Some(l) = lat {
+            if let (None, Some(l)) = (rt, lat) {
                 let li = l.at(i * hd * 4);
                 let (kn2, ikp, idxk) = match key {
                     Some(k) => (
@@ -1234,11 +1446,13 @@ impl GpuModel {
                         (1024, 1, 1),
                         0,
                         &self.s,
-                        args![li.ptr, hdi, ckv, ikp, ihdi, kn2, idxk, tb, rdi, pp, ri, one, eps],
+                        args![
+                            li.ptr, hdi, ckv, ikp, ihdi, kn2, idxk, tb, rdi, pp, ri, one, eps, 0u64
+                        ],
                     )?
                 };
             }
-            if let Some((qi, wts)) = iq {
+            if let (Some((qi, wts)), false) = (iq, idx_done) {
                 let tk = self.fbuf(kmax)?;
                 let cand_out = if makes_cand {
                     Some(self.bytes(wmax)?)
@@ -1259,7 +1473,7 @@ impl GpuModel {
                 if let Some(cb) = cand_out {
                     self.cand = Some((cb, wmax));
                 }
-            } else if makes_cand {
+            } else if makes_cand && !idx_done {
                 anyhow::bail!("rows step: a candidate source that is not an index source");
             }
             let (mut kc, mut kv1) = (0, 0);
@@ -1290,7 +1504,7 @@ impl GpuModel {
                         B256,
                         0,
                         &self.s,
-                        args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki],
+                        args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki, 0i32],
                     )?
                 };
                 Ix::Rows(idx)
@@ -1351,7 +1565,7 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![qq.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi],
+                args![qq.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi, 0i32],
             )?
         };
         if let Some(cb) = cand_out {
@@ -1366,7 +1580,10 @@ impl GpuModel {
                     SEL,
                     0,
                     &self.s,
-                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi],
+                    args![
+                        score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi,
+                        0i32
+                    ],
                 )?
             };
         } else if let Some((cb, st)) = cand_in {
@@ -1378,7 +1595,7 @@ impl GpuModel {
                     B256,
                     0,
                     &self.s,
-                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti],
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti, 0i32],
                 )?
             };
         }
@@ -1391,7 +1608,7 @@ impl GpuModel {
                 SEL,
                 0,
                 &self.s,
-                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi],
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi, 0i32],
             )
         }
     }
@@ -1499,11 +1716,12 @@ impl GpuModel {
         let ids: Vec<usize> = rows.iter().map(|r| r.1).collect();
         let mut inp = self.inputs(&ids, 1, hashes.as_deref())?;
         let mut segs = Vec::with_capacity(t);
-        for &(sl, _, pos) in rows {
+        for (row, &(sl, _, pos)) in rows.iter().enumerate() {
             let (pb, u) = self.stage(&[pos as i32, 0, 0, 0])?;
             inp.copies.push(u);
             segs.push(Seg {
                 slot: sl,
+                row,
                 p: pb,
                 topk: None,
                 cand: None,
@@ -1512,6 +1730,29 @@ impl GpuModel {
             });
         }
         self.segs = Some(segs);
+        self.rowtab = None;
+        if rows_tab() {
+            let nl = c.n_layers;
+            let mut tab = vec![RowP::default(); nl * t];
+            for l in 0..nl {
+                for (row, &(sl, _, pos)) in rows.iter().enumerate() {
+                    let q = &self.seqs[sl];
+                    let (kst, sst) = q.cst.get(&l).map_or((0, 0), |(a, b2)| (a.ptr, b2.ptr));
+                    tab[l * t + row] = RowP {
+                        ring: q.win[l].ptr,
+                        kst,
+                        sst,
+                        ckv: q.ckv.get(&l).map_or(0, |b2| b2.ptr),
+                        idxk: q.idxk.get(&l).map_or(0, |b2| b2.ptr),
+                        pos: pos as i32,
+                        pad: 0,
+                    };
+                }
+            }
+            let (tb, u) = self.stage(&tab)?;
+            inp.copies.push(u);
+            self.rowtab = Some((tb, t));
+        }
         // graphs keyed by the rows' slots (each row's cache addresses are baked in)
         let graphable = self.graphable(1, false) && rows_graph();
         // (a leading usize::MAX: never a plain step's [slot] key)
@@ -1520,6 +1761,7 @@ impl GpuModel {
             .collect();
         let out = self.run_step(&inp, t, DYN, true, graphable, key, None);
         self.segs = None;
+        self.rowtab = None;
         self.cur = home;
         self.sh_ckv = 0;
         self.sh_idxk = 0;
@@ -1677,7 +1919,7 @@ impl GpuModel {
                 (1024, 1, 1),
                 0,
                 &self.s,
-                args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, ring.ptr, wi, allp, eps],
+                args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, ring.ptr, wi, allp, eps, 0u64],
             )?
         };
         self.end(sp);
@@ -1778,7 +2020,7 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![idx.ptr, ti, st, ni, mi, pp, wi, src, ki],
+                args![idx.ptr, ti, st, ni, mi, pp, wi, src, ki, 0i32],
             )?
         };
         self.end(s);
@@ -2415,7 +2657,7 @@ impl GpuModel {
                     (1024, 1, 1),
                     0,
                     &self.s,
-                    args![kst.ptr, sst.ptr, kv.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps],
+                    args![kst.ptr, sst.ptr, kv.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps, 0u64],
                 )?;
                 let ti = t as i32;
                 self.k.go(
@@ -2424,7 +2666,7 @@ impl GpuModel {
                     B256,
                     0,
                     &self.s,
-                    args![kst.ptr, kv.ptr, sst.ptr, sc.ptr, ti, hdi, ri, pp],
+                    args![kst.ptr, kv.ptr, sst.ptr, sc.ptr, ti, hdi, ri, pp, 0u64],
                 )?;
             }
             for e in 0..t {
@@ -2456,7 +2698,7 @@ impl GpuModel {
                 (1024, 1, 1),
                 0,
                 &self.s,
-                args![lat.ptr, hdi, ckv, ikp, ihdi, kn, idxk, tab, rdi, pp, ri, ti, eps],
+                args![lat.ptr, hdi, ckv, ikp, ihdi, kn, idxk, tab, rdi, pp, ri, ti, eps, 0u64],
             )?
         };
         Ok(())
@@ -2545,7 +2787,7 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![q.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi],
+                args![q.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi, 0i32],
             )?
         };
         if let Some(cb) = cand_out {
@@ -2560,7 +2802,10 @@ impl GpuModel {
                     SEL,
                     0,
                     &self.s,
-                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi],
+                    args![
+                        score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi,
+                        0i32
+                    ],
                 )?
             };
         } else if let Some((cb, st)) = cand_in {
@@ -2572,7 +2817,7 @@ impl GpuModel {
                     B256,
                     0,
                     &self.s,
-                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti],
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti, 0i32],
                 )?
             };
         }
@@ -2585,7 +2830,7 @@ impl GpuModel {
                 SEL,
                 0,
                 &self.s,
-                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi],
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi, 0i32],
             )
         }
     }

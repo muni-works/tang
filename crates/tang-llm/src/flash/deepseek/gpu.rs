@@ -5581,7 +5581,7 @@ mod tests {
                     &s,
                     tang_moe::args![
                         qr.ptr, qn, qc, qs, kvb.ptr, kn, tab.ptr, rdi, pdev.ptr, ring.ptr, wi,
-                        all.ptr, eps
+                        all.ptr, eps, 0u64
                     ],
                 )
                 .unwrap()
@@ -5682,7 +5682,7 @@ mod tests {
                 0,
                 &s,
                 tang_moe::args![
-                    qi.ptr, ik.ptr, wts.ptr, score.ptr, pp.ptr, 0i32, ri, nhi, ihdi, wi
+                    qi.ptr, ik.ptr, wts.ptr, score.ptr, pp.ptr, 0i32, ri, nhi, ihdi, wi, 0i32
                 ],
             )
             .unwrap();
@@ -5692,7 +5692,7 @@ mod tests {
                 super::super::graph::SEL,
                 0,
                 &s,
-                tang_moe::args![score.ptr, sel.ptr, out.ptr, pp.ptr, 0i32, ri, kmi, offi, wi],
+                tang_moe::args![score.ptr, sel.ptr, out.ptr, pp.ptr, 0i32, ri, kmi, offi, wi, 0i32],
             )
             .unwrap();
         });
