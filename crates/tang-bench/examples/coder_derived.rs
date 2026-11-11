@@ -57,13 +57,16 @@ fn main() {
     let gen: usize = opt("-n").map_or(64, |v| v.parse().unwrap());
     let ctx: usize = opt("--ctx").map_or(4096, |v| v.parse().unwrap());
     let top: usize = opt("--top").map_or(5, |v| v.parse().unwrap());
+    // --chunk K: the derived step appends K tokens; the prompt runs in
+    // K-token chunks (chunked prefill), timed, and the run stops there
+    let chunk: usize = opt("--chunk").map_or(1, |v| v.parse().unwrap());
 
     let t0 = Instant::now();
     let g = Gguf::open(Path::new(&path)).unwrap();
     let dims = dims_from_gguf(&g).unwrap();
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
-    let st = derived_step(&pg, 1, ctx).unwrap();
+    let st = derived_step(&pg, chunk, ctx).unwrap();
     let low = lower_real_step(&pg, &st, &tys);
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
@@ -169,6 +172,33 @@ fn main() {
             .map(|i| (i, l[i] as f64 - m - z.ln()))
             .collect()
     };
+    if chunk > 1 {
+        let n = ids.len() / chunk * chunk;
+        let toks: Vec<f32> = ids[..n].iter().map(|&t| t as f32).collect();
+        // one warm chunk, then the real run from an empty cache
+        prog.write(&rt, prog.input(pos_in), &[0.0]);
+        prog.write(&rt, prog.input(tok_in), &toks[..chunk]);
+        prog.run(&rt);
+        let _ = prog.read(&rt, outs[0]);
+        let t = Instant::now();
+        for c in 0..n / chunk {
+            prog.write(&rt, prog.input(pos_in), &[(c * chunk) as f32]);
+            prog.write(&rt, prog.input(tok_in), &toks[c * chunk..(c + 1) * chunk]);
+            prog.run(&rt);
+            for &(k, upd) in &swaps {
+                prog.copy(&rt, prog.input(k), &prog, upd);
+            }
+        }
+        let _ = prog.read(&rt, outs[0]);
+        let s = t.elapsed().as_secs_f64();
+        println!(
+            "chunked prefill: {n} tokens in chunks of {chunk}: {:.1} ms = {:.1} tok/s ({:.2} ms a chunk)",
+            s * 1e3,
+            n as f64 / s,
+            s * 1e3 / (n / chunk) as f64
+        );
+        return;
+    }
     let mut lines = Vec::new();
     let t2 = Instant::now();
     for (p, &tok) in ids.iter().enumerate() {
