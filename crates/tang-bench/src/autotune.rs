@@ -124,15 +124,17 @@ fn time_sigs(
     m
 }
 
-/// Same logits as the reference: relative max error under 1e-3 and the same argmax.
-fn same_output(o: &[f32], r: &[f32]) -> bool {
-    if o.len() != r.len() || o.iter().any(|x| !x.is_finite()) {
-        return false;
+/// Max abs difference over the reference's max magnitude.
+fn rel_err(o: &[f32], r: &[f32]) -> f64 {
+    if o.len() != r.len() {
+        return f64::INFINITY;
     }
-    let scale = r.iter().fold(0f32, |a, x| a.max(x.abs())).max(1e-6);
-    let err = o.iter().zip(r).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
-    let am = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap()).unwrap_or(0);
-    err / scale < 1e-3 && am(o) == am(r)
+    let scale = r.iter().fold(0f32, |a, x| a.max(x.abs())).max(1e-6) as f64;
+    o.iter().zip(r).fold(0f64, |a, (x, y)| a.max((*x as f64 - *y as f64).abs())) / scale
+}
+
+fn argmax(v: &[f32]) -> usize {
+    (0..v.len()).max_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0)
 }
 
 /// Better than `base` at every position, and by `MIN_GAIN` in total.
@@ -183,16 +185,24 @@ pub fn tune_step<F: FnMut() -> Program>(
         rt.sync();
         check(p)
     };
-    let reference = {
+    // the default's own spread (atomics, split reductions): built twice, run twice
+    let (reference, noise) = {
         let (p, _) = build_forced(rt, &mut build, Choice::new()).expect("default step lowers");
-        out_at(&p)
+        let a = out_at(&p);
+        let b = out_at(&p);
+        drop(p);
+        let (q, _) = build_forced(rt, &mut build, Choice::new()).expect("default step lowers");
+        let c = out_at(&q);
+        let n = rel_err(&a, &b).max(rel_err(&a, &c));
+        (a, n)
     };
+    let tol = (20.0 * noise).max(1e-3);
+    msg(&format!("output check: default's own spread {noise:.2e}, tolerance {tol:.2e}"));
     let correct = |p: &Program| -> bool {
         let o = out_at(p);
-        let ok = same_output(&o, &reference);
-        if !ok {
-            msg("  wrong output: rejected");
-        }
+        let e = rel_err(&o, &reference);
+        let ok = o.iter().all(|x| x.is_finite()) && e <= tol && argmax(&o) == argmax(&reference);
+        msg(&format!("  output err {e:.2e}, argmax {} vs {}: {}", argmax(&o), argmax(&reference), if ok { "ok" } else { "rejected" }));
         ok
     };
     // step level: whole-step time per value, one knob at a time
