@@ -198,7 +198,12 @@ enum A {
 fn abstract_body(c: &Comp, var: &dyn Fn(usize) -> A) -> Vec<A> {
     use A::*;
     let nodes = c.body.nodes_slice();
-    let n = c.body_outs.iter().map(|o| o.index() as usize + 1).max().unwrap_or(0);
+    let n = c
+        .body_outs
+        .iter()
+        .map(|o| o.index() as usize + 1)
+        .max()
+        .unwrap_or(0);
     let mut v: Vec<A> = Vec::with_capacity(n);
     let zero = |x: A| x == K(0.0);
     let lin0 = |x: A| x == Lin || zero(x);
@@ -263,9 +268,15 @@ fn abstract_body(c: &Comp, var: &dyn Fn(usize) -> A) -> Vec<A> {
 
 /// The body is 0 whenever the args in `zero` are 0, whatever the others.
 fn vanishes(c: &Comp, zero: &[usize]) -> bool {
-    abstract_body(c, &|a| if zero.contains(&a) { A::K(0.0) } else { A::Free })
-        .iter()
-        .all(|x| *x == A::K(0.0))
+    abstract_body(c, &|a| {
+        if zero.contains(&a) {
+            A::K(0.0)
+        } else {
+            A::Free
+        }
+    })
+    .iter()
+    .all(|x| *x == A::K(0.0))
 }
 
 /// The body is linear and homogeneous in the args `lin` jointly.
@@ -278,12 +289,18 @@ fn linear_in(c: &Comp, lin: &[usize]) -> bool {
 /// Propagate placements through `g` (topologically ordered, as built).
 type Sweep = (Vec<Place>, Vec<Option<usize>>, Vec<Vec<Option<CollKind>>>);
 
-fn sweep(g: &TensorGraph, live: &[bool], plan: &ShardPlan, cache_place: &HashMap<TensorId, Place>) -> Sweep {
+fn sweep(
+    g: &TensorGraph,
+    live: &[bool],
+    plan: &ShardPlan,
+    cache_place: &HashMap<TensorId, Place>,
+) -> Sweep {
     let n = g.nodes.len();
     let world = plan.world;
     let mut place = vec![Place::R; n];
     let mut split = vec![None; n];
-    let mut conv: Vec<Vec<Option<CollKind>>> = (0..n).map(|i| vec![None; dep_srcs(g, i).len()]).collect();
+    let mut conv: Vec<Vec<Option<CollKind>>> =
+        (0..n).map(|i| vec![None; dep_srcs(g, i).len()]).collect();
     for i in (0..n).filter(|&i| live[i]) {
         let shape = fixed(&g.nodes[i].shape);
         match &g.nodes[i].op {
@@ -335,7 +352,13 @@ fn sweep(g: &TensorGraph, live: &[bool], plan: &ShardPlan, cache_place: &HashMap
 
 /// A scan is independent along its leading (non-matrix, non-scan) dims:
 /// inputs all split on the same such dim give an output split on it.
-fn scan_rule(g: &TensorGraph, sc: &Scan, place: &[Place], conv: &mut [Option<CollKind>], out: &[usize]) -> Place {
+fn scan_rule(
+    g: &TensorGraph,
+    sc: &Scan,
+    place: &[Place],
+    conv: &mut [Option<CollKind>],
+    out: &[usize],
+) -> Place {
     let lead = match &sc.kind {
         ScanKind::Monoid(m) => out.len() - usize::from(m.width > 1),
         ScanKind::Affine { .. } => out.len() - 2,
@@ -345,7 +368,10 @@ fn scan_rule(g: &TensorGraph, sc: &Scan, place: &[Place], conv: &mut [Option<Col
         let d = *d;
         let ok = d < lead
             && d != sc.dim
-            && ps.iter().zip(&sc.inputs).all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
+            && ps
+                .iter()
+                .zip(&sc.inputs)
+                .all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
         if ok {
             return Place::S(d);
         }
@@ -398,7 +424,13 @@ pub fn analyze(g: &TensorGraph, outputs: &[TensorId], plan: &ShardPlan) -> Analy
     let out_conv: Vec<Option<CollKind>> = outputs
         .iter()
         .zip(&out_local)
-        .map(|(o, l)| if l.is_some() { None } else { to_r(&place[o.n()]) })
+        .map(|(o, l)| {
+            if l.is_some() {
+                None
+            } else {
+                to_r(&place[o.n()])
+            }
+        })
         .collect();
     // one collective per (source, kind)
     let mut seen = HashSet::new();
@@ -506,10 +538,20 @@ fn comp_rule(
     for a in 0..c.args.len() {
         match pl(a, conv) {
             Place::Ep => {
-                let gth = c.args[a].view.gather.as_ref().expect("expert weight read without a gather");
+                let gth = c.args[a]
+                    .view
+                    .gather
+                    .as_ref()
+                    .expect("expert weight read without a gather");
                 assert!(gth.coefs[0] != 0, "expert weight gathered off dim 0");
                 let ia = &c.args[gth.arg];
-                masks.push((a, Mask { idx: ia.src, forms: ia.view.forms.clone() }));
+                masks.push((
+                    a,
+                    Mask {
+                        idx: ia.src,
+                        forms: ia.view.forms.clone(),
+                    },
+                ));
             }
             Place::M(m) => {
                 let v = &c.args[a].view;
@@ -524,20 +566,29 @@ fn comp_rule(
         }
     }
     if !masks.is_empty() {
-        let ep_mask = masks.iter().find(|(a, _)| pl(*a, conv) == Place::Ep).map(|(_, m)| m.clone());
+        let ep_mask = masks
+            .iter()
+            .find(|(a, _)| pl(*a, conv) == Place::Ep)
+            .map(|(_, m)| m.clone());
         let want = ep_mask.unwrap_or_else(|| masks[0].1.clone());
         let mut keep: Vec<usize> = Vec::new();
         for (a, m) in &masks {
             if *m == want {
                 keep.push(*a);
             } else {
-                assert!(pl(*a, conv) != Place::Ep, "expert weights of one comp under different masks");
+                assert!(
+                    pl(*a, conv) != Place::Ep,
+                    "expert weights of one comp under different masks"
+                );
                 conv[*a] = Some(CollKind::AllReduce);
             }
         }
         let ok = sum != Some(false) && vanishes(c, &keep);
         if !ok {
-            assert!(!has_ep, "an expert-parallel comp whose body does not vanish off its experts");
+            assert!(
+                !has_ep,
+                "an expert-parallel comp whose body does not vanish off its experts"
+            );
             for a in keep {
                 conv[a] = Some(CollKind::AllReduce);
             }
@@ -548,16 +599,34 @@ fn comp_rule(
                     conv[a] = Some(CollKind::AllReduce);
                 }
             }
-            let over_red = want.forms.iter().any(|f| f.coefs[np..].iter().any(|&x| x != 0));
+            let over_red = want
+                .forms
+                .iter()
+                .any(|f| f.coefs[np..].iter().any(|&x| x != 0));
             if over_red {
                 return (Place::P, None);
             }
-            let forms = want.forms.iter().map(|f| Form { coefs: f.coefs[..np].to_vec(), offset: f.offset }).collect();
-            return (Place::M(Mask { idx: want.idx, forms }), None);
+            let forms = want
+                .forms
+                .iter()
+                .map(|f| Form {
+                    coefs: f.coefs[..np].to_vec(),
+                    offset: f.offset,
+                })
+                .collect();
+            return (
+                Place::M(Mask {
+                    idx: want.idx,
+                    forms,
+                }),
+                None,
+            );
         }
     }
     // 3. partials
-    let ps: Vec<usize> = (0..c.args.len()).filter(|&a| pl(a, conv) == Place::P).collect();
+    let ps: Vec<usize> = (0..c.args.len())
+        .filter(|&a| pl(a, conv) == Place::P)
+        .collect();
     if !ps.is_empty() {
         if sum != Some(false) && linear_in(c, &ps) {
             return (Place::P, None);
@@ -737,7 +806,11 @@ pub fn rank_program(
     let mut colls: HashMap<(usize, CollKind), TensorId> = HashMap::new();
     let mut boxes: Vec<Vec<(usize, usize)>> = vec![Vec::new(); g.n_inputs];
     // a collective on the (local) source `s` of global node `src`
-    let mut collective = |ng: &mut TensorGraph, src: usize, kind: CollKind, remap: &[Option<TensorId>]| -> TensorId {
+    let mut collective = |ng: &mut TensorGraph,
+                          src: usize,
+                          kind: CollKind,
+                          remap: &[Option<TensorId>]|
+     -> TensorId {
         if let Some(&t) = colls.get(&(src, kind)) {
             return t;
         }
@@ -746,7 +819,12 @@ pub fn rank_program(
             CollKind::AllGather(d) => full[..d].iter().product(),
             CollKind::AllReduce => 1,
         };
-        let op = Arc::new(CollOp { kind, rank, outer, comm: comm.clone() });
+        let op = Arc::new(CollOp {
+            kind,
+            rank,
+            outer,
+            comm: comm.clone(),
+        });
         let t = ng.operator(op, &[remap[src].unwrap()], &full);
         colls.insert((src, kind), t);
         t
@@ -859,7 +937,11 @@ pub fn rank_program(
         })
         .collect();
     // cut replicated weights to what this rank reads
-    let wl: HashSet<usize> = weights.iter().filter_map(|t| remap[t.n()]).map(|t| t.n()).collect();
+    let wl: HashSet<usize> = weights
+        .iter()
+        .filter_map(|t| remap[t.n()])
+        .map(|t| t.n())
+        .collect();
     // readers of each weight: (node, comp arg) or (node, None) for a non-comp reader
     let mut readers: HashMap<usize, Vec<(usize, Option<usize>)>> = HashMap::new();
     for i in 0..ng.nodes.len() {
@@ -881,7 +963,9 @@ pub fn rank_program(
         }
     }
     for (t, rs) in readers {
-        let Op::Input(k) = ng.nodes[t].op else { continue };
+        let Op::Input(k) = ng.nodes[t].op else {
+            continue;
+        };
         if rs.iter().any(|(_, a)| a.is_none()) {
             continue;
         }
@@ -889,13 +973,23 @@ pub fn rank_program(
         let mut lo: Vec<i64> = vec![i64::MAX; shape.len()];
         let mut hi: Vec<i64> = vec![i64::MIN; shape.len()];
         for &(i, ai) in &rs {
-            let Op::Comp(c) = &ng.nodes[i].op else { unreachable!() };
+            let Op::Comp(c) = &ng.nodes[i].op else {
+                unreachable!()
+            };
             let space: Vec<usize> = c.space().iter().map(|d| d.n()).collect();
             let a = &c.args[ai.unwrap()];
             for (d, f) in a.view.forms.iter().enumerate() {
                 let gathered = a.view.gather.as_ref().is_some_and(|gg| gg.coefs[d] != 0);
-                let (l, h) = if gathered { (0, shape[d] as i64 - 1) } else { f.range(&space) };
-                let (l, h) = if a.view.guard { (l.max(0), h.min(shape[d] as i64 - 1)) } else { (l, h) };
+                let (l, h) = if gathered {
+                    (0, shape[d] as i64 - 1)
+                } else {
+                    f.range(&space)
+                };
+                let (l, h) = if a.view.guard {
+                    (l.max(0), h.min(shape[d] as i64 - 1))
+                } else {
+                    (l, h)
+                };
                 lo[d] = lo[d].min(l);
                 hi[d] = hi[d].max(h);
             }
@@ -904,12 +998,16 @@ pub fn rank_program(
             continue;
         }
         for &(i, ai) in &rs {
-            let Op::Comp(c) = &mut ng.nodes[i].op else { unreachable!() };
+            let Op::Comp(c) = &mut ng.nodes[i].op else {
+                unreachable!()
+            };
             for (d, f) in c.args[ai.unwrap()].view.forms.iter_mut().enumerate() {
                 f.offset -= lo[d];
             }
         }
-        ng.nodes[t].shape = (0..shape.len()).map(|d| Dim::Fixed((hi[d] - lo[d] + 1) as usize)).collect();
+        ng.nodes[t].shape = (0..shape.len())
+            .map(|d| Dim::Fixed((hi[d] - lo[d] + 1) as usize))
+            .collect();
         for d in 0..shape.len() {
             let base = boxes[k][d].0;
             boxes[k][d] = (base + lo[d] as usize, base + hi[d] as usize + 1);
@@ -947,9 +1045,15 @@ pub fn simulate(
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     for r in 1..res.len() {
-        let same = res[r].iter().zip(&res[0]).zip(&an.out_local).all(|((a, b), l)| {
-            l.is_some() || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
-        });
+        let same = res[r]
+            .iter()
+            .zip(&res[0])
+            .zip(&an.out_local)
+            .all(|((a, b), l)| {
+                l.is_some()
+                    || (a.len() == b.len()
+                        && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
+            });
         assert!(same, "rank {r} disagrees with rank 0");
     }
     assemble(g, outputs, an, &res)
@@ -957,7 +1061,12 @@ pub fn simulate(
 
 /// The step's outputs from every rank's: replicated outputs from rank 0,
 /// outputs left split ([`Analysis::out_local`]) concatenated along their dim.
-pub fn assemble(g: &TensorGraph, outputs: &[TensorId], an: &Analysis, ranks: &[Vec<Vec<f64>>]) -> Vec<Vec<f64>> {
+pub fn assemble(
+    g: &TensorGraph,
+    outputs: &[TensorId],
+    an: &Analysis,
+    ranks: &[Vec<Vec<f64>>],
+) -> Vec<Vec<f64>> {
     (0..outputs.len())
         .map(|o| match an.out_local[o] {
             None => ranks[0][o].clone(),
@@ -1007,12 +1116,22 @@ impl CostModel {
     /// 8× H200 SXM: 4.8 TB/s HBM, NVLink ~450 GB/s a direction, 12 µs per
     /// small collective (`scripts/ds-roofline.py`).
     pub fn h200() -> Self {
-        Self { hbm: 4.8e12, link: 450e9, latency: 12e-6, act_bytes: 4.0 }
+        Self {
+            hbm: 4.8e12,
+            link: 450e9,
+            latency: 12e-6,
+            act_bytes: 4.0,
+        }
     }
 
     /// Collectives free: split everything the rules can (a stress plan).
     pub fn eager() -> Self {
-        Self { hbm: 1.0, link: f64::INFINITY, latency: 0.0, act_bytes: 0.0 }
+        Self {
+            hbm: 1.0,
+            link: f64::INFINITY,
+            latency: 0.0,
+            act_bytes: 0.0,
+        }
     }
 }
 
@@ -1045,7 +1164,12 @@ pub fn step_cost(
         .flat_map(|c| {
             c.args
                 .iter()
-                .filter(|a| a.view.gather.as_ref().is_some_and(|gg| gg.coefs.iter().any(|&x| x != 0)))
+                .filter(|a| {
+                    a.view
+                        .gather
+                        .as_ref()
+                        .is_some_and(|gg| gg.coefs.iter().any(|&x| x != 0))
+                })
                 .map(|a| a.src.n())
         })
         .collect();
@@ -1061,7 +1185,11 @@ pub fn step_cost(
             }
         }
     }
-    let cb: f64 = an.collectives.iter().map(|c| c.ring_bytes(an.world, cm.act_bytes)).sum();
+    let cb: f64 = an
+        .collectives
+        .iter()
+        .map(|c| c.ring_bytes(an.world, cm.act_bytes))
+        .sum();
     let n_coll = an.collectives.len();
     StepCost {
         weight_bytes: wb,
@@ -1077,9 +1205,7 @@ pub fn step_cost(
 pub fn expert_inputs(g: &TensorGraph, outputs: &[TensorId], world: usize) -> HashSet<TensorId> {
     let live = g.live(outputs);
     let from_topk = |t: TensorId| -> bool {
-        let is_topk = |t: TensorId| {
-            matches!(&g.nodes[t.n()].op, Op::Comp(c) if c.monoid.as_ref().is_some_and(|m| m.width >= 2 && m.width % 2 == 0 && m.matches(&Monoid::topk(m.width / 2))))
-        };
+        let is_topk = |t: TensorId| matches!(&g.nodes[t.n()].op, Op::Comp(c) if c.monoid.as_ref().is_some_and(|m| m.width >= 2 && m.width % 2 == 0 && m.matches(&Monoid::topk(m.width / 2))));
         is_topk(t)
             || matches!(&g.nodes[t.n()].op, Op::Comp(c) if c.monoid.is_none() && c.args.iter().any(|a| is_topk(a.src)))
     };
@@ -1096,7 +1222,12 @@ pub fn expert_inputs(g: &TensorGraph, outputs: &[TensorId], world: usize) -> Has
                             && gg.coefs[1..].iter().all(|&x| x == 0)
                             && a.view.forms[0].coefs.iter().all(|&x| x == 0)
                             && from_topk(c.args[gg.arg].src)
-                    }) && c.args.iter().all(|b| b.view.gather.as_ref().is_none_or(|gg| c.args[gg.arg].src != a.src));
+                    }) && c.args.iter().all(|b| {
+                        b.view
+                            .gather
+                            .as_ref()
+                            .is_none_or(|gg| c.args[gg.arg].src != a.src)
+                    });
                     let e = ok.entry(a.src.n()).or_insert(true);
                     *e &= good;
                 }
@@ -1109,7 +1240,9 @@ pub fn expert_inputs(g: &TensorGraph, outputs: &[TensorId], world: usize) -> Has
         }
     }
     ok.into_iter()
-        .filter(|&(t, good)| good && g.nodes[t].shape[0].n() % world == 0 && g.nodes[t].shape[0].n() >= world)
+        .filter(|&(t, good)| {
+            good && g.nodes[t].shape[0].n() % world == 0 && g.nodes[t].shape[0].n() >= world
+        })
         .map(|(t, _)| TensorId(t as u32))
         .collect()
 }
@@ -1148,7 +1281,8 @@ fn greedy_splits(
             jobs.iter().map(one).collect()
         } else {
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let out: Vec<std::sync::Mutex<f64>> = jobs.iter().map(|_| std::sync::Mutex::new(0.0)).collect();
+            let out: Vec<std::sync::Mutex<f64>> =
+                jobs.iter().map(|_| std::sync::Mutex::new(0.0)).collect();
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| loop {
@@ -1197,7 +1331,11 @@ pub fn plan_auto(
     elem: &dyn Fn(TensorId) -> f64,
     cm: &CostModel,
 ) -> ShardPlan {
-    let mut plan = ShardPlan { world, inputs: HashMap::new(), caches: caches.to_vec() };
+    let mut plan = ShardPlan {
+        world,
+        inputs: HashMap::new(),
+        caches: caches.to_vec(),
+    };
     if world == 1 {
         return plan;
     }
@@ -1207,7 +1345,9 @@ pub fn plan_auto(
         }
     }
     // element sizes up front: the cost runs on worker threads
-    let elems: Vec<f64> = (0..g.nodes.len()).map(|i| elem(TensorId(i as u32))).collect();
+    let elems: Vec<f64> = (0..g.nodes.len())
+        .map(|i| elem(TensorId(i as u32)))
+        .collect();
     let elem_of = |t: TensorId| elems[t.n()];
     let cost = |plan: &ShardPlan| {
         let an = analyze(g, outputs, plan);
@@ -1233,7 +1373,9 @@ pub fn plan_auto(
     cands.sort_by_key(|t| (std::cmp::Reverse(numel(&g.nodes[t.n()].shape)), t.n()));
     let dims = |t: TensorId| -> Vec<usize> {
         let shape = fixed(&g.nodes[t.n()].shape);
-        (0..shape.len()).filter(|&d| shape[d] % world == 0 && shape[d] >= world).collect()
+        (0..shape.len())
+            .filter(|&d| shape[d] % world == 0 && shape[d] >= world)
+            .collect()
     };
     let failed = greedy_splits(&cost, &dims, &mut plan, &mut best, &cands, threads);
     // Joint moves: a block split by head (GDN: in-projections, conv, decay
@@ -1245,9 +1387,16 @@ pub fn plan_auto(
     let trace = std::env::var("TANG_PLAN_TRACE").is_ok();
     let t_joint = std::time::Instant::now();
     if trace {
-        eprintln!("plan_auto: greedy pass done, {} failed singles; joint moves next", failed.len());
+        eprintln!(
+            "plan_auto: greedy pass done, {} failed singles; joint moves next",
+            failed.len()
+        );
     }
-    let mut near: Vec<TensorId> = weights.iter().copied().filter(|t| !plan.inputs.contains_key(t)).collect();
+    let mut near: Vec<TensorId> = weights
+        .iter()
+        .copied()
+        .filter(|t| !plan.inputs.contains_key(t))
+        .collect();
     near.sort_by_key(|t| t.n());
     // repeated layers repeat their neighbourhoods: search each shape pattern
     // once, then replay its answer (one cost check) at the other layers
@@ -1258,13 +1407,17 @@ pub fn plan_auto(
             continue;
         }
         let at = near.iter().position(|u| *u == t).unwrap();
-        let hood: Vec<TensorId> = near[at.saturating_sub(JOINT_REACH)..(at + JOINT_REACH + 1).min(near.len())]
+        let hood: Vec<TensorId> = near
+            [at.saturating_sub(JOINT_REACH)..(at + JOINT_REACH + 1).min(near.len())]
             .iter()
             .copied()
             .filter(|u| *u != t && !plan.inputs.contains_key(u))
             .collect();
         let shape = fixed(&g.nodes[t.n()].shape);
-        let sig: Sig = (shape.clone(), hood.iter().map(|u| fixed(&g.nodes[u.n()].shape)).collect());
+        let sig: Sig = (
+            shape.clone(),
+            hood.iter().map(|u| fixed(&g.nodes[u.n()].shape)).collect(),
+        );
         if let Some(known) = memo.get(&sig) {
             // (hood index + 1, dim); 0 is t itself
             if let Some(rel) = known {
@@ -1302,7 +1455,19 @@ pub fn plan_auto(
             }
         }
         let rel = adopt.as_ref().map(|(_, group)| {
-            group.iter().map(|&(u, e)| (if u == t { 0 } else { 1 + hood.iter().position(|h| *h == u).unwrap() }, e)).collect()
+            group
+                .iter()
+                .map(|&(u, e)| {
+                    (
+                        if u == t {
+                            0
+                        } else {
+                            1 + hood.iter().position(|h| *h == u).unwrap()
+                        },
+                        e,
+                    )
+                })
+                .collect()
         });
         memo.insert(sig, rel);
         if let Some((c, group)) = adopt {
@@ -1313,7 +1478,11 @@ pub fn plan_auto(
         }
     }
     if trace {
-        eprintln!("plan_auto: joint moves {:.1?} ({} shape patterns)", t_joint.elapsed(), memo.len());
+        eprintln!(
+            "plan_auto: joint moves {:.1?} ({} shape patterns)",
+            t_joint.elapsed(),
+            memo.len()
+        );
     }
     plan
 }
@@ -1334,18 +1503,31 @@ pub fn describe(g: &TensorGraph, t: TensorId) -> String {
                 .args
                 .iter()
                 .map(|a| {
-                    let fs: Vec<String> = a.view.forms.iter().map(|f| format!("{:?}+{}", f.coefs, f.offset)).collect();
+                    let fs: Vec<String> = a
+                        .view
+                        .forms
+                        .iter()
+                        .map(|f| format!("{:?}+{}", f.coefs, f.offset))
+                        .collect();
                     format!(
                         "{}[{}]{}{}",
                         a.src.n(),
                         fs.join(","),
                         if a.view.guard { "g" } else { "" },
-                        a.view.gather.as_ref().map_or(String::new(), |gg| format!(" gather@{}{:?}", gg.arg, gg.coefs))
+                        a.view.gather.as_ref().map_or(String::new(), |gg| format!(
+                            " gather@{}{:?}",
+                            gg.arg, gg.coefs
+                        ))
                     )
                 })
                 .collect();
             let nodes = c.body.nodes_slice();
-            let n = c.body_outs.iter().map(|o| o.index() as usize + 1).max().unwrap_or(0);
+            let n = c
+                .body_outs
+                .iter()
+                .map(|o| o.index() as usize + 1)
+                .max()
+                .unwrap_or(0);
             let body: Vec<String> = (0..n).map(|i| format!("{i}:{:?}", nodes[i])).collect();
             format!(
                 "comp out {:?} red {:?} {:?} args {} body [{}] outs {:?}",
@@ -1434,10 +1616,17 @@ pub fn segments(p: &RankProgram) -> Segmented {
     }
     let mut segs = Vec::with_capacity(n_seg);
     for s in 0..n_seg {
-        let mut ng = TensorGraph { nodes: Vec::new(), n_inputs: 0 };
+        let mut ng = TensorGraph {
+            nodes: Vec::new(),
+            n_inputs: 0,
+        };
         let mut feeds = Vec::new();
         let mut map: HashMap<usize, TensorId> = HashMap::new();
-        let fed = |ng: &mut TensorGraph, feeds: &mut Vec<Feed>, map: &mut HashMap<usize, TensorId>, d: usize| -> TensorId {
+        let fed = |ng: &mut TensorGraph,
+                   feeds: &mut Vec<Feed>,
+                   map: &mut HashMap<usize, TensorId>,
+                   d: usize|
+         -> TensorId {
             if let Some(&t) = map.get(&d) {
                 return t;
             }
@@ -1453,7 +1642,9 @@ pub fn segments(p: &RankProgram) -> Segmented {
         let (mut outputs, mut defines) = (Vec::new(), Vec::new());
         for i in (0..n).filter(|&i| level[i] == s) {
             if is_coll(i) {
-                let Op::Operator(o) = &g.nodes[i].op else { unreachable!() };
+                let Op::Operator(o) = &g.nodes[i].op else {
+                    unreachable!()
+                };
                 let src = o.inputs[0].n();
                 let full = fixed(&g.nodes[i].shape);
                 let (kind, outer) = if o.op.name() == "all_reduce" {
@@ -1463,7 +1654,12 @@ pub fn segments(p: &RankProgram) -> Segmented {
                     let d = (0..full.len()).find(|&d| full[d] != local[d]).unwrap_or(0);
                     (CollKind::AllGather(d), full[..d].iter().product())
                 };
-                before[s].push(Boundary { kind, src, dst: i, outer });
+                before[s].push(Boundary {
+                    kind,
+                    src,
+                    dst: i,
+                    outer,
+                });
                 continue;
             }
             if matches!(g.nodes[i].op, Op::Input(_)) {
@@ -1501,7 +1697,12 @@ pub fn segments(p: &RankProgram) -> Segmented {
                 defines.push(i);
             }
         }
-        segs.push(Segment { graph: ng, feeds, outputs, defines });
+        segs.push(Segment {
+            graph: ng,
+            feeds,
+            outputs,
+            defines,
+        });
     }
     Segmented {
         segments: segs,
@@ -1518,9 +1719,17 @@ pub fn segments(p: &RankProgram) -> Segmented {
 
 /// Run a segmented rank program on the interpreter, collectives through
 /// `comm` (what a device runner does with a `Program` per segment).
-pub fn run_segmented(sg: &Segmented, rank: usize, comm: &dyn Comm, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let mut vals: HashMap<usize, Vec<f64>> =
-        sg.input_nodes.iter().map(|&(i, k)| (i, inputs[k].clone())).collect();
+pub fn run_segmented(
+    sg: &Segmented,
+    rank: usize,
+    comm: &dyn Comm,
+    inputs: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let mut vals: HashMap<usize, Vec<f64>> = sg
+        .input_nodes
+        .iter()
+        .map(|&(i, k)| (i, inputs[k].clone()))
+        .collect();
     for (s, seg) in sg.segments.iter().enumerate() {
         for b in &sg.before[s] {
             let x = &vals[&b.src];
@@ -1556,8 +1765,9 @@ pub fn simulate_segmented(
 ) -> Vec<Vec<f64>> {
     let comm = HostComm::new(an.world);
     let shapes = input_shapes(g);
-    let progs: Vec<RankProgram> =
-        (0..an.world).map(|r| rank_program(g, outputs, an, weights, r, comm.clone())).collect();
+    let progs: Vec<RankProgram> = (0..an.world)
+        .map(|r| rank_program(g, outputs, an, weights, r, comm.clone()))
+        .collect();
     let res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
         let hs: Vec<_> = progs
             .iter()
@@ -1596,8 +1806,9 @@ mod tests {
     fn gather_copies_match_host_all_gather() {
         for (world, outer, row) in [(2usize, 1usize, 3usize), (4, 3, 2), (8, 5, 1)] {
             let local = outer * row;
-            let chunks: Vec<Vec<f64>> =
-                (0..world).map(|r| (0..local).map(|i| (r * 1000 + i) as f64).collect()).collect();
+            let chunks: Vec<Vec<f64>> = (0..world)
+                .map(|r| (0..local).map(|i| (r * 1000 + i) as f64).collect())
+                .collect();
             let comm = HostComm::new(world);
             let want: Vec<Vec<f64>> = std::thread::scope(|s| {
                 let hs: Vec<_> = (0..world)

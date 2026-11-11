@@ -23,7 +23,9 @@
 //! its weights from [`Loader::load`] only, against the unsharded step.
 use std::collections::{HashMap, HashSet};
 
-use tang_compile::tensor::shard::{assemble, cut, input_shapes, rank_program, Analysis, HostComm, RankProgram};
+use tang_compile::tensor::shard::{
+    assemble, cut, input_shapes, rank_program, Analysis, HostComm, RankProgram,
+};
 use tang_compile::tensor::{Format, TensorGraph, TensorId};
 
 use crate::ir_ds_real::{ckpt_name, e4m3, e8m0, fp4, St};
@@ -32,7 +34,11 @@ use crate::ir_ds_real::{ckpt_name, e4m3, e8m0, fp4, St};
 #[derive(Clone, Debug)]
 pub enum Shard {
     /// Device bytes in `format` (codes, then scales) of a tensor of `extents`.
-    Native { format: Format, bytes: Vec<u8>, extents: Vec<usize> },
+    Native {
+        format: Format,
+        bytes: Vec<u8>,
+        extents: Vec<usize>,
+    },
     /// Values (unquantized, computed, or a demoted quantized box).
     Values(Vec<f64>),
     /// Left in the checkpoint's memory map (Engram tables).
@@ -42,11 +48,21 @@ pub enum Shard {
 /// What a box will load as, without reading it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
-    Native { format: Format, bytes: usize },
+    Native {
+        format: Format,
+        bytes: usize,
+    },
     /// A quantized tensor whose box cuts a scale block.
-    Demoted { ckpt: String, values: usize },
-    Values { values: usize },
-    Host { ckpt: String },
+    Demoted {
+        ckpt: String,
+        values: usize,
+    },
+    Values {
+        values: usize,
+    },
+    Host {
+        ckpt: String,
+    },
 }
 
 /// How graph inputs bind to the checkpoint.
@@ -79,7 +95,10 @@ fn vocab_indexed(name: &str) -> bool {
 
 /// Rows box and column box of `shape` flattened to `[shape[0], rest]`, when
 /// only dim 0 / dim 1 (2-D) is cut.
-fn flat_box(shape: &[usize], bx: &[(usize, usize)]) -> Option<((usize, usize), (usize, usize), usize, usize)> {
+fn flat_box(
+    shape: &[usize],
+    bx: &[(usize, usize)],
+) -> Option<((usize, usize), (usize, usize), usize, usize)> {
     let rows = shape[0];
     let cols: usize = shape[1..].iter().product();
     match shape.len() {
@@ -108,13 +127,21 @@ impl Loader<'_> {
 
     fn expert_ckpt(&self, prefix: &str, e: usize, k: &str) -> String {
         let p = self.ckpt(&format!("{prefix}.x"));
-        format!("{}.ffn.experts.{e}.{k}.weight", p.strip_suffix(".x").unwrap())
+        format!(
+            "{}.ffn.experts.{e}.{k}.weight",
+            p.strip_suffix(".x").unwrap()
+        )
     }
 
     fn rows_of(&self, prefix: &str, n: usize) -> Vec<Option<usize>> {
         match self.experts.get(prefix) {
             Some(m) => {
-                assert_eq!(m.len(), n, "{prefix}: expert map of {} rows, table {n}", m.len());
+                assert_eq!(
+                    m.len(),
+                    n,
+                    "{prefix}: expert map of {} rows, table {n}",
+                    m.len()
+                );
                 m.clone()
             }
             None => (0..n).map(Some).collect(),
@@ -122,13 +149,20 @@ impl Loader<'_> {
     }
 
     /// What `name` (graph input of `shape`) cut to `bx` loads as.
-    pub fn classify(&self, name: &str, shape: &[usize], bx: &[(usize, usize)]) -> Result<Kind, String> {
+    pub fn classify(
+        &self,
+        name: &str,
+        shape: &[usize],
+        bx: &[(usize, usize)],
+    ) -> Result<Kind, String> {
         let ext: usize = bx.iter().map(|(a, b)| b - a).product();
         if name.ends_with(".engram.embed.weight") {
             if !full(bx, shape) {
                 return Err(format!("{name}: an Engram table split {bx:?}"));
             }
-            return Ok(Kind::Host { ckpt: self.ckpt(name) });
+            return Ok(Kind::Host {
+                ckpt: self.ckpt(name),
+            });
         }
         if let Some((p, k)) = expert_table(name) {
             if !full(&bx[1..], &shape[1..]) {
@@ -140,7 +174,10 @@ impl Loader<'_> {
             };
             let cn = self.expert_ckpt(p, *e0, k);
             return Ok(match self.st.native_parts(&cn) {
-                Ok((format, c, s)) => Kind::Native { format, bytes: (bx[0].1 - bx[0].0) * (c.len() + s.len()) },
+                Ok((format, c, s)) => Kind::Native {
+                    format,
+                    bytes: (bx[0].1 - bx[0].0) * (c.len() + s.len()),
+                },
                 Err(_) => Kind::Values { values: ext },
             });
         }
@@ -152,7 +189,9 @@ impl Loader<'_> {
         if have != shape {
             return Err(format!("{cn}: checkpoint {have:?}, graph {shape:?}"));
         }
-        let Some(format) = self.st.native_format(&cn) else { return Ok(Kind::Values { values: ext }) };
+        let Some(format) = self.st.native_format(&cn) else {
+            return Ok(Kind::Values { values: ext });
+        };
         match flat_box(shape, bx) {
             Some((rb, cb, _, _)) if aligned(format, rb, cb) => {
                 let n = (rb.1 - rb.0) * (cb.1 - cb.0);
@@ -162,12 +201,20 @@ impl Loader<'_> {
                 };
                 Ok(Kind::Native { format, bytes })
             }
-            _ => Ok(Kind::Demoted { ckpt: cn, values: ext }),
+            _ => Ok(Kind::Demoted {
+                ckpt: cn,
+                values: ext,
+            }),
         }
     }
 
     /// Read `name`'s box `bx` (graph input of `shape`) from the checkpoint.
-    pub fn load(&self, name: &str, shape: &[usize], bx: &[(usize, usize)]) -> Result<Shard, String> {
+    pub fn load(
+        &self,
+        name: &str,
+        shape: &[usize],
+        bx: &[(usize, usize)],
+    ) -> Result<Shard, String> {
         let ext: Vec<usize> = bx.iter().map(|(a, b)| b - a).collect();
         let kind = self.classify(name, shape, bx)?;
         if let Kind::Host { ckpt } = kind {
@@ -193,19 +240,27 @@ impl Loader<'_> {
                     v[r * cn..(r + 1) * cn].copy_from_slice(c);
                     v[n * cn + r * sn..n * cn + (r + 1) * sn].copy_from_slice(s);
                 }
-                return Ok(Shard::Native { format, bytes: v, extents: ext });
+                return Ok(Shard::Native {
+                    format,
+                    bytes: v,
+                    extents: ext,
+                });
             }
             let mut v = vec![0.0; mine.len() * per];
             for (r, e) in mine.iter().enumerate() {
                 if let Some(e) = e {
-                    v[r * per..(r + 1) * per].copy_from_slice(&self.st.f64(&self.expert_ckpt(p, *e, k))?);
+                    v[r * per..(r + 1) * per]
+                        .copy_from_slice(&self.st.f64(&self.expert_ckpt(p, *e, k))?);
                 }
             }
             return Ok(Shard::Values(v));
         }
         if let Some(p) = name.strip_suffix(".ffn.expert_slot") {
             // the slot map of the table of the same prefix: expert → row
-            let rows = self.experts.get(p).ok_or_else(|| format!("{name}: no expert map for {p}"))?;
+            let rows = self
+                .experts
+                .get(p)
+                .ok_or_else(|| format!("{name}: no expert map for {p}"))?;
             let mut slot = vec![0.0; shape[0]];
             for (r, e) in rows.iter().enumerate() {
                 if let Some(e) = e {
@@ -227,7 +282,8 @@ impl Loader<'_> {
             return Ok(Shard::Values(cut(&v, &sh, &b)));
         }
         if !self.st.has(&cn) {
-            let v = (self.computed)(name).ok_or_else(|| format!("{name}: not in the checkpoint, not computed"))?;
+            let v = (self.computed)(name)
+                .ok_or_else(|| format!("{name}: not in the checkpoint, not computed"))?;
             return Ok(Shard::Values(cut(&v, shape, bx)));
         }
         if let Kind::Native { format, .. } = kind {
@@ -253,7 +309,11 @@ impl Loader<'_> {
                     }
                 }
             }
-            return Ok(Shard::Native { format, bytes: v, extents: ext });
+            return Ok(Shard::Native {
+                format,
+                bytes: v,
+                extents: ext,
+            });
         }
         // unquantized or demoted: the box's rows, dequantized, then cut
         let v = self.st.rows(&cn, bx[0].0, bx[0].1)?;
@@ -267,7 +327,11 @@ impl Loader<'_> {
     /// A shard's values (a host-mapped table read from the map).
     pub fn values(&self, s: &Shard) -> Result<Vec<f64>, String> {
         match s {
-            Shard::Native { format, bytes, extents } => Ok(dequant(*format, bytes, extents)),
+            Shard::Native {
+                format,
+                bytes,
+                extents,
+            } => Ok(dequant(*format, bytes, extents)),
             Shard::Values(v) => Ok(v.clone()),
             Shard::Host { ckpt } => self.st.f64(ckpt),
         }
@@ -330,7 +394,15 @@ pub fn load_rank(
     full: &[Vec<f64>],
     check: Option<&[Vec<f64>]>,
 ) -> Result<RankLoad, String> {
-    let mut out = RankLoad { ins: Vec::new(), native_bytes: 0, value_elems: 0, native: 0, demoted: Vec::new(), host: Vec::new(), shards: Vec::new() };
+    let mut out = RankLoad {
+        ins: Vec::new(),
+        native_bytes: 0,
+        value_elems: 0,
+        native: 0,
+        demoted: Vec::new(),
+        host: Vec::new(),
+        shards: Vec::new(),
+    };
     for k in 0..shapes.len() {
         let bx = &p.boxes[k];
         let Some(name) = &names[k] else {
@@ -355,8 +427,11 @@ pub fn load_rank(
         let v = ld.values(&s)?;
         if let Some(c) = check {
             let want = cut(&c[k], &shapes[k], bx);
-            if v.len() != want.len() || v.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()) {
-                return Err(format!("{name} box {bx:?}: loaded values differ from the full tensor's box"));
+            if v.len() != want.len() || v.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits())
+            {
+                return Err(format!(
+                    "{name} box {bx:?}: loaded values differ from the full tensor's box"
+                ));
             }
         }
         out.ins.push(v);
@@ -384,13 +459,19 @@ pub fn simulate_loaded(
 ) -> Result<(Vec<Vec<f64>>, Vec<RankLoad>), String> {
     let comm = HostComm::new(an.world);
     let shapes = input_shapes(g);
-    let progs: Vec<RankProgram> =
-        (0..an.world).map(|r| rank_program(g, outputs, an, weights, r, comm.clone())).collect();
-    let loads: Vec<RankLoad> =
-        progs.iter().map(|p| load_rank(ld, p, &shapes, names, full, check)).collect::<Result<_, _>>()?;
+    let progs: Vec<RankProgram> = (0..an.world)
+        .map(|r| rank_program(g, outputs, an, weights, r, comm.clone()))
+        .collect();
+    let loads: Vec<RankLoad> = progs
+        .iter()
+        .map(|p| load_rank(ld, p, &shapes, names, full, check))
+        .collect::<Result<_, _>>()?;
     let res: Vec<Vec<Vec<f64>>> = std::thread::scope(|s| {
-        let hs: Vec<_> =
-            progs.iter().zip(&loads).map(|(p, l)| s.spawn(move || p.graph.eval(&l.ins, &p.outputs))).collect();
+        let hs: Vec<_> = progs
+            .iter()
+            .zip(&loads)
+            .map(|(p, l)| s.spawn(move || p.graph.eval(&l.ins, &p.outputs)))
+            .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     Ok((assemble(g, outputs, an, &res), loads))
@@ -418,19 +499,31 @@ pub mod synth {
     }
 
     fn nearest(table: &[(u8, f64)], x: f64) -> u8 {
-        table.iter().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs())).unwrap().0
+        table
+            .iter()
+            .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
+            .unwrap()
+            .0
     }
 
     /// `(name, dtype, shape, bytes)` tensors of `e` under `name`.
     fn tensors(name: &str, e: &Entry) -> Vec<(String, &'static str, Vec<usize>, Vec<u8>)> {
         match e {
             Entry::F32(s, v) => {
-                vec![(name.into(), "F32", s.clone(), v.iter().flat_map(|x| (*x as f32).to_le_bytes()).collect())]
+                vec![(
+                    name.into(),
+                    "F32",
+                    s.clone(),
+                    v.iter().flat_map(|x| (*x as f32).to_le_bytes()).collect(),
+                )]
             }
             Entry::Fp8(s, v) => {
                 let (rows, cols) = (s[0], s[1..].iter().product::<usize>());
                 assert!(rows % 32 == 0 && cols % 32 == 0, "{name}: {s:?}");
-                let t: Vec<(u8, f64)> = (0..=255u8).map(|c| (c, e4m3(c))).filter(|x| x.1.is_finite()).collect();
+                let t: Vec<(u8, f64)> = (0..=255u8)
+                    .map(|c| (c, e4m3(c)))
+                    .filter(|x| x.1.is_finite())
+                    .collect();
                 let (br, bc) = (rows / 32, cols / 32);
                 let mut sc = vec![0u8; br * bc];
                 for i in 0..br {
@@ -449,7 +542,12 @@ pub mod synth {
                     .collect();
                 vec![
                     (name.into(), "F8_E4M3", s.clone(), codes),
-                    (format!("{}scale", name.strip_suffix("weight").unwrap()), "F8_E8M0", vec![br, bc], sc),
+                    (
+                        format!("{}scale", name.strip_suffix("weight").unwrap()),
+                        "F8_E8M0",
+                        vec![br, bc],
+                        sc,
+                    ),
                 ]
             }
             Entry::Fp4(s, v) => {
@@ -457,13 +555,27 @@ pub mod synth {
                 assert!(rows % 32 == 0 && cols % 32 == 0, "{name}: {s:?}");
                 let t: Vec<(u8, f64)> = (0..16u8).map(|c| (c, fp4(c))).collect();
                 let sc: Vec<u8> = (0..rows * cols / 32)
-                    .map(|b| e8m0_for(v[b * 32..b * 32 + 32].iter().fold(0.0f64, |m, x| m.max(x.abs())), 6.0))
+                    .map(|b| {
+                        e8m0_for(
+                            v[b * 32..b * 32 + 32]
+                                .iter()
+                                .fold(0.0f64, |m, x| m.max(x.abs())),
+                            6.0,
+                        )
+                    })
                     .collect();
-                let q: Vec<u8> = (0..rows * cols).map(|k| nearest(&t, v[k] / e8m0(sc[k / 32]))).collect();
+                let q: Vec<u8> = (0..rows * cols)
+                    .map(|k| nearest(&t, v[k] / e8m0(sc[k / 32])))
+                    .collect();
                 let codes = q.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect();
                 vec![
                     (name.into(), "I8", vec![rows, cols / 2], codes),
-                    (format!("{}scale", name.strip_suffix("weight").unwrap()), "F8_E8M0", vec![rows, cols / 32], sc),
+                    (
+                        format!("{}scale", name.strip_suffix("weight").unwrap()),
+                        "F8_E8M0",
+                        vec![rows, cols / 32],
+                        sc,
+                    ),
                 ]
             }
         }
@@ -506,7 +618,12 @@ mod tests {
 
     /// `ds_wide` at widths the checkpoint formats can hold (32-multiples).
     fn tiny_dims() -> DsDims {
-        DsDims { dim: 64, moe_inter: 32, q_lora_rank: 32, ..ds_wide() }
+        DsDims {
+            dim: 64,
+            moe_inter: 32,
+            q_lora_rank: 32,
+            ..ds_wide()
+        }
     }
 
     fn step_names(m: &Model, st: &tang_compile::tensor::step::StepGraph) -> Vec<Option<String>> {
@@ -537,7 +654,14 @@ mod tests {
                     let x = v[e * per..(e + 1) * per].to_vec();
                     let n = format!("{p}.ffn.experts.{e}.{k}.weight");
                     let es = s[1..].to_vec();
-                    entries.push((n, if es[0] % 32 == 0 && es[1] % 32 == 0 { Entry::Fp4(es, x) } else { Entry::F32(es, x) }));
+                    entries.push((
+                        n,
+                        if es[0] % 32 == 0 && es[1] % 32 == 0 {
+                            Entry::Fp4(es, x)
+                        } else {
+                            Entry::F32(es, x)
+                        },
+                    ));
                 }
                 continue;
             }
@@ -548,7 +672,14 @@ mod tests {
                 && s.len() == 2
                 && s[0] % 32 == 0
                 && s[1] % 32 == 0;
-            entries.push((name.clone(), if quant { Entry::Fp8(s, v.clone()) } else { Entry::F32(s, v.clone()) }));
+            entries.push((
+                name.clone(),
+                if quant {
+                    Entry::Fp8(s, v.clone())
+                } else {
+                    Entry::F32(s, v.clone())
+                },
+            ));
         }
         let dir = std::env::temp_dir().join(format!("tang-shard-ckpt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -579,21 +710,54 @@ mod tests {
             };
             w.insert(name.clone(), v);
         }
-        let quantized = m.inputs.iter().filter(|(n, _)| st.native_format(n).is_some()).count();
-        let Case { st: step, ins, outs, want, weights, caches } = case_with(&m, 1, 5, &w);
+        let quantized = m
+            .inputs
+            .iter()
+            .filter(|(n, _)| st.native_format(n).is_some())
+            .count();
+        let Case {
+            st: step,
+            ins,
+            outs,
+            want,
+            weights,
+            caches,
+        } = case_with(&m, 1, 5, &w);
         assert!(want[0].iter().all(|x| x.is_finite()));
         let names = step_names(&m, &step);
-        let bare: Vec<Vec<f64>> =
-            ins.iter().zip(&names).map(|(v, n)| if n.is_some() { Vec::new() } else { v.clone() }).collect();
+        let bare: Vec<Vec<f64>> = ins
+            .iter()
+            .zip(&names)
+            .map(|(v, n)| if n.is_some() { Vec::new() } else { v.clone() })
+            .collect();
         let none = |_: &str| None;
-        let ld = Loader { st: &st, layer_ids: None, vocab_ids: None, experts: HashMap::new(), computed: &none };
+        let ld = Loader {
+            st: &st,
+            layer_ids: None,
+            vocab_ids: None,
+            experts: HashMap::new(),
+            computed: &none,
+        };
         for n in [2usize, 4] {
             for (label, cm) in [("eager", CostModel::eager()), ("8xH200", CostModel::h200())] {
                 let plan = plan_auto(&step.graph, &outs, &weights, &caches, n, &|_| 1.0, &cm);
                 let an = analyze(&step.graph, &outs, &plan);
-                let (got, loads) =
-                    simulate_loaded(&step.graph, &outs, &an, &weights, &names, &bare, &ld, Some(&ins)).unwrap();
-                let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+                let (got, loads) = simulate_loaded(
+                    &step.graph,
+                    &outs,
+                    &an,
+                    &weights,
+                    &names,
+                    &bare,
+                    &ld,
+                    Some(&ins),
+                )
+                .unwrap();
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| rel(a, b))
+                    .fold(0.0, f64::max);
                 let s = summary(&plan, &an);
                 let l = &loads[0];
                 eprintln!(
@@ -606,7 +770,10 @@ mod tests {
                     l.demoted
                 );
                 assert!(err < 1e-10, "N={n} {label}: {err:e}");
-                assert!(l.native > 0, "nothing loaded natively ({quantized} quantized tensors)");
+                assert!(
+                    l.native > 0,
+                    "nothing loaded natively ({quantized} quantized tensors)"
+                );
             }
         }
         std::fs::remove_dir_all(dir).ok();
@@ -618,17 +785,28 @@ mod tests {
     #[test]
     fn native_boxes_cut_like_values() {
         let (r, c) = (64usize, 96usize);
-        let v: Vec<f64> = (0..r * c).map(|k| ((k * 7919 % 1000) as f64 / 500.0 - 1.0) * 3.0).collect();
+        let v: Vec<f64> = (0..r * c)
+            .map(|k| ((k * 7919 % 1000) as f64 / 500.0 - 1.0) * 3.0)
+            .collect();
         let dir = std::env::temp_dir().join(format!("tang-shard-box-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write(
             &dir.join("m.safetensors"),
-            &[("a.weight".into(), Entry::Fp8(vec![r, c], v.clone())), ("b.weight".into(), Entry::Fp4(vec![r, c], v))],
+            &[
+                ("a.weight".into(), Entry::Fp8(vec![r, c], v.clone())),
+                ("b.weight".into(), Entry::Fp4(vec![r, c], v)),
+            ],
         )
         .unwrap();
         let st = St::open(&dir).unwrap();
         let none = |_: &str| None;
-        let ld = Loader { st: &st, layer_ids: None, vocab_ids: None, experts: HashMap::new(), computed: &none };
+        let ld = Loader {
+            st: &st,
+            layer_ids: None,
+            vocab_ids: None,
+            experts: HashMap::new(),
+            computed: &none,
+        };
         let mut native = 0;
         for name in ["a.weight", "b.weight"] {
             let fullv = st.f64(name).unwrap();
@@ -646,10 +824,20 @@ mod tests {
                 let k = ld.classify(name, &[r, c], &bx).unwrap();
                 if let Shard::Native { bytes, .. } = &s {
                     native += 1;
-                    assert_eq!(Kind::Native { format: st.native_format(name).unwrap(), bytes: bytes.len() }, k);
+                    assert_eq!(
+                        Kind::Native {
+                            format: st.native_format(name).unwrap(),
+                            bytes: bytes.len()
+                        },
+                        k
+                    );
                 }
                 let unaligned = bx[1].1 % 32 != 0 || (name == "a.weight" && bx[0].0 % 32 != 0);
-                assert_eq!(matches!(k, Kind::Demoted { .. }), unaligned, "{name} {bx:?}: {k:?}");
+                assert_eq!(
+                    matches!(k, Kind::Demoted { .. }),
+                    unaligned,
+                    "{name} {bx:?}: {k:?}"
+                );
             }
         }
         assert_eq!(native, 9);
@@ -671,7 +859,9 @@ mod tests {
         let run = RealRun::from_env().expect("DS41_DIR");
         let t_pre = 3;
         let toks = run.rows_of(&prompt(t_pre + 1));
-        let used = run.read_routed(toks.len()).expect("routed tables (run real_layers_match_reference)");
+        let used = run
+            .read_routed(toks.len())
+            .expect("routed tables (run real_layers_match_reference)");
         let rows = used.iter().map(|u| u.len()).max().unwrap().div_ceil(4) * 4;
         let dm = dims_from_config(&run.cfg, &run.layer_ids, run.vocab_ids.len(), rows, 8);
         let pg = prefill_graph(&dm);
@@ -681,8 +871,17 @@ mod tests {
             run.expert_tables(l, u, rows, &dm, &mut w);
         }
         let names0: Vec<String> = pg.inputs.iter().map(|s| s.name.clone()).collect();
-        let mut base: Vec<Vec<f64>> =
-            pg.inputs.iter().map(|s| if s.name == "tokens" { toks[..t_pre].to_vec() } else { w.remove(&s.name).unwrap() }).collect();
+        let mut base: Vec<Vec<f64>> = pg
+            .inputs
+            .iter()
+            .map(|s| {
+                if s.name == "tokens" {
+                    toks[..t_pre].to_vec()
+                } else {
+                    w.remove(&s.name).unwrap()
+                }
+            })
+            .collect();
         let st = derived_step(&pg, &dm, 1).unwrap();
         let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
         let pre = pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes);
@@ -692,7 +891,10 @@ mod tests {
             .zip(&st.caches)
             .map(|((&n, v), c)| {
                 let shape: Vec<usize> =
-                    pg.g.shape(n).iter().map(|d| if *d == Dim::Sym(SEQ) { t_pre } else { d.n() }).collect();
+                    pg.g.shape(n)
+                        .iter()
+                        .map(|d| if *d == Dim::Sym(SEQ) { t_pre } else { d.n() })
+                        .collect();
                 seed_cache(c, &shape, &v, t_pre, dm.ctx)
             })
             .collect();
@@ -717,7 +919,11 @@ mod tests {
         let mut outs = st.outputs.clone();
         outs.extend(st.caches.iter().map(|c| c.updated));
         let want = st.graph.eval(&ins, &outs);
-        eprintln!("real layers {:?}: reference step in {:.1?}", run.layer_ids, t0.elapsed());
+        eprintln!(
+            "real layers {:?}: reference step in {:.1?}",
+            run.layer_ids,
+            t0.elapsed()
+        );
         let weights: HashSet<TensorId> = names
             .iter()
             .enumerate()
@@ -727,13 +933,21 @@ mod tests {
         let by_node: HashMap<TensorId, String> = names
             .iter()
             .enumerate()
-            .filter_map(|(k, n)| n.clone().map(|n| (crate::ir_model::input_node(&st.graph, k), n)))
+            .filter_map(|(k, n)| {
+                n.clone()
+                    .map(|n| (crate::ir_model::input_node(&st.graph, k), n))
+            })
             .collect();
-        let bare: Vec<Vec<f64>> =
-            ins.iter().zip(&names).map(|(v, n)| if n.is_some() { Vec::new() } else { v.clone() }).collect();
+        let bare: Vec<Vec<f64>> = ins
+            .iter()
+            .zip(&names)
+            .map(|(v, n)| if n.is_some() { Vec::new() } else { v.clone() })
+            .collect();
         let computed = |n: &str| {
             let i = pg.inputs.iter().find(|i| i.name == n)?;
-            run.dense_inputs(std::slice::from_ref(i), &dm).ok()?.remove(n)
+            run.dense_inputs(std::slice::from_ref(i), &dm)
+                .ok()?
+                .remove(n)
         };
         let experts: HashMap<String, Vec<Option<usize>>> = used
             .iter()
@@ -755,12 +969,33 @@ mod tests {
         for n in [2usize, 4] {
             let t0 = std::time::Instant::now();
             let elem = |t: TensorId| by_node.get(&t).map_or(1.0, |s| native_bytes(s));
-            let plan = plan_auto(&st.graph, &outs, &weights, &caches_p, n, &elem, &CostModel::h200());
+            let plan = plan_auto(
+                &st.graph,
+                &outs,
+                &weights,
+                &caches_p,
+                n,
+                &elem,
+                &CostModel::h200(),
+            );
             let an = analyze(&st.graph, &outs, &plan);
             let s = summary(&plan, &an);
-            let (got, loads) =
-                simulate_loaded(&st.graph, &outs, &an, &weights, &names, &bare, &ld, Some(&ins)).unwrap();
-            let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+            let (got, loads) = simulate_loaded(
+                &st.graph,
+                &outs,
+                &an,
+                &weights,
+                &names,
+                &bare,
+                &ld,
+                Some(&ins),
+            )
+            .unwrap();
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| rel(a, b))
+                .fold(0.0, f64::max);
             for (r, l) in loads.iter().enumerate() {
                 eprintln!(
                     "  N={n} rank {r}: {} native tensors {:.1} MB, {:.1} M values, demoted {:?}, host {:?}",
@@ -799,24 +1034,43 @@ mod tests {
         let vocab = run.cfg["vocab_size"].as_u64().unwrap() as usize;
         let dm = dims_from_config(&run.cfg, &run.layer_ids, vocab, 0, 4096);
         let t0 = std::time::Instant::now();
-        let m = Model { cap: 4096, ..ds_model(dm.clone()) };
-        let st = tang_compile::tensor::step::derive_step(&m.g, &[m.logits], &crate::derive_all::spec(&m, 1)).expect("derives");
+        let m = Model {
+            cap: 4096,
+            ..ds_model(dm.clone())
+        };
+        let st = tang_compile::tensor::step::derive_step(
+            &m.g,
+            &[m.logits],
+            &crate::derive_all::spec(&m, 1),
+        )
+        .expect("derives");
         let mut outs = st.outputs.clone();
         outs.extend(st.caches.iter().map(|c| c.updated));
         let names = step_names(&m, &st);
         let wi = crate::ir_shard::weight_inputs(&m, &st);
         let ws: HashSet<TensorId> = wi.iter().map(|(t, _)| *t).collect();
         let by_node: HashMap<TensorId, String> = wi.into_iter().collect();
-        eprintln!("full layers {:?}: step derived in {:.1?}", run.layer_ids, t0.elapsed());
+        eprintln!(
+            "full layers {:?}: step derived in {:.1?}",
+            run.layer_ids,
+            t0.elapsed()
+        );
         let shapes = input_shapes(&st.graph);
         let read = std::env::var("DS_SHARD_READ").as_deref() == Ok("1");
         let computed = |n: &str| {
             let pg = crate::ir_ds_prefill::prefill_graph(&dm);
             let i = pg.inputs.iter().find(|i| i.name == n)?.clone();
-            run.dense_inputs(std::slice::from_ref(&i), &dm).ok()?.remove(n)
+            run.dense_inputs(std::slice::from_ref(&i), &dm)
+                .ok()?
+                .remove(n)
         };
-        let ld =
-            Loader { st: &run.st, layer_ids: Some(&run.layer_ids), vocab_ids: None, experts: HashMap::new(), computed: &computed };
+        let ld = Loader {
+            st: &run.st,
+            layer_ids: Some(&run.layer_ids),
+            vocab_ids: None,
+            experts: HashMap::new(),
+            computed: &computed,
+        };
         let worlds: Vec<usize> = std::env::var("DS_SHARD_WORLDS")
             .unwrap_or_else(|_| "4".into())
             .split(',')
@@ -825,7 +1079,15 @@ mod tests {
         for n in worlds {
             let t0 = std::time::Instant::now();
             let elem = |t: TensorId| by_node.get(&t).map_or(1.0, |s| native_bytes(s));
-            let plan = crate::ir_shard::plan_auto_cached(&st.graph, &outs, &ws, &crate::ir_shard::cache_pairs(&st), n, &elem, &CostModel::h200());
+            let plan = crate::ir_shard::plan_auto_cached(
+                &st.graph,
+                &outs,
+                &ws,
+                &crate::ir_shard::cache_pairs(&st),
+                n,
+                &elem,
+                &CostModel::h200(),
+            );
             let an = analyze(&st.graph, &outs, &plan);
             let s = summary(&plan, &an);
             eprintln!(
@@ -840,7 +1102,8 @@ mod tests {
             let mut demoted = Vec::new();
             for r in 0..n {
                 let p = rank_program(&st.graph, &outs, &an, &ws, r, comm.clone());
-                let (mut nat, mut vals, mut host, mut experts) = (0usize, 0usize, Vec::new(), 0usize);
+                let (mut nat, mut vals, mut host, mut experts) =
+                    (0usize, 0usize, Vec::new(), 0usize);
                 let t1 = std::time::Instant::now();
                 for (k, name) in names.iter().enumerate() {
                     let Some(name) = name else { continue };
@@ -859,8 +1122,21 @@ mod tests {
                         experts = bx[0].1 - bx[0].0;
                         if read {
                             let sh = ld.load(name, &shapes[k], bx).unwrap();
-                            let Shard::Native { format, bytes, extents } = &sh else { panic!("{name}: not native") };
-                            assert_eq!(kind, Kind::Native { format: *format, bytes: bytes.len() });
+                            let Shard::Native {
+                                format,
+                                bytes,
+                                extents,
+                            } = &sh
+                            else {
+                                panic!("{name}: not native")
+                            };
+                            assert_eq!(
+                                kind,
+                                Kind::Native {
+                                    format: *format,
+                                    bytes: bytes.len()
+                                }
+                            );
                             // the box's first expert against the checkpoint
                             let per: usize = extents[1..].iter().product();
                             let e = bx[0].0;
@@ -876,7 +1152,9 @@ mod tests {
                         }
                     } else if read {
                         let sh = ld.load(name, &shapes[k], bx).unwrap();
-                        if let (Shard::Native { bytes, .. }, Kind::Native { bytes: b, .. }) = (&sh, &kind) {
+                        if let (Shard::Native { bytes, .. }, Kind::Native { bytes: b, .. }) =
+                            (&sh, &kind)
+                        {
                             assert_eq!(bytes.len(), *b, "{name}");
                         }
                     }

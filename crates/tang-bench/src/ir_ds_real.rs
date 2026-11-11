@@ -686,7 +686,9 @@ pub fn lower_native_step(
     };
     let mut outs = st.outputs.clone();
     outs.extend(st.caches.iter().map(|c| c.updated));
-    let fmt: Vec<Option<Format>> = (0..st.inputs.len()).map(|k| name_of(k).and_then(format_of)).collect();
+    let fmt: Vec<Option<Format>> = (0..st.inputs.len())
+        .map(|k| name_of(k).and_then(format_of))
+        .collect();
     let (graph, outs, program, sched, storage) = lower_native_graph(&st.graph, &outs, &fmt);
     let demoted = (0..st.inputs.len())
         .filter(|&k| storage[k].is_none() && fmt[k].is_some())

@@ -33,7 +33,11 @@ pub fn native_bytes(name: &str) -> f64 {
         0.5 + 1.0 / 32.0
     } else if name.contains("head") || name.contains("embed") {
         2.0
-    } else if name.contains("hc_") || name.contains("norm") || name.contains("bias") || name.contains("sink") {
+    } else if name.contains("hc_")
+        || name.contains("norm")
+        || name.contains("bias")
+        || name.contains("sink")
+    {
         4.0
     } else {
         1.0 + 1.0 / 1024.0
@@ -49,8 +53,16 @@ pub struct Summary {
 
 pub fn summary(plan: &ShardPlan, an: &Analysis) -> Summary {
     Summary {
-        experts: plan.inputs.values().filter(|p| **p == WeightPlace::Experts).count(),
-        splits: plan.inputs.values().filter(|p| matches!(p, WeightPlace::Split(_))).count(),
+        experts: plan
+            .inputs
+            .values()
+            .filter(|p| **p == WeightPlace::Experts)
+            .count(),
+        splits: plan
+            .inputs
+            .values()
+            .filter(|p| matches!(p, WeightPlace::Split(_)))
+            .count(),
         all_reduce: an.count(|k| *k == CollKind::AllReduce),
         all_gather: an.count(|k| matches!(k, CollKind::AllGather(_))),
     }
@@ -60,7 +72,11 @@ pub fn ds_model(dm: crate::ir_ds_prefill::DsDims) -> Model {
     let pg = crate::ir_ds_prefill::prefill_graph(&dm);
     Model {
         name: "deepseek-v4.1",
-        inputs: pg.inputs.iter().map(|i| (i.name.clone(), i.shape.clone())).collect(),
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
         logits: pg.logits,
         named: pg.named.clone(),
         g: pg.g,
@@ -72,7 +88,11 @@ pub fn coder_model(cd: crate::ir_coder_prefill::CoderDims) -> Model {
     let pg = crate::ir_coder_prefill::prefill_graph(&cd);
     Model {
         name: "coder-next",
-        inputs: pg.inputs.iter().map(|i| (i.name.clone(), i.shape.clone())).collect(),
+        inputs: pg
+            .inputs
+            .iter()
+            .map(|i| (i.name.clone(), i.shape.clone()))
+            .collect(),
         logits: pg.logits,
         named: vec![],
         g: pg.g,
@@ -107,7 +127,6 @@ pub fn coder_wide() -> crate::ir_coder_prefill::CoderDims {
     }
 }
 
-
 /// One step case on the interpreter: the derived step of `k` tokens at
 /// position `p0` after a prefill (caches seeded from it), its inputs, the
 /// outputs checked (logits then updated caches) and their values.
@@ -126,11 +145,27 @@ pub fn case(m: &Model, k: usize, p0: usize) -> Case {
 }
 
 /// [`case`] with the weights `w` (by input name).
-pub fn case_with(m: &Model, k: usize, p0: usize, w: &std::collections::HashMap<String, Vec<f64>>) -> Case {
+pub fn case_with(
+    m: &Model,
+    k: usize,
+    p0: usize,
+    w: &std::collections::HashMap<String, Vec<f64>>,
+) -> Case {
     use crate::derive_all::{seed, spec, vocab};
-    let toks: Vec<f64> = (0..p0 + k).map(|i| ((37 * i + 5) % vocab(m)) as f64).collect();
+    let toks: Vec<f64> = (0..p0 + k)
+        .map(|i| ((37 * i + 5) % vocab(m)) as f64)
+        .collect();
     let full_ins = |t: &[f64]| -> Vec<Vec<f64>> {
-        m.inputs.iter().map(|(n, _)| if n == "tokens" { t.to_vec() } else { w[n].clone() }).collect()
+        m.inputs
+            .iter()
+            .map(|(n, _)| {
+                if n == "tokens" {
+                    t.to_vec()
+                } else {
+                    w[n].clone()
+                }
+            })
+            .collect()
     };
     let st = derive_step(&m.g, &[m.logits], &spec(m, k)).expect("derives");
     let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
@@ -156,19 +191,33 @@ pub fn case_with(m: &Model, k: usize, p0: usize, w: &std::collections::HashMap<S
     let want = st.graph.eval(&ins, &outs);
     let weights: HashSet<TensorId> = weight_inputs(m, &st).into_iter().map(|(t, _)| t).collect();
     let caches = cache_pairs(&st);
-    Case { st, ins, outs, want, weights, caches }
+    Case {
+        st,
+        ins,
+        outs,
+        want,
+        weights,
+        caches,
+    }
 }
 
 /// Each cache's input and the index of its update in `outputs ++ updated`.
 pub fn cache_pairs(st: &StepGraph) -> Vec<(TensorId, usize)> {
-    st.caches.iter().enumerate().map(|(c, s)| (s.input, st.outputs.len() + c)).collect()
+    st.caches
+        .iter()
+        .enumerate()
+        .map(|(c, s)| (s.input, st.outputs.len() + c))
+        .collect()
 }
 
 /// Worst `|a − b| / max|b|` over the finite reference entries (unwritten
 /// cache rows are NaN in both).
 pub fn rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let scale = b.iter().filter(|x| x.is_finite()).fold(1e-300f64, |s, x| s.max(x.abs()));
+    let scale = b
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(1e-300f64, |s, x| s.max(x.abs()));
     a.iter()
         .zip(b)
         .map(|(x, y)| match (x.is_nan(), y.is_nan()) {
@@ -183,17 +232,33 @@ pub fn rel(a: &[f64], b: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::derive_all::spec;
-    use tang_compile::tensor::shard::{analyze, plan_auto, simulate, simulate_segmented, step_cost, CostModel};
+    use tang_compile::tensor::shard::{
+        analyze, plan_auto, simulate, simulate_segmented, step_cost, CostModel,
+    };
 
     /// Step `k` tokens at `p0` unsharded and on `N` simulated ranks under the
     /// eager plan (every split the rules take) and the 8×H200 plan, whole
     /// and cut into segments at the collectives.
     fn check(m: &Model, k: usize, worlds: &[usize]) {
-        let Case { st, ins, outs, want, weights: ws, caches } = case(m, k, 5);
+        let Case {
+            st,
+            ins,
+            outs,
+            want,
+            weights: ws,
+            caches,
+        } = case(m, k, 5);
         assert!(want[0].iter().all(|x| x.is_finite()));
         let one = |_: TensorId| 1.0;
         let dense = |n: usize| {
-            let an = analyze(&st.graph, &outs, &ShardPlan { world: n, ..Default::default() });
+            let an = analyze(
+                &st.graph,
+                &outs,
+                &ShardPlan {
+                    world: n,
+                    ..Default::default()
+                },
+            );
             step_cost(&st.graph, &outs, &an, &ws, &one, &CostModel::h200()).weight_bytes
         };
         for &n in worlds {
@@ -201,9 +266,17 @@ mod tests {
                 let plan = plan_auto(&st.graph, &outs, &ws, &caches, n, &one, &cm);
                 let an = analyze(&st.graph, &outs, &plan);
                 let got = simulate(&st.graph, &outs, &an, &ws, &ins);
-                let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| rel(a, b))
+                    .fold(0.0, f64::max);
                 let seg = simulate_segmented(&st.graph, &outs, &an, &ws, &ins);
-                let serr = seg.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+                let serr = seg
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| rel(a, b))
+                    .fold(0.0, f64::max);
                 let s = summary(&plan, &an);
                 let c = step_cost(&st.graph, &outs, &an, &ws, &one, &CostModel::h200());
                 eprintln!(
@@ -249,9 +322,24 @@ mod tests {
         use tang_compile::tensor::Op;
         let m = coder_model(coder_wide());
         // two rows: the step keeps a real scan (one row lowers to plain comps)
-        let Case { st, ins, outs, want, weights: ws, caches } = case(&m, 2, 5);
+        let Case {
+            st,
+            ins,
+            outs,
+            want,
+            weights: ws,
+            caches,
+        } = case(&m, 2, 5);
         for n in [2usize, 4, 8] {
-            let plan = plan_auto(&st.graph, &outs, &ws, &caches, n, &|_| 1.0, &CostModel::eager());
+            let plan = plan_auto(
+                &st.graph,
+                &outs,
+                &ws,
+                &caches,
+                n,
+                &|_| 1.0,
+                &CostModel::eager(),
+            );
             let an = analyze(&st.graph, &outs, &plan);
             let scans: Vec<bool> = st
                 .graph
@@ -262,11 +350,22 @@ mod tests {
                 .map(|(i, _)| matches!(an.place[i], Place::S(_)))
                 .collect();
             let local = an.out_local.iter().filter(|l| l.is_some()).count();
-            eprintln!("coder N={n}: {}/{} scans split, {local} caches kept split", scans.iter().filter(|&&b| b).count(), scans.len());
-            assert!(!scans.is_empty() && scans.iter().any(|&b| b), "N={n}: no scan split");
+            eprintln!(
+                "coder N={n}: {}/{} scans split, {local} caches kept split",
+                scans.iter().filter(|&&b| b).count(),
+                scans.len()
+            );
+            assert!(
+                !scans.is_empty() && scans.iter().any(|&b| b),
+                "N={n}: no scan split"
+            );
             assert!(local > 0, "N={n}: no cache kept split");
             let got = simulate(&st.graph, &outs, &an, &ws, &ins);
-            let err = got.iter().zip(&want).map(|(a, b)| rel(a, b)).fold(0.0, f64::max);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| rel(a, b))
+                .fold(0.0, f64::max);
             eprintln!("  rel err {err:.2e}");
             assert!(err < 1e-9, "N={n}: sharded GDN diverges");
         }
@@ -277,8 +376,23 @@ mod tests {
     #[test]
     fn negative_control_dropped_all_reduce_fails() {
         for m in [ds_model(ds_wide()), coder_model(coder_wide())] {
-            let Case { st, ins, outs, want, weights: ws, caches } = case(&m, 1, 5);
-            let plan = plan_auto(&st.graph, &outs, &ws, &caches, 4, &|_| 1.0, &CostModel::eager());
+            let Case {
+                st,
+                ins,
+                outs,
+                want,
+                weights: ws,
+                caches,
+            } = case(&m, 1, 5);
+            let plan = plan_auto(
+                &st.graph,
+                &outs,
+                &ws,
+                &caches,
+                4,
+                &|_| 1.0,
+                &CostModel::eager(),
+            );
             let mut an = analyze(&st.graph, &outs, &plan);
             for c in an.conv.iter_mut().flatten().chain(an.out_conv.iter_mut()) {
                 if *c == Some(CollKind::AllReduce) {
@@ -288,7 +402,11 @@ mod tests {
             let got = std::panic::catch_unwind(|| simulate(&st.graph, &outs, &an, &ws, &ins));
             let e = got.map_or(f64::INFINITY, |g| rel(&g[0], &want[0]));
             eprintln!("{}: all-reduces dropped: logits rel err {e:.2e}", m.name);
-            assert!(e > 1e-3, "{}: dropping the all-reduces went unnoticed", m.name);
+            assert!(
+                e > 1e-3,
+                "{}: dropping the all-reduces went unnoticed",
+                m.name
+            );
         }
     }
 
@@ -300,18 +418,29 @@ mod tests {
     #[ignore]
     fn ds_real_plan_and_comm() {
         let dir = crate::ir_ds_real::ds_dir();
-        let cfg = crate::ir_ds_real::load_config(std::path::Path::new(&dir)).expect("DS41_DIR config");
+        let cfg =
+            crate::ir_ds_real::load_config(std::path::Path::new(&dir)).expect("DS41_DIR config");
         let layers: Vec<usize> = (0..cfg["n_layers"].as_u64().unwrap() as usize).collect();
         let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
         let dm = crate::ir_ds_real::dims_from_config(&cfg, &layers, vocab, 0, 4096);
         // every index source has its own indexer (24..36 keyed off layer
         // 20's compressed latent); ~6 MB fp8 a layer, replicated
-        eprintln!("index sources {:?}, KV sources {:?}", dm.index_source_layers, dm.kv_source_layers);
+        eprintln!(
+            "index sources {:?}, KV sources {:?}",
+            dm.index_source_layers, dm.kv_source_layers
+        );
         let (l, inter, d) = (dm.n_layers, dm.moe_inter, dm.dim);
         let t0 = std::time::Instant::now();
-        let m = Model { cap: 4096, ..ds_model(dm.clone()) };
+        let m = Model {
+            cap: 4096,
+            ..ds_model(dm.clone())
+        };
         let st = derive_step(&m.g, &[m.logits], &spec(&m, 1)).expect("derives");
-        eprintln!("real DS: {} step nodes, derived in {:.1?}", st.graph.nodes().len(), t0.elapsed());
+        eprintln!(
+            "real DS: {} step nodes, derived in {:.1?}",
+            st.graph.nodes().len(),
+            t0.elapsed()
+        );
         let mut outs = st.outputs.clone();
         outs.extend(st.caches.iter().map(|c| c.updated));
         let wi = weight_inputs(&m, &st);
@@ -321,7 +450,15 @@ mod tests {
         for (n, bw, label) in [(8usize, 4.8e12, "8xH200"), (4, 4.8e12, "4xH200")] {
             let t0 = std::time::Instant::now();
             let cm = CostModel::h200();
-            let plan = plan_auto(&st.graph, &outs, &ws, &crate::ir_shard::cache_pairs(&st), n, &elem, &cm);
+            let plan = plan_auto(
+                &st.graph,
+                &outs,
+                &ws,
+                &crate::ir_shard::cache_pairs(&st),
+                n,
+                &elem,
+                &cm,
+            );
             let an = analyze(&st.graph, &outs, &plan);
             let c = step_cost(&st.graph, &outs, &an, &ws, &elem, &cm);
             let s = summary(&plan, &an);
@@ -329,7 +466,10 @@ mod tests {
                 .inputs
                 .iter()
                 .filter_map(|(t, p)| match p {
-                    WeightPlace::Split(dd) => Some(format!("{}[{dd}]", names[t].split('.').skip(2).collect::<Vec<_>>().join("."))),
+                    WeightPlace::Split(dd) => Some(format!(
+                        "{}[{dd}]",
+                        names[t].split('.').skip(2).collect::<Vec<_>>().join(".")
+                    )),
                     _ => None,
                 })
                 .collect();
@@ -359,7 +499,8 @@ mod tests {
                 c.n_coll as f64 / l as f64,
                 c.coll_bytes / 1e3
             );
-            let mut sizes: Vec<(usize, CollKind)> = an.collectives.iter().map(|c| (c.numel, c.kind)).collect();
+            let mut sizes: Vec<(usize, CollKind)> =
+                an.collectives.iter().map(|c| (c.numel, c.kind)).collect();
             sizes.sort_by_key(|x| (x.0, format!("{:?}", x.1)));
             let mut hist: Vec<(usize, CollKind, usize)> = Vec::new();
             for (e, k) in sizes {
@@ -369,7 +510,10 @@ mod tests {
                 }
             }
             for (e, k, cnt) in hist {
-                eprintln!("    {cnt:4} x {k:?} of {e} f32 ({:.1} KB)", e as f64 * 4.0 / 1e3);
+                eprintln!(
+                    "    {cnt:4} x {k:?} of {e} f32 ({:.1} KB)",
+                    e as f64 * 4.0 / 1e3
+                );
             }
             eprintln!(
                 "  rank reads: dense {:.2} GB + experts {:.2} GB; time {:.0} us weights + {:.0} us experts + {:.0} us collectives = {:.0} us -> {:.0} tok/s plain",
@@ -413,19 +557,31 @@ pub fn plan_auto_cached(
             d.fixed().hash(&mut h);
         }
     }
-    outputs.iter().map(|t| t.index()).collect::<Vec<_>>().hash(&mut h);
+    outputs
+        .iter()
+        .map(|t| t.index())
+        .collect::<Vec<_>>()
+        .hash(&mut h);
     let mut ws: Vec<usize> = weights.iter().map(|t| t.index()).collect();
     ws.sort();
     for &w in &ws {
         w.hash(&mut h);
         elem(TensorId::from_index(w)).to_bits().hash(&mut h);
     }
-    caches.iter().map(|(t, o)| (t.index(), *o)).collect::<Vec<_>>().hash(&mut h);
+    caches
+        .iter()
+        .map(|(t, o)| (t.index(), *o))
+        .collect::<Vec<_>>()
+        .hash(&mut h);
     world.hash(&mut h);
     format!("{cm:?}").hash(&mut h);
     let path = std::path::Path::new(&dir).join(format!("plan-{:016x}.txt", h.finish()));
     if let Ok(text) = std::fs::read_to_string(&path) {
-        let mut plan = ShardPlan { world, inputs: Default::default(), caches: caches.to_vec() };
+        let mut plan = ShardPlan {
+            world,
+            inputs: Default::default(),
+            caches: caches.to_vec(),
+        };
         for line in text.lines() {
             let (n, p) = line.split_once(' ').expect("plan cache line");
             let t = TensorId::from_index(n.parse().expect("node"));
@@ -455,7 +611,10 @@ pub fn plan_auto_cached(
     lines.sort();
     std::fs::create_dir_all(&dir).ok();
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    if std::fs::write(&tmp, lines.join("\n")).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+    if std::fs::write(&tmp, lines.join("\n"))
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .is_ok()
+    {
         eprintln!("plan cache: wrote {}", path.display());
     }
     plan
