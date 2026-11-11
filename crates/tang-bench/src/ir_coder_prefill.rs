@@ -788,26 +788,39 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
     let g_h = expert_in(b, w_gate);
     let u_h = expert_in(b, w_up);
     let h = b.g.map(&[g_h, u_h], |v| silu(v[0]) * v[1]).unwrap();
-    // Σ_slot w_slot · down_e(h): space (t, n, slot, f)
+    // each picked expert's down projection: space (t, slot, n, f) (a
+    // gathered GEMV, the int8 GEMV's shape), then Σ_slot w_slot / Σw · dn
+    let dn =
+        b.g.comp(
+            &[T, Dim::Fixed(k), Dim::Fixed(d)],
+            &[Dim::Fixed(ff)],
+            vec![
+                arg(topk, vec![unit(4, 0), form(4, &[(1, 2)], 0)]),
+                arg(h, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
+                Arg {
+                    src: w_down,
+                    view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+                },
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[1] * v[2]],
+        )
+        .unwrap();
+    // space (t, n, slot)
     let routed =
         b.g.comp(
             &[T, Dim::Fixed(d)],
-            &[Dim::Fixed(k), Dim::Fixed(ff)],
+            &[Dim::Fixed(k)],
             vec![
-                arg(topk, vec![unit(4, 0), form(4, &[(2, 2)], 0)]),
-                arg(topk, vec![unit(4, 0), form(4, &[(2, 2)], 1)]),
-                arg(wsum, vec![unit(4, 0)]),
-                arg(h, vec![unit(4, 0), unit(4, 2), unit(4, 3)]),
-                Arg {
-                    src: w_down,
-                    view: View::pick(4, &[None, Some(1), Some(3)]).gather(0, 0, 1),
-                },
+                arg(topk, vec![unit(3, 0), form(3, &[(2, 2)], 1)]),
+                arg(wsum, vec![unit(3, 0)]),
+                arg(dn, vec![unit(3, 0), unit(3, 2), unit(3, 1)]),
             ],
             Some(Monoid::sum()),
             |v| {
                 let clamp = lit(6.103515625e-5);
-                let ws = select(v[2] - clamp, v[2], clamp);
-                vec![v[1] / ws * v[3] * v[4]]
+                let ws = select(v[1] - clamp, v[1], clamp);
+                vec![v[0] / ws * v[2]]
             },
         )
         .unwrap();

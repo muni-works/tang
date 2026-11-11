@@ -69,6 +69,9 @@ mod grad;
 /// GGUF block formats on the CPU: the values a block-format input stands for.
 #[path = "tensor_gguf.rs"]
 pub mod gguf;
+/// Block-format weights onto the int8 GEMV in any graph.
+#[path = "tensor_int8_sched.rs"]
+pub mod int8_sched;
 #[path = "tensor_io.rs"]
 pub mod io;
 pub use io::{IoReport, KernelIo};

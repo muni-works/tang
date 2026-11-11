@@ -100,6 +100,98 @@ pub fn bind(pg: &CoderPrefill, g: &Gguf) -> Result<Vec<Option<GgmlType>>, String
     Ok(tys)
 }
 
+/// A lowered real-size step and how its weights are stored.
+pub struct RealStep {
+    pub graph: tang_compile::tensor::TensorGraph,
+    /// `[logits, updated caches…]` in `graph`.
+    pub outs: Vec<tang_compile::tensor::TensorId>,
+    pub program: tang_compile::tensor::cuda_gemv::DecodeProgram,
+    pub sched: tang_compile::tensor::int8_sched::BlockSchedule,
+    /// Step input index → the storage its buffer holds (`None`: f32 values,
+    /// a block tensor's dequantized when its GGUF type is not f32).
+    pub storage: Vec<Option<Format>>,
+    /// Names of GGUF block tensors uploaded as dequantized f32.
+    pub f32_inputs: Vec<String>,
+}
+
+/// The derived step with its weights stored as the GGUF stores them where
+/// the int8 GEMV reads them, through the decode passes and `to_cuda_decode`.
+/// Full-capacity row caches update in place; rings and states are written
+/// to fresh buffers (the runner swaps them in).
+pub fn lower_real_step(
+    pg: &CoderPrefill,
+    st: &tang_compile::tensor::step::StepGraph,
+    tys: &[Option<GgmlType>],
+) -> RealStep {
+    use tang_compile::tensor::step::StepInput;
+    use tang_compile::tensor::{Op, Precision};
+    let mut graph = st.graph.clone();
+    let input_node = |g: &tang_compile::tensor::TensorGraph, k: usize| {
+        (0..g.nodes().len())
+            .find(|&i| matches!(g.nodes()[i].op, Op::Input(j) if j == k))
+            .map(tang_compile::tensor::TensorId::from_index)
+            .unwrap()
+    };
+    let gguf_of = |k: usize| match st.inputs[k] {
+        StepInput::Same(i) => tys[i],
+        _ => None,
+    };
+    for k in 0..st.inputs.len() {
+        if let Some(f) = gguf_of(k).and_then(format_of) {
+            if matches!(f, Format::Q4K | Format::Q5K | Format::Q8_0) {
+                graph.set_precision(input_node(&graph, k), Precision::storage(f));
+            }
+        }
+    }
+    let mut outs = st.outputs.clone();
+    outs.extend(st.caches.iter().map(|c| c.updated));
+    let (graph, outs, sched) = graph.schedule_block_weights(&outs);
+    let n = outs.len();
+    let mut keep = outs.clone();
+    keep.extend(&sched.copies);
+    let (graph, keep) = graph.substitute_maps(&keep);
+    let (graph, keep) = graph.eliminate_common(&keep);
+    let outs = keep[..n].to_vec();
+    let storage: Vec<Option<Format>> = (0..st.inputs.len())
+        .map(|k| {
+            let s = graph.nodes()[input_node(&graph, k).index()]
+                .precision
+                .storage;
+            s.is_block().then_some(s)
+        })
+        .collect();
+    let f32_inputs = (0..st.inputs.len())
+        .filter(|&k| storage[k].is_none() && gguf_of(k).and_then(format_of).is_some())
+        .map(|k| match st.inputs[k] {
+            StepInput::Same(i) => pg.inputs[i].name.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    let input_of = |t: tang_compile::tensor::TensorId| match st.graph.nodes()[t.index()].op {
+        Op::Input(i) => i,
+        _ => unreachable!(),
+    };
+    let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
+        inplace: st
+            .caches
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.state && s.ring.is_none())
+            .map(|(c, s)| (outs[st.outputs.len() + c], input_of(s.input)))
+            .collect(),
+        ..Default::default()
+    };
+    let program = graph.to_cuda_decode(&outs, &opts);
+    RealStep {
+        graph,
+        outs,
+        program,
+        sched,
+        storage,
+        f32_inputs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +265,110 @@ mod tests {
             tys.iter().flatten().count(),
             pg.g.nodes().len()
         );
+    }
+
+    /// The real-size decode step (k = 1, capacity 4096) derived from the
+    /// real prefill graph, then lowered by `to_cuda_decode` with f32
+    /// weights (no storage formats yet): kernels, native, reductions over
+    /// the capacity, and (with `--features cuda`) nvrtc.
+    #[test]
+    #[ignore]
+    fn real_step_derives_and_lowers_f32() {
+        let Some(g) = open() else {
+            eprintln!("no {}", gguf_path());
+            return;
+        };
+        let dims = dims_from_gguf(&g).unwrap();
+        let pg = crate::ir_coder_prefill::prefill_graph(&dims);
+        let t0 = std::time::Instant::now();
+        let st = crate::ir_coder_prefill::derived_step(&pg, 1, 4096).unwrap();
+        let derive = t0.elapsed();
+        let rows = st
+            .caches
+            .iter()
+            .filter(|c| !c.state && c.ring.is_none())
+            .count();
+        let rings = st.caches.iter().filter(|c| c.ring.is_some()).count();
+        let states = st.caches.iter().filter(|c| c.state).count();
+        let mut outs = st.outputs.clone();
+        outs.extend(st.caches.iter().map(|c| c.updated));
+        let (sg, outs) = st.graph.substitute_maps(&outs);
+        let (sg, outs) = sg.eliminate_common(&outs);
+        let dp = sg.to_cuda_decode(&outs, &Default::default());
+        let ks = &dp.program.kernels;
+        let native = dp.native.iter().filter(|n| **n).count();
+        let cap = ks
+            .iter()
+            .filter(|k| {
+                sg.comp_at(k.node.index())
+                    .is_some_and(|c| c.red.iter().any(|d| d.n() == 4096))
+            })
+            .count();
+        eprintln!(
+            "real coder step: derived in {derive:.2?} ({} step nodes); caches: {rows} rows, {rings} rings, {states} states; \
+             CUDA: {} kernels, {native} native, {cap} reduce over the capacity; total {:.2?}",
+            st.graph.nodes().len(),
+            ks.len(),
+            t0.elapsed()
+        );
+        #[cfg(feature = "cuda")]
+        {
+            let mut srcs: Vec<&str> = ks.iter().map(|k| k.source.as_str()).collect();
+            srcs.sort_unstable();
+            srcs.dedup();
+            for s in &srcs {
+                assert!(tang_gpu::cuda::ptx(s, "sm_90").contains(".entry"));
+            }
+            eprintln!(
+                "  nvrtc: {} distinct sources compiled to sm_90 PTX",
+                srcs.len()
+            );
+        }
+    }
+
+    /// The real-size step with the weights in their GGUF formats: Q4_K /
+    /// Q5_K / Q8_0 contractions on the int8 GEMV (Q8x32 activation copies),
+    /// everything else (the Q6_K experts, BF16, the Q8_0 embedding gather)
+    /// uploaded as dequantized f32. Kernels, int8 GEMVs, PTX.
+    #[test]
+    #[ignore]
+    fn real_step_lowers_with_gguf_formats() {
+        let Some(g) = open() else {
+            eprintln!("no {}", gguf_path());
+            return;
+        };
+        let dims = dims_from_gguf(&g).unwrap();
+        let pg = crate::ir_coder_prefill::prefill_graph(&dims);
+        let tys = bind(&pg, &g).unwrap();
+        let st = crate::ir_coder_prefill::derived_step(&pg, 1, 4096).unwrap();
+        let low = lower_real_step(&pg, &st, &tys);
+        eprintln!(
+            "real coder step, GGUF formats: {} kernels, {} native, {} int8 GEMVs, {} Q8x32 copies; \
+             f32-uploaded block inputs: {:?}",
+            low.program.program.kernels.len(),
+            low.program.native.iter().filter(|n| **n).count(),
+            low.sched.gemvs,
+            low.sched.copies.len(),
+            low.f32_inputs
+        );
+        #[cfg(feature = "cuda")]
+        {
+            let mut srcs: Vec<&str> = low
+                .program
+                .program
+                .kernels
+                .iter()
+                .map(|k| k.source.as_str())
+                .collect();
+            srcs.sort_unstable();
+            srcs.dedup();
+            for s in &srcs {
+                assert!(tang_gpu::cuda::ptx(s, "sm_90").contains(".entry"));
+            }
+            eprintln!(
+                "  nvrtc: {} distinct sources compiled to sm_90 PTX",
+                srcs.len()
+            );
+        }
     }
 }

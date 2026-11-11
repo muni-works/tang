@@ -243,7 +243,31 @@ impl TensorGraph {
         target: DecodeTarget,
         tiles: &[usize],
     ) -> DecodeProgram {
-        let mut program = self.to_program_numbered(outputs, Target::Wgsl);
+        // Block formats (GGUF weights, Q8x32 activations) on CUDA: laid out
+        // as f32, then the buffers get their formats back; the int8 GEMV
+        // (`IntMma`) reads them and Q8x32 writers store them (see
+        // `to_cuda_variant_scheduled`)
+        let blocky = |i: usize| self.nodes[i].precision.storage.is_block();
+        let any_block = target == DecodeTarget::Cuda && (0..self.nodes.len()).any(blocky);
+        let plain;
+        let layout = if any_block {
+            let mut p = self.clone();
+            for n in &mut p.nodes {
+                if n.precision.storage.is_block() {
+                    n.precision.storage = super::Format::F32;
+                }
+            }
+            plain = p;
+            &plain
+        } else {
+            self
+        };
+        let mut program = layout.to_program_numbered(outputs, Target::Wgsl);
+        if any_block {
+            for b in &mut program.buffers {
+                b.format = self.nodes[b.node.index()].precision.storage;
+            }
+        }
         let input_node = |k: usize| {
             (0..self.nodes.len())
                 .find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
@@ -270,6 +294,36 @@ impl TensorGraph {
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            if any_block {
+                if let Some(s) = self.nodes[root].int_mma {
+                    let (src, threads, blocks) = self
+                        .cuda_int8_kernel(root, &reads, s)
+                        .unwrap_or_else(|e| panic!("int8 GEMV schedule on node {root}: {e}"));
+                    k.source = src;
+                    k.workgroup_size = threads as u32;
+                    k.count = (threads * blocks) as u32;
+                    native.push(true);
+                    continue;
+                }
+                assert!(
+                    !reads.iter().any(|&r| blocky(r)),
+                    "to_cuda_decode: node {root} reads a block-format buffer without an int8 GEMV"
+                );
+                if blocky(root) {
+                    let st = self.nodes[root].precision.storage;
+                    let src = super::cuda::wgsl_to_cuda(&k.source, k.workgroup_size);
+                    k.source = super::cuda_int8::q8x32_writer(
+                        &src,
+                        k.points as usize,
+                        st == super::Format::Q8x32F,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("node {root}: a Q8x32 store needs a one-thread-per-point kernel")
+                    });
+                    native.push(false);
+                    continue;
+                }
+            }
             let lw = Lowering {
                 g: self,
                 reads: &reads,
