@@ -498,12 +498,25 @@ impl ServeEngine for BatchedCoder {
     }
     /// Slot 0, the caller having extended `tokens`: step `tokens[pos0..pos0 + t]`.
     fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>> {
+        ensure!(pos0 + t <= self.slots[0].tokens.len(), "window past the sequence");
+        // the caller extended `tokens` past this window (a span, window by window): step
+        // these `t`, which re-appends them, and put the span's tail back
         let ids = self.slots[0].tokens[pos0..pos0 + t].to_vec();
+        let tail = self.slots[0].tokens[pos0 + t..].to_vec();
         self.slots[0].tokens.truncate(pos0);
         let mut out = Vec::with_capacity(t);
+        let mut res = Ok(());
         for id in ids {
-            out.push(self.step(&[(0, id)])?[0]);
+            match self.step(&[(0, id)]) {
+                Ok(v) => out.push(v[0]),
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            }
         }
+        self.slots[0].tokens.extend_from_slice(&tail);
+        res?;
         self.logits_slot = 0;
         Ok(out)
     }
