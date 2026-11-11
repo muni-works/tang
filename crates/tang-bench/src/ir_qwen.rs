@@ -1614,12 +1614,10 @@ pub fn plan_slots(
         program.buffers.iter().position(|b| b.node == t).unwrap()
     };
     let words = |b: usize| {
+        // the buffer's words in its format (f32, f16, or a block format:
+        // GGUF weights, Q8x32 activations)
         let spec = &program.buffers[b];
-        match spec.format {
-            tang_compile::tensor::Format::F32 => spec.len,
-            _ => spec.len.div_ceil(2),
-        }
-        .max(1)
+        spec.format.words(spec.len).max(1)
     };
     let mut last = vec![0usize; nb];
     for (p, k) in program.kernels.iter().enumerate() {

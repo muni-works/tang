@@ -1202,6 +1202,14 @@ fn bench_coder(a: &Args, ids: &[u32]) -> Result<()> {
     let tps = sp.tokens as f64 / secs;
     let mut walls: Vec<f64> = stats.iter().map(|s| s.wall_ms).collect();
     walls.sort_by(|a, b| a.total_cmp(b));
+    // the greedy tokens, for comparisons (scripts/coder-derived-race.sh)
+    println!(
+        "ids: {}",
+        out.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let ctx = ids.len() + a.n / 2;
     let bytes = e.step_bytes(ctx);
     let sol = a.bw * 1e9 / bytes;
