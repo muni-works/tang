@@ -89,6 +89,9 @@ fn main() {
             let (g, outs) = st.graph.substitute_maps(&ids);
             let (g, outs) = g.eliminate_common(&outs);
             let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
+            if std::env::var("BISECT").is_ok_and(|v| v == m.name) {
+                bisect(&rt, &g, &outs, &dp, &step_ins);
+            }
             let native = dp.native.iter().filter(|n| **n).count();
             let nk = dp.program.kernels.len();
             let words: Vec<Vec<f32>> = step_ins
@@ -123,5 +126,83 @@ fn main() {
     }
     if failed > 0 {
         std::process::exit(1);
+    }
+}
+
+/// `BISECT=<model>`: every kernel's node kept as an output, the program run
+/// once, each node's buffer compared with the interpreter's value of the
+/// same (compiled) graph, in kernel order: the first nodes that disagree.
+fn bisect(
+    rt: &tang_gpu::program::Runtime,
+    g: &tang_compile::tensor::TensorGraph,
+    outs: &[TensorId],
+    dp: &tang_compile::tensor::cuda_gemv::DecodeProgram,
+    step_ins: &[Vec<f64>],
+) {
+    let mut all = outs.to_vec();
+    for k in &dp.program.kernels {
+        if !all.contains(&k.node) {
+            all.push(k.node);
+        }
+    }
+    let dp = lower(rt, g, &all, &DecodeOpts::default());
+    let order: Vec<(TensorId, bool, String)> = dp
+        .program
+        .kernels
+        .iter()
+        .zip(&dp.native)
+        .map(|(k, &n)| (k.node, n, k.source.lines().next().unwrap_or("").to_string()))
+        .collect();
+    let want = g.eval(step_ins, &all);
+    let words: Vec<Vec<f32>> = step_ins
+        .iter()
+        .map(|v| v.iter().map(|&x| x as f32).collect())
+        .collect();
+    let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
+    let prog = Program::new(rt, dp.program, &refs);
+    prog.run(rt);
+    let mut shown = 0;
+    for (node, native, head) in order {
+        let i = all.iter().position(|&t| t == node).unwrap();
+        let got: Vec<f64> = prog.read(rt, node).iter().map(|&x| x as f64).collect();
+        let (gk, wk): (Vec<f64>, Vec<f64>) = got
+            .iter()
+            .zip(&want[i])
+            .filter(|(_, w)| !w.is_nan())
+            .map(|(a, b)| (*a, *b))
+            .unzip();
+        let e = rel(&gk, &wk);
+        if e > 1e-3 {
+            let nd = &g.nodes()[node.index()];
+            let what = match g.comp_at(node.index()) {
+                Some(c) => format!(
+                    "red {:?} monoid {:?} tuple {} args {:?}",
+                    c.red,
+                    c.monoid.as_ref().map(|m| m.kind()),
+                    c.tuple,
+                    c.args
+                        .iter()
+                        .map(|a| (
+                            a.src,
+                            g.nodes()[a.src.index()].shape.clone(),
+                            a.view.guard,
+                            a.view.is_gather()
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+                None => format!("{:?}", std::mem::discriminant(&nd.op)),
+            };
+            println!(
+                "DIVERGE node {node:?} {:?} native {native} rel {e:.2e}: {what}\n  {head}",
+                nd.shape
+            );
+            shown += 1;
+            if shown >= 4 {
+                break;
+            }
+        }
+    }
+    if shown == 0 {
+        println!("bisect: every kernel's node agrees");
     }
 }

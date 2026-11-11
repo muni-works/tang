@@ -740,7 +740,9 @@ impl Lowering<'_> {
     /// The value tree of `a` (a view over a space of `rank`), leaves
     /// interned in `leaves`.
     fn tree(&self, a: &Arg, rank: usize, leaves: &mut Vec<Leaf>) -> Option<Val> {
-        if a.view.guard {
+        // a guarded read, or a gathered one (data-dependent address, which
+        // `flat_addr` cannot express): no decode lowering (WGSL handles it)
+        if a_guarded(a) {
             return None;
         }
         let j = a.src.n();
@@ -2779,6 +2781,9 @@ impl Lowering<'_> {
             return None;
         }
         if mc.monoid.is_some() {
+            if a_guarded(a) {
+                return None;
+            }
             let i = staged.iter().position(|&p| p == j).unwrap_or_else(|| {
                 staged.push(j);
                 staged.len() - 1
