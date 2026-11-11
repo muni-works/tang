@@ -375,3 +375,262 @@ fn topk_negative_controls() {
         assert!(msg.contains("causal"), "{msg}");
     }
 }
+
+const B: Dim = Dim::Sym("B");
+
+fn bproj(g: &mut TensorGraph, x: TensorId, a: usize, n: usize) -> TensorId {
+    let w = g.input(&[a, n]);
+    g.comp(
+        &[B, T, Dim::Fixed(n)],
+        &[Dim::Fixed(a)],
+        vec![
+            arg(x, pk(4, &[Some(0), Some(1), Some(3)])),
+            arg(w, pk(4, &[Some(3), Some(2)])),
+        ],
+        Some(Monoid::sum()),
+        |v| vec![v[0] * v[1]],
+    )
+    .unwrap()
+}
+
+/// The gather layer over independent sessions `x [B, T, DM]`.
+fn batched_layer() -> (TensorGraph, TensorId) {
+    let mut g = TensorGraph::new();
+    let x = g.input(&[B, T, Dim::Fixed(DM)]);
+    let q = bproj(&mut g, x, DM, DH);
+    let k = bproj(&mut g, x, DM, DH);
+    let v = bproj(&mut g, x, DM, DH);
+    let iq = bproj(&mut g, x, DM, DH);
+    let s = g
+        .comp(
+            &[B, T, T],
+            &[Dim::Fixed(DH)],
+            vec![
+                arg(iq, pk(4, &[Some(0), Some(1), Some(3)])),
+                arg(k, pk(4, &[Some(0), Some(2), Some(3)])),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![v[0] * v[1]],
+        )
+        .unwrap();
+    let (ti, tj) = (g.iota(&[B, T, T], 1), g.iota(&[B, T, T], 2));
+    let fmax = -(f32::MAX as f64);
+    let id3 = || View::identity(3, 3);
+    let top = g
+        .comp_tuple(
+            &[B, T, Dim::Fixed(2 * KK)],
+            &[T],
+            vec![arg(s, id3()), arg(ti, id3()), arg(tj, id3())],
+            Some(Monoid::topk(KK)),
+            move |v| {
+                let causal = v[1] - v[2] + lit(0.5);
+                let mut o = vec![sel(causal, v[2], lit(0.0)), sel(causal, v[0], lit(fmax))];
+                for _ in 1..KK {
+                    o.push(sel(causal, lit(0.0), lit(0.0)));
+                    o.push(sel(causal, lit(fmax), lit(fmax)));
+                }
+                o
+            },
+        )
+        .unwrap();
+    // slot form `2·s + off` of top in a rank-r space (b = 0, i = 1)
+    let slot = |r: usize, sd: usize, off: i64| {
+        arg(
+            top,
+            View {
+                forms: vec![Form::unit(r, 0), Form::unit(r, 1), form(r, &[(sd, 2)], off)],
+                guard: false,
+                gather: None,
+            },
+        )
+    };
+    // source row idx of session b: forms (b, ·, c), gathered on dim 1 by arg `ix`
+    let gat = |src: TensorId, r: usize, c: usize, ix: usize| {
+        arg(
+            src,
+            View {
+                forms: vec![Form::unit(r, 0), Form::zero(r), Form::unit(r, c)],
+                guard: false,
+                gather: None,
+            }
+            .gather(1, ix, 1),
+        )
+    };
+    let kp = Dim::Fixed(KK);
+    let scale = 1.0 / (DH as f64).sqrt();
+    // sg[b, i, s]: space (b, i, s, c)
+    let sg = g
+        .comp(
+            &[B, T, kp],
+            &[Dim::Fixed(DH)],
+            vec![
+                arg(q, pk(4, &[Some(0), Some(1), Some(3)])),
+                gat(k, 4, 3, 2),
+                slot(4, 2, 0),
+            ],
+            Some(Monoid::sum()),
+            move |v| vec![v[0] * v[1] * lit(scale)],
+        )
+        .unwrap();
+    let m = g
+        .comp(
+            &[B, T],
+            &[kp],
+            vec![arg(sg, id3()), slot(3, 2, 1)],
+            Some(Monoid::max()),
+            |v| vec![sel(v[1] + lit(1e29), v[0], lit(-1e30))],
+        )
+        .unwrap();
+    let l = g
+        .comp(
+            &[B, T],
+            &[kp],
+            vec![
+                arg(sg, id3()),
+                arg(m, pk(3, &[Some(0), Some(1)])),
+                slot(3, 2, 1),
+            ],
+            Some(Monoid::sum()),
+            |v| vec![sel(v[2] + lit(1e29), (v[0] - v[1]).exp(), lit(0.0))],
+        )
+        .unwrap();
+    // o[b, i, c]: space (b, i, c, s)
+    let o = g
+        .comp(
+            &[B, T, Dim::Fixed(DH)],
+            &[kp],
+            vec![
+                arg(sg, pk(4, &[Some(0), Some(1), Some(3)])),
+                arg(m, pk(4, &[Some(0), Some(1)])),
+                arg(l, pk(4, &[Some(0), Some(1)])),
+                gat(v, 4, 2, 4),
+                slot(4, 3, 0),
+                slot(4, 3, 1),
+            ],
+            Some(Monoid::sum()),
+            |v| {
+                vec![sel(
+                    v[5] + lit(1e29),
+                    (v[0] - v[1]).exp() / v[2] * v[3],
+                    lit(0.0),
+                )]
+            },
+        )
+        .unwrap();
+    (g, o)
+}
+
+/// Sessions at lengths 3, 6 and 1 stepped together through the gather
+/// layer (`p0` is `[B]`): each equals its session stepped alone, bit for
+/// bit, and the grown session's prefill. Steps of 4, then 1.
+#[test]
+fn batched_gather_ragged_sessions() {
+    use super::super::Op;
+    use super::{derive_step_with, StepInput, StepOptions};
+    use std::collections::HashMap;
+    let (g, o) = batched_layer();
+    let (ps, ks, cap, tmax) = ([3usize, 6, 1], [4usize, 1], 16usize, 12usize);
+    let nb = ps.len();
+    let n_in = g
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Input(_)))
+        .count();
+    let val = |n: usize, seed: usize| -> Vec<f64> {
+        (0..n)
+            .map(|j| (((j * 7919 + seed * 104729) % 1009) as f64 / 1009.0 - 0.5) * 1.6)
+            .collect()
+    };
+    let xs: Vec<Vec<f64>> = (0..nb).map(|b| val(tmax * DM, 100 + b)).collect();
+    let mut weights: Vec<Vec<f64>> = (0..n_in).map(|i| val(DM * DH, 17 + i)).collect();
+    weights[0] = Vec::new();
+    let x_rows = |b: usize, r0: usize, r1: usize| xs[b][r0 * DM..r1 * DM].to_vec();
+    let prefill = |b: usize, t: usize, ids: &[TensorId]| {
+        let mut ins = weights.clone();
+        ins[0] = x_rows(b, 0, t);
+        g.bind(&[("B", 1), ("T", t)]).unwrap().eval(&ins, ids)
+    };
+    // per session: cache buffers [1, cap, DH], NaN past the filled rows
+    let mut caches: Vec<HashMap<TensorId, Vec<f64>>> = vec![HashMap::new(); nb];
+    let mut pos = ps;
+    let mut worst = 0.0f64;
+    let opts = StepOptions {
+        rows: Rows::All,
+        batch: Some("B"),
+    };
+    for &k in &ks {
+        let step = derive_step_with(&g, &[o], &spec(k), &opts).unwrap();
+        assert_eq!(step.caches.len(), 2, "k and v");
+        if caches[0].is_empty() {
+            let nodes: Vec<TensorId> = step.caches.iter().map(|c| c.node).collect();
+            for b in 0..nb {
+                for (c, v) in step.caches.iter().zip(prefill(b, pos[b], &nodes)) {
+                    let mut buf = vec![f64::NAN; cap * DH];
+                    buf[..v.len()].copy_from_slice(&v);
+                    caches[b].insert(c.node, buf);
+                }
+            }
+        }
+        let mut ids = step.outputs.clone();
+        ids.extend(step.caches.iter().map(|c| c.updated));
+        let inputs_for = |ss: &[usize]| -> Vec<Vec<f64>> {
+            step.inputs
+                .iter()
+                .map(|si| match *si {
+                    StepInput::Pos => ss.iter().map(|&b| pos[b] as f64).collect(),
+                    StepInput::New(_) => ss
+                        .iter()
+                        .flat_map(|&b| x_rows(b, pos[b], pos[b] + k))
+                        .collect(),
+                    StepInput::Same(i) => weights[i].clone(),
+                    StepInput::Cache(c) => ss
+                        .iter()
+                        .flat_map(|&b| caches[b][&step.caches[c].node].clone())
+                        .collect(),
+                })
+                .collect()
+        };
+        let all: Vec<usize> = (0..nb).collect();
+        let together = step
+            .graph
+            .bind(&[("B", nb)])
+            .unwrap()
+            .eval(&inputs_for(&all), &ids);
+        let one = step.graph.bind(&[("B", 1)]).unwrap();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut alones = Vec::new();
+        for b in 0..nb {
+            let alone = one.eval(&inputs_for(&[b]), &ids);
+            for (t, a) in together.iter().zip(&alone) {
+                let per = t.len() / nb;
+                assert_eq!(bits(&t[b * per..(b + 1) * per]), bits(a), "session {b}");
+            }
+            let want = prefill(b, pos[b] + k, &[o]);
+            let w = &want[0][pos[b] * DH..(pos[b] + k) * DH];
+            let e = alone[0]
+                .iter()
+                .zip(w)
+                .map(|(x, y)| {
+                    let e = (x - y).abs() / (1.0 + y.abs());
+                    if e.is_finite() {
+                        e
+                    } else {
+                        f64::INFINITY
+                    }
+                })
+                .fold(0.0, f64::max);
+            worst = worst.max(e);
+            alones.push(alone);
+        }
+        for (b, alone) in alones.into_iter().enumerate() {
+            for (ci, c) in step.caches.iter().enumerate() {
+                caches[b].insert(c.node, alone[1 + ci].clone());
+            }
+        }
+        for p in pos.iter_mut() {
+            *p += k;
+        }
+    }
+    eprintln!("batched gather, sessions {ps:?}, steps {ks:?}: together == alone bit for bit; vs prefill {worst:.2e}");
+    assert!(worst < 1e-12, "{worst}");
+}
