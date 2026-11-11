@@ -291,6 +291,11 @@ mod tests {
                     .unwrap_or("")
             );
         }
+        if let Ok(dir) = std::env::var("DUMP_KERNELS") {
+            for (j, k) in dp.program.kernels.iter().enumerate() {
+                std::fs::write(format!("{dir}/k{j:03}_n{}.cu", k.node.index()), &k.source).unwrap();
+            }
+        }
         eprintln!("{} kernels", dp.program.kernels.len());
     }
 
