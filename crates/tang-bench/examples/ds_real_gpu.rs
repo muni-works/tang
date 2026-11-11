@@ -1,0 +1,152 @@
+//! DeepSeek-V4.1-Flash at real size from its derived graph, on the GPU:
+//! the real-dims graph of `DS_REAL_LAYERS` checkpoint layers (default 0
+//! and 2; `tang_bench::ir_ds_real`), real weights dequantized to f32, the
+//! routed experts the CPU check recorded (`routed-*.txt`, written by
+//! `ir_ds_real::tests::real_layers_match_reference`) in compact tables.
+//! Prefills `DS_REAL_T` tokens (default 3) on the interpreter, seeds the
+//! caches, runs the derived one-token step on the device and compares its
+//! logits and updated caches with the interpreter's step (f32 device, f64
+//! reference).
+//!
+//! ```text
+//! DS41_DIR=/workspace/ds41-l02 ds_real_gpu
+//! ```
+//!
+//! Exits 1 when the device disagrees by more than 1e-3 of the output scale.
+use std::time::Instant;
+
+use tang_bench::ir_ds_prefill::{derived_step, prefill_graph, DsDims, SEQ};
+use tang_bench::ir_ds_real::*;
+use tang_bench::qwen_session::{lower, runtime};
+use tang_compile::tensor::cuda_gemv::DecodeOpts;
+use tang_compile::tensor::step::{seed_cache, StepInput};
+use tang_compile::tensor::{Dim, TensorId};
+use tang_gpu::program::Program;
+
+fn rel(a: &[f64], b: &[f64]) -> f64 {
+    let scale = b.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-300);
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = (x - y).abs() / scale;
+            if d.is_nan() {
+                f64::INFINITY
+            } else {
+                d
+            }
+        })
+        .fold(0.0, f64::max)
+}
+
+fn main() {
+    let run =
+        RealRun::from_env().unwrap_or_else(|| panic!("no {}/inference_config.json", ds_dir()));
+    let t_pre: usize = std::env::var("DS_REAL_T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let toks = run.rows_of(&prompt(t_pre + 1));
+    let used = run.read_routed(toks.len()).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e} (run ir_ds_real::tests::real_layers_match_reference first)",
+            run.routed_path(toks.len()).display()
+        )
+    });
+    let rows = used.iter().map(|u| u.len()).max().unwrap();
+    let dm: DsDims = dims_from_config(
+        &run.cfg,
+        &run.layer_ids,
+        run.vocab_ids.len(),
+        rows,
+        8.max(t_pre + 1),
+    );
+    let t0 = Instant::now();
+    let pg = prefill_graph(&dm);
+    let mut w = run.dense_inputs(&pg.inputs, &dm).unwrap();
+    for (l, u) in used.iter().enumerate() {
+        run.expert_tables(l, u, rows, &dm, &mut w);
+    }
+    let mut base: Vec<Vec<f64>> = pg
+        .inputs
+        .iter()
+        .map(|s| {
+            if s.name == "tokens" {
+                toks[..t_pre].to_vec()
+            } else {
+                w.remove(&s.name).unwrap()
+            }
+        })
+        .collect();
+    eprintln!("weights loaded: {:.1?}", t0.elapsed());
+
+    let t0 = Instant::now();
+    let st = derived_step(&pg, &dm, 1).unwrap();
+    let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+    let pre = pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes);
+    let caches: Vec<Vec<f64>> = nodes
+        .iter()
+        .zip(pre)
+        .zip(&st.caches)
+        .map(|((&n, v), c)| {
+            let shape: Vec<usize> =
+                pg.g.shape(n)
+                    .iter()
+                    .map(|d| if *d == Dim::Sym(SEQ) { t_pre } else { d.n() })
+                    .collect();
+            seed_cache(c, &shape, &v, t_pre, dm.ctx)
+        })
+        .collect();
+    let step_ins: Vec<Vec<f64>> = st
+        .inputs
+        .iter()
+        .map(|&x| match x {
+            StepInput::Pos => vec![t_pre as f64],
+            StepInput::New(_) => toks[t_pre..t_pre + 1].to_vec(),
+            StepInput::Same(i) => std::mem::take(&mut base[i]),
+            StepInput::Cache(c) => caches[c].clone(),
+        })
+        .collect();
+    let mut ids = st.outputs.clone();
+    ids.extend(st.caches.iter().map(|c| c.updated));
+    let want = st.graph.eval(&step_ins, &ids);
+    eprintln!("CPU prefill + interpreter step: {:.1?}", t0.elapsed());
+
+    let rt = runtime();
+    let t0 = Instant::now();
+    let (g, outs) = st.graph.substitute_maps(&ids);
+    let (g, outs) = g.eliminate_common(&outs);
+    let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
+    let native = dp.native.iter().filter(|n| **n).count();
+    let nk = dp.program.kernels.len();
+    let words: Vec<Vec<f32>> = step_ins
+        .iter()
+        .map(|v| v.iter().map(|&x| x as f32).collect())
+        .collect();
+    let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
+    let prog = Program::new(&rt, dp.program, &refs);
+    eprintln!("{}: lowered + uploaded in {:.1?}", rt.name(), t0.elapsed());
+    prog.run(&rt);
+    let mut worst = 0.0f64;
+    for (o, wv) in outs.iter().zip(&want) {
+        let got: Vec<f64> = prog.read(&rt, *o).iter().map(|&x| x as f64).collect();
+        let (gk, wk): (Vec<f64>, Vec<f64>) = got
+            .iter()
+            .zip(wv)
+            .filter(|(_, w)| !w.is_nan())
+            .map(|(a, b)| (*a, *b))
+            .unzip();
+        worst = worst.max(rel(&gk, &wk));
+    }
+    let ms = prog.time(&rt, 20);
+    let ok = worst < 1e-3;
+    println!(
+        "deepseek-v4.1 real size, layers {:?}, step at position {t_pre}: {nk} kernels ({native} native), \
+         GPU vs interpreter rel err {worst:.2e}, {ms:.3} ms device (f32 weights, {} layers): {}",
+        run.layer_ids,
+        dm.n_layers,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
+}
