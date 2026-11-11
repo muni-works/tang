@@ -148,7 +148,18 @@ pub(super) fn q8x32_writer(src: &str, points: usize, f32_scale: bool) -> Option<
     }
     let src = src.replace(store, "tang_q8x32_store(out, g, v[0], params.count);");
     let at = src.find("extern \"C\"")?;
-    let helper = if f32_scale {
+    Some(format!(
+        "{}{}{}",
+        &src[..at],
+        q8x32_store(f32_scale),
+        &src[at..]
+    ))
+}
+
+/// The `tang_q8x32_store` helper (`f32_scale`: the scale alone, one f32 a
+/// 32, as `Format::Q8x32F` stores it).
+pub(super) fn q8x32_store(f32_scale: bool) -> String {
+    if f32_scale {
         // the scale alone, one f32 a 32
         Q8X32_STORE.replace(
             "    int s = q;\n    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);\n    if ((g & 31u) == 0u) ((float2*)((unsigned char*)out + n))[g >> 5] = make_float2(d, d * (float)s);",
@@ -156,8 +167,7 @@ pub(super) fn q8x32_writer(src: &str, points: usize, f32_scale: bool) -> Option<
         )
     } else {
         Q8X32_STORE.to_string()
-    };
-    Some(format!("{}{helper}{}", &src[..at], &src[at..]))
+    }
 }
 
 impl TensorGraph {

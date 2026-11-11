@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a polite email to a landlord asking to fix a leaking kitchen faucet, and suggest two times next week that work for a visit.
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

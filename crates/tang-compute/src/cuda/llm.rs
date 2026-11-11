@@ -184,16 +184,16 @@ impl CudaComputeDevice {
     ) -> CudaBuffer {
         assert!(group % 8 == 0, "4-bit groups must be a multiple of 8");
         let q = Q4Weight {
-            packed: self.stream.memcpy_stod(packed).unwrap(),
-            scales: self.stream.memcpy_stod(scales).unwrap(),
-            biases: self.stream.memcpy_stod(biases).unwrap(),
+            packed: self.stream.clone_htod(packed).unwrap(),
+            scales: self.stream.clone_htod(scales).unwrap(),
+            biases: self.stream.clone_htod(biases).unwrap(),
             group,
         };
         Self::make_buf_unpooled(CudaStorage::Q4(Box::new(q)), packed.len() * 8)
     }
 
     pub(super) fn upload_bf16_impl(&self, bits: &[u16]) -> CudaBuffer {
-        let slice = self.stream.memcpy_stod(bits).unwrap();
+        let slice = self.stream.clone_htod(bits).unwrap();
         Self::make_buf_unpooled(CudaStorage::Bf16(slice), bits.len())
     }
 

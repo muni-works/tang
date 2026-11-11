@@ -34,6 +34,8 @@ inline thread_local tang_dim3 threadIdx;
 inline tang_dim3 blockIdx, blockDim, gridDim;
 struct float4 { float x, y, z, w; };
 struct float2 { float x, y; };
+static inline float2 make_float2(float x, float y) { return {x, y}; }
+static inline float4 make_float4(float x, float y, float z, float w) { return {x, y, z, w}; }
 struct uint4 { unsigned x, y, z, w; };
 struct uint2 { unsigned x, y; };
 struct int4 { int x, y, z, w; };
@@ -212,7 +214,9 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
             .iter()
             .map(|&t| format!("B[{}].data()", bi(t)))
             .collect();
-        args.push(format!("B[{}].data()", bi(k.node)));
+        for t in k.outputs() {
+            args.push(format!("B[{}].data()", bi(t)));
+        }
         args.push(format!("{}u", k.points));
         let blocks = k.count.div_ceil(k.workgroup_size);
         format!(
@@ -361,7 +365,12 @@ mod tests {
     /// The tiny coder-next step (prefill 5 tokens on the interpreter, one
     /// derived step) as its CUDA decode program run on the CPU, against
     /// the interpreter's step: `(worst rel err, kernels)`.
-    pub(crate) fn coder_step_on_cpu(opts: &DecodeOpts, keep_residual: bool) -> (f64, usize) {
+    pub(crate) fn coder_step_on_cpu(
+        opts: &DecodeOpts,
+        keep_residual: bool,
+        staged: bool,
+        cokernels: bool,
+    ) -> (f64, usize) {
         let m = coder();
         let w = weights(&m);
         let p0 = 5;
@@ -414,10 +423,38 @@ mod tests {
             keep.extend(crate::ir_coder_real::residual_stream(&st.graph, &pg));
         }
         let (g, keep) = st.graph.substitute_maps(&keep);
-        let (g, keep) = g.eliminate_common(&keep);
+        let (mut g, keep) = g.eliminate_common(&keep);
         let outs = keep[..n].to_vec();
+        if staged {
+            let k = g.schedule_staged_stats(&outs, &[]);
+            assert!(k > 0, "no statistic staged");
+            let m = g.schedule_small_maps(&outs, &[]);
+            assert!(m > 0, "no small map inlined");
+        }
+        if cokernels {
+            let (a, b) = g.schedule_cokernels(&outs, opts);
+            eprintln!("cokernels: {a} inlined and stored, {b} side jobs");
+            assert!(a + b > 0, "no multi-output kernel");
+            if std::env::var("LIST").is_ok() {
+                for (i, nd) in g.nodes().iter().enumerate() {
+                    if let Some(h) = nd.host {
+                        eprintln!("host n{i} {:?} -> n{}", nd.shape, h.index());
+                    }
+                }
+            }
+        }
         let dp = g.to_cuda_decode(&outs, opts);
         let nk = dp.program.kernels.len();
+        if std::env::var("LIST").is_ok() {
+            for k in &dp.program.kernels {
+                eprintln!(
+                    "K n{} writes {:?} | {}",
+                    k.node.index(),
+                    k.writes.iter().map(|t| t.index()).collect::<Vec<_>>(),
+                    k.source.lines().next().unwrap_or("")
+                );
+            }
+        }
         // NaN in unwritten cache rows: zero for the run (masked anyway),
         // skipped in the comparison
         let words: Vec<Vec<f32>> = step_ins
@@ -430,22 +467,258 @@ mod tests {
             .collect();
         let got = super::run(&dp, &words, &outs);
         let mut worst = 0.0f64;
-        for (gv, wv) in got.iter().zip(&want) {
+        for (oi, (gv, wv)) in got.iter().zip(&want).enumerate() {
             let (gk, wk): (Vec<f64>, Vec<f64>) = gv
                 .iter()
                 .zip(wv)
                 .filter(|(_, w)| !w.is_nan())
                 .map(|(a, b)| (*a as f64, *b))
                 .unzip();
-            worst = worst.max(rel(&gk, &wk));
+            let e = rel(&gk, &wk);
+            if e > 1e-4 {
+                eprintln!("output {oi} (node {}): rel err {e:.2e}", outs[oi].index());
+            }
+            worst = worst.max(e);
         }
         (worst, nk)
     }
 
+    /// The tiny coder step with multi-output kernels
+    /// (`schedule_cokernels`: residual adds folded into their norms, the
+    /// conv window into the conv, ring and state updates as side jobs)
+    /// against the interpreter, and the kernel counts with and without.
+    #[test]
+    fn coder_step_cokernels_run_on_the_cpu() {
+        let (e0, n0) = coder_step_on_cpu(&DecodeOpts::default(), true, true, false);
+        let (e1, n1) = coder_step_on_cpu(&DecodeOpts::default(), true, true, true);
+        eprintln!(
+            "tiny coder step: {n0} kernels (rel err {e0:.2e}) -> {n1} with multi-output \
+             kernels (rel err {e1:.2e} vs interpreter)"
+        );
+        assert!(e1 < 1e-4, "{e1}");
+        assert!(n1 < n0, "{n1} >= {n0}");
+    }
+
     #[test]
     fn coder_step_kernels_run_on_the_cpu() {
-        let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true);
-        eprintln!("tiny coder step, {nk} CUDA kernels on the CPU vs interpreter: rel err {e:.2e}");
-        assert!(e < 1e-4, "{e}");
+        for staged in [false, true] {
+            let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true, staged, false);
+            eprintln!(
+                "tiny coder step (staged stats {staged}): {nk} CUDA kernels on the CPU vs \
+                 interpreter: rel err {e:.2e}"
+            );
+            assert!(e < 1e-4, "{e}");
+        }
+    }
+
+    /// The shapes `schedule_cokernels` fuses at real size, on a small
+    /// graph: a residual add read by its RMSNorm (whose sum of squares
+    /// is staged) and by a later map, the norm read by its Q8x32 copy
+    /// and the later map; a zero-padded conv window (old ring rows, then
+    /// the new row) read by a depthwise conv and by the shifted ring;
+    /// an independent state update. Multi-output kernels against the
+    /// one-output kernels, on the CPU: the same bytes, fewer launches.
+    #[test]
+    fn cokernel_patterns_match_unfused() {
+        use tang::Scalar;
+        use tang_compile::tensor::{Arg, Dim, Form, Format, Monoid, Precision, TensorGraph, View};
+        let (d, c) = (256usize, 64usize);
+        let mut g = TensorGraph::new();
+        let x = g.input(&[1, d]);
+        let r = g.input(&[1, d]);
+        let w = g.input(&[1, d]);
+        let ring = g.input(&[3, c]);
+        let new = g.input(&[1, c]);
+        let kw = g.input(&[c, 4]);
+        let st = g.input(&[c, 8]);
+        let a = g.map(&[x, r], |v| v[0] + v[1]).unwrap();
+        let sq = g.map(&[a], |v| v[0] * v[0]).unwrap();
+        let ss = g.reduce(sq, 1, Monoid::sum()).unwrap();
+        let ssb = g.broadcast(ss, &[Dim::Fixed(1), Dim::Fixed(d)]).unwrap();
+        let nrm = g
+            .map(&[a, ssb, w], |v| {
+                let one = tang_expr::ExprId::ONE;
+                let k = tang_expr::ExprId::from_f64(1.0 / d as f64);
+                let eps = tang_expr::ExprId::from_f64(1e-6);
+                v[0] * (one / (v[1] * k + eps).sqrt()) * v[2]
+            })
+            .unwrap();
+        let q = g.map(&[nrm], |v| v[0]).unwrap();
+        g.set_precision(q, Precision::storage(Format::Q8x32));
+        let m = g.map(&[nrm, a], |v| v[0] * v[1]).unwrap();
+        // win[t, ch] = ring[t, ch] (t < 3), new[t - 3, ch] (t = 3)
+        let f = |coefs: &[i64], offset: i64| Form {
+            coefs: coefs.to_vec(),
+            offset,
+        };
+        let pad = |forms: Vec<Form>| {
+            View {
+                forms,
+                guard: false,
+                gather: None,
+            }
+            .guarded()
+        };
+        let win = g
+            .comp(
+                &[4, c],
+                &[] as &[usize],
+                vec![
+                    Arg {
+                        src: ring,
+                        view: pad(vec![f(&[1, 0], 0), f(&[0, 1], 0)]),
+                    },
+                    Arg {
+                        src: new,
+                        view: pad(vec![f(&[1, 0], -3), f(&[0, 1], 0)]),
+                    },
+                ],
+                None,
+                |v| vec![v[0] + v[1]],
+            )
+            .unwrap();
+        let conv = g
+            .comp(
+                &[c],
+                &[4],
+                vec![
+                    Arg {
+                        src: win,
+                        view: View::pick(2, &[Some(1), Some(0)]),
+                    },
+                    Arg {
+                        src: kw,
+                        view: View::pick(2, &[Some(0), Some(1)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let shifted = g
+            .comp(
+                &[3, c],
+                &[] as &[usize],
+                vec![Arg {
+                    src: win,
+                    view: View {
+                        forms: vec![f(&[1, 0], 1), f(&[0, 1], 0)],
+                        guard: false,
+                        gather: None,
+                    },
+                }],
+                None,
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let upd = g
+            .comp(
+                &[c, 8],
+                &[] as &[usize],
+                vec![
+                    Arg {
+                        src: st,
+                        view: View::identity(2, 2),
+                    },
+                    Arg {
+                        src: new,
+                        view: View::pick(2, &[None, Some(0)]),
+                    },
+                ],
+                None,
+                |v| vec![v[0] * tang_expr::ExprId::from_f64(0.5) + v[1]],
+            )
+            .unwrap();
+        let outs0 = [a, m, q, conv, shifted, upd];
+        let mut keep = outs0.to_vec();
+        keep.extend([nrm, win]);
+        let (mut g, keep) = g.substitute_maps(&keep);
+        let outs = keep[..outs0.len()].to_vec();
+        assert!(g.schedule_staged_stats(&outs, &[]) > 0);
+        let ins: Vec<Vec<f32>> = [d, d, d, 3 * c, c, 4 * c, 8 * c]
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| {
+                (0..n)
+                    .map(|i| (((i * 37 + k * 11) % 101) as f32 - 50.0) / 23.0)
+                    .collect()
+            })
+            .collect();
+        let run = |g: &TensorGraph| {
+            let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+            (super::run(&dp, &ins, &outs), dp.program.kernels.len())
+        };
+        let (one, n1) = run(&g);
+        let mut fg = g.clone();
+        let (ai, bj) = fg.schedule_cokernels(&outs, &DecodeOpts::default());
+        let (multi, nm) = run(&fg);
+        let bits = |v: &[Vec<f32>]| {
+            v.iter()
+                .map(|o| o.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "cokernel patterns: {n1} one-output kernels -> {nm} ({ai} inlined and stored, \
+             {bj} side jobs); bytes identical: {}",
+            bits(&one) == bits(&multi)
+        );
+        assert!(one.iter().all(|o| o.iter().any(|&x| x != 0.0)));
+        assert!(nm < n1);
+        assert_eq!(bits(&one), bits(&multi));
+    }
+
+    /// An RMSNorm stored as Q8x32 (what an int8 GEMV reads): the sum of
+    /// squares staged into the norm's kernel (`schedule_staged_stats`,
+    /// one launch) against its own warp kernel plus the transpiled Q8x32
+    /// writer (two launches), on the CPU: the same bytes, codes and
+    /// scales.
+    #[test]
+    fn staged_q8_norm_matches_two_kernels() {
+        use tang::Scalar;
+        use tang_compile::tensor::{Dim, Format, Monoid, Precision, TensorGraph};
+        for f in [Format::Q8x32, Format::Q8x32F] {
+            let d = 256;
+            let mut g = TensorGraph::new();
+            let x = g.input(&[Dim::Fixed(2), Dim::Fixed(d)]);
+            let w = g.input(&[Dim::Fixed(1), Dim::Fixed(d)]);
+            let sq = g.map(&[x], |v| v[0] * v[0]).unwrap();
+            let ss = g.reduce(sq, 1, Monoid::sum()).unwrap();
+            let ssb = g.broadcast(ss, &[Dim::Fixed(2), Dim::Fixed(d)]).unwrap();
+            let wb = g.broadcast(w, &[Dim::Fixed(2), Dim::Fixed(d)]).unwrap();
+            let y = g
+                .map(&[x, ssb, wb], |v| {
+                    let one = tang_expr::ExprId::ONE;
+                    let k = tang_expr::ExprId::from_f64(1.0 / d as f64);
+                    let eps = tang_expr::ExprId::from_f64(1e-6);
+                    v[0] * (one / (v[1] * k + eps).sqrt()) * v[2]
+                })
+                .unwrap();
+            g.set_precision(y, Precision::storage(f));
+            let (g, outs) = g.substitute_maps(&[y]);
+            let xs: Vec<f32> = (0..2 * d)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let ws: Vec<f32> = (0..d).map(|i| 0.5 + (i % 7) as f32 / 9.0).collect();
+            let run = |g: &TensorGraph| {
+                let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+                let nk = dp.program.kernels.len();
+                (
+                    super::run(&dp, &[xs.clone(), ws.clone()], &outs).remove(0),
+                    nk,
+                )
+            };
+            let (two, n2) = run(&g);
+            let mut sg = g.clone();
+            assert_eq!(sg.schedule_staged_stats(&outs, &[]), 1);
+            let (one, n1) = run(&sg);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            eprintln!(
+                "{f:?} norm: {n2} kernels unfused, {n1} staged; bytes identical: {}",
+                bits(&two) == bits(&one)
+            );
+            assert_eq!((n2, n1), (2, 1));
+            assert!(two.iter().any(|&x| x != 0.0));
+            assert_eq!(bits(&two), bits(&one), "{f:?}");
+        }
     }
 }
