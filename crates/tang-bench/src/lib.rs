@@ -282,6 +282,8 @@ pub mod qwen_session;
 pub mod cuda_cpu;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Per-rank native weight loading for the sharded DeepSeek step.
+pub mod ds_shard_load;
 /// DS pieces on a CUDA device: the top-k block select, the Engram table
 /// in host-mapped memory.
 #[cfg(all(test, feature = "cuda"))]
