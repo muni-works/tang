@@ -152,53 +152,34 @@ impl RealRun {
         self.g.dequantize(t).map_err(|e| format!("{name}: {e}"))
     }
 
-    /// A GGUF tensor of `blk.{l}` as f64.
-    fn blk(&self, l: usize, suffix: &str) -> Result<Vec<f64>, String> {
-        Ok(self
-            .f32s(&format!("blk.{l}.{suffix}"))?
-            .into_iter()
-            .map(|x| x as f64)
-            .collect())
-    }
-
-    /// Graph input `name` as f64 from the GGUF (everything but `tokens`,
-    /// `sample.params` and, with compact tables, the expert tensors).
-    pub fn input(&self, name: &str) -> Result<Vec<f64>, String> {
-        let rows = |n: &str| -> Result<Vec<f64>, String> {
+    /// Graph input `name` as f32 from the GGUF (every value exact: the
+    /// dequantized weight), for everything but `tokens`, `sample.params`
+    /// and compact expert tables / slot maps. Full expert tensors
+    /// (`expert_rows = 0`) come whole.
+    pub fn input32(&self, name: &str) -> Result<Vec<f32>, String> {
+        let rows = |n: &str| -> Result<Vec<f32>, String> {
             let t = self.g.info(n).map_err(|e| e.to_string())?;
             let mut v = Vec::new();
             for &id in &self.vocab_ids {
-                v.extend(
-                    self.g
-                        .rows(t, id, 1)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(|x| x as f64),
-                );
+                v.extend(self.g.rows(t, id, 1).map_err(|e| e.to_string())?);
             }
             Ok(v)
         };
         match name {
             "token_embd" => return rows("token_embd.weight"),
             "output" => return rows("output.weight"),
-            "output_norm" => {
-                return Ok(self
-                    .f32s("output_norm.weight")?
-                    .into_iter()
-                    .map(|x| x as f64)
-                    .collect())
-            }
+            "output_norm" => return self.f32s("output_norm.weight"),
             _ => {}
         }
         let rest = name
             .strip_prefix("blk.")
             .ok_or_else(|| format!("{name}: not a layer input"))?;
         let (l, tail) = rest.split_once('.').unwrap();
-        let l: usize = l.parse().unwrap();
-        let stack = |parts: [&str; 3]| -> Result<Vec<f64>, String> {
+        let blk = |suffix: &str| self.f32s(&format!("blk.{l}.{suffix}"));
+        let stack = |parts: [&str; 3]| -> Result<Vec<f32>, String> {
             let mut v = Vec::new();
             for p in parts {
-                v.extend(self.blk(l, p)?);
+                v.extend(blk(p)?);
             }
             Ok(v)
         };
@@ -209,13 +190,18 @@ impl RealRun {
                 "ssm_conv1d_k.weight",
                 "ssm_conv1d_v.weight",
             ]),
-            "ssm_decay_rate" => Ok(self.blk(l, "ssm_a")?.into_iter().map(|a| -a).collect()),
-            "ssm_dt" => self.blk(l, "ssm_dt.bias"),
-            "exp_probs_b" => self.blk(l, "exp_probs_b.bias"),
-            "attn_out" => self.blk(l, "attn_output.weight"),
-            t if t.ends_with(".weight") || t.ends_with(".bias") => self.blk(l, t),
-            t => self.blk(l, &format!("{t}.weight")),
+            "ssm_decay_rate" => Ok(blk("ssm_a")?.into_iter().map(|a| -a).collect()),
+            "ssm_dt" => blk("ssm_dt.bias"),
+            "exp_probs_b" => blk("exp_probs_b.bias"),
+            "attn_out" => blk("attn_output.weight"),
+            t if t.ends_with(".weight") || t.ends_with(".bias") => blk(t),
+            t => blk(&format!("{t}.weight")),
         }
+    }
+
+    /// [`Self::input32`] as f64.
+    pub fn input(&self, name: &str) -> Result<Vec<f64>, String> {
+        Ok(self.input32(name)?.into_iter().map(|x| x as f64).collect())
     }
 
     /// Every graph input but `tokens`, `sample.params` and the MoE expert
@@ -275,6 +261,58 @@ impl RealRun {
         }
         into.insert(format!("blk.{l}.ffn_expert_slot"), slot);
         Ok(())
+    }
+
+    /// The experts each MoE layer routes `toks` (graph vocab rows) to,
+    /// from the graph's own `blk.{l}.expert_ids`, layer by layer (a layer's
+    /// routing needs the earlier layers' experts bound). `w` holds the
+    /// dense inputs ([`Self::dense_inputs`]); the expert tables of the
+    /// last pass are left in it.
+    pub fn route(
+        &self,
+        toks: &[f64],
+        d0: &GlmDims,
+        w: &mut HashMap<String, Vec<f64>>,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        use crate::ir_glm_prefill::{prefill_graph, SEQ};
+        let moe: Vec<usize> = (0..d0.layers.len())
+            .filter(|&l| d0.layers[l].1 == Ffn::Moe)
+            .collect();
+        let mut used: Vec<Vec<usize>> = vec![Vec::new(); d0.layers.len()];
+        for &l in &moe {
+            let rows = used.iter().map(|u| u.len()).max().unwrap().max(1);
+            let d = GlmDims {
+                expert_rows: rows,
+                ..d0.clone()
+            };
+            let pg = prefill_graph(&d);
+            for &m in &moe {
+                self.expert_tables(m, &used[m], rows, &d, w)?;
+            }
+            let node = pg
+                .named
+                .iter()
+                .find(|(n, _)| *n == format!("blk.{l}.expert_ids"))
+                .unwrap()
+                .1;
+            let base: Vec<Vec<f64>> = pg
+                .inputs
+                .iter()
+                .map(|s| {
+                    if s.name == "tokens" {
+                        toks.to_vec()
+                    } else {
+                        w[&s.name].clone()
+                    }
+                })
+                .collect();
+            let e = pg.g.bind(&[(SEQ, toks.len())]).unwrap().eval(&base, &[node]);
+            let mut u: Vec<usize> = e[0].iter().map(|&x| x as usize).collect();
+            u.sort_unstable();
+            u.dedup();
+            used[l] = u;
+        }
+        Ok(used)
     }
 
     /// The hand engine on the same file: `Glm5Ref::forward`'s logits over
@@ -396,40 +434,7 @@ mod tests {
         let moe: Vec<usize> = (0..d0.layers.len())
             .filter(|&l| d0.layers[l].1 == Ffn::Moe)
             .collect();
-        let mut used: Vec<Vec<usize>> = vec![Vec::new(); d0.layers.len()];
-        for &l in &moe {
-            let rows = used.iter().map(|u| u.len()).max().unwrap().max(1);
-            let d = GlmDims {
-                expert_rows: rows,
-                ..d0.clone()
-            };
-            let pg = prefill_graph(&d);
-            for &m in &moe {
-                run.expert_tables(m, &used[m], rows, &d, &mut w).unwrap();
-            }
-            let node = pg
-                .named
-                .iter()
-                .find(|(n, _)| *n == format!("blk.{l}.expert_ids"))
-                .unwrap()
-                .1;
-            let base: Vec<Vec<f64>> = pg
-                .inputs
-                .iter()
-                .map(|s| {
-                    if s.name == "tokens" {
-                        toks.clone()
-                    } else {
-                        w[&s.name].clone()
-                    }
-                })
-                .collect();
-            let e = pg.g.bind(&[(SEQ, toks.len())]).unwrap().eval(&base, &[node]);
-            let mut u: Vec<usize> = e[0].iter().map(|&x| x as usize).collect();
-            u.sort_unstable();
-            u.dedup();
-            used[l] = u;
-        }
+        let used = run.route(&toks, &d0, &mut w).unwrap();
         eprintln!(
             "routing (graph's expert_ids): experts per layer {:?} in {:.1?}",
             used.iter().map(|u| u.len()).collect::<Vec<_>>(),
