@@ -1088,7 +1088,12 @@ mod tests {
     fn derived_step_kernels_compile_with_nvrtc() {
         let arch = "sm_86";
         let mut progs = Vec::new();
-        for (dims, k) in [(tiny(), 1), (tiny(), 4), (QwenDims::qwen3_8b(4352), 1)] {
+        for (dims, k) in [
+            (tiny(), 1),
+            (tiny(), 4),
+            (QwenDims::qwen3_8b(4352), 1),
+            (QwenDims::qwen3_8b(4352), 4),
+        ] {
             let pg = prefill_graph(&dims);
             let step = derived_step(&pg, &dims, k);
             let dg = as_decode_graph(&pg, &step, &dims);
@@ -1109,8 +1114,14 @@ mod tests {
                 let ptx = tang_gpu::cuda::ptx(src, arch);
                 assert!(ptx.contains(".entry"), "no entry point");
             }
+            let mma = p
+                .program
+                .kernels
+                .iter()
+                .filter(|kn| kn.source.contains("mma"))
+                .count();
             eprintln!(
-                "{layers} layers, k={k}: {} kernels ({} distinct sources) compiled to {arch} PTX",
+                "{layers} layers, k={k}: {} kernels ({} distinct sources, {mma} mma) compiled to {arch} PTX",
                 p.program.kernels.len(),
                 distinct.len()
             );

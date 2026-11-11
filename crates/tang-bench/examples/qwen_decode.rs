@@ -8,7 +8,9 @@
 //! 8-byte readback.
 //!
 //! ```text
-//! qwen_decode tiny                      random small model: GPU vs the interpreter
+//! qwen_decode tiny [--derived]           random small model: GPU vs the interpreter
+//!     --derived        (any mode) the steps derived from the one prefill graph
+//!                      (`ir_qwen::prefill`) instead of the hand-written ones
 //! qwen_decode model <dir> <ids> [opts]  MLX 4-bit checkpoint: prompt, then greedy decode
 //!     --gen N          greedy tokens after the prompt (default 64)
 //!     --ctx C          KV capacity (default 4352)
@@ -21,6 +23,8 @@
 //!                      writing every step's logits to --logits from --from on
 //!     --from P         (default 0)
 //!     --bench L        device time of a decode step at context lengths L (comma list)
+//!     --bench-window K with --bench: also a K-token window (a draft verify)
+//!                      at each length
 //!     --profile        per-kernel times of a decode step
 //! qwen_decode reference <dir> <ids> <logits out> [--from P]
 //!                                       CPU f32 forward (f64 accumulation), the
@@ -49,7 +53,12 @@ fn main() {
     #[cfg(feature = "otel")]
     let _otel = tang_bench::otel_init("qwen_decode");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--derived") {
+        // read by `Step::new` (qwen_session::derived_mode)
+        std::env::set_var("QWEN_DERIVED", "1");
+    }
     match args.first().map(String::as_str) {
+        Some("tiny") if derived_mode() => tiny_derived(),
         Some("tiny") => tiny(),
         Some("model") => model(&args[1..]),
         Some("reference") => reference(&args[1..]),
@@ -400,6 +409,125 @@ fn tiny() {
 
 // ----------------------------------------------------------------------
 // MLX checkpoint
+/// `tiny` for the derived steps (`--derived`): decode steps, a 6-token
+/// window continuing the cache at p0, and a decode step after it, each
+/// against the interpreter on the same derived graph (f16 caches emulated).
+fn tiny_derived() {
+    use tang_bench::ir_qwen::prefill::{as_decode_graph, derived_step, prefill_graph};
+    let dims = tiny_dims();
+    let rt = runtime();
+    let pg = prefill_graph(&dims);
+    let dg = as_decode_graph(&pg, &derived_step(&pg, &dims, 1), &dims);
+    let logical = tiny_logical(&dims, &dg, 11);
+    let device = device_words(&dg, &logical);
+    let dec = Step::new(&rt, &dims, 1, dims.ctx, &|_| device.clone(), None);
+    assert!(dec.is_derived());
+    let mut cpu: Vec<Vec<f64>> = logical
+        .iter()
+        .map(|v| v.iter().map(|&x| x as f64).collect())
+        .collect();
+    let emulate = |dg: &DecodeGraph| {
+        let mut g = dg.g.clone();
+        if dims.kv_f16 {
+            use tang_compile::tensor::{Format, Precision};
+            for &t in &dg.outputs[1..] {
+                g.set_precision(t, Precision::storage(Format::F16));
+            }
+        }
+        g
+    };
+    let kv = |v: &Vec<f64>| -> Vec<f64> {
+        if dims.kv_f16 {
+            v.iter().map(|&x| f16_round(x)).collect()
+        } else {
+            v.clone()
+        }
+    };
+    // the reference's updated caches back into its inputs
+    let store = |cpu: &mut Vec<Vec<f64>>, res: &[Vec<f64>]| {
+        for l in 0..dims.layers {
+            cpu[dg.input(&format!("model.layers.{l}.k_cache"))] = kv(&res[1 + 2 * l]);
+            cpu[dg.input(&format!("model.layers.{l}.v_cache"))] = kv(&res[2 + 2 * l]);
+        }
+    };
+    let gref = emulate(&dg);
+    let mut rng = tang_bench::Rng::new(5);
+    let (p0, seq) = (9, 6);
+    let mut worst = 0.0f64;
+    let mut agree = 0;
+    for pos in 0..p0 {
+        let tok = ((rng.f32() + 1.0) * 0.5 * dims.vocab as f32) as usize % dims.vocab;
+        dec.feed(&rt, &[tok], pos);
+        dec.prog.run(&rt);
+        let got = dec.logits(&rt);
+        cpu[dg.input("tokens")] = vec![tok as f64];
+        cpu[dg.input("pos")] = vec![pos as f64];
+        let res = gref.eval_emulated(&cpu, &dg.outputs);
+        let e = rel_err(&got, &res[0]);
+        worst = worst.max(e);
+        agree += usize::from(argmax(&got) == argmax_f64(&res[0]));
+        store(&mut cpu, &res);
+        println!("derived decode pos {pos:2}: rel logit err {e:.2e}");
+    }
+    // a window of `seq` tokens at p0 (shares weights and caches)
+    let pre = Step::new(
+        &rt,
+        &dims,
+        seq,
+        dims.ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        Some(&dec),
+    );
+    let tokens: Vec<usize> = (0..seq).map(|i| (37 * i + 5) % dims.vocab).collect();
+    pre.feed(&rt, &tokens, p0);
+    pre.prog.run(&rt);
+    let got = pre.logits(&rt);
+    let pcpu: Vec<Vec<f64>> = pre
+        .dg
+        .inputs
+        .iter()
+        .map(|s| match s.name.as_str() {
+            "tokens" => tokens.iter().map(|&t| t as f64).collect(),
+            "pos" => vec![p0 as f64],
+            n => cpu[dg.input(n)].clone(),
+        })
+        .collect();
+    let pres = emulate(&pre.dg).eval_emulated(&pcpu, &pre.dg.outputs);
+    let werr = rel_err(&got, &pres[0]);
+    println!("derived window of {seq} at {p0}: rel logit err {werr:.2e} (all {seq} rows)");
+    store(&mut cpu, &pres);
+    // one decode step after the window
+    let next = pre.next_token(&rt);
+    dec.feed(&rt, &[next], p0 + seq);
+    dec.prog.run(&rt);
+    let got = dec.logits(&rt);
+    cpu[dg.input("tokens")] = vec![next as f64];
+    cpu[dg.input("pos")] = vec![(p0 + seq) as f64];
+    let res = gref.eval_emulated(&cpu, &dg.outputs);
+    let derr = rel_err(&got, &res[0]);
+    println!("derived decode after the window: rel logit err {derr:.2e}");
+    worst = worst.max(derr);
+    println!(
+        "tiny --derived: worst relative logit error {worst:.2e} (decode), {werr:.2e} (window); argmax {agree}/{p0} ({})",
+        if dims.kv_f16 { "f16 caches" } else { "f32 caches" }
+    );
+    let tol = if dims.kv_f16 { 1e-3 } else { 1e-4 };
+    assert!(
+        worst < tol && werr < tol,
+        "the GPU disagrees with the interpreter"
+    );
+}
+
+fn argmax_f64(v: &[f64]) -> usize {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
 fn read_ids(path: &str) -> Vec<usize> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -482,11 +610,11 @@ fn model(args: &[String]) {
         let mut out = Vec::new();
         let mut agree = 0;
         for (pos, &tok) in ids.iter().enumerate() {
-            dec.set_state(&rt, tok, pos);
+            dec.feed(&rt, &[tok], pos);
             dec.prog.run(&rt);
             if pos >= from {
                 let l = dec.logits(&rt);
-                let (next, _) = dec.state(&rt);
+                let next = dec.next_token(&rt);
                 agree += usize::from(next == argmax(&l));
                 out.extend(l);
             }
@@ -505,6 +633,8 @@ fn model(args: &[String]) {
     // the prompt: prefill chunks (shared weights and caches) or decode steps
     let t = Instant::now();
     let mut prefill_ms = Vec::new();
+    // the first generated token (a derived step has no `state`)
+    let mut first_tok = 0;
     match opt("--chunks") {
         Some(cs) => {
             let sizes: Vec<usize> = cs.split(',').map(|v| v.parse().unwrap()).collect();
@@ -526,8 +656,9 @@ fn model(args: &[String]) {
                     &|dg| vec![Vec::new(); dg.inputs.len()],
                     Some(&dec),
                 );
-                pre.prefill(&rt, &ids[p0..p0 + seq], p0);
-                let _ = pre.state(&rt);
+                pre.feed(&rt, &ids[p0..p0 + seq], p0);
+                pre.prog.run(&rt);
+                first_tok = pre.next_token(&rt);
                 if args.iter().any(|a| a == "--time-prefill") {
                     let ms = pre.prog.time(&rt, 3);
                     prefill_ms.push((seq, p0, ms));
@@ -543,12 +674,17 @@ fn model(args: &[String]) {
         }
         None => {
             for (pos, &tok) in ids.iter().enumerate() {
-                dec.set_state(&rt, tok, pos);
+                dec.feed(&rt, &[tok], pos);
                 dec.prog.run(&rt);
             }
+            first_tok = dec.next_token(&rt);
         }
     }
-    let (first, pos) = dec.state(&rt);
+    let (first, pos) = if dec.is_derived() {
+        (first_tok, ids.len())
+    } else {
+        dec.state(&rt)
+    };
     assert_eq!(pos, ids.len());
     let prompt_s = t.elapsed().as_secs_f64();
     for (seq, p0, ms) in &prefill_ms {
@@ -565,9 +701,20 @@ fn model(args: &[String]) {
     // greedy decode: per token one run and one 8-byte readback
     let mut out = vec![first];
     let t = Instant::now();
+    let mut p = pos;
     for _ in 1..gen {
-        dec.prog.run(&rt);
-        let (tok, p) = dec.state(&rt);
+        let tok = if dec.is_derived() {
+            // token and position in, logits out, argmax on the host
+            dec.feed(&rt, &[*out.last().unwrap()], p);
+            dec.prog.run(&rt);
+            p += 1;
+            dec.next_token(&rt)
+        } else {
+            dec.prog.run(&rt);
+            let (tok, np) = dec.state(&rt);
+            p = np;
+            tok
+        };
         if p >= ctx {
             break;
         }
@@ -592,17 +739,43 @@ fn model(args: &[String]) {
     }
     // device time of one step at a few context lengths
     if let Some(ls) = opt("--bench") {
+        let kind = if dec.is_derived() { "derived" } else { "hand" };
+        // a K-token window (draft verify) over the whole cache, sharing the
+        // decode program's weights and caches
+        let window = opt("--bench-window").map(|k| {
+            let k: usize = k.parse().unwrap();
+            Step::new(
+                &rt,
+                &dims,
+                k,
+                ctx,
+                &|dg| vec![Vec::new(); dg.inputs.len()],
+                Some(&dec),
+            )
+        });
         for l in ls.split(',').map(|v| v.parse::<usize>().unwrap()) {
             let pos = l.min(ctx - 200) - 1;
             let mut best = f64::INFINITY;
             for _ in 0..3 {
-                dec.set_state(&rt, first, pos);
+                dec.feed(&rt, &[first], pos);
                 best = best.min(dec.prog.time(&rt, 20));
             }
             println!(
-                "decode step at len {l}: {best:.3} ms device ({:.1} tok/s)",
+                "decode step at len {l} ({kind}): {best:.3} ms device ({:.1} tok/s)",
                 1e3 / best
             );
+            if let Some(w) = &window {
+                let k = w.dg.seq;
+                let mut wbest = f64::INFINITY;
+                for _ in 0..3 {
+                    w.feed(&rt, &vec![first; k], pos);
+                    wbest = wbest.min(w.prog.time(&rt, 20));
+                }
+                println!(
+                    "window of {k} at len {l} ({kind}): {wbest:.3} ms device ({:.1} tok/s)",
+                    k as f64 * 1e3 / wbest
+                );
+            }
             // TANG_TRACE_OUT=prefix: per-phase ns of the megakernel (min
             // over 20 runs), or every kernel's ms alone, at this length
             if let Ok(pre) = std::env::var("TANG_TRACE_OUT") {

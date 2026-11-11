@@ -115,7 +115,16 @@ impl Step {
             prefill_q4: dims.prefill_q4 || prefill_q4(rt),
             ..dims.clone()
         };
-        let dg = step_graph(dims, seq, kctx);
+        let dg = if derived_mode() {
+            // QWEN_DERIVED=1: the step derived from the one prefill graph
+            // (`ir_qwen::prefill`) instead of the hand-written `step_graph`;
+            // its position is the `pos` input, its tokens `tokens`
+            let pg = prefill::prefill_graph(dims);
+            let step = prefill::derived_step(&pg, dims, seq);
+            prefill::as_decode_graph(&pg, &step, dims)
+        } else {
+            step_graph(dims, seq, kctx)
+        };
         let (g, mut outs) = compiled_decode(&dg, rt.kind() == BackendKind::Cuda);
         let named = outs.len();
         let options = |outs: &[TensorId]| {
@@ -180,7 +189,12 @@ impl Step {
                 .iter()
                 .enumerate()
                 .filter_map(|(k, s)| {
-                    let j = b.dg.inputs.iter().position(|bs| bs.name == s.name)?;
+                    // (same name and shape: a derived window's `tokens` is
+                    // its own)
+                    let j =
+                        b.dg.inputs
+                            .iter()
+                            .position(|bs| bs.name == s.name && bs.shape == s.shape)?;
                     Some(Shared {
                         input: k,
                         from: &b.prog,
@@ -287,6 +301,41 @@ impl Step {
         l
     }
 
+    /// A step derived from the prefill graph (`QWEN_DERIVED=1`): no
+    /// `state`; tokens and position are inputs, the next token is the
+    /// host's argmax.
+    pub fn is_derived(&self) -> bool {
+        self.dg.inputs.iter().any(|s| s.name == "pos")
+    }
+
+    /// The step's tokens (`seq` of them) at positions `p0..`, before a
+    /// run: `state` (decode) or `chunk` (prefill) for the hand step,
+    /// `tokens` and `pos` for a derived one.
+    pub fn feed(&self, rt: &Runtime, tokens: &[usize], p0: usize) {
+        assert_eq!(tokens.len(), self.dg.seq);
+        if self.is_derived() {
+            let t: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+            self.prog.write(rt, self.tensor("tokens"), &t);
+            self.prog.write(rt, self.tensor("pos"), &[p0 as f32]);
+        } else if self.dg.seq == 1 {
+            self.set_state(rt, tokens[0], p0);
+        } else {
+            self.prog
+                .write(rt, self.tensor("chunk"), &chunk_input(tokens, p0));
+        }
+    }
+
+    /// The greedy next token after a run: `state`'s, or (derived) the
+    /// argmax of the last row's logits.
+    pub fn next_token(&self, rt: &Runtime) -> usize {
+        if !self.is_derived() {
+            return self.state(rt).0;
+        }
+        let l = self.logits(rt);
+        let vocab = l.len() / self.dg.seq;
+        argmax(&l[(self.dg.seq - 1) * vocab..])
+    }
+
     /// Prefill: `tokens` at positions `p0..`, then `state` holds the next
     /// token and its position.
     pub fn prefill(&self, rt: &Runtime, tokens: &[usize], p0: usize) {
@@ -295,6 +344,11 @@ impl Step {
             .write(rt, self.tensor("chunk"), &chunk_input(tokens, p0));
         self.prog.run(rt);
     }
+}
+
+/// `QWEN_DERIVED=1`: [`Step`]s are derived from the one prefill graph.
+pub fn derived_mode() -> bool {
+    std::env::var("QWEN_DERIVED").as_deref() == Ok("1")
 }
 
 pub fn argmax(v: &[f32]) -> usize {
@@ -483,7 +537,12 @@ pub fn load_inputs<'a>(
     let one = move |s: &InputSpec| -> Vec<f32> {
         let n: usize = s.shape.iter().product();
         let name = &s.name;
-        if name == "state" || name == "chunk" || name.ends_with("cache") {
+        if name == "state"
+            || name == "chunk"
+            || name == "pos"
+            || name == "tokens"
+            || name.ends_with("cache")
+        {
             return Vec::new();
         }
         if name == "rope" {
