@@ -2530,7 +2530,13 @@ pub(crate) mod tests {
         dm: &DsDims,
         p0: usize,
         k: usize,
-    ) -> (StepGraph, Vec<Vec<f64>>, Vec<TensorId>, Vec<Vec<f64>>, Vec<usize>) {
+    ) -> (
+        StepGraph,
+        Vec<Vec<f64>>,
+        Vec<TensorId>,
+        Vec<Vec<f64>>,
+        Vec<usize>,
+    ) {
         let pg = prefill_graph(dm);
         let (w, all) = setup(dm, &pg, p0 + k);
         let st = derived_step(&pg, dm, k).unwrap();

@@ -51,7 +51,13 @@ fn cache() -> &'static Mutex<Cache> {
 pub fn gpu_key(name: &str) -> String {
     let mut s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     while s.contains("--") {
         s = s.replace("--", "-");
@@ -68,7 +74,9 @@ pub fn parse(text: &str) -> HashMap<String, Choice> {
             continue;
         }
         let mut f = l.split('\t');
-        let (Some(sig), Some(kv)) = (f.next(), f.next()) else { continue };
+        let (Some(sig), Some(kv)) = (f.next(), f.next()) else {
+            continue;
+        };
         let c: Choice = kv
             .split(',')
             .filter_map(|p| p.split_once('='))
@@ -220,6 +228,9 @@ mod tests {
         let m = parse("# c\nab\tTANG_GEMV_WARPS=4,TANG_GEMV_UPL=1\t0.01\t0.02\tx\n");
         assert_eq!(m["ab"]["TANG_GEMV_WARPS"], "4");
         assert_eq!(gpu_key("NVIDIA H200"), "nvidia-h200");
-        assert_eq!(gpu_key("NVIDIA RTX PRO 6000 Blackwell"), "nvidia-rtx-pro-6000-blackwell");
+        assert_eq!(
+            gpu_key("NVIDIA RTX PRO 6000 Blackwell"),
+            "nvidia-rtx-pro-6000-blackwell"
+        );
     }
 }

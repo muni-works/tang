@@ -193,11 +193,7 @@ fn u(rank: usize, d: usize) -> Form {
 }
 
 /// Sampling over `logits [seq, V]`; adds the `params [4]` input to `g`.
-pub fn append_sampler(
-    g: &mut TensorGraph,
-    logits: TensorId,
-    spec: SampleSpec,
-) -> Sampler {
+pub fn append_sampler(g: &mut TensorGraph, logits: TensorId, spec: SampleSpec) -> Sampler {
     let sh = g.shape(logits).to_vec();
     let (t, v) = (sh[0], sh[1]);
     let vn = v.n();
@@ -214,12 +210,16 @@ pub fn append_sampler(
         g.comp(out, red, args, m, |x| vec![f(x)])
             .unwrap_or_else(|e| panic!("sampler comp {out:?}/{red:?}: {e:?}"))
     };
-    let m = comp(g, &[t], &[v], vec![lv.clone()], Some(Monoid::max()), &|x| x[0]);
+    let m = comp(g, &[t], &[v], vec![lv.clone()], Some(Monoid::max()), &|x| {
+        x[0]
+    });
     let mrow = || arg(m, vec![u(1, 0)]);
     let (it, range) = (spec.iters, spec.range);
 
     // top-k: bisection on θ with #{l ≥ θ} ≥ k (k = 0: V + 1, never met)
-    let mut lo = comp(g, &[t], &[], vec![mrow()], None, &move |x| x[0] - lit(range));
+    let mut lo = comp(g, &[t], &[], vec![mrow()], None, &move |x| {
+        x[0] - lit(range)
+    });
     let mut hi = comp(g, &[t], &[], vec![mrow()], None, &|x| x[0]);
     let keff = move |k: ExprId| select(k - lit(0.5), k, lit(vn as f64 + 1.0));
     for _ in 0..it {
@@ -287,11 +287,19 @@ pub fn append_sampler(
         let args = vec![one(lo), one(hi), one(mass), one(z), p(1, TOP_P)];
         let nlo = comp(g, &[t], &[], args.clone(), None, &|x| {
             let mid = (x[0] + x[1]) * lit(0.5);
-            select(x[2] - x[4] * x[3], mid, select(x[4] * x[3] - x[2], x[0], mid))
+            select(
+                x[2] - x[4] * x[3],
+                mid,
+                select(x[4] * x[3] - x[2], x[0], mid),
+            )
         });
         let nhi = comp(g, &[t], &[], args, None, &|x| {
             let mid = (x[0] + x[1]) * lit(0.5);
-            select(x[2] - x[4] * x[3], x[1], select(x[4] * x[3] - x[2], mid, x[1]))
+            select(
+                x[2] - x[4] * x[3],
+                x[1],
+                select(x[4] * x[3] - x[2], mid, x[1]),
+            )
         });
         lo = nlo;
         hi = nhi;
@@ -439,8 +447,22 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
     let cv = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 1)]);
     let ci = |rank: usize, ax: usize| arg(cand, vec![u(rank, 0), form(rank, &[(ax, 2)], 0)]);
     let row = |x: TensorId, rank: usize| arg(x, vec![u(rank, 0)]);
-    let m = comp(g, &[t], &[], vec![arg(cand, vec![u(1, 0), Form::constant(1, 1)])], None, &|x| x[0]);
-    let first = comp(g, &[t], &[], vec![arg(cand, vec![u(1, 0), Form::constant(1, 0)])], None, &|x| x[0]);
+    let m = comp(
+        g,
+        &[t],
+        &[],
+        vec![arg(cand, vec![u(1, 0), Form::constant(1, 1)])],
+        None,
+        &|x| x[0],
+    );
+    let first = comp(
+        g,
+        &[t],
+        &[],
+        vec![arg(cand, vec![u(1, 0), Form::constant(1, 0)])],
+        None,
+        &|x| x[0],
+    );
     let kf = kc as f64;
     // top-k threshold: candidate min(k, K) − 1 (k = 0: K − 1)
     let rk = g.iota(&[t, kd], 1);
@@ -491,7 +513,14 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
         Some(Monoid::sum()),
         &move |x| select(x[2] - x[0], lit(0.0), ((x[0] - x[1]) / temp(x[3])).exp()),
     );
-    let z = comp(g, &[t], &[nbd], vec![arg(z1, vec![u(2, 0), u(2, 1)])], Some(Monoid::sum()), &|x| x[0]);
+    let z = comp(
+        g,
+        &[t],
+        &[nbd],
+        vec![arg(z1, vec![u(2, 0), u(2, 1)])],
+        Some(Monoid::sum()),
+        &|x| x[0],
+    );
     let r3 = g.iota(&[t, kd, kd], 1);
     let q3 = g.iota(&[t, kd, kd], 2);
     // mass strictly before rank r
@@ -734,7 +763,9 @@ mod tests {
             .iter()
             .map(|&c| (c as f64 - n as f64 / 16.0).powi(2) / (n as f64 / 16.0))
             .sum();
-        eprintln!("hash: mean {mean:.4} var {var:.4} (1/12 = 0.0833) chi2(15) {chi:.1} hist {hist:?}");
+        eprintln!(
+            "hash: mean {mean:.4} var {var:.4} (1/12 = 0.0833) chi2(15) {chi:.1} hist {hist:?}"
+        );
         assert!((mean - 0.5).abs() < 0.02 && (var - 1.0 / 12.0).abs() < 0.01 && chi < 40.0);
     }
 
@@ -747,7 +778,10 @@ mod tests {
         rs[3][201] = 100.0; // tie: the lower id wins
         let (tok, _) = run(v, &rs, [0.0, 0.9, 40.0, 7.0]);
         for (r, row) in rs.iter().enumerate() {
-            assert_eq!(tok[r], sample_host(row, [0.0, 0.0, 0.0, 0.0], r as u64, 64.0).0);
+            assert_eq!(
+                tok[r],
+                sample_host(row, [0.0, 0.0, 0.0, 0.0], r as u64, 64.0).0
+            );
         }
         assert_eq!(tok[3], 17);
     }
@@ -781,7 +815,11 @@ mod tests {
         rs[3][201] = 100.0;
         let (tok, _) = run_topk(v, &rs, [0.0, 0.9, 40.0, 7.0]);
         for (r, row) in rs.iter().enumerate() {
-            assert_eq!(tok[r], sample_host(row, [0.0; 4], r as u64, 64.0).0, "greedy row {r}");
+            assert_eq!(
+                tok[r],
+                sample_host(row, [0.0; 4], r as u64, 64.0).0,
+                "greedy row {r}"
+            );
         }
         assert_eq!(tok[3], 17);
         let rs = rows(40, v, 2);
@@ -853,7 +891,10 @@ mod tests {
             let (tok, th) = run(v, &rs, params);
             let kept: Vec<usize> = (0..v).filter(|&i| base[i] >= th[0]).collect();
             let m = base.iter().cloned().fold(f64::MIN, f64::max);
-            let w: Vec<f64> = kept.iter().map(|&i| ((base[i] - m) / params[0]).exp()).collect();
+            let w: Vec<f64> = kept
+                .iter()
+                .map(|&i| ((base[i] - m) / params[0]).exp())
+                .collect();
             let z: f64 = w.iter().sum();
             let mut chi = 0.0;
             for (j, &i) in kept.iter().enumerate() {

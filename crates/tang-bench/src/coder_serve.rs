@@ -34,7 +34,9 @@ use tang_llm::gguf::{GgmlType, Gguf};
 
 use crate::ir_coder_prefill::{prefill_graph, CoderInput};
 use crate::ir_coder_real::{bind, dims_from_gguf, lower_real_step};
-use crate::ir_sample::{append_sampler, append_sampler_topk, SampleSpec, SEED, TEMPERATURE, TOP_K, TOP_P};
+use crate::ir_sample::{
+    append_sampler, append_sampler_topk, SampleSpec, SEED, TEMPERATURE, TOP_K, TOP_P,
+};
 use crate::qwen_session::{runtime, slot_plan};
 
 /// `tang-llm serve` with `TANG_CODER_ENGINE=derived` available: register before serving.
@@ -373,7 +375,10 @@ impl DerivedCoder {
             me.zero_rows(0, 0, 20);
             me.clear_slot(0);
             if let Some(gp) = &me.slots[0].gprog {
-                eprintln!("coder derived: greedy step {:.3} ms device (no sampler)", gp.time(&me.rt, 20));
+                eprintln!(
+                    "coder derived: greedy step {:.3} ms device (no sampler)",
+                    gp.time(&me.rt, 20)
+                );
             }
             eprintln!(
                 "coder derived: step {dev:.3} ms device, {} cache copies {copies:.3} ms, \
@@ -384,13 +389,22 @@ impl DerivedCoder {
         // TANG_CODER_DERIVED_PROFILE=1: the slowest kernels of the sampled step, timed alone
         if std::env::var("TANG_CODER_DERIVED_PROFILE").as_deref() == Ok("1") {
             let p = &me.slots[0].prog;
-            let mut t: Vec<(f64, usize)> =
-                p.order().iter().map(|&i| (p.time_kernel(&me.rt, i, 5), i)).collect();
+            let mut t: Vec<(f64, usize)> = p
+                .order()
+                .iter()
+                .map(|&i| (p.time_kernel(&me.rt, i, 5), i))
+                .collect();
             let total: f64 = t.iter().map(|x| x.0).sum();
             t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            eprintln!("coder derived: profile {} kernels, sum {total:.3} ms", t.len());
+            eprintln!(
+                "coder derived: profile {} kernels, sum {total:.3} ms",
+                t.len()
+            );
             for (ms, i) in t.iter().take(15) {
-                eprintln!("  {ms:8.4} ms  k{i} (order {})", p.order().iter().position(|x| x == i).unwrap());
+                eprintln!(
+                    "  {ms:8.4} ms  k{i} (order {})",
+                    p.order().iter().position(|x| x == i).unwrap()
+                );
             }
         }
         let kv_mb: usize = me.rows.iter().map(|&(_, w)| w * ctx * 4).sum::<usize>() >> 20;
@@ -444,7 +458,11 @@ impl DerivedCoder {
 
     /// Queue one step of slot `s`: token `tok` at position `pos`.
     fn enqueue(&self, s: usize, tok: u32, pos: usize) -> Result<()> {
-        ensure!(pos < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
+        ensure!(
+            pos < self.ctx,
+            "slot {s} is past its context ({} tokens)",
+            self.ctx
+        );
         let sl = &self.slots[s];
         if let (Some(gp), Some(v)) = (&sl.gprog, &self.greedy) {
             if sl.params[TEMPERATURE] <= 0.0 {
@@ -662,11 +680,17 @@ impl ServeEngine for DerivedCoder {
             s.temperature
         );
         if s.presence != 0.0 && !self.presence_noted.replace(true) {
-            eprintln!("coder derived: presence penalty not supported on the device sampler; ignored");
+            eprintln!(
+                "coder derived: presence penalty not supported on the device sampler; ignored"
+            );
         }
         let mut p = [0.0f32; 4];
         p[TEMPERATURE] = s.temperature.max(0.0);
-        p[TOP_P] = if s.top_p > 0.0 && s.top_p < 1.0 { s.top_p } else { 1.0 };
+        p[TOP_P] = if s.top_p > 0.0 && s.top_p < 1.0 {
+            s.top_p
+        } else {
+            1.0
+        };
         p[TOP_K] = s.top_k as f32;
         p[SEED] = (s.seed & 0xff_ffff) as f32;
         self.slots[slot].params = p;
@@ -690,7 +714,11 @@ impl ServeEngine for DerivedCoder {
     fn restore_running_at(&mut self, slot: usize, s: &RunningState, prefix: &[u32]) -> Result<()> {
         ensure!(prefix.len() == s.pos, "prefix/state length mismatch");
         let parts = s.parts();
-        ensure!(parts.len() >= self.running.len(), "state has {} parts", parts.len());
+        ensure!(
+            parts.len() >= self.running.len(),
+            "state has {} parts",
+            parts.len()
+        );
         let p = &self.slots[slot].prog;
         for (&k, part) in self.running.iter().zip(&parts) {
             let t = p.input(k);
