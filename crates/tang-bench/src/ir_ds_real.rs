@@ -373,7 +373,7 @@ impl RealRun {
         let mut out = HashMap::new();
         for i in inputs {
             let n = i.name.as_str();
-            if n == "tokens"
+            if i.shape.iter().any(|d| d.fixed().is_none())
                 || n.contains(".ffn.experts.")
                 || n.ends_with(".ffn.expert_slot")
                 || n.ends_with(".engram.hash")
@@ -978,13 +978,15 @@ mod tests {
             }
         };
         bind(&mut w, &u_pre);
-        let ins = |w: &HashMap<String, Vec<f64>>, m: &[f64], nx: &[u32]| -> Vec<Vec<f64>> {
+        // moved out of `w` (one copy of the weights); expert tables taken,
+        // the rest cloned back for the step
+        let ins = |w: &mut HashMap<String, Vec<f64>>, m: &[f64], nx: &[u32]| -> Vec<Vec<f64>> {
             sg.inputs
                 .iter()
                 .map(|s| match s.name.as_str() {
                     "mains" => m.to_vec(),
                     "next" => nx.iter().map(|&x| x as f64).collect(),
-                    k => w[k].clone(),
+                    k => w.remove(k).unwrap_or_else(|| panic!("no input {k}")),
                 })
                 .collect()
         };
@@ -993,7 +995,15 @@ mod tests {
         let g = sg.g.bind(&[(SEQ, t_pre)]).unwrap();
         let mut outs = vec![sg.ids, sg.logits, sg.conf];
         outs.extend(st.caches.iter().map(|c| c.node));
-        let got = g.eval(&ins(&w, &mains[..t_pre * nt * d], &next[..t_pre]), &outs);
+        let mut pins = ins(&mut w, &mains[..t_pre * nt * d], &next[..t_pre]);
+        let got = g.eval(&pins, &outs);
+        // the dense weights back for the step (the expert tables rebound)
+        for (s, v) in sg.inputs.iter().zip(pins.iter_mut()) {
+            if s.name != "mains" && s.name != "next" && !s.name.contains(".ffn.expert") {
+                w.insert(s.name.clone(), std::mem::take(v));
+            }
+        }
+        drop(pins);
         let gids: Vec<u32> = got[0].iter().map(|&x| x as u32).collect();
         let want_ids: Vec<u32> = rids[..t_pre].concat();
         let el = rel(&got[1], &rlg[..t_pre].concat());
@@ -1025,13 +1035,13 @@ mod tests {
             .collect();
         drop(got);
         bind(&mut w, &u_step);
-        let step_ins = ins(&w, &mains[t_pre * nt * d..], &next[t_pre..]);
+        let mut step_ins = ins(&mut w, &mains[t_pre * nt * d..], &next[t_pre..]);
         let sins: Vec<Vec<f64>> = st
             .inputs
             .iter()
             .map(|&si| match si {
                 StepInput::Pos => vec![t_pre as f64],
-                StepInput::New(i) | StepInput::Same(i) => step_ins[i].clone(),
+                StepInput::New(i) | StepInput::Same(i) => std::mem::take(&mut step_ins[i]),
                 StepInput::Cache(c) => caches[c].clone(),
             })
             .collect();
