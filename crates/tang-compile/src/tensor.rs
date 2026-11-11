@@ -58,6 +58,9 @@ pub mod cuda_scan;
 pub mod discover;
 #[path = "tensor_discover_catalog.rs"]
 pub mod discover_catalog;
+/// Routed contractions over positions sorted by expert (batched decode).
+#[path = "tensor_expert_group.rs"]
+pub mod expert_group;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;
@@ -65,8 +68,6 @@ mod gather_tests;
 #[path = "tensor_gguf.rs"]
 pub mod gguf;
 /// Vulkan decode lowering: the decode kernels as GLSL (SPIR-V passthrough).
-#[path = "tensor_expert_group.rs"]
-pub mod expert_group;
 #[path = "tensor_glsl_gemv.rs"]
 pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]
