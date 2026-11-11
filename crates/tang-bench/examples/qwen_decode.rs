@@ -902,7 +902,12 @@ fn model(args: &[String]) {
     if args.iter().any(|a| a == "--tune") {
         use tang_bench::autotune;
         let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
-        dec.feed(&rt, &[first], (ids.len() + out.len()).min(ctx - 200) - 1);
+        let pos: Vec<usize> = opt("--bench")
+            .unwrap_or_else(|| "128,4096".into())
+            .split(',')
+            .map(|v| v.parse::<usize>().unwrap().min(ctx - 200) - 1)
+            .collect();
+        let set_pos = |q: usize| dec.feed(&rt, &[first], q);
         let t = autotune::tune_step(
             &rt,
             "qwen3-8b",
@@ -919,6 +924,8 @@ fn model(args: &[String]) {
                 .prog
             },
             reps,
+            &pos,
+            &set_pos,
         );
         autotune::report(&t);
         let path = std::env::var("TANG_TUNE_OUT")

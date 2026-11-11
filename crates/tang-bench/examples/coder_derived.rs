@@ -265,8 +265,14 @@ fn main() {
     if args.iter().any(|a| a == "--tune") {
         use tang_bench::autotune;
         use tang_gpu::program::Shared;
-        let p = ctx.min(ids.len() + gen) - 1;
-        prog.write(&rt, prog.input(pos_in), &[p as f32]);
+        // positions: the --bench lengths (default 128,4096)
+        let pos: Vec<usize> = opt("--bench")
+            .unwrap_or_else(|| "128,4096".into())
+            .split(',')
+            .map(|v| v.parse::<usize>().unwrap().min(ctx - 1))
+            .collect();
+        prog.write(&rt, prog.input(tok_in), &[ids[0] as f32]);
+        let set_pos = |q: usize| prog.write(&rt, prog.input(pos_in), &[q as f32]);
         let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
         let t = autotune::tune_step(
             &rt,
@@ -285,6 +291,8 @@ fn main() {
                 Program::with_shared(&rt, low.program.program, &empty, &plan, &shared)
             },
             reps,
+            &pos,
+            &set_pos,
         );
         autotune::report(&t);
         let path = std::env::var("TANG_TUNE_OUT")

@@ -101,7 +101,36 @@ fn sample<'a>(
     m
 }
 
-fn time_sigs(rt: &Runtime, p: &Program, s: &BTreeMap<&str, Vec<usize>>, reps: usize) -> HashMap<String, f64> {
+/// Per signature: mean ms of its sampled kernels at each position of `pos`
+/// (`set_pos` writes the step's position input; context-dependent kernels
+/// such as attention reductions must win at every length, not one).
+fn time_sigs(
+    rt: &Runtime,
+    p: &Program,
+    s: &BTreeMap<&str, Vec<usize>>,
+    reps: usize,
+    pos: &[usize],
+    set_pos: &dyn Fn(usize),
+) -> HashMap<String, Vec<f64>> {
+    let mut m: HashMap<String, Vec<f64>> = HashMap::new();
+    for &q in pos {
+        set_pos(q);
+        p.run(rt);
+        rt.sync();
+        for (k, v) in time_sigs_at(rt, p, s, reps) {
+            m.entry(k).or_default().push(v);
+        }
+    }
+    m
+}
+
+/// Better than `base` at every position, and by `MIN_GAIN` in total.
+fn wins(t: &[f64], base: &[f64]) -> bool {
+    let (a, b): (f64, f64) = (t.iter().sum(), base.iter().sum());
+    t.len() == base.len() && t.iter().zip(base).all(|(x, y)| *x <= *y * 1.01) && a < b * (1.0 - MIN_GAIN)
+}
+
+fn time_sigs_at(rt: &Runtime, p: &Program, s: &BTreeMap<&str, Vec<usize>>, reps: usize) -> HashMap<String, f64> {
     s.iter()
         .map(|(sig, ks)| {
             let n = p.program.kernels.len();
@@ -130,6 +159,8 @@ pub fn tune_step<F: FnMut() -> Program>(
     step_grid: &[(&str, &[&str])],
     mut build: F,
     reps: usize,
+    pos: &[usize],
+    set_pos: &dyn Fn(usize),
 ) -> Tuned {
     tune::set_entries(HashMap::new());
     // step level: whole-step time per value, one knob at a time
@@ -137,7 +168,7 @@ pub fn tune_step<F: FnMut() -> Program>(
     if !step_grid.is_empty() {
         let (mut p, _) = build_forced(rt, &mut build, Choice::new()).expect("default step lowers");
         p.capture(rt);
-        let mut best = step_ms(rt, &p, 20);
+        let mut best: f64 = pos.iter().map(|&q| { set_pos(q); step_ms(rt, &p, 20) }).sum();
         drop(p);
         msg(&format!("step {step_name}: default {best:.3} ms"));
         for (k, vals) in step_grid {
@@ -149,7 +180,7 @@ pub fn tune_step<F: FnMut() -> Program>(
                     continue;
                 };
                 p.capture(rt);
-                let ms = step_ms(rt, &p, 20);
+                let ms: f64 = pos.iter().map(|&q| { set_pos(q); step_ms(rt, &p, 20) }).sum();
                 msg(&format!("step {k}={v}: {ms:.3} ms"));
                 if ms < best * (1.0 - MIN_GAIN / 3.0) {
                     best = ms;
@@ -166,7 +197,7 @@ pub fn tune_step<F: FnMut() -> Program>(
     // base: per-kernel times and what each kernel consults
     let (p0, r0) = build_forced(rt, &mut build, with_step(&Choice::new())).expect("base lowers");
     let all = sample(&r0, 3, |_| true);
-    let t0 = time_sigs(rt, &p0, &all, reps);
+    let t0 = time_sigs(rt, &p0, &all, reps, pos, set_pos);
     let instances: HashMap<&str, usize> = r0.iter().fold(HashMap::new(), |mut m, (_, s, _)| {
         *m.entry(s.as_str()).or_default() += 1;
         m
@@ -194,13 +225,14 @@ pub fn tune_step<F: FnMut() -> Program>(
                 continue;
             };
             let readers = sample(&r, 3, |ks| ks.iter().any(|x| x == k));
-            let t = time_sigs(rt, &p, &readers, reps);
+            let t = time_sigs(rt, &p, &readers, reps, pos, set_pos);
             let mut won = 0;
-            for (sig, ms) in t {
-                let base = t0.get(&sig).copied().unwrap_or(f64::INFINITY);
+            for (sig, tv) in t {
+                let Some(base) = t0.get(&sig) else { continue };
+                let ms: f64 = tv.iter().sum();
                 let cur = best_ms.entry(sig.clone()).or_default();
-                let prev = cur.get(*k).copied().unwrap_or(base);
-                if ms < prev && ms < base * (1.0 - MIN_GAIN) {
+                let prev = cur.get(*k).copied().unwrap_or(base.iter().sum());
+                if ms < prev && wins(&tv, base) {
                     cur.insert(k.to_string(), ms);
                     best.entry(sig).or_default().insert(k.to_string(), v.to_string());
                     won += 1;
@@ -214,15 +246,16 @@ pub fn tune_step<F: FnMut() -> Program>(
     let (p1, _) = build_forced(rt, &mut build, with_step(&Choice::new())).expect("tuned lowers");
     let tuned_sample: BTreeMap<&str, Vec<usize>> =
         all.iter().filter(|(s, _)| best.contains_key(**s)).map(|(s, v)| (*s, v.clone())).collect();
-    let t1 = time_sigs(rt, &p1, &tuned_sample, reps);
+    let t1 = time_sigs(rt, &p1, &tuned_sample, reps, pos, set_pos);
     drop(p1);
     let mut sigs = Vec::new();
     let (mut sum0, mut sum1) = (0.0, 0.0);
     for (sig, _) in &all {
         let n = instances[sig] as f64;
-        let d = t0[*sig];
+        let d0 = &t0[*sig];
+        let d: f64 = d0.iter().sum::<f64>() / d0.len() as f64;
         let (ms, choice) = match (best.get(*sig), t1.get(*sig)) {
-            (Some(c), Some(&ms)) if ms < d * (1.0 - MIN_GAIN) => (ms, c.clone()),
+            (Some(c), Some(v)) if wins(v, d0) => (v.iter().sum::<f64>() / v.len() as f64, c.clone()),
             _ => (d, Choice::new()),
         };
         sum0 += d * n;

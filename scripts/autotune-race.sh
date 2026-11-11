@@ -28,7 +28,7 @@ fi
 echo "=== baseline (no cache)"
 TANG_TUNE=0 run $D --bench "$LENS" --out "$OUT/ids-base.txt" 2>&1 | grep -E 'step|tok/s|cache' | tee "$OUT/base.txt"
 echo "=== tune"
-TANG_TUNE=0 TANG_TUNE_OUT="$OUT/tune.tsv" run $D --tune 2>&1 | grep -E 'autotune|tuning|^  ' | tee "$OUT/tune.txt"
+TANG_TUNE=0 TANG_TUNE_OUT="$OUT/tune.tsv" run $D --tune --bench "$LENS" 2>&1 | grep -E 'autotune|tuning|^  ' | tee "$OUT/tune.txt"
 echo "=== tuned"
 TANG_TUNE_CACHE="$OUT/tune.tsv" run $D --bench "$LENS" --out "$OUT/ids-tuned.txt" 2>&1 | grep -E 'step|tok/s|cache' | tee "$OUT/tuned.txt"
 cmp -s "$OUT/ids-base.txt" "$OUT/ids-tuned.txt" && echo "greedy ids tuned vs base: identical" || echo "greedy ids tuned vs base: DIFFER"
