@@ -62,6 +62,19 @@ struct Slot {
     params: [f32; 4],
     /// Handed out by `alloc_slot` (running or parked) until `free_slot`.
     allocated: bool,
+    /// The step without the sampler, sharing `prog`'s weights and caches: greedy slots
+    /// step here (the sampler's reductions over the vocabulary cost ~3 ms a token).
+    gprog: Option<Program>,
+    /// The last step ran on `gprog` (its logits, a host argmax for the token).
+    last_greedy: Cell<bool>,
+}
+
+/// The greedy step's own inputs and outputs (`[logits, updated caches…]`).
+struct GreedyVar {
+    pos_in: usize,
+    tok_in: usize,
+    outs: Vec<TensorId>,
+    swaps: Vec<(usize, TensorId)>,
 }
 
 pub struct DerivedCoder {
@@ -88,6 +101,7 @@ pub struct DerivedCoder {
     /// The slot whose logits [`ServeEngine::logits`] reads (the last one stepped alone).
     logits_slot: usize,
     presence_noted: Cell<bool>,
+    greedy: Option<GreedyVar>,
 }
 
 impl DerivedCoder {
@@ -189,9 +203,80 @@ impl DerivedCoder {
             drop(shared);
             progs.push(p);
         }
+        // the greedy variant: the same graph's logits alone, its weights and caches bound to
+        // each slot's sampled program (TANG_CODER_DERIVED_GREEDY_FAST=0: off)
+        let fast = sampled && std::env::var("TANG_CODER_DERIVED_GREEDY_FAST").as_deref() != Ok("0");
+        let mut gprogs: Vec<Option<Program>> = (0..progs.len()).map(|_| None).collect();
+        let mut greedy_var = None;
+        if fast {
+            let st2 = tang_compile::tensor::step::derive_step(
+                &pg.g,
+                &[pg.logits],
+                &tang_compile::tensor::step::StepSpec {
+                    seq: crate::ir_coder_prefill::SEQ,
+                    new: 1,
+                    capacity: ctx,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("derive_step (greedy): {}", e.0))?;
+            let low2 = lower_real_step(&pg, &st2, &tys);
+            let plan2 = slot_plan(&low2.program.program, &low2.outs, &low2.inplace);
+            let empty2: Vec<&[f32]> = vec![&[]; st2.inputs.len()];
+            // step-2 input -> step-1 input: same weights by GGUF input, same caches by node
+            let mut map = Vec::new();
+            for (k2, si) in st2.inputs.iter().enumerate() {
+                let k1 = match *si {
+                    StepInput::Same(i) if Some(i) != params_k => input_k(StepInput::Same(i)),
+                    StepInput::Cache(c2) => st
+                        .caches
+                        .iter()
+                        .position(|c| c.node == st2.caches[c2].node)
+                        .and_then(|c1| input_k(StepInput::Cache(c1))),
+                    _ => None,
+                };
+                if let Some(k1) = k1 {
+                    map.push((k2, k1));
+                }
+            }
+            for (s, p1) in progs.iter().enumerate() {
+                let shared: Vec<Shared<'_>> = map
+                    .iter()
+                    .map(|&(k2, k1)| Shared {
+                        input: k2,
+                        from: p1,
+                        tensor: p1.input(k1),
+                    })
+                    .collect();
+                gprogs[s] = Some(Program::with_shared(
+                    &rt,
+                    low2.program.program.clone(),
+                    &empty2,
+                    &plan2,
+                    &shared,
+                ));
+            }
+            let in2 = |want: StepInput| st2.inputs.iter().position(|s| *s == want);
+            let swaps2 = st2
+                .caches
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.state || c.ring.is_some())
+                .map(|(c, _)| (in2(StepInput::Cache(c)).unwrap(), low2.outs[1 + c]))
+                .collect();
+            greedy_var = Some(GreedyVar {
+                pos_in: in2(StepInput::Pos).context("greedy pos input")?,
+                tok_in: st2
+                    .inputs
+                    .iter()
+                    .position(|s| matches!(s, StepInput::New(_)))
+                    .context("greedy token input")?,
+                outs: low2.outs,
+                swaps: swaps2,
+            });
+        }
         let capture = std::env::var("TANG_CODER_DERIVED_GRAPH").as_deref() != Ok("0");
         if capture {
-            for p in &mut progs {
+            for p in progs.iter_mut().chain(gprogs.iter_mut().flatten()) {
                 p.capture(&rt);
             }
         }
@@ -226,11 +311,14 @@ impl DerivedCoder {
         let greedy = [0.0, 1.0, 0.0, 0.0];
         let slots: Vec<Slot> = progs
             .into_iter()
-            .map(|prog| Slot {
+            .zip(gprogs)
+            .map(|(prog, gprog)| Slot {
                 prog,
                 tokens: Vec::new(),
                 params: greedy,
                 allocated: false,
+                gprog,
+                last_greedy: Cell::new(false),
             })
             .collect();
         let mut me = DerivedCoder {
@@ -250,6 +338,7 @@ impl DerivedCoder {
             last: WinStats::default(),
             logits_slot: 0,
             presence_noted: Cell::new(false),
+            greedy: greedy_var,
         };
         for s in 0..me.slots.len() {
             me.write_params(s);
@@ -276,6 +365,9 @@ impl DerivedCoder {
             let wall = t.elapsed().as_secs_f64() * 1e3 / 20.0;
             me.zero_rows(0, 0, 20);
             me.clear_slot(0);
+            if let Some(gp) = &me.slots[0].gprog {
+                eprintln!("coder derived: greedy step {:.3} ms device (no sampler)", gp.time(&me.rt, 20));
+            }
             eprintln!(
                 "coder derived: step {dev:.3} ms device, {} cache copies {copies:.3} ms, \
                  enqueue + token read {wall:.3} ms wall a token",
@@ -328,7 +420,21 @@ impl DerivedCoder {
     /// Queue one step of slot `s`: token `tok` at position `pos`.
     fn enqueue(&self, s: usize, tok: u32, pos: usize) -> Result<()> {
         ensure!(pos < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
-        let p = &self.slots[s].prog;
+        let sl = &self.slots[s];
+        if let (Some(gp), Some(v)) = (&sl.gprog, &self.greedy) {
+            if sl.params[TEMPERATURE] <= 0.0 {
+                gp.write(&self.rt, gp.input(v.pos_in), &[pos as f32]);
+                gp.write(&self.rt, gp.input(v.tok_in), &[tok as f32]);
+                gp.run(&self.rt);
+                for &(k, upd) in &v.swaps {
+                    gp.copy(&self.rt, gp.input(k), gp, upd);
+                }
+                sl.last_greedy.set(true);
+                return Ok(());
+            }
+        }
+        sl.last_greedy.set(false);
+        let p = &sl.prog;
         p.write(&self.rt, p.input(self.pos_in), &[pos as f32]);
         p.write(&self.rt, p.input(self.tok_in), &[tok as f32]);
         p.run(&self.rt);
@@ -340,12 +446,12 @@ impl DerivedCoder {
 
     /// Slot `s`'s sampled (or greedy) token from its last step.
     fn token(&self, s: usize) -> u32 {
-        let p = &self.slots[s].prog;
-        if self.params_in.is_some() {
-            return p.read(&self.rt, self.outs[1])[0] as u32;
+        let l = self.last_logits(s);
+        let sl = &self.slots[s];
+        if self.params_in.is_some() && !sl.last_greedy.get() {
+            return sl.prog.read(&self.rt, self.outs[1])[0] as u32;
         }
         // no sampler: the first maximum of the logits
-        let l = p.read(&self.rt, self.outs[0]);
         let l = &l[l.len() - self.vocab..];
         let mut a = 0;
         for (i, &x) in l.iter().enumerate() {
@@ -384,6 +490,17 @@ impl DerivedCoder {
             kept.push(self.feed(s, &[d])?);
         }
         Ok(kept)
+    }
+
+    /// Slot `s`'s last step's logits (whichever program ran it). Read lazily: only greedy
+    /// tokens and `logits()` need them.
+    fn last_logits(&self, s: usize) -> Vec<f32> {
+        let sl = &self.slots[s];
+        match (&sl.gprog, &self.greedy) {
+            (Some(gp), Some(v)) if sl.last_greedy.get() => gp.read(&self.rt, v.outs[0]),
+            _ if self.params_in.is_some() => Vec::new(),
+            _ => sl.prog.read(&self.rt, self.outs[0]),
+        }
     }
 
     fn gdn_layers(&self) -> usize {
@@ -444,8 +561,11 @@ impl ServeEngine for DerivedCoder {
     }
     /// The last step's logits (one row: the step is one token wide), `t` rows asked for.
     fn logits(&self, t: usize) -> Vec<f32> {
-        let p = &self.slots[self.logits_slot].prog;
-        let l = p.read(&self.rt, self.outs[0]);
+        let sl = &self.slots[self.logits_slot];
+        let l = match (&sl.gprog, &self.greedy) {
+            (Some(gp), Some(g)) if sl.last_greedy.get() => gp.read(&self.rt, g.outs[0]),
+            _ => sl.prog.read(&self.rt, self.outs[0]),
+        };
         let mut v = Vec::with_capacity(t * self.vocab);
         for _ in 0..t {
             v.extend_from_slice(&l[l.len() - self.vocab..]);
