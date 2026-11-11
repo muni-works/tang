@@ -1,6 +1,6 @@
 [package]
 name = "tang-compute"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -27,7 +27,7 @@ tang-expr = { workspace = true }
 bytemuck = { workspace = true }
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
-cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12080"], optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12080"], optional = true }
 
 [build-dependencies]
 

@@ -1,6 +1,6 @@
 [package]
 name = "tang-gpu"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,7 +26,7 @@ tang-otel = { workspace = true, optional = true }
 # CUDA backend: the driver and nvrtc are loaded at run time, so the
 # feature builds (and the binary runs, falling back to wgpu) on machines
 # without NVIDIA hardware or a CUDA toolkit.
-cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12080"], optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12080"], optional = true }
 # GLSL -> SPIR-V for the Vulkan decode kernels (`to_glsl_decode`), built
 # from source so the binary needs no shaderc on the target (the K1 has none).
 shaderc = { version = "0.10", features = ["build-from-source"], optional = true }

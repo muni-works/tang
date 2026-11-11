@@ -258,7 +258,7 @@ impl CudaComputeDevice {
     pub(super) fn upload_q2_impl(&self, raw: &[u8], n: usize, k: usize) -> CudaBuffer {
         let bytes = crate::flash::q2_repack(raw, n, k);
         let len = bytes.len().div_ceil(4);
-        let data = self.stream.memcpy_stod(&bytes).unwrap();
+        let data = self.stream.clone_htod(&bytes).unwrap();
         Self::make_buf_unpooled(CudaStorage::Q2(Box::new(Q2Weight { data, n, k })), len)
     }
 

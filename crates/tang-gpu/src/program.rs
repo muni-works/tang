@@ -127,6 +127,19 @@ impl Runtime {
         CudaDevice::new_capturable(0).map(Self::Cuda)
     }
 
+    /// A runtime on an existing cudarc context and stream, shared with the
+    /// caller ([`CudaDevice::from_stream`]). `None` without nvrtc.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_from_stream(
+        ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::from_stream(ctx, stream).map(Self::Cuda)
+    }
+
     /// The first OpenCL GPU, if a driver and a device are present.
     #[cfg(feature = "opencl")]
     pub fn opencl() -> Option<Self> {
@@ -670,6 +683,19 @@ impl Program {
         }
     }
 
+    /// The CUDA buffer holding `t` (packed words of [`Self::format`]; f32
+    /// for the default format), so a caller sharing the context
+    /// ([`Runtime::cuda_from_stream`]) can copy device-to-device into or
+    /// out of the program on its stream instead of round-tripping the host.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_slice(&self, t: TensorId) -> Option<&cudarc::driver::CudaSlice<f32>> {
+        match &self.storage {
+            Storage::Cuda { slots, .. } => Some(&slots[self.slot_of(t)]),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Run every kernel in plan order (one submission on wgpu,
     /// asynchronous launches on the CUDA stream, or one graph launch once
     /// [`capture`](Self::capture)d).
@@ -925,7 +951,7 @@ impl Program {
                     p
                 })
                 .collect();
-            let table = d.stream.memcpy_stod(&ptrs).expect("pointer table");
+            let table = d.stream.clone_htod(&ptrs).expect("pointer table");
             let sync = d
                 .stream
                 .alloc_zeros::<u32>(2 + 2 * (mega.phases.len() + 1))
@@ -971,7 +997,7 @@ impl Program {
         }) else {
             return Vec::new();
         };
-        let words = d.stream.memcpy_dtov(&m.sync).expect("read trace");
+        let words = d.stream.clone_dtoh(&m.sync).expect("read trace");
         let t: Vec<u64> = words[2..]
             .chunks(2)
             .map(|c| c[0] as u64 | (c[1] as u64) << 32)
@@ -1929,6 +1955,43 @@ mod tests {
     /// same bits as launching them one by one, and stays correct across
     /// runs (the barrier state resets itself).
     #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_shared_context_runs_on_callers_stream() {
+        use cudarc::driver::CudaContext;
+        if !CudaDevice::has_nvrtc() {
+            return;
+        }
+        let Ok(ctx) = std::panic::catch_unwind(|| CudaContext::new(0)).map(|r| r.ok()) else {
+            return;
+        };
+        let Some(ctx) = ctx else { return };
+        // the caller's context and stream, as phyz-gpu would own them
+        let stream = ctx.new_stream().unwrap();
+        let rt = Runtime::cuda_from_stream(ctx.clone(), stream.clone()).unwrap();
+        let d = rt.cuda_device().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&d.ctx, &ctx));
+        assert!(std::sync::Arc::ptr_eq(&d.stream, &stream));
+        let mut g = TensorGraph::new();
+        let a = g.input(&[16, 8]);
+        let b = g.input(&[8, 4]);
+        let out = g.matmul(a, b).unwrap();
+        let va: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
+        let vb: Vec<f32> = (0..32).map(|i| 1.0 - i as f32 * 0.03).collect();
+        let p = Program::compile(&rt, &g, &[out], &[&va, &vb]);
+        p.run(&rt);
+        // the caller takes the result device-to-device on its own stream
+        let res = p.cuda_slice(out).unwrap();
+        let copy = stream.clone_dtod(&res.slice(0..64)).unwrap();
+        let got = stream.clone_dtoh(&copy).unwrap();
+        assert_eq!(got, p.read(&rt, out));
+        for i in 0..16 {
+            for j in 0..4 {
+                let want: f32 = (0..8).map(|k| va[i * 8 + k] * vb[k * 4 + j]).sum();
+                assert!((got[i * 4 + j] - want).abs() < 1e-4, "{i},{j}");
+            }
+        }
+    }
+
     #[test]
     fn cuda_megakernel_matches_launches() {
         use tang_compile::tensor::cuda_mega::MegaOpts;
