@@ -1889,4 +1889,36 @@ mod tests {
         assert!(gathers >= 2);
         assert_eq!(dense_reads, 0);
     }
+
+    /// CUDA lowering of the derived step (source only, no device): the
+    /// kernels that read compressed_kv by gather, and their loops.
+    #[test]
+    fn derived_step_cuda_kernels() {
+        use tang_compile::tensor::Op;
+        let dm = DsDims::tiny();
+        let pg = prefill_graph(&dm);
+        let st = derived_step(&pg, &dm, 1).unwrap();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let prog = st.graph.to_cuda(&ids);
+        eprintln!("ds step cuda: {} kernels", prog.kernels.len());
+        for kn in &prog.kernels {
+            let Op::Comp(c) = &st.graph.nodes()[kn.node.index()].op else {
+                continue;
+            };
+            if !c.has_gather() {
+                continue;
+            }
+            let loops: Vec<&str> = kn
+                .source
+                .lines()
+                .filter(|l| l.trim_start().starts_with("for"))
+                .map(str::trim)
+                .collect();
+            eprintln!(
+                "gather kernel node {:?}: out {:?} red {:?} points {}; loops {loops:?}",
+                kn.node, c.out, c.red, kn.points
+            );
+        }
+    }
 }
