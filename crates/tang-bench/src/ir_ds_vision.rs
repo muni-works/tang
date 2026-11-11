@@ -40,7 +40,7 @@ use tang::Scalar;
 use tang_compile::tensor::{Arg, Dim, Monoid, TensorGraph, TensorId, View};
 use tang_expr::ExprId;
 
-use crate::ir_ds_prefill::{arg, form, fx, ident, lit, select, unit, PrefillInput};
+use crate::ir_ds_prefill::{arg, form, fx, ident, konst, lit, select, unit, PrefillInput};
 
 /// Token types of an image span (`image_processor.py`); text is -1.
 pub const TEXT: i8 = -1;
@@ -776,7 +776,7 @@ impl E {
     }
 
     /// Full (bidirectional) softmax attention: `q`, `k` `[N, H·hd]`, `v`
-    /// at column `vbase` of `qkv`; `[N, H·hd]`.
+    /// at column `vbase` of `qkv`; `[H, N, hd]`.
     fn attention(
         &mut self,
         q: TensorId,
@@ -802,55 +802,87 @@ impl E {
                 move |v| vec![v[0] * v[1] * lit(scale)],
             )
             .unwrap();
+        // m and l keep the key dim as size 1 ([h, i, 1]): their spaces then
+        // have p·v's rank, so the softmax fusion sees one score and makes
+        // one online-softmax state (m, l, acc) — the flash tile's input
         let m = self
             .g
             .comp(
-                &[fx(heads), fx(n)],
+                &[fx(heads), fx(n), fx(1)],
                 &[fx(n)],
-                vec![arg(s, ident(3))],
+                vec![arg(s, vec![unit(4, 0), unit(4, 1), unit(4, 3)])],
                 Some(Monoid::max()),
                 |v| vec![v[0]],
+            )
+            .unwrap();
+        let p = self
+            .g
+            .comp(
+                &[fx(heads), fx(n), fx(n)],
+                &[],
+                vec![arg(s, ident(3)), arg(m, vec![unit(3, 0), unit(3, 1), konst(3, 0)])],
+                None,
+                |v| vec![(v[0] - v[1]).exp()],
             )
             .unwrap();
         let z = self
             .g
             .comp(
-                &[fx(heads), fx(n)],
+                &[fx(heads), fx(n), fx(1)],
                 &[fx(n)],
-                vec![arg(s, ident(3)), arg(m, vec![unit(3, 0), unit(3, 1)])],
+                vec![arg(p, vec![unit(4, 0), unit(4, 1), unit(4, 3)])],
                 Some(Monoid::sum()),
-                |v| vec![(v[0] - v[1]).exp()],
+                |v| vec![v[0]],
             )
             .unwrap();
-        // o[i, h, d] = Σ_j e[h, i, j]·v[j, h, d], space (i, h, d, j)
+        // o[h, i, d] = Σ_j p[h, i, j]·v[j, h, d], space (h, i, d, j)
         let o = self
             .g
             .comp(
-                &[fx(n), fx(heads), fx(hd)],
+                &[fx(heads), fx(n), fx(hd)],
                 &[fx(n)],
                 vec![
-                    arg(s, vec![unit(4, 1), unit(4, 0), unit(4, 3)]),
-                    arg(m, vec![unit(4, 1), unit(4, 0)]),
+                    arg(p, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
                     arg(
                         qkv,
-                        vec![unit(4, 3), form(4, &[(1, hd as i64), (2, 1)], vbase as i64)],
+                        vec![unit(4, 3), form(4, &[(0, hd as i64), (2, 1)], vbase as i64)],
                     ),
                 ],
                 Some(Monoid::sum()),
-                |v| vec![(v[0] - v[1]).exp() * v[2]],
+                |v| vec![v[0] * v[1]],
             )
             .unwrap();
-        let o = self
-            .g
+        // normalized in place, [h, i, d] (the flash epilogue's layout)
+        self.g
             .comp(
-                &[fx(n), fx(heads), fx(hd)],
+                &[fx(heads), fx(n), fx(hd)],
                 &[],
-                vec![arg(o, ident(3)), arg(z, vec![unit(3, 1), unit(3, 0)])],
+                vec![arg(o, ident(3)), arg(z, vec![unit(3, 0), unit(3, 1), konst(3, 0)])],
                 None,
                 |v| vec![v[0] / v[1]],
             )
+            .unwrap()
+    }
+
+    /// `y[i, n] = Σ_{h,d} a[h, i, d]·w[n, h·hd + d] + b[n]`: the output
+    /// projection reading the attention in its `[h, i, d]` layout.
+    fn proj_heads(&mut self, a: TensorId, w: TensorId, b: TensorId) -> TensorId {
+        let (h, n, hd) = (self.n(a, 0), self.n(a, 1), self.n(a, 2));
+        let c = self.n(w, 0);
+        let y = self
+            .g
+            .comp(
+                &[fx(n), fx(c)],
+                &[fx(h), fx(hd)],
+                vec![
+                    arg(a, vec![unit(4, 2), unit(4, 0), unit(4, 3)]),
+                    arg(w, vec![unit(4, 1), form(4, &[(2, hd as i64), (3, 1)], 0)]),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
             .unwrap();
-        self.g.reshape(o, &[fx(n), fx(heads * hd)]).unwrap()
+        self.map2(y, b, |a, b| a + b)
     }
 }
 
@@ -973,7 +1005,7 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         let q = e.rope(qkv, 0, h, hd, ang);
         let k = e.rope(qkv, c, h, hd, ang);
         let o = e.attention(q, k, qkv, 2 * c, h, hd);
-        let a = e.linear(o, wo, Some(bo));
+        let a = e.proj_heads(o, wo, bo);
         x = e.add(x, a);
         let xn = e.rms(x, n2, vd.eps);
         let gu = e.linear(xn, w1, None);
@@ -1036,6 +1068,25 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         out,
         vit,
     }
+}
+
+/// The prefill/training lowering pipeline for the encoder: softmax
+/// stabilized and fused into an online-softmax reduction (the flash tile),
+/// maps substituted, siblings merged, reduce dims merged/split, then
+/// `schedule_auto` and `to_cuda` (TF32 MMA tiles where matmul-shaped).
+pub fn lower_prefill(
+    g: &TensorGraph,
+    outs: &[TensorId],
+) -> (tang_compile::tensor::wgsl::WgslProgram, Vec<TensorId>) {
+    let (g, o) = g.stabilize_softmax(outs);
+    let (g, o) = g.substitute_maps(&o);
+    let (g, o) = g.eliminate_common(&o);
+    let (g, o) = g.merge_siblings(&o);
+    let (g, o) = g.relayout(&o);
+    let (g, o) = g.merge_reduce_dims(&o);
+    let (mut g, o) = g.split_reduce_dims(&o);
+    g.schedule_auto(&o);
+    (g.to_cuda(&o), o)
 }
 
 /// The encoder's graph inputs in order: `patches`, `rope_angles`, then
@@ -1662,5 +1713,60 @@ pub(crate) mod tests {
         assert!(moved > 1e-6, "the image must change the logits");
         assert!(e_pre < 1e-9, "prefill {e_pre:e}");
         assert!(e_step < 1e-9, "step {e_step:e}");
+    }
+
+    /// The kernels the prefill lowering makes of one real-size block
+    /// (`VISION_LOWER_PRINT=1` prints each kernel's kind and points).
+    #[test]
+    #[ignore]
+    fn encoder_lowering_kernels() {
+        let vd = VisionDims { n_layers: 1, ..VisionDims::tiny(1) };
+        let vd = VisionDims { dim: 1024, n_heads: 16, inter: 2816, patch: 14, llm_dim: 5120, ..vd };
+        let eg = encoder_graph(&vd, 39, 39);
+        let (g, o) = eg.g.eliminate_common(&[eg.out]);
+        let kinds = |g: &TensorGraph| {
+            let mut c = std::collections::BTreeMap::<String, usize>::new();
+            for n in g.nodes() {
+                if let tang_compile::tensor::Op::Comp(cp) = &n.op {
+                    if let Some(m) = &cp.monoid {
+                        let k = format!("{:?}", m.kind());
+                        let k = if k == "OnlineSoftmax" { format!("{k} out {:?} red {:?}", cp.out, cp.red) } else { k };
+                        *c.entry(format!("{k}/w{}", m.width)).or_default() += 1;
+                    }
+                }
+            }
+            c
+        };
+        eprintln!("before: {:?}", kinds(&g));
+        let (g2, o2) = g.stabilize_softmax(&o);
+        eprintln!("after stabilize_softmax: {:?}", kinds(&g2));
+        let (g2, o2) = g2.substitute_maps(&o2);
+        let (g2, o2) = g2.eliminate_common(&o2);
+        eprintln!("after substitute+cse: {:?}", kinds(&g2));
+        let (g2, _) = g2.merge_siblings(&o2);
+        eprintln!("after merge_siblings: {:?}", kinds(&g2));
+        {
+            // the reference: the training block's forward (flash there)
+            let dims = crate::ir_block::BlockDims {
+                seq: 256, kv_len: 256, rope: true, bias: true, d_model: 576,
+                n_heads: 9, n_kv_heads: 3, head_dim: 64, ff_dim: 1536,
+            };
+            let (bg, bo) = crate::ir_block::transformer_block(&dims);
+            eprintln!("block before: {:?}", kinds(&bg));
+            let (bg, bo) = bg.stabilize_softmax(&[bo]);
+            eprintln!("block after stabilize: {:?}", kinds(&bg));
+            let (bg, bo) = bg.substitute_maps(&bo);
+            let (bg, bo) = bg.eliminate_common(&bo);
+            let (bg, _) = bg.merge_siblings(&bo);
+            eprintln!("block after merge_siblings: {:?}", kinds(&bg));
+        }
+        let (p, _) = lower_prefill(&g, &o);
+        for (i, k) in p.kernels.iter().enumerate() {
+            let t = k.source.lines().find(|l| l.contains("//")).unwrap_or("").trim();
+            eprintln!("k{i:<3} pts {:<9} wg {:<4} {}", k.points, k.workgroup_size, t.trim_start_matches("// Auto-generated by tang-compile: "));
+            if std::env::var("VISION_LOWER_SRC").ok().and_then(|v| v.parse::<usize>().ok()) == Some(i) {
+                eprintln!("{}", k.source);
+            }
+        }
     }
 }
