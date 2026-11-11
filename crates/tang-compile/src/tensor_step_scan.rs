@@ -68,6 +68,7 @@ impl Deriver<'_> {
             input,
             updated,
             state: true,
+            ring: None,
         });
         self.cache_of.insert(n, slot);
     }
