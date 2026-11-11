@@ -3102,7 +3102,8 @@ impl Lowering<'_> {
     /// producer is recomputed per block instead of launched as a kernel
     /// of its own (a decode step's statistics are a few thousand
     /// elements; the launch and the dependency cost more).
-    /// `TANG_STAGED_MAP=0` disables it.
+    /// Coder-next schedules them only with `TANG_STAGED_MAP=1`;
+    /// `TANG_STAGED_MAP=0` disables it everywhere.
     fn staged_map(&self, root: usize) -> Option<Kernel> {
         if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("0") {
             return None;

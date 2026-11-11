@@ -1,0 +1,260 @@
+loaded in 13s; full weight read 0.97 GB
+drafter skip-odd-mid layers=18 bits=4 cost=0.707
+drafter skip-every4th layers=21 bits=4 cost=0.795
+drafter q2-all layers=28 bits=2 cost=0.636
+drafter skip-odd-mid-own layers=18 bits=4 cost=0.707
+drafter skip-every4th-own layers=21 bits=4 cost=0.795
+prompt 0: 39 + 128 tokens in 197s (0.65 tok/s decode)
+---
+Sure! Here's a Rust function that parses a semantic version string like `"1.2.3-beta"` into a `Version` struct, returning a `Result`.
+
+```rust
+use std::str::FromStr;
+
+#[derive(Debug, PartialEq)]
+pub struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    prerelease: Option<String>,
+    buildmetadata: Option<String>,
+}
+
+impl FromStr for Version {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> =
+---
+  skip-odd-mid : 64 windows, mean match 0.86 (92s)
+  skip-every4th : 64 windows, mean match 2.23 (185s)
+  q2-all : 64 windows, mean match 0.55 (113s)
+  skip-odd-mid-own : 64 windows, mean match 0.19 (88s)
+  skip-every4th-own : 64 windows, mean match 1.23 (162s)
+prompt 1: 37 + 128 tokens in 165s (0.77 tok/s decode)
+---
+Implementing an **LRU (Least Recently Used)** cache using a **dictionary** and a **doubly linked list** is a common approach to achieve **O(1)** time complexity for both `get` and `put` operations.
+
+---
+
+### 🧠 Key Concepts:
+- **Dictionary** for fast access to keys.
+- **Doubly linked list** to maintain the order of access (LRU).
+- The linked list is ordered by the time of access (most recently used at the front, least recently used at the end).
+
+---
+
+### ✅ Implementation in Python
+
+```python
+class Node:
+    def
+---
+  skip-odd-mid : 64 windows, mean match 0.72 (91s)
+  skip-every4th : 64 windows, mean match 2.50 (190s)
+  q2-all : 64 windows, mean match 0.73 (67s)
+  skip-odd-mid-own : 64 windows, mean match 0.22 (36s)
+  skip-every4th-own : 64 windows, mean match 1.20 (77s)
+prompt 2: 35 + 128 tokens in 82s (1.56 tok/s decode)
+---
+Sure! Here's a simple `useDebounce` React hook in TypeScript, and an example of how to use it in a search box.
+
+---
+
+### ✅ `useDebounce` Hook (TypeScript)
+
+```typescript
+import { useState, useEffect, useCallback } from 'react';
+
+export function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+
+  useEffect(() => {
+    const handler = () => {
+      setDebouncedValue(value);
+    };
+
+    // Delay the update by `delay` milliseconds
+   
+---
+  skip-odd-mid : 64 windows, mean match 0.69 (44s)
+  skip-every4th : 64 windows, mean match 2.34 (65s)
+  q2-all : 64 windows, mean match 0.56 (42s)
+  skip-odd-mid-own : 64 windows, mean match 0.36 (42s)
+  skip-every4th-own : 64 windows, mean match 0.81 (50s)
+prompt 3: 32 + 128 tokens in 70s (1.82 tok/s decode)
+---
+Sure! Let's break this down.
+
+---
+
+### ✅ **Objective:**
+Implement **binary search** on a **sorted array** in **C**, and **handle the overflow** in the **midpoint**.
+
+---
+
+## 🧩 Step 1: Understand the Problem
+
+Binary search is a search algorithm that works on a sorted array. It works by repeatedly dividing the search interval in half.
+
+### Key Points:
+- The array must be **sorted**.
+- The search is **iterative**.
+- The **midpoint** is calculated using `low` and `high`.
+
+---
+
+## 🧩 Step 2:
+---
+  skip-odd-mid : 64 windows, mean match 0.78 (38s)
+  skip-every4th : 64 windows, mean match 1.77 (132s)
+  q2-all : 64 windows, mean match 0.91 (71s)
+  skip-odd-mid-own : 64 windows, mean match 0.27 (40s)
+  skip-every4th-own : 64 windows, mean match 1.12 (55s)
+prompt 4: 34 + 128 tokens in 48s (2.65 tok/s decode)
+---
+To retrieve the **top 3 customers by total order amount per country**, using **window functions**, you can use the `ROW_NUMBER()` or `RANK()` function in SQL, depending on whether you want strict ranking (like 1st, 2nd, 3rd) or just the top 3.
+
+Here’s an example using **`ROW_NUMBER()`** to rank customers by total order amount per country, and then selecting the top 3:
+
+### ✅ SQL Query (Using `ROW_NUMBER()` and `ORDER BY`):
+
+```sql
+WITH CustomerOrders AS (
+    SELECT
+        customer_id,
+        country
+---
+  skip-odd-mid : 64 windows, mean match 1.05 (35s)
+  skip-every4th : 64 windows, mean match 1.95 (55s)
+  q2-all : 64 windows, mean match 1.00 (41s)
+  skip-odd-mid-own : 64 windows, mean match 0.19 (34s)
+  skip-every4th-own : 64 windows, mean match 1.11 (69s)
+prompt 5: 37 + 128 tokens in 53s (2.40 tok/s decode)
+---
+Sure! Here's a simple Bash script that finds all files larger than 100MB in a given directory and prints them sorted by size.
+
+```bash
+#!/bin/bash
+
+# Define the threshold in MB
+THRESHOLD=100
+
+# Define the directory to search
+DIRECTORY="/path/to/your/directory"
+
+# Find files larger than 100MB
+find "$DIRECTORY" -type f -size +${THRESHOLD}M | sort -n -k 4,4 -k 5,5
+```
+
+### Explanation:
+- `find "$DIRECTORY" -type f -size
+---
+  skip-odd-mid : 64 windows, mean match 1.25 (38s)
+  skip-every4th : 64 windows, mean match 2.56 (69s)
+  q2-all : 64 windows, mean match 0.69 (40s)
+  skip-odd-mid-own : 64 windows, mean match 0.34 (36s)
+  skip-every4th-own : 64 windows, mean match 1.00 (54s)
+prompt 6: 31 + 128 tokens in 58s (2.20 tok/s decode)
+---
+To implement a **thread-safe bounded queue** in Go, we need to use **sync/atomic** for atomic operations and **sync.Mutex** for mutual exclusion. The queue should support:
+
+- `Push`: Add an element to the queue.
+- `Pop`: Remove an element from the queue.
+- **Blocking** when the queue is full or empty.
+
+---
+
+### ✅ Key Concepts:
+
+- Use a `sync.Mutex` for thread-safety.
+- Use `sync/atomic` for atomic `int` operations (like `len` and `cap`).
+- Use `sync/atomic.AddInt` and `sync/atomic
+---
+  skip-odd-mid : 64 windows, mean match 1.02 (37s)
+  skip-every4th : 64 windows, mean match 2.17 (60s)
+  q2-all : 64 windows, mean match 0.98 (43s)
+  skip-odd-mid-own : 64 windows, mean match 0.28 (34s)
+  skip-every4th-own : 64 windows, mean match 1.16 (50s)
+prompt 7: 29 + 128 tokens in 50s (2.57 tok/s decode)
+---
+Sure! Here's a Python function that merges overlapping intervals, and I'll provide a simple `pytest` test suite to verify its correctness.
+
+---
+
+### ✅ Problem: Merge Overlapping Intervals
+
+Given a list of intervals, merge all **overlapping** intervals.
+
+#### Example:
+```python
+intervals = [[1,5], [2,3], [6,9], [7,8], [4,10]]
+```
+**Merged:** `[[1,9], [4,10]]`
+
+---
+
+### ✅ Python Function: `merge_overlapping_intervals`
+
+```python
+def merge_overlapping
+---
+  skip-odd-mid : 64 windows, mean match 0.88 (31s)
+  skip-every4th : 64 windows, mean match 2.38 (62s)
+  q2-all : 64 windows, mean match 0.77 (38s)
+  skip-odd-mid-own : 64 windows, mean match 0.17 (33s)
+  skip-every4th-own : 64 windows, mean match 1.28 (57s)
+prompt 8: 44 + 128 tokens in 54s (2.35 tok/s decode)
+---
+Sure! Here's a refactored version of your JavaScript code using `async/await`:
+
+```javascript
+async function fetchData() {
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    console.log(data);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+fetchData();
+```
+
+### Explanation:
+- `fetchData` is an `async` function.
+- `await fetch(url)` is used to handle the `fetch` promise.
+- `await response.json()` is used to handle the JSON parsing.
+- The `catch` block is now inside the `
+---
+  skip-odd-mid : 64 windows, mean match 0.97 (34s)
+  skip-every4th : 64 windows, mean match 2.62 (69s)
+  q2-all : 64 windows, mean match 0.81 (39s)
+  skip-odd-mid-own : 64 windows, mean match 0.47 (38s)
+  skip-every4th-own : 64 windows, mean match 1.08 (55s)
+prompt 9: 37 + 128 tokens in 54s (2.39 tok/s decode)
+---
+Sure! Here's a generic Rust iterator adapter that yields **consecutive pairs** (also known as "windows of size 2") from any iterator.
+
+This is a common pattern in data processing, such as when you want to process pairs of elements from a stream.
+
+### ✅ Example Usage:
+
+```rust
+use std::iter;
+
+fn main() {
+    let data = vec![1, 2, 3, 4, 5];
+
+    // Create an iterator that yields pairs of consecutive elements
+    let pairs = data.iter().zip(data.iter().skip(1));
+
+    // Print each pair
+    for (
+---
+  skip-odd-mid : 64 windows, mean match 0.92 (33s)
+  skip-every4th : 64 windows, mean match 2.27 (63s)
+  q2-all : 64 windows, mean match 0.70 (42s)
+  skip-odd-mid-own : 64 windows, mean match 0.34 (31s)
+  skip-every4th-own : 64 windows, mean match 1.30 (55s)

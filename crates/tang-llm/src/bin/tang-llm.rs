@@ -3,7 +3,10 @@
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
-//! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`. Beyond loopback
+//! every route but `/health` and `/pair/*` needs a key: the static one or a paired client's.
+//! `tang-llm pair [--port P]` opens a 120 s pairing window on the running server and shows its
+//! code; `tang-llm unpair <client_id | all | list>` drops paired clients.
 //! For frog's scheduler it also serves `GET /node` (hardware, free memory, model, measured
 //! rates, queue, KV blocks), `POST /models/load` / `/models/unload` (swap the model, only into
 //! free memory) and takes `x-frog-priority: interactive | background` (see `docs/node.md`).
@@ -320,6 +323,11 @@ fn take_device(args: &mut Vec<String>) -> Result<Backend> {
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let backend = take_device(&mut args)?;
+    match args.first().map(String::as_str) {
+        Some("pair") => return tang_llm::pair::cli_pair(&args[1..]),
+        Some("unpair") => return tang_llm::pair::cli_unpair(&args[1..]),
+        _ => {}
+    }
     let (cmd, dir) = match args.as_slice() {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
@@ -615,7 +623,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
     }
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let name = s
         .gguf
@@ -710,7 +718,7 @@ fn deepseek_serve(args: &[String]) -> Result<()> {
     }
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let name = dir
         .file_name()
@@ -811,7 +819,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     }
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let opts = tang_llm::server::Options {
         addr,

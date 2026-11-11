@@ -54,13 +54,22 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 llguidance = { version = "=1.9.1", default-features = false }
 libc = "0.2"
+# Bonjour advertisement of a node reachable beyond loopback (src/advertise.rs).
+mdns-sd = "0.11"
+# Node identity and pairing (src/auth.rs, src/pair.rs; frog's docs/node-protocol.md).
+spake2 = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+aes-gcm = "0.10"
+ed25519-dalek = "2"
+getrandom = "0.2"
 tang-moe = { workspace = true, optional = true }
 tang-expr = { workspace = true }
 tang = { workspace = true }
 opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "metrics"], optional = true }
 tang-otel = { workspace = true, optional = true }
-cudarc = { version = "0.16", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.19", features = ["nvrtc", "cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

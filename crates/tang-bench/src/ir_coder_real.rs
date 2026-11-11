@@ -190,8 +190,9 @@ pub fn lower_real_step(
     };
     // norms' and gates' statistics recomputed inside their maps (one
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
-    // evaluated in their readers; TANG_STAGED_MAP=0: off
-    if std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+    // evaluated in their readers; opt-in with TANG_STAGED_MAP=1 (measured
+    // slower on coder-next: 6.18 vs 5.885 ms)
+    if std::env::var("TANG_STAGED_MAP").as_deref() == Ok("1") {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
         graph.schedule_small_maps(&outs, &inplace);
