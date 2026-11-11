@@ -77,6 +77,12 @@ fn rows_tab() -> bool {
     std::env::var("DS_ROWS_TAB").map_or(true, |v| v != "0")
 }
 
+/// `DS_ROWS_ATTN=0`: a rows step's decode attention runs row by row instead of one
+/// `attn_fd_win_rows` launch pair for all rows (A/B).
+fn rows_attn() -> bool {
+    std::env::var("DS_ROWS_ATTN").map_or(true, |v| v != "0")
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1121,11 +1127,6 @@ impl GpuModel {
             r > 0 && c.is_kv_source(lid),
             r > 0 && c.is_index_source(lid),
         );
-        let at0 = At::Dev {
-            add: 0,
-            stride: 1,
-            fixed_r: 0,
-        };
         // ---- batched: wq_a | wkv over the rows (each bit for bit its own ks_gemv)
         let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
         let sp = self.span("q");
@@ -1421,6 +1422,14 @@ impl GpuModel {
                 idx_done = true;
             }
         }
+        let fdm_rows = rt.is_some()
+            && rows_attn()
+            && rd % 2 == 0
+            && rd <= hd
+            && self.k.attn_fdm
+            && self
+                .k
+                .attn_fd_win_ok(h, hd, win + if r > 0 { kmax } else { 0 });
         for (i, sg) in segs.iter_mut().enumerate() {
             self.seg_in(sg);
             let pp = self.p.ptr;
@@ -1476,56 +1485,131 @@ impl GpuModel {
             } else if makes_cand && !idx_done {
                 anyhow::bail!("rows step: a candidate source that is not an index source");
             }
-            let (mut kc, mut kv1) = (0, 0);
-            if r > 0 {
-                kc = self.topk.as_ref().context("no top-k")?.1;
-                kv1 = self.seqs[self.cur].ckv[&self.sh_ckv].ptr;
+            if fdm_rows {
+                // the attention runs once for all rows below
+                self.seg_out(sg);
+                continue;
             }
-            let (src, ki) = match kc {
-                0 => (0, 0),
-                _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
-            };
-            let ring = b(&self.seqs[self.cur].win[lid]);
-            let qi = q.at(i * h * hd * 4);
-            let ix = if rd % 2 == 0 && rd <= hd && self.k.attn_fd_win_ok(h, hd, win + kc) {
-                Ix::Win(WinIdx {
-                    mode: 1,
-                    win: win as i32,
-                    src,
-                    kc: ki,
-                })
-            } else {
-                let idx = self.fbuf(win + kc)?;
-                let (st, ni, mi, wi2) = ((win + kc) as i32, win as i32, 1i32, win as i32);
-                unsafe {
-                    self.gk.go(
-                        "dg_win_idx",
-                        blocks(win + kc, 256),
-                        B256,
-                        0,
-                        &self.s,
-                        args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki, 0i32],
-                    )?
-                };
-                Ix::Rows(idx)
-            };
-            let (oi, _) = self.attn_core(
+            self.attn_row(
                 p,
-                qi,
-                false,
-                (ring, win, kv1),
-                ix,
-                1,
-                win + kc,
                 lid,
-                at0,
-                false,
+                q.at(i * h * hd * 4),
+                o.ptr + (i * h * hd * 4) as u64,
             )?;
-            self.copy(o.ptr + (i * h * hd * 4) as u64, oi.ptr, h * hd)?;
             self.seg_out(sg);
+        }
+        if fdm_rows {
+            let kc = if r > 0 { kmax } else { 0 };
+            let tk = segs[0].topk.map(|x| x.0);
+            let contiguous = r == 0
+                || segs.iter().enumerate().all(|(i, sg)| {
+                    sg.topk.is_some_and(|(b2, k2)| {
+                        k2 == kmax && tk.is_some_and(|b0| b2.ptr == b0.ptr + (i * kmax * 4) as u64)
+                    })
+                });
+            if contiguous {
+                let (tb, nrows) = self.rowtab.unwrap();
+                let rtk = if r > 0 {
+                    let kl = segs[0].sh_ckv;
+                    tb.ptr + ((kl * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64
+                } else {
+                    0
+                };
+                let sink = self.dw(&format!("{p}.attn.attn_sink"))?.v.w;
+                let scale = (hd as f32).powf(-0.5);
+                let s = self.span("sparse_attn");
+                self.k.attn_fd_win_rows(
+                    &self.s,
+                    q.ptr,
+                    rt.unwrap(),
+                    rtk,
+                    win,
+                    sink,
+                    o.ptr,
+                    t,
+                    h,
+                    hd,
+                    kc,
+                    scale,
+                    self.tabs[lid].ptr,
+                    rd as i32,
+                    tk.map_or(0, |b0| b0.ptr),
+                )?;
+                self.end(s);
+            } else {
+                for (i, sg) in segs.iter_mut().enumerate() {
+                    self.seg_in(sg);
+                    self.attn_row(
+                        p,
+                        lid,
+                        q.at(i * h * hd * 4),
+                        o.ptr + (i * h * hd * 4) as u64,
+                    )?;
+                    self.seg_out(sg);
+                }
+            }
         }
         // ---- batched: wo over the rows
         self.attn_wo(p, o, t, false)
+    }
+
+    /// One row's attention in a rows step (its state swapped in by `seg_in`): the window and
+    /// selected compressed keys of its slot, the t = 1 kernels, o into `dst` [h][hd].
+    fn attn_row(&mut self, p: &str, lid: usize, qi: Buf, dst: u64) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let (h, hd, win, rd) = (c.n_heads, c.head_dim, c.window_size, c.rope_head_dim);
+        let r = c.compress_ratios[lid];
+        let at0 = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        let pp = self.p.ptr;
+        let (mut kc, mut kv1) = (0, 0);
+        if r > 0 {
+            kc = self.topk.as_ref().context("no top-k")?.1;
+            kv1 = self.seqs[self.cur].ckv[&self.sh_ckv].ptr;
+        }
+        let (src, ki) = match kc {
+            0 => (0, 0),
+            _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
+        };
+        let ring = b(&self.seqs[self.cur].win[lid]);
+        let ix = if rd % 2 == 0 && rd <= hd && self.k.attn_fd_win_ok(h, hd, win + kc) {
+            Ix::Win(WinIdx {
+                mode: 1,
+                win: win as i32,
+                src,
+                kc: ki,
+            })
+        } else {
+            let idx = self.fbuf(win + kc)?;
+            let (st, ni, mi, wi2) = ((win + kc) as i32, win as i32, 1i32, win as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_win_idx",
+                    blocks(win + kc, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki, 0i32],
+                )?
+            };
+            Ix::Rows(idx)
+        };
+        let (oi, _) = self.attn_core(
+            p,
+            qi,
+            false,
+            (ring, win, kv1),
+            ix,
+            1,
+            win + kc,
+            lid,
+            at0,
+            false,
+        )?;
+        self.copy(dst, oi.ptr, h * hd)
     }
 
     /// One row's indexer selection (as [`Self::indexer_dyn`] at t = 1, from its projected

@@ -2049,6 +2049,34 @@ impl Kernels {
         rope: Option<AttnRope>,
         widx: Option<WinIdx>,
     ) -> Result<()> {
+        self.attn_fd_p(
+            s, q, kv, sp, kv1, sink, idxs, o, t, h, d, k, scale, rope, widx, 0,
+        )
+    }
+
+    /// [`Self::attn_fd`]; `pk` != 0: rows mode, `rope.p` the rows' RowP table (each row's
+    /// position and window ring) and `pk` the key layer's (its compressed cache).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_fd_p(
+        &self,
+        s: &Stream,
+        q: u64,
+        kv: u64,
+        sp: i32,
+        kv1: u64,
+        sink: u64,
+        idxs: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        k: usize,
+        scale: f32,
+        rope: Option<AttnRope>,
+        widx: Option<WinIdx>,
+        pk: u64,
+    ) -> Result<()> {
+        let prow = (pk != 0) as i32;
         let r = rope.unwrap_or_default();
         let (pp, rd, ps) = (r.p, r.rd, r.stride);
         if widx.is_some() {
@@ -2075,8 +2103,10 @@ impl Kernels {
         let mut t0 = 0;
         while t0 < t {
             let n0 = (t - t0).min(64);
+            // rows mode keeps the t = 1 decode's key split (each row its lone result)
+            let nsplit = if prow != 0 { 1 } else { n0 };
             let sp_n = match self.attn_fd_s {
-                0 => self.sms.div_ceil(n0 * hg),
+                0 => self.sms.div_ceil(nsplit * hg),
                 v => v,
             }
             .clamp(1, ntile);
@@ -2084,7 +2114,12 @@ impl Kernels {
             let ns = sp_n as i32;
             let part = self.scratch.ptr;
             let ml = part + (n * sp_n * h * d * 4) as u64;
-            let add = r.add + t0 as i32 * r.stride;
+            let add = if prow != 0 {
+                t0 as i32
+            } else {
+                r.add + t0 as i32 * r.stride
+            };
+            let fadd = if prow != 0 { 0 } else { add };
             let (wsrc_o, r0) = (wsrc + (t0 * wkc as usize * 4) as u64, t0 as i32);
             let (qo, io, oo) = (
                 q + (t0 * h * d * 4) as u64,
@@ -2107,8 +2142,8 @@ impl Kernels {
                     smem as u32,
                     s,
                     tang_moe::args![
-                        qo, kv, sp, kv1, io, part, ml, hi, di, ki, scale, ns, qtab, pp, rd, add,
-                        ps, wm, ww, wsrc_o, wkc, r0
+                        qo, kv, sp, kv1, io, part, ml, hi, di, ki, scale, ns, qtab, pp, rd, fadd,
+                        ps, wm, ww, wsrc_o, wkc, r0, prow, pk
                     ],
                 )?;
                 super::obs::launch(
@@ -2118,7 +2153,7 @@ impl Kernels {
                     0,
                     s,
                     tang_moe::args![
-                        part, ml, sink, oo, hi, di, ns, r.tab, pp, rd, add, ps, qc, qsc
+                        part, ml, sink, oo, hi, di, ns, r.tab, pp, rd, add, ps, qc, qsc, prow
                     ],
                 )?;
             }
@@ -2277,6 +2312,71 @@ impl Kernels {
             scale,
             Some(rope),
             Some(widx),
+        )
+    }
+
+    /// [`Self::attn_fd_win`] over `t` decode rows of DIFFERENT sequences in one launch pair:
+    /// `rt` the rows' RowP table for this layer (each row's position and window ring of
+    /// `win` rows), `rtk` the key layer's (each row's compressed cache), `src` the rows'
+    /// top-k [t][kc]. Row i is bit for bit `attn_fd_win` at t = 1 on its own buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fd_win_rows(
+        &self,
+        s: &Stream,
+        q: u64,
+        rt: u64,
+        rtk: u64,
+        win: usize,
+        sink: u64,
+        o: u64,
+        t: usize,
+        h: usize,
+        d: usize,
+        kc: usize,
+        scale: f32,
+        tab: u64,
+        rd: i32,
+        src: u64,
+    ) -> Result<()> {
+        let k = win + kc;
+        anyhow::ensure!(
+            self.attn_fd_win_ok(h, d, k) && self.attn_fdm,
+            "attn_fd_win_rows: shape h {h} d {d} k {k}"
+        );
+        let rope = AttnRope {
+            tab,
+            p: rt,
+            rd,
+            add: 0,
+            stride: 1,
+            q: true,
+            wo_quant: false,
+        };
+        let w = WinIdx {
+            mode: 1,
+            win: win as i32,
+            src,
+            kc: kc as i32,
+        };
+        // pk != 0 marks rows mode: a layer without compressed keys passes its own table
+        let pk = if rtk != 0 { rtk } else { rt };
+        self.attn_fd_p(
+            s,
+            q,
+            0,
+            win as i32,
+            0,
+            sink,
+            0,
+            o,
+            t,
+            h,
+            d,
+            k,
+            scale,
+            Some(rope),
+            Some(w),
+            pk,
         )
     }
 
@@ -4283,6 +4383,132 @@ mod tests {
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "scales"
             );
+        }
+    }
+
+    /// `attn_fd_win_rows`: rows of different sequences (each its own window ring, compressed
+    /// cache, position and top-k) in one launch pair give, row by row, exactly
+    /// `attn_fd_win` at t = 1 on that row's buffers.
+    #[test]
+    fn attn_fd_win_rows_matches_per_row() {
+        let Some(g) = Gpu::for_test() else { return };
+        g.bind().unwrap();
+        let k = Kernels::new(&g).unwrap();
+        let s = Stream::blocking().unwrap();
+        let (h, d, rd, win, kc, ncomp) = (64, 512, 64, 128usize, 512usize, 2048usize);
+        if !k.attn_fd_win_ok(h, d, win + kc) || !k.attn_fdm {
+            return;
+        }
+        let tabv: Vec<f32> = (0..4096 * rd / 2)
+            .flat_map(|e| {
+                let (pos, j) = ((e / (rd / 2)) as f32, (e % (rd / 2)) as f32);
+                let th = pos * 10000f32.powf(-2.0 * j / rd as f32);
+                [th.cos(), th.sin()]
+            })
+            .collect();
+        let tab = DevBuf::from_slice(&tabv).unwrap();
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Rp {
+            ring: u64,
+            kst: u64,
+            sst: u64,
+            ckv: u64,
+            idxk: u64,
+            pos: i32,
+            pad: i32,
+        }
+        let poss = [37usize, 300, 5, 1999, 128, 640, 77];
+        let t = poss.len();
+        let q = DevBuf::from_slice(&data(t * h * d, 31, 2.0)).unwrap();
+        let sink = DevBuf::from_slice(&data(h, 5, 1.0)).unwrap();
+        let rings: Vec<DevBuf> = (0..t)
+            .map(|i| DevBuf::from_slice(&data(win * d, 100 + i as u64, 1.0)).unwrap())
+            .collect();
+        let ckvs: Vec<DevBuf> = (0..t)
+            .map(|i| DevBuf::from_slice(&data(ncomp * d, 200 + i as u64, 1.0)).unwrap())
+            .collect();
+        let src: Vec<i32> = (0..t * kc)
+            .map(|i| {
+                if i % 41 == 3 {
+                    -1
+                } else {
+                    ((i * 31 + 7) % ncomp) as i32 + win as i32
+                }
+            })
+            .collect();
+        let srcb = DevBuf::from_slice(&src).unwrap();
+        let tabl: Vec<Rp> = (0..t)
+            .map(|i| Rp {
+                ring: rings[i].ptr,
+                kst: 0,
+                sst: 0,
+                ckv: ckvs[i].ptr,
+                idxk: 0,
+                pos: poss[i] as i32,
+                pad: 0,
+            })
+            .collect();
+        let bytes: Vec<u8> = tabl
+            .iter()
+            .flat_map(|r| {
+                let p = r as *const Rp as *const u8;
+                unsafe { std::slice::from_raw_parts(p, std::mem::size_of::<Rp>()) }.to_vec()
+            })
+            .collect();
+        let rt = DevBuf::from_slice(&bytes).unwrap();
+        let scale = (d as f32).powf(-0.5);
+        let o = DevBuf::alloc(t * h * d * 4).unwrap();
+        k.attn_fd_win_rows(
+            &s, q.ptr, rt.ptr, rt.ptr, win, sink.ptr, o.ptr, t, h, d, kc, scale, tab.ptr,
+            rd as i32, srcb.ptr,
+        )
+        .unwrap();
+        s.sync().unwrap();
+        let got = o.read::<f32>(0, t * h * d).unwrap();
+        for i in 0..t {
+            let pb = DevBuf::from_slice(&[poss[i] as i32]).unwrap();
+            let rope = AttnRope {
+                tab: tab.ptr,
+                p: pb.ptr,
+                rd: rd as i32,
+                add: 0,
+                stride: 1,
+                q: true,
+                wo_quant: false,
+            };
+            let w = WinIdx {
+                mode: 1,
+                win: win as i32,
+                src: srcb.ptr + (i * kc * 4) as u64,
+                kc: kc as i32,
+            };
+            let o1 = DevBuf::alloc(h * d * 4).unwrap();
+            k.attn_fd_win(
+                &s,
+                q.ptr + (i * h * d * 4) as u64,
+                rings[i].ptr,
+                win,
+                ckvs[i].ptr,
+                sink.ptr,
+                o1.ptr,
+                1,
+                h,
+                d,
+                win + kc,
+                scale,
+                rope,
+                w,
+            )
+            .unwrap();
+            s.sync().unwrap();
+            let want = o1.read::<f32>(0, h * d).unwrap();
+            let bad = got[i * h * d..(i + 1) * h * d]
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(bad, 0, "row {i} (pos {}): {bad} differ", poss[i]);
         }
     }
 

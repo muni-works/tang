@@ -2724,7 +2724,8 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
 extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
                                                                   const float* sink, float* o, int h, int d,
                                                                   int S, const float2* tab, const int* Pp, int rd,
-                                                                  int add, int ps, unsigned char* qc, float* qs) { DS_PDL_ENTRY
+                                                                  int add, int ps, unsigned char* qc, float* qs,
+                                                                  int prow) { DS_PDL_ENTRY
     int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
     float M = -DS_INF;
     for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
@@ -2743,7 +2744,8 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* p
     int col = 2 * tid;
     float x = bf(a.x / den), y = bf(a.y / den);
     if (tab && col >= d - rd) {
-        int pos = Pp[0] + add + ti * ps;
+        // prow: add is the launch's first row in the RowP table
+        int pos = prow ? Pp[(add + ti) * 12 + 10] : Pp[0] + add + ti * ps;
         float x2 = ds_rope_at(x, y, col, d, rd, tab, pos, 1);
         y = ds_rope_at(x, y, col + 1, d, rd, tab, pos, 1);
         x = x2;
@@ -2783,7 +2785,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                                                               float* ml, int h, int d, int k, float scale, int S,
                                                               const float2* tab, const int* Pp, int rd, int add,
                                                               int ps, int wmode, int win, const int* wsrc, int kc,
-                                                              int r0) { DS_PDL_ENTRY
+                                                              int r0, int prow, const int* Pk) { DS_PDL_ENTRY
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;       // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;          // [FD_KT][FD_QP]
@@ -2796,12 +2798,21 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
     int hg = h / 64, b = blockIdx.x, tid = threadIdx.x;
     int si = b % S, g = (b / S) % hg, ti = b / (S * hg);
     int lane = tid & 31, w = tid >> 5, gq = lane >> 2, tq = lane & 3;
+    // prow: Pp is a rows step's RowP table (row r0 + ti: its position, its slot's window
+    // ring as kv0), Pk the key layer's (its compressed cache as kv1); every row a decode row
+    int spr = Pp[0];
+    if (prow) {
+        const unsigned long long* rp = (const unsigned long long*)Pp + (long long)(r0 + ti) * 6;
+        spr = Pp[(r0 + ti) * 12 + 10];
+        kv0 = (const float*)rp[0];
+        if (Pk) kv1 = (const float*)((const unsigned long long*)Pk)[(long long)(r0 + ti) * 6 + 3];
+    }
     for (int e = tid; e < 64 * 128; e += 256) {
         int hh = e / 128, c4 = e % 128, col = 4 * c4;
         const float* qr = q + ((long long)ti * h + g * 64 + hh) * d;
         float4 v = *(const float4*)(qr + col);
         if (tab && col >= d - rd) {
-            int pos = Pp[0] + add + ti * ps;
+            int pos = prow ? spr + add : Pp[0] + add + ti * ps;
             float a0 = ds_rope_at(v.x, v.y, col, d, rd, tab, pos, 0);
             float a1 = ds_rope_at(v.x, v.y, col + 1, d, rd, tab, pos, 0);
             float a2 = ds_rope_at(v.z, v.w, col + 2, d, rd, tab, pos, 0);
@@ -2827,7 +2838,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                 v = wsrc[(long long)ti * kc + j - win];  // the top-k columns (ds_idx_cat's)
             } else {
                 // the window columns, as dg_win_idx modes 1 / 3 at sp = P[0]
-                int sp = Pp[0];
+                int sp = spr;
                 if (wmode == 1) {
                     int i = (sp % win + 1 + j) % win;
                     v = i > sp ? -1 : i;
