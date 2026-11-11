@@ -422,7 +422,7 @@ impl TensorGraph {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn affine_scan(
+    pub(crate) fn affine_scan(
         &mut self,
         inputs: Vec<TensorId>,
         dim: usize,

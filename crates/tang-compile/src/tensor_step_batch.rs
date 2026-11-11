@@ -12,8 +12,8 @@ use super::super::{Scan, ScanKind, Segment};
 /// Each comp of such a node gets the batch coordinate in front of its
 /// space; reads of batched sources pick it, every other coordinate shifts
 /// by one. Returns the graph and `outputs`' new ids. Inputs keep their
-/// order: a sequence input becomes `[batch, …]`. A scan's `DeltaForm`
-/// (the chunked schedule's description) is dropped.
+/// order: a sequence input becomes `[batch, …]`. A scan keeps its
+/// `DeltaForm`.
 pub fn batch_graph(
     g: &TensorGraph,
     outputs: &[TensorId],
@@ -119,9 +119,14 @@ pub fn batch_graph(
                 } = *sc;
                 match &sc.kind {
                     ScanKind::Monoid(m) => ng.scan(&ins, dim, m.clone(), exclusive, reverse)?,
+                    // the delta rule's structure travels with it (its
+                    // inputs keep their order): the step folds the cached
+                    // state in `O(n·m)` instead of the dense `A·S`
                     ScanKind::Affine {
-                        ring, bands: None, ..
-                    } => ng.semiring_scan(ins[0], ins[1], dim, exclusive, reverse, *ring)?,
+                        ring,
+                        bands: None,
+                        form,
+                    } => ng.affine_scan(ins.clone(), dim, exclusive, reverse, form.clone(), *ring, None)?,
                     ScanKind::Affine {
                         ring,
                         bands: Some(bands),
