@@ -76,7 +76,7 @@ tang-optim = { version = "0.2", path = "crates/tang-optim" }
 tang-train = { version = "0.1", path = "crates/tang-train" }
 tang-safetensors = { version = "0.1", path = "crates/tang-safetensors" }
 tang-hub = { version = "0.1", path = "crates/tang-hub" }
-tang-expr = { version = "0.2", path = "crates/tang-expr" }
+tang-expr = { version = "0.2.1", path = "crates/tang-expr" }
 tang-mesh = { version = "0.1", path = "crates/tang-mesh" }
 tang-infer = { version = "0.1", path = "crates/tang-infer" }
 tang-onnx = { version = "0.1", path = "crates/tang-onnx" }

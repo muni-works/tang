@@ -43,10 +43,12 @@ pub use tensor::ComputeTensor;
 pub use metal::MetalDevice;
 
 #[cfg(feature = "cuda")]
-pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda};
+pub use cuda::{cuda_memory_info, CudaComputeDevice, RawCuda, Real, RowKernel, RowLoad, RowStore};
+/// The expression graph crate kernels are traced in (`elementwise`, row kernels).
+pub use tang_expr;
 
-#[cfg(feature = "cuda")]
-pub use cudarc::driver::CudaGraph;
 /// The cudarc this crate is built on (0.19), so callers sharing a context use the same types.
 #[cfg(feature = "cuda")]
 pub use cudarc;
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaGraph;
