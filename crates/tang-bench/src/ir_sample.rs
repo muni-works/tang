@@ -376,7 +376,8 @@ fn form(rank: usize, terms: &[(usize, i64)], offset: i64) -> Form {
 ///   vocabulary (one more reduction), as the hand sampler does;
 /// - greedy: the first candidate (the first maximum).
 ///
-/// Same params and outputs as [`append_sampler`]. Unlike it, a nucleus that
+/// Outputs as [`append_sampler`]; `params` is `[seq, 4]` (one row of
+/// `(temperature, top_p, top_k, seed)` per position). Unlike it, a nucleus that
 /// would need more than `K` tokens stops at `K` (the hand sampler's cap).
 pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
     let sh = g.shape(logits).to_vec();
@@ -392,8 +393,9 @@ pub fn append_sampler_topk(g: &mut TensorGraph, logits: TensorId) -> Sampler {
     let _ = bd;
     // a `[t, v]` tensor read at chunk b, element c (space (t, b, c))
     let chunked = |x: TensorId| arg(x, vec![u(3, 0), form(3, &[(1, cl as i64), (2, 1)], 0)]);
-    let params = g.input(&[Dim::Fixed(4)]);
-    let p = |rank: usize, i: usize| arg(params, vec![Form::constant(rank, i as i64)]);
+    // per row: a batched step (`batch_graph`) gives every stream its own parameters
+    let params = g.input(&[t, Dim::Fixed(4)]);
+    let p = |rank: usize, i: usize| arg(params, vec![u(rank, 0), Form::constant(rank, i as i64)]);
     let comp = |g: &mut TensorGraph,
                 out: &[Dim],
                 red: &[Dim],
@@ -757,7 +759,8 @@ mod tests {
         let l = g.input(&[Dim::Sym(SEQ), Dim::Fixed(v)]);
         let s = append_sampler_topk(&mut g, l);
         let b = g.bind(&[(SEQ, rows.len())]).unwrap();
-        let out = b.eval(&[rows.concat(), params.to_vec()], &[s.token, s.threshold]);
+        let per_row: Vec<f64> = rows.iter().flat_map(|_| params).collect();
+        let out = b.eval(&[rows.concat(), per_row], &[s.token, s.threshold]);
         (out[0].iter().map(|&x| x as usize).collect(), out[1].clone())
     }
 
