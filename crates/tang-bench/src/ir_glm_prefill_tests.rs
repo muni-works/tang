@@ -697,3 +697,25 @@ fn glm_derive_step_probes() {
     eprintln!("probe [data-dependent mask]: {r:?}");
     assert!(r.is_err());
 }
+
+/// Sparse DSA (the indexer's data mask ANDed with the causal mask): the
+/// derived step is the prefill's continuation across the dense → sparse
+/// boundary (`T > topk`), NaN tails.
+#[test]
+fn glm_dsa_sparse_step_matches_prefill() {
+    for absorbed in [true, false] {
+        let d = GlmDims {
+            layers: vec![(Mixer::Dsa, Ffn::Dense), (Mixer::Dsa, Ffn::Moe)],
+            sparse: true,
+            absorbed,
+            ..GlmDims::tiny()
+        };
+        for (p0, ks) in [(5, &[1usize, 3, 1][..]), (2, &[1, 4, 1, 1, 2])] {
+            let e = step_matches_prefill(&d, p0, ks, 12);
+            eprintln!(
+                "glm dsa-sparse (absorbed {absorbed}): derived steps {ks:?} from {p0} vs prefill: {e:.2e}"
+            );
+            assert!(e < 1e-12, "{e:e}");
+        }
+    }
+}
