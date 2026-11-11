@@ -123,6 +123,17 @@ __device__ __forceinline__ void row_prefetch(const DsW& w, int r, int lane) {
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
 }
 
+// One row of a batched rows step (engine.rs `RowP`): its position and its sequence slot's
+// buffers for this layer (window ring, compressor partial groups, compressed KV, indexer
+// keys). A kernel given a non-null table treats row e as its own one-token sequence.
+#ifndef DS_ROWP
+#define DS_ROWP
+struct RowP {
+    unsigned long long ring, kst, sst, ckv, idxk;
+    int pos, pad;
+};
+#endif
+
 extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int round) { DS_PDL_ENTRY
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= t * w.rows) return;
@@ -2220,17 +2231,6 @@ DS_MOE_KP(2, 3)
     }
 DS_WO_KS(2)
 DS_WO_KS(3)
-
-// One row of a batched rows step (engine.rs `RowP`): its position and its sequence slot's
-// buffers for this layer (window ring, compressor partial groups, compressed KV, indexer
-// keys). A kernel given a non-null table treats row e as its own one-token sequence.
-#ifndef DS_ROWP
-#define DS_ROWP
-struct RowP {
-    unsigned long long ring, kst, sst, ckv, idxk;
-    int pos, pad;
-};
-#endif
 
 // The q/kv epilogue of the decode attention, block (token, part) of 1024 threads (as ds_rms):
 // part 0 rms(qr) in place (bit for bit ds_rms) and its K-split codes/scales for wq_b (as
