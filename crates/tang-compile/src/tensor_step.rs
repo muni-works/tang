@@ -19,24 +19,29 @@
 //!
 //! **The cache.** A node with one `T`-axis demanded full is not
 //! recomputed: its new rows are computed and written into a cache input
-//! of `capacity` rows at `p0..p0+k` (a map with a guarded gather through
-//! `p0`, which is a one-element runtime input). Those nodes are the
-//! cache; for attention, K and V (before any position map the rewrite
-//! passes inlined into the scores).
+//! of `capacity` rows at `p0..p0+k` (`p0` a one-element runtime input),
+//! in the in-place form `ir_qwen`'s hand-written step uses. Those nodes
+//! are the cache: for attention, the K and V nodes as the author wrote
+//! them (derive on the graph as built to keep that cut; after
+//! `substitute_maps` a position map may be inlined and the cache taken
+//! before it).
 //!
 //! **Causality.** The derivation computes only new rows, which is right
 //! iff growing `T` leaves old rows unchanged. Views are unit reads, so
 //! the only way a row can see a later one is a reduction over `T`; each
-//! such reduction must contain a `select` whose condition is affine in
-//! iota reads and changes sign exactly between `j = i` and `j = i + 1`
-//! (a causal mask). That the masked branch contributes the monoid's
-//! identity (`exp(−1e30 − m) = 0`, or `select(c, x, id)`) is not proven
-//! here; the interpreter tests check it.
+//! such reduction's contribution must be `select(cond, x, identity)`,
+//! `cond` affine in iota reads and changing sign exactly between
+//! `j = i` and `j = i + 1`. The masked elements are then exactly the
+//! monoid's identity whatever `x` is (NaN in an unfilled cache row
+//! included). An additive mask (`s + (−1e30)` before `exp`) is refused:
+//! `0·NaN` would leak.
 //!
 //! Not handled (an error, not a wrong graph): shifted or strided reads
 //! along `T` (convolutions over time would need a ring of the last few
-//! rows), position tables indexed by `T` through a fixed axis, gathers
-//! and guards over `T`, reshapes/operators/scans touching `T`, outputs
+//! rows), position tables indexed by `T` through a fixed axis (write the
+//! lookup as a masked sum over the table, as `ir_qwen` does), gathers
+//! and guards over `T`, reshapes that move `T` off the outer dim,
+//! operators/scans touching `T`, outputs
 //! with several `T`-axes, and reductions over `T` whose output has no
 //! `T` (a running state: the monoid state itself would be the cache).
 
@@ -93,6 +98,9 @@ pub struct StepGraph {
     pub outputs: Vec<TensorId>,
     pub caches: Vec<CacheSlot>,
     pub pos: TensorId,
+    /// Prefill node → its step node holding the new rows (every derived
+    /// node whose sequence axes are all new, and the sequence-free ones).
+    pub rows: HashMap<TensorId, TensorId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,10 +111,9 @@ enum Mode {
 
 type Modes = Vec<Option<Mode>>;
 
-/// Derive the `T → T + k` step of a causal prefill graph. Run the rewrite
-/// passes first (`substitute_maps`, optionally `stabilize_softmax`): the
-/// derivation works on materialized nodes, so `[T, T]` maps such as a
-/// mask or probabilities should already be inlined into their readers.
+/// Derive the `T → T + k` step of a causal prefill graph, as built or after
+/// rewrite passes. `[T, T]` nodes (scores) are computed for the new rows
+/// against every cache row; only single-`T` nodes are cached.
 pub fn derive_step(
     g: &TensorGraph,
     outputs: &[TensorId],
@@ -137,12 +144,19 @@ pub fn derive_step(
         let modes = d.modes_with(o.n(), Mode::New);
         outs.push(d.get(o.n(), modes)?);
     }
+    let rows = d
+        .memo
+        .iter()
+        .filter(|((_, m), _)| m.iter().all(|x| *x != Some(Mode::Full)))
+        .map(|((n, _), &t)| (TensorId(*n as u32), t))
+        .collect();
     Ok(StepGraph {
         graph: d.sg,
         inputs: d.inputs,
         outputs: outs,
         caches: d.caches,
         pos: d.pos,
+        rows,
     })
 }
 
@@ -226,11 +240,20 @@ impl Deriver<'_> {
             Op::Comp(c) => self.comp(n, c, &modes)?,
             Op::Reshape(src) => {
                 let src = *src;
-                if !tax.is_empty() || !self.t_axes(src.n()).is_empty() {
-                    return err("step: reshape over the sequence dim");
-                }
-                let s = self.get(src.n(), vec![None; self.g.nodes[src.n()].shape.len()])?;
-                let shape = node.shape.clone();
+                let stax = self.t_axes(src.n());
+                let smodes = match (tax.as_slice(), stax.as_slice()) {
+                    ([], []) => vec![None; g.nodes[src.n()].shape.len()],
+                    // the sequence is the outer dim on both sides: row-major,
+                    // its rows are the same bytes whatever the inner dims
+                    ([0], [0]) => {
+                        let mut m = vec![None; g.nodes[src.n()].shape.len()];
+                        m[0] = modes[0];
+                        m
+                    }
+                    _ => return err("step: reshape that moves the sequence dim"),
+                };
+                let s = self.get(src.n(), smodes)?;
+                let shape = self.step_shape(&node.shape, &modes);
                 self.sg.reshape(s, &shape)?
             }
             Op::Operator(_) | Op::Scan(_) => {
@@ -263,7 +286,10 @@ impl Deriver<'_> {
     }
 
     /// Node `n` (one `T`-axis, `axis`) read at old rows: its new rows
-    /// written into a cache input.
+    /// written into a cache input at `p0..p0 + k`, in the form the decode
+    /// lowerings run as an in-place update: `select(p0 ≤ j < p0 + k, new,
+    /// old)`, where `new` is the one new row (`k = 1`) or a sum over the
+    /// new rows with one live term (`Σ_t [t = j − p0]·new[t]`).
     fn cache(&mut self, n: usize, axis: usize) -> Result<TensorId, ShapeError> {
         if let Some(&c) = self.cache_of.get(&n) {
             return Ok(self.caches[c].updated);
@@ -275,36 +301,68 @@ impl Deriver<'_> {
         let input = self.sg.input(&shape);
         self.inputs.push(StepInput::Cache(slot));
         let r = shape.len();
+        let k = self.spec.new;
+        let pos_at = |rank: usize| Arg {
+            src: self.pos,
+            view: View::pick(rank, &[None]),
+        };
+        let row = if k == 1 {
+            let mut v = View::identity(r, r);
+            v.forms[axis] = Form::zero(r);
+            Arg { src: new, view: v }
+        } else {
+            // space: cache coords ++ (t)
+            let mut sp = shape.clone();
+            sp.push(Dim::Fixed(k));
+            let mut v = View::identity(r + 1, r);
+            v.forms[axis] = Form::unit(r + 1, r);
+            let (jt, tt) = (self.sg.iota(&sp, axis), self.sg.iota(&sp, r));
+            let gathered = self.sg.comp(
+                &shape,
+                &[Dim::Fixed(k)],
+                vec![
+                    Arg { src: new, view: v },
+                    Arg {
+                        src: jt,
+                        view: View::identity(r + 1, r + 1),
+                    },
+                    Arg {
+                        src: tt,
+                        view: View::identity(r + 1, r + 1),
+                    },
+                    pos_at(r + 1),
+                ],
+                Some(super::Monoid::sum()),
+                // new row t lands at cache row j = p0 + t
+                |v| vec![pick(v[2], v[1] - v[3], v[0])],
+            )?;
+            Arg {
+                src: gathered,
+                view: View::identity(r, r),
+            }
+        };
         let iota = self.sg.iota(&shape, axis);
-        let k = self.spec.new as f64;
-        // new[j − p0] (0 outside the new rows), through a gather on `p0`
-        let gathered = View::identity(r, r).gather(axis, 2, -1).guarded();
         let args = vec![
+            row,
             Arg {
                 src: input,
                 view: View::identity(r, r),
             },
             Arg {
-                src: new,
-                view: gathered,
-            },
-            Arg {
-                src: self.pos,
-                view: View::pick(r, &[None]),
-            },
-            Arg {
                 src: iota,
                 view: View::identity(r, r),
             },
+            pos_at(r),
         ];
+        let kf = k as f64;
         let updated = self.sg.comp(&shape, &[], args, None, |v| {
-            let (old, new, p0, j) = (v[0], v[1], v[2], v[3]);
+            let (new, old, j, p0) = (v[0], v[1], v[2], v[3]);
             let half = ExprId::from_f64(0.5);
-            let lo = j - p0 + half; // j >= p0
-            let hi = p0 + ExprId::from_f64(k) - j - half; // j < p0 + k
+            let below = p0 + ExprId::from_f64(kf) - j - half; // j < p0 + k
+            let above = j - p0 + half; // j >= p0
             vec![tang_expr::with_graph(|eg| {
-                let inner = eg.select(hi, new, old);
-                eg.select(lo, inner, old)
+                let inner = eg.select(above, new, old);
+                eg.select(below, inner, old)
             })]
         })?;
         self.caches.push(CacheSlot {
@@ -417,52 +475,79 @@ impl Deriver<'_> {
         })
     }
 
-    /// Whether `c`'s body (or the body of a materialized map it reads,
-    /// recursively) has a `select` whose condition is affine in iota reads
-    /// and flips sign exactly between reduce coord `j = i` and `j = i + 1`
-    /// (point coord `i`): a causal mask.
+    /// Whether every value `c`'s body contributes is `select(cond, x, id)`
+    /// with `id` the monoid's identity and `cond` affine in iota reads,
+    /// flipping sign exactly between reduce coord `j = i` and `j = i + 1`
+    /// (point coord `i`): a causal mask whose masked elements are exactly
+    /// the identity, whatever `x` is there (an unfilled cache row may hold
+    /// NaN). A body that is a read of a materialized map is looked through.
+    /// For a max-like slot (identity −∞ or ≤ −1e30) any literal ≤ −1e30
+    /// counts: it is absorbed by the unmasked diagonal.
     fn causal_mask(&self, c: &Comp, i: usize, j: usize) -> bool {
-        let rank = c.rank();
-        let mut stack: Vec<(&ExprGraph, Vec<(TensorId, View)>)> = vec![(
-            &c.body,
-            c.args.iter().map(|a| (a.src, a.view.clone())).collect(),
-        )];
-        while let Some((body, args)) = stack.pop() {
-            for nd in body.nodes_slice() {
-                let Node::Select(cond, _, _) = *nd else {
-                    continue;
+        let Some(m) = &c.monoid else {
+            return false;
+        };
+        let args: Vec<(TensorId, View)> = c.args.iter().map(|a| (a.src, a.view.clone())).collect();
+        c.body_outs
+            .iter()
+            .enumerate()
+            .all(|(k, &out)| self.masked(&c.body, &args, c.rank(), out, m.identity[k], i, j))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn masked(
+        &self,
+        body: &ExprGraph,
+        args: &[(TensorId, View)],
+        rank: usize,
+        e: ExprId,
+        id: f64,
+        i: usize,
+        j: usize,
+    ) -> bool {
+        let nodes = body.nodes_slice();
+        match nodes[e.index() as usize] {
+            Node::Select(cond, _, f) => {
+                let Some(l) = nodes[f.index() as usize].as_f64() else {
+                    return false;
                 };
-                let Some((coefs, konst)) = self.affine(body, &args, rank, cond) else {
-                    continue;
+                let identity = l == id || (id <= -1e30 && l <= -1e30);
+                let Some((coefs, konst)) = self.affine(body, args, rank, cond) else {
+                    return false;
                 };
                 let only_ij = coefs
                     .iter()
                     .enumerate()
                     .all(|(d, &k)| k == 0.0 || d == i || d == j);
-                // value at (i, j = i + δ) is coefs[j]·δ + konst
+                // value at (i, j = i + δ) is coefs[j]·δ + konst; unmasked
+                // (cond > 0) at δ = 0, masked at δ = 1
                 let at = |delta: f64| coefs[j] * delta + konst > 0.0;
-                if only_ij && coefs[j] != 0.0 && coefs[i] == -coefs[j] && at(0.0) != at(1.0) {
-                    return true;
-                }
+                identity
+                    && only_ij
+                    && coefs[j] != 0.0
+                    && coefs[i] == -coefs[j]
+                    && at(0.0)
+                    && !at(1.0)
             }
-            // look inside materialized maps read here, views composed
-            for (src, view) in &args {
-                if let Op::Comp(m) = &self.g.nodes[src.n()].op {
-                    if m.red.is_empty() && m.tuple == 0 && !view.is_gather() {
-                        let inner = m
-                            .args
-                            .iter()
-                            .filter(|a| !a.view.is_gather())
-                            .map(|a| (a.src, a.view.compose(view, rank)))
-                            .collect::<Vec<_>>();
-                        if inner.len() == m.args.len() {
-                            stack.push((&m.body, inner));
-                        }
-                    }
+            Node::Var(v) => {
+                let Some((src, view)) = args.get(v as usize) else {
+                    return false;
+                };
+                let Op::Comp(m) = &self.g.nodes[src.n()].op else {
+                    return false;
+                };
+                if !m.red.is_empty() || m.tuple != 0 || view.is_gather() || m.has_gather() {
+                    return false;
                 }
+                let inner: Vec<(TensorId, View)> = m
+                    .args
+                    .iter()
+                    .map(|a| (a.src, a.view.compose(view, rank)))
+                    .collect();
+                self.masked(&m.body, &inner, rank, m.body_outs[0], id, i, j)
             }
+            _ => false,
         }
-        false
     }
 
     /// `e` of `body` (vars: `args`, views over a `rank`-dim space) as
@@ -512,6 +597,19 @@ impl Deriver<'_> {
             _ => None,
         }
     }
+}
+
+/// `x` where the integer-valued `a == b`, else 0 (two half-planes; the
+/// form `ir_qwen`'s gathers use, which the decode lowerings run as a
+/// one-iteration loop).
+fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
+    let half = ExprId::from_f64(0.5);
+    let (lo, hi) = (a - b + half, b - a + half);
+    tang_expr::with_graph(|eg| {
+        let z = eg.lit(0.0);
+        let inner = eg.select(hi, x, z);
+        eg.select(lo, inner, z)
+    })
 }
 
 #[cfg(test)]
@@ -564,8 +662,18 @@ mod tests {
         .unwrap()
     }
 
-    /// Single-head attention `x → softmax(q·kᵀ/√d [+ mask])·v · Wo`.
-    fn attention(g: &mut TensorGraph, x: TensorId, dm: usize, dh: usize, causal: bool) -> TensorId {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Mask {
+        /// No mask: non-causal attention.
+        None,
+        /// `s + select(j > i, −1e30, 0)` before max/exp: the textbook form.
+        Additive,
+        /// Every reduction over keys contributes `select(i − j + ½, x, id)`.
+        Select,
+    }
+
+    /// Single-head attention `x → softmax(q·kᵀ/√d)·v · Wo`, causal per `mask`.
+    fn attention(g: &mut TensorGraph, x: TensorId, dm: usize, dh: usize, mask: Mask) -> TensorId {
         let wq = g.input(&[dm, dh]);
         let wk = g.input(&[dm, dh]);
         let wv = g.input(&[dm, dh]);
@@ -578,8 +686,12 @@ mod tests {
         let kt = g.transpose(k, &[1, 0]).unwrap();
         let s = g.matmul(q, kt).unwrap();
         let scale = 1.0 / (dh as f64).sqrt();
+        if mask == Mask::Select {
+            let o = select_softmax_v(g, s, v, dh, scale);
+            return g.matmul(o, wo).unwrap();
+        }
         let mut s = g.map(&[s], |v| v[0] * lit(scale)).unwrap();
-        if causal {
+        if mask == Mask::Additive {
             let mask = causal_mask(g);
             s = g.map(&[s, mask], |v| v[0] + v[1]).unwrap();
         }
@@ -591,6 +703,77 @@ mod tests {
         let lb = g.broadcast(l, &[T, Dim::Fixed(dh)]).unwrap();
         let o = g.map(&[o, lb], |v| v[0] / v[1]).unwrap();
         g.matmul(o, wo).unwrap()
+    }
+
+    /// `softmax(s·scale)·v` with every reduction over keys `j` masked as
+    /// `select(t − j + ½, x, identity)`.
+    fn select_softmax_v(
+        g: &mut TensorGraph,
+        s: TensorId,
+        v: TensorId,
+        dh: usize,
+        scale: f64,
+    ) -> TensorId {
+        let a = |src, picks: &[Option<usize>], r| Arg {
+            src,
+            view: View::pick(r, picks),
+        };
+        let (it, ij) = (g.iota(&[T, T], 0), g.iota(&[T, T], 1));
+        let vis = |t: ExprId, j: ExprId| t - j + lit(0.5);
+        let sel = |c, x, f| tang_expr::with_graph(|eg| eg.select(c, x, f));
+        let m = g
+            .comp(
+                &[T],
+                &[T],
+                vec![
+                    a(s, &[Some(0), Some(1)], 2),
+                    a(it, &[Some(0), Some(1)], 2),
+                    a(ij, &[Some(0), Some(1)], 2),
+                ],
+                Some(Monoid::max()),
+                |v| vec![sel(vis(v[1], v[2]), v[0] * lit(scale), lit(-1e30))],
+            )
+            .unwrap();
+        let l = g
+            .comp(
+                &[T],
+                &[T],
+                vec![
+                    a(s, &[Some(0), Some(1)], 2),
+                    a(m, &[Some(0)], 2),
+                    a(it, &[Some(0), Some(1)], 2),
+                    a(ij, &[Some(0), Some(1)], 2),
+                ],
+                Some(Monoid::sum()),
+                |v| {
+                    vec![sel(
+                        vis(v[2], v[3]),
+                        (v[0] * lit(scale) - v[1]).exp(),
+                        lit(0.0),
+                    )]
+                },
+            )
+            .unwrap();
+        let sp = [T, Dim::Fixed(dh), T];
+        let (it3, ij3) = (g.iota(&sp, 0), g.iota(&sp, 2));
+        g.comp(
+            &[T, Dim::Fixed(dh)],
+            &[T],
+            vec![
+                a(s, &[Some(0), Some(2)], 3),
+                a(m, &[Some(0)], 3),
+                a(l, &[Some(0)], 3),
+                a(v, &[Some(2), Some(1)], 3),
+                a(it3, &[Some(0), Some(1), Some(2)], 3),
+                a(ij3, &[Some(0), Some(1), Some(2)], 3),
+            ],
+            Some(Monoid::sum()),
+            |v| {
+                let pv = (v[0] * lit(scale) - v[1]).exp() * v[3] / v[2];
+                vec![sel(vis(v[4], v[5]), pv, lit(0.0))]
+            },
+        )
+        .unwrap()
     }
 
     fn rmsnorm(g: &mut TensorGraph, x: TensorId, dm: usize) -> TensorId {
@@ -616,18 +799,18 @@ mod tests {
 
     /// `layers` pre-norm blocks: `x += attn(norm(x)); x += mlp(norm(x))`.
     /// With `layers == 0`, one bare attention layer.
-    fn model(layers: usize, causal: bool) -> (TensorGraph, TensorId) {
+    fn model(layers: usize, mask: Mask) -> (TensorGraph, TensorId) {
         let (dm, dh, df) = (6, 4, 8);
         let mut g = TensorGraph::new();
         let x = g.input(&[T, Dim::Fixed(dm)]);
         if layers == 0 {
-            let y = attention(&mut g, x, dm, dh, causal);
+            let y = attention(&mut g, x, dm, dh, mask);
             return (g, y);
         }
         let mut h = x;
         for _ in 0..layers {
             let n = rmsnorm(&mut g, h, dm);
-            let a = attention(&mut g, n, dm, dh, causal);
+            let a = attention(&mut g, n, dm, dh, mask);
             h = g.map(&[h, a], |v| v[0] + v[1]).unwrap();
             let n = rmsnorm(&mut g, h, dm);
             let f = mlp(&mut g, n, dm, df);
@@ -690,11 +873,20 @@ mod tests {
             .collect()
     }
 
+    /// Worst `|a − b| / (1 + |b|)`; a NaN or infinity anywhere is ∞ (a
+    /// plain `f64::max` fold would skip NaN).
     fn max_err(a: &[f64], b: &[f64]) -> f64 {
         assert_eq!(a.len(), b.len());
         a.iter()
             .zip(b)
-            .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
+            .map(|(x, y)| {
+                let e = (x - y).abs() / (1.0 + y.abs());
+                if e.is_finite() {
+                    e
+                } else {
+                    f64::INFINITY
+                }
+            })
             .fold(0.0, f64::max)
     }
 
@@ -720,7 +912,7 @@ mod tests {
         let mut worst = 0.0f64;
         let mut pos = p0;
         // cache buffers keyed by prefill node, `cap` rows; unfilled rows hold
-        // junk, which the derived mask must hide
+        // NaN, which the derived masks must keep out
         let mut caches: HashMap<TensorId, Vec<f64>> = HashMap::new();
         for &k in ks {
             let spec = StepSpec {
@@ -736,7 +928,7 @@ mod tests {
                 for (c, v) in step.caches.iter().zip(vals) {
                     let shape = concrete(g.shape(c.node), pos);
                     let cshape = concrete(g.shape(c.node), cap);
-                    let mut buf = vec![7.0; cshape.iter().product()];
+                    let mut buf = vec![f64::NAN; cshape.iter().product()];
                     // scatter rows 0..pos into the capacity buffer
                     let inner: usize = shape[c.axis + 1..].iter().product();
                     let outer: usize = shape[..c.axis].iter().product();
@@ -825,41 +1017,54 @@ mod tests {
             .collect()
     }
 
-    fn prepared(layers: usize, causal: bool, stable: bool) -> (TensorGraph, Vec<TensorId>) {
-        let (g, y) = model(layers, causal);
-        let (g, outs) = g.substitute_maps(&[y]);
-        if stable {
-            g.stabilize_softmax(&outs)
-        } else {
-            (g, outs)
+    /// How the graph is prepared before deriving.
+    #[derive(Clone, Copy, Debug)]
+    enum Prep {
+        /// As built.
+        Raw,
+        /// After `substitute_maps`.
+        Fused,
+        /// After `substitute_maps` and `stabilize_softmax`.
+        Online,
+    }
+
+    fn prepared(layers: usize, mask: Mask, prep: Prep) -> (TensorGraph, Vec<TensorId>) {
+        let (g, y) = model(layers, mask);
+        match prep {
+            Prep::Raw => (g, vec![y]),
+            Prep::Fused => g.substitute_maps(&[y]),
+            Prep::Online => {
+                let (g, outs) = g.substitute_maps(&[y]);
+                g.stabilize_softmax(&outs)
+            }
+        }
+    }
+
+    fn spec(k: usize) -> StepSpec {
+        StepSpec {
+            seq: "T",
+            new: k,
+            capacity: 16,
         }
     }
 
     #[test]
     fn attention_step_matches_prefill() {
-        for stable in [false, true] {
-            let (g, outs) = prepared(0, true, stable);
-            let step = derive_step(
-                &g,
-                &outs,
-                &StepSpec {
-                    seq: "T",
-                    new: 1,
-                    capacity: 16,
-                },
-            )
-            .unwrap();
+        for prep in [Prep::Raw, Prep::Fused, Prep::Online] {
+            let (g, outs) = prepared(0, Mask::Select, prep);
+            let step = derive_step(&g, &outs, &spec(1)).unwrap();
             let caches = describe(&g, &step);
-            eprintln!("attention (online softmax: {stable}) caches: {caches:#?}");
+            eprintln!("attention ({prep:?}) caches: {caches:#?}");
             // K and V, [T, dh]: nothing else is read at old rows
             assert_eq!(caches.len(), 2, "{caches:?}");
-            assert!(step
-                .caches
-                .iter()
-                .all(|c| g.shape(c.node) == [T, Dim::Fixed(4)]));
+            // (as built, K is cached as the author's transposed `kᵀ`)
+            assert!(step.caches.iter().all(|c| {
+                let sh = g.shape(c.node);
+                sh.len() == 2 && sh.contains(&T) && sh.contains(&Dim::Fixed(4))
+            }));
             for k in [1usize, 4] {
                 let e = check_steps(&g, &outs, 5, &[k]);
-                eprintln!("attention stable={stable} k={k}: max rel err {e:.2e}");
+                eprintln!("attention {prep:?} k={k}: max rel err {e:.2e}");
                 assert!(e < 1e-12, "k={k}: {e}");
             }
         }
@@ -868,7 +1073,7 @@ mod tests {
     #[test]
     fn chained_steps_feed_the_cache_back() {
         // prefill 3, verify a 4-token window, then decode one at a time
-        let (g, outs) = prepared(0, true, false);
+        let (g, outs) = prepared(0, Mask::Select, Prep::Raw);
         let e = check_steps(&g, &outs, 3, &[4, 1, 1, 2]);
         eprintln!("chained: max rel err {e:.2e}");
         assert!(e < 1e-12, "{e}");
@@ -876,24 +1081,15 @@ mod tests {
 
     #[test]
     fn two_layer_stack_caches_k_and_v_per_layer() {
-        for stable in [false, true] {
-            let (g, outs) = prepared(2, true, stable);
-            let step = derive_step(
-                &g,
-                &outs,
-                &StepSpec {
-                    seq: "T",
-                    new: 1,
-                    capacity: 16,
-                },
-            )
-            .unwrap();
+        for prep in [Prep::Raw, Prep::Fused, Prep::Online] {
+            let (g, outs) = prepared(2, Mask::Select, prep);
+            let step = derive_step(&g, &outs, &spec(1)).unwrap();
             let caches = describe(&g, &step);
-            eprintln!("2 layers (online softmax: {stable}) caches: {caches:#?}");
+            eprintln!("2 layers ({prep:?}) caches: {caches:#?}");
             assert_eq!(caches.len(), 4, "{caches:?}");
             for ks in [&[1usize][..], &[4], &[4, 1, 1]] {
                 let e = check_steps(&g, &outs, 5, ks);
-                eprintln!("2 layers stable={stable} ks={ks:?}: max rel err {e:.2e}");
+                eprintln!("2 layers {prep:?} ks={ks:?}: max rel err {e:.2e}");
                 assert!(e < 1e-12, "{ks:?}: {e}");
             }
         }
@@ -903,25 +1099,23 @@ mod tests {
     /// cache rows one off and masks one key too many.
     #[test]
     fn wrong_position_is_caught() {
-        let (g, outs) = prepared(0, true, false);
+        let (g, outs) = prepared(0, Mask::Select, Prep::Raw);
         let e = check_steps_skewed(&g, &outs, 5, &[1], 1);
         eprintln!("skewed position: max rel err {e:.2e}");
         assert!(e > 1e-3, "{e}");
     }
 
+    /// Without a mask, or with an additive one (whose `0·NaN` would read
+    /// an unfilled cache row), there is no step.
     #[test]
-    fn non_causal_attention_has_no_step() {
-        let (g, outs) = prepared(0, false, false);
-        let r = derive_step(
-            &g,
-            &outs,
-            &StepSpec {
-                seq: "T",
-                new: 1,
-                capacity: 16,
-            },
-        );
-        let msg = r.err().expect("non-causal attention must be refused").0;
-        assert!(msg.contains("causal"), "{msg}");
+    fn unmasked_and_additive_attention_have_no_step() {
+        for mask in [Mask::None, Mask::Additive] {
+            for prep in [Prep::Raw, Prep::Fused] {
+                let (g, outs) = prepared(0, mask, prep);
+                let r = derive_step(&g, &outs, &spec(1));
+                let msg = r.err().expect("must be refused").0;
+                assert!(msg.contains("causal"), "{mask:?} {prep:?}: {msg}");
+            }
+        }
     }
 }
