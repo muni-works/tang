@@ -168,6 +168,10 @@ impl St {
                 .collect(),
             "F8_E4M3" => b[r0 * cols..r1 * cols].iter().map(|&v| e4m3(v)).collect(),
             "F8_E8M0" => b[r0 * cols..r1 * cols].iter().map(|&v| e8m0(v)).collect(),
+            "I64" => b[r0 * cols * 8..r1 * cols * 8]
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f64)
+                .collect(),
             "I8" | "U8" => b[r0 * cols / 2..r1 * cols / 2]
                 .iter()
                 .flat_map(|&v| [fp4(v & 0xF), fp4(v >> 4)])
@@ -274,6 +278,17 @@ pub fn dims_from_config(
         eps: f("norm_eps"),
         ctx,
         expert_rows,
+        candidate_source: layer_ids
+            .iter()
+            .position(|&l| l as u64 == c["candidate_source_layer"].as_u64().unwrap_or(u64::MAX)),
+        candidate_topk_blocks: u("candidate_topk_blocks"),
+        candidate_block_size: u("candidate_block_size"),
+        engram_layers: at(&list("engram_layer_ids")),
+        engram_cols: (u("engram_max_ngram_size") - 1) * u("engram_n_heads"),
+        engram_head_dim: u("engram_head_dim"),
+        // a real run binds the rows its hashes hit (see `engram_tables`)
+        engram_rows: 0,
+        dspark_targets: at(&list("dspark_target_layer_ids")),
     }
 }
 
@@ -352,7 +367,12 @@ impl RealRun {
         let mut out = HashMap::new();
         for i in inputs {
             let n = i.name.as_str();
-            if n == "tokens" || n.contains(".ffn.experts.") || n.ends_with(".ffn.expert_slot") {
+            if n == "tokens"
+                || n.contains(".ffn.experts.")
+                || n.ends_with(".ffn.expert_slot")
+                || n.ends_with(".engram.hash")
+                || n.ends_with(".engram.embed.weight")
+            {
                 continue;
             }
             let shape: Vec<usize> = i.shape.iter().map(|d| d.n()).collect();
@@ -385,6 +405,53 @@ impl RealRun {
             out.insert(i.name.clone(), v);
         }
         Ok(out)
+    }
+
+    /// The Engram inputs of `ids` (checkpoint token ids, the whole run):
+    /// per graph Engram layer, its hashes `[T · cols]` as rows of the
+    /// compact table and the table itself, `(name, values)`, plus the
+    /// table's row count. The compact table holds the rows
+    /// `scripts/ds-fetch-engram-rows.py` fetched (hashed there by the
+    /// Python reference); a hash this side computes that it lacks is an
+    /// error, so the two hashings must agree.
+    #[allow(clippy::type_complexity)]
+    pub fn engram_inputs(&self, ids: &[usize]) -> Result<(Vec<(String, Vec<f64>)>, usize), String> {
+        let ckpt: Vec<usize> = self.cfg["engram_layer_ids"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_u64().unwrap() as usize).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        let mut rows = 0;
+        for (i, &l) in self.layer_ids.iter().enumerate() {
+            let Some(j) = ckpt.iter().position(|&e| e == l) else {
+                continue;
+            };
+            let meta =
+                crate::ir_ds_prefill::EngramMeta::load(&Path::new(&ds_dir()).join("engram.json"))?;
+            let have: Vec<i64> = self
+                .st
+                .f64(&format!("layers.{l}.engram.row_ids"))?
+                .into_iter()
+                .map(|v| v as i64)
+                .collect();
+            let hs: Vec<f64> = meta.hashes(ids)[j]
+                .iter()
+                .flatten()
+                .map(|h| {
+                    have.binary_search(h)
+                        .map(|r| r as f64)
+                        .map_err(|_| format!("layer {l}: hash row {h} not fetched"))
+                })
+                .collect::<Result<_, _>>()?;
+            let table = self.st.f64(&format!("layers.{l}.engram.embed.weight"))?;
+            if rows != 0 && rows != have.len() {
+                return Err("Engram layers with different fetched row counts".into());
+            }
+            rows = have.len();
+            out.push((format!("layers.{i}.engram.hash"), hs));
+            out.push((format!("layers.{i}.engram.embed.weight"), table));
+        }
+        Ok((out, rows))
     }
 
     /// Expert `e` of graph layer `l`: `(w1 [inter, d], w3 [inter, d], w2 [d, inter])`.
@@ -575,7 +642,15 @@ mod tests {
             .unwrap_or(3);
         let toks = run.rows_of(&prompt(t_pre + 1));
         let ctx = 8.max(t_pre + 1);
-        let dm0 = dims_from_config(&run.cfg, &run.layer_ids, run.vocab_ids.len(), 0, ctx);
+        let mut dm0 = dims_from_config(&run.cfg, &run.layer_ids, run.vocab_ids.len(), 0, ctx);
+        let (engram, erows) = run.engram_inputs(&prompt(t_pre + 1)).unwrap();
+        dm0.engram_rows = erows;
+        if !engram.is_empty() {
+            eprintln!(
+                "engram: graph layers {:?}, {erows} table rows bound (of the host-resident table)",
+                dm0.engram_layers
+            );
+        }
         eprintln!(
             "real dims: layers {:?} (ratios {:?}), d {}, {} heads x {}, experts {} top {}, vocab rows {}",
             run.layer_ids,
@@ -590,6 +665,7 @@ mod tests {
         let t0 = Instant::now();
         let pg0 = prefill_graph(&dm0);
         let mut w = run.dense_inputs(&pg0.inputs, &dm0).unwrap();
+        w.extend(engram);
         eprintln!(
             "dense inputs: {} tensors, {:.2} G values, {:.1?}",
             w.len(),
@@ -636,12 +712,18 @@ mod tests {
             run.expert_tables(l, u, rows, &dm, &mut w);
         }
         // the graph's inputs, moved out of `w` (one copy of the weights)
+        let mut hashes: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut base: Vec<Vec<f64>> = pg
             .inputs
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 if s.name == "tokens" {
                     toks[..t_pre].to_vec()
+                } else if s.name.ends_with(".engram.hash") {
+                    let c = s.shape[1].n();
+                    hashes.insert(i, w[&s.name].clone());
+                    w[&s.name][..t_pre * c].to_vec()
                 } else {
                     w.remove(&s.name)
                         .unwrap_or_else(|| panic!("no input {}", s.name))
@@ -709,7 +791,13 @@ mod tests {
             .iter()
             .map(|&si| match si {
                 StepInput::Pos => vec![t_pre as f64],
-                StepInput::New(_) => toks[t_pre..t_pre + 1].to_vec(),
+                StepInput::New(i) => match hashes.get(&i) {
+                    Some(h) => {
+                        let c = pg.inputs[i].shape[1].n();
+                        h[t_pre * c..(t_pre + 1) * c].to_vec()
+                    }
+                    None => toks[t_pre..t_pre + 1].to_vec(),
+                },
                 StepInput::Same(i) => std::mem::take(&mut base[i]),
                 StepInput::Cache(c) => caches[c].clone(),
             })
