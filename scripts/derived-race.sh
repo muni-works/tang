@@ -49,11 +49,13 @@ fi
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv | tee "$OUT/gpu.txt"
-git log --oneline -1 | tee "$OUT/commit.txt"
+# (a copy without .git, e.g. rsynced, has no commit to name)
+{ git log --oneline -1 2>/dev/null || echo "no git checkout"; } | tee "$OUT/commit.txt"
 
 log "weights: mlx-community/Qwen3-8B-4bit -> $MODEL_DIR"
 if [ ! -f "$MODEL_DIR/model.safetensors" ]; then
-  python3 -m pip install -q "huggingface_hub[hf_transfer]"
+  # the RunPod PyTorch image's system Python is "externally managed"
+  PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install -q "huggingface_hub[hf_transfer]"
   export HF_HUB_ENABLE_HF_TRANSFER=1
   if command -v hf >/dev/null; then
     hf download mlx-community/Qwen3-8B-4bit --local-dir "$MODEL_DIR"
@@ -73,8 +75,9 @@ BIN=target/release/examples/qwen_decode
 log "tiny: GPU vs interpreter"
 for kv in f16 f32; do
   if [ "$kv" = f32 ]; then export TANG_KV_F32=1; else unset TANG_KV_F32; fi
-  "$BIN" tiny 2>&1 | tee "$OUT/tiny-hand-$kv.txt" | tail -2
-  "$BIN" tiny --derived 2>&1 | tee "$OUT/tiny-derived-$kv.txt" | tail -2
+  # a failed check is reported and the race goes on
+  "$BIN" tiny 2>&1 | tee "$OUT/tiny-hand-$kv.txt" | tail -2 || echo "tiny hand $kv: exit status nonzero"
+  "$BIN" tiny --derived 2>&1 | tee "$OUT/tiny-derived-$kv.txt" | tail -2 || echo "tiny derived $kv: exit status nonzero"
 done
 unset TANG_KV_F32
 
@@ -99,7 +102,7 @@ log "summary"
   echo "tiny (worst relative logit error, GPU vs interpreter):"
   for kv in f16 f32; do
     for kind in hand derived; do
-      printf '  %-8s %s: %s\n' "$kind" "$kv" "$(grep -E '^tiny' "$OUT/tiny-$kind-$kv.txt" | tail -1)"
+      printf '  %-8s %s: %s\n' "$kind" "$kv" "$(grep -E '^tiny' "$OUT/tiny-$kind-$kv.txt" | tr '\n' ' ')"
     done
   done
   echo

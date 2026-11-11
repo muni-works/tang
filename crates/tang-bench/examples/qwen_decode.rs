@@ -401,9 +401,12 @@ fn tiny() {
     // f16 caches: a one-ulp flip of a cached value moves the logits by
     // about 1e-4 of their scale
     let tol = if dims.kv_f16 { 1e-3 } else { 1e-4 };
-    assert!(
-        worst < tol && perr < tol && cache_ulps.max(pre_ulps) <= 1.0,
-        "the GPU disagrees with the interpreter"
+    let ptol = window_tol(&rt, tol);
+    report_tiny(
+        "tiny",
+        worst < tol && perr < ptol && cache_ulps.max(pre_ulps) <= 1.0,
+        tol,
+        ptol,
     );
 }
 
@@ -512,10 +515,42 @@ fn tiny_derived() {
         if dims.kv_f16 { "f16 caches" } else { "f32 caches" }
     );
     let tol = if dims.kv_f16 { 1e-3 } else { 1e-4 };
-    assert!(
-        worst < tol && werr < tol,
-        "the GPU disagrees with the interpreter"
+    let wtol = window_tol(&rt, tol);
+    report_tiny("tiny --derived", worst < tol && werr < wtol, tol, wtol);
+}
+
+/// Tolerance of a prefill / window step's logits against the interpreter.
+/// On CUDA its projections are f16 tensor-core tiles (`compiled_decode`
+/// stores the dequantized weights f16, and the tile stages the f32
+/// activations as f16) unless `TANG_PREFILL_TF32` is set; the reference is
+/// the f32 graph, so each weight and activation carries an f16 rounding
+/// (2⁻¹¹ relative): a few 1e-4 of the logit scale even with f32 caches
+/// (RTX PRO 6000: 2e-4 hand, 5.6e-4 derived). Decode has no tiles and keeps
+/// the decode tolerance.
+fn window_tol(rt: &Runtime, decode_tol: f64) -> f64 {
+    let f16_tiles =
+        rt.kind() == BackendKind::Cuda && std::env::var_os("TANG_PREFILL_TF32").is_none();
+    if f16_tiles {
+        decode_tol.max(1e-3)
+    } else {
+        decode_tol
+    }
+}
+
+/// The verdict of a `tiny` check: a line, and exit status 1 on failure
+/// (after printing, so a script can carry on to its next check).
+fn report_tiny(name: &str, ok: bool, tol: f64, window_tol: f64) {
+    println!(
+        "{name}: {} (tolerance {tol:.0e} decode, {window_tol:.0e} prefill/window)",
+        if ok {
+            "PASS"
+        } else {
+            "FAIL: the GPU disagrees with the interpreter"
+        }
     );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 fn argmax_f64(v: &[f64]) -> usize {
