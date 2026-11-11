@@ -114,6 +114,9 @@ pub struct RealStep {
     pub f32_inputs: Vec<String>,
     /// `(updated cache, step input)` pairs written in place.
     pub inplace: Vec<(tang_compile::tensor::TensorId, usize)>,
+    /// The residual stream's nodes in `graph`, layer order (kept
+    /// materialized).
+    pub residual: Vec<tang_compile::tensor::TensorId>,
 }
 
 /// The derived step with its weights stored as the GGUF stores them where
@@ -189,10 +192,13 @@ pub fn lower_real_step_with(
     // for Qwen3): a [k, d] map read by several kernels would otherwise be
     // substituted into each reader, every layer's norm recomputing the
     // whole stream back to the (gathered) embedding
-    keep.extend(residual_stream(&graph, pg));
+    let rs = residual_stream(&graph, pg);
+    let r0 = keep.len();
+    keep.extend(&rs);
     let (graph, keep) = graph.substitute_maps(&keep);
     let (mut graph, keep) = graph.eliminate_common(&keep);
     let outs = keep[..n].to_vec();
+    let residual = keep[r0..].to_vec();
     let storage: Vec<Option<Format>> = (0..st.inputs.len())
         .map(|k| {
             let s = graph.nodes()[input_node(&graph, k).index()]
@@ -248,6 +254,7 @@ pub fn lower_real_step_with(
         storage,
         f32_inputs,
         inplace: opts.inplace,
+        residual,
     }
 }
 
