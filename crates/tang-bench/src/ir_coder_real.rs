@@ -151,6 +151,11 @@ pub fn lower_real_step(
     let n = outs.len();
     let mut keep = outs.clone();
     keep.extend(&sched.copies);
+    // the residual stream stays materialized (as `DecodeGraph::keep` does
+    // for Qwen3): a [k, d] map read by several kernels would otherwise be
+    // substituted into each reader, every layer's norm recomputing the
+    // whole stream back to the (gathered) embedding
+    keep.extend(residual_stream(&graph, pg));
     let (graph, keep) = graph.substitute_maps(&keep);
     let (graph, keep) = graph.eliminate_common(&keep);
     let outs = keep[..n].to_vec();
@@ -193,6 +198,43 @@ pub fn lower_real_step(
         f32_inputs,
         inplace: opts.inplace,
     }
+}
+
+/// The maps of shape `[k, d_model]` read by more than one comp: the
+/// residual stream of the step.
+fn residual_stream(
+    g: &tang_compile::tensor::TensorGraph,
+    pg: &CoderPrefill,
+) -> Vec<tang_compile::tensor::TensorId> {
+    let dm = pg
+        .inputs
+        .iter()
+        .find(|i| i.name == "token_embd.weight")
+        .map(|i| i.shape[1].n())
+        .unwrap();
+    let n = g.nodes().len();
+    let mut readers = vec![0usize; n];
+    for i in 0..n {
+        if let Some(c) = g.comp_at(i) {
+            let mut seen = Vec::new();
+            for a in &c.args {
+                if !seen.contains(&a.src.index()) {
+                    seen.push(a.src.index());
+                    readers[a.src.index()] += 1;
+                }
+            }
+        }
+    }
+    (0..n)
+        .filter(|&i| {
+            g.comp_at(i)
+                .is_some_and(|c| c.red.is_empty() && c.monoid.is_none())
+                && g.nodes()[i].shape.len() == 2
+                && g.nodes()[i].shape[1].n() == dm
+                && readers[i] >= 2
+        })
+        .map(tang_compile::tensor::TensorId::from_index)
+        .collect()
 }
 
 #[cfg(test)]
