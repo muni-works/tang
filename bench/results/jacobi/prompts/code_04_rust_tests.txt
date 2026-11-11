@@ -1,0 +1,28 @@
+pub fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "ms" => Some(n),
+        "s" => Some(n * 1000),
+        "m" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_milliseconds() {
+        assert_eq!(parse_duration("250ms"), Some(250));
+    }
+
+    #[test]
+    fn parses_seconds() {
+        assert_eq!(parse_duration("3s"), Some(3000));
+    }
+
+    #[test]
