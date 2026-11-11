@@ -125,9 +125,36 @@ pub fn lower_real_step(
     st: &tang_compile::tensor::step::StepGraph,
     tys: &[Option<GgmlType>],
 ) -> RealStep {
+    lower_real_step_with(pg, st, tys, &RealOpts::default())
+}
+
+/// Options of [`lower_real_step_with`]: a batched step
+/// ([`derived_step_batched`](crate::ir_coder_prefill::derived_step_batched)).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RealOpts {
+    /// Streams the step's batch dim `B` is bound to (`None`: an unbatched
+    /// step).
+    pub batch: Option<usize>,
+    /// Routed experts grouped by expert from this many (stream, slot)
+    /// positions (`schedule_expert_groups`; 0: never).
+    pub group: usize,
+    /// Stages of the int8 contractions by their positions.
+    pub block: tang_compile::tensor::int8_sched::BlockOpts,
+}
+
+/// [`lower_real_step`] with [`RealOpts`].
+pub fn lower_real_step_with(
+    pg: &CoderPrefill,
+    st: &tang_compile::tensor::step::StepGraph,
+    tys: &[Option<GgmlType>],
+    ro: &RealOpts,
+) -> RealStep {
     use tang_compile::tensor::step::StepInput;
     use tang_compile::tensor::{Op, Precision};
-    let mut graph = st.graph.clone();
+    let mut graph = match ro.batch {
+        Some(b) => st.graph.bind(&[("B", b)]).expect("bind the batch dim"),
+        None => st.graph.clone(),
+    };
     let input_node = |g: &tang_compile::tensor::TensorGraph, k: usize| {
         (0..g.nodes().len())
             .find(|&i| matches!(g.nodes()[i].op, Op::Input(j) if j == k))
@@ -147,7 +174,14 @@ pub fn lower_real_step(
     }
     let mut outs = st.outputs.clone();
     outs.extend(st.caches.iter().map(|c| c.updated));
-    let (graph, outs, sched) = graph.schedule_block_weights(&outs);
+    let (graph, outs) = if ro.group > 0 {
+        let (g, o, eg) = graph.schedule_expert_groups(&outs, ro.group);
+        eprintln!("expert groups: {} routed contractions sorted by expert", eg.grouped.len());
+        (g, o)
+    } else {
+        (graph, outs)
+    };
+    let (graph, outs, sched) = graph.schedule_block_weights_with(&outs, &ro.block);
     let n = outs.len();
     let mut keep = outs.clone();
     keep.extend(&sched.copies);
@@ -257,8 +291,9 @@ pub(crate) fn residual_stream(
             g.comp_at(i)
                 .is_some_and(|c| c.red.is_empty() && c.monoid.is_none() && is_add(c))
                 && g.nodes()[i].precision.storage == tang_compile::tensor::Format::F32
-                && g.nodes()[i].shape.len() == 2
-                && g.nodes()[i].shape[1].n() == dm
+                // `[k, d]`, or `[B, k, d]` in a batched step
+                && (2..=3).contains(&g.nodes()[i].shape.len())
+                && g.nodes()[i].shape.last().unwrap().n() == dm
                 && readers[i] >= 2
         })
         .map(tang_compile::tensor::TensorId::from_index)

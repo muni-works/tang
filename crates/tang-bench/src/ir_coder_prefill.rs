@@ -866,6 +866,30 @@ pub fn derived_step(pg: &CoderPrefill, k: usize, capacity: usize) -> Result<Step
     .map_err(|e| e.0)
 }
 
+/// The batched `T → T + 1` step: [`batch_graph`] adds a leading dim `B` of
+/// independent streams, each at its own length (its `p0` an element of the
+/// `[B]` position input).
+///
+/// [`batch_graph`]: tang_compile::tensor::step::batch_graph
+pub fn derived_step_batched(pg: &CoderPrefill, capacity: usize) -> Result<StepGraph, String> {
+    use tang_compile::tensor::step::{batch_graph, derive_step_with, Rows, StepOptions};
+    let (bg, outs) = batch_graph(&pg.g, &[pg.logits], SEQ, "B").map_err(|e| e.0)?;
+    derive_step_with(
+        &bg,
+        &outs,
+        &StepSpec {
+            seq: SEQ,
+            new: 1,
+            capacity,
+        },
+        &StepOptions {
+            rows: Rows::All,
+            batch: Some("B"),
+        },
+    )
+    .map_err(|e| e.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
