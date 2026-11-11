@@ -55,8 +55,8 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 cargo_args() {
   case "$1" in
-    cpu) echo "build --release -p tang-llm --target $triple" ;;
-    cuda) echo "build --release -p tang-llm --no-default-features --features cuda --target $triple" ;;
+    cpu) echo "build --release --locked -p tang-llm --target $triple" ;;
+    cuda) echo "build --release --locked -p tang-llm --no-default-features --features cuda --target $triple" ;;
     *) echo "release-linux: unknown variant $1" >&2; exit 2 ;;
   esac
 }
