@@ -241,6 +241,32 @@ impl DerivedCoder {
             me.write_params(s);
             me.clear_slot(s);
         }
+        // where a token's time goes: the step graph on the device, the cache copies, and
+        // the host side of a step (two input writes, one token read)
+        {
+            let p = &me.slots[0].prog;
+            let dev = p.time(&me.rt, 20);
+            let t = Instant::now();
+            for _ in 0..20 {
+                for &(k, upd) in &me.swaps {
+                    p.copy(&me.rt, p.input(k), p, upd);
+                }
+            }
+            let _ = me.token(0);
+            let copies = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            let t = Instant::now();
+            for i in 0..20 {
+                me.enqueue(0, 0, i)?;
+                let _ = me.token(0);
+            }
+            let wall = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            me.clear_slot(0);
+            eprintln!(
+                "coder derived: step {dev:.3} ms device, {} cache copies {copies:.3} ms, \
+                 enqueue + token read {wall:.3} ms wall a token",
+                me.swaps.len()
+            );
+        }
         let kv_mb: usize = me.rows.iter().map(|&(_, w)| w * ctx * 4).sum::<usize>() >> 20;
         eprintln!(
             "coder derived: {} slot(s), ctx {ctx}, {ncache} caches ({kv_mb} MB of K/V a slot), graphs {}, ready in {:.1} s",
