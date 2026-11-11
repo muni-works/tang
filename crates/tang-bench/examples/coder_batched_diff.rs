@@ -68,6 +68,16 @@ fn main() {
             .iter()
             .map(|&t| format!("{:?}", low.graph.nodes()[t.index()].shape))
             .collect();
+        // the routers' top-k (expert, p) pairs: tuple comps over `[.., 2k]`
+        let kk = 2 * dims.n_expert_used;
+        let tops: Vec<tang_compile::tensor::TensorId> = (0..low.graph.nodes().len())
+            .filter(|&i| {
+                low.graph.comp_at(i).is_some_and(|c| {
+                    c.tuple != 0 && c.out.last().and_then(|d| d.fixed()) == Some(kk)
+                })
+            })
+            .map(tang_compile::tensor::TensorId::from_index)
+            .collect();
         let prog = Program::new(&rt, low.program.program, &empty);
         for (k, si) in st.inputs.iter().enumerate() {
             match *si {
@@ -87,7 +97,8 @@ fn main() {
         prog.run(&rt);
         let r: Vec<Vec<f32>> = res.iter().map(|&t| prog.read(&rt, t)).collect();
         let l = prog.read(&rt, out0);
-        sides.push((r, l, names));
+        let tk: Vec<Vec<f32>> = tops.iter().map(|&t| prog.read(&rt, t)).collect();
+        sides.push((r, l, names, tk));
         drop(prog);
     }
     let rel = |a: &[f32], b: &[f32]| {
@@ -104,4 +115,23 @@ fn main() {
         println!("  residual {i:3} {}: rel {:.2e}", a.2[i], rel(y, x));
     }
     println!("logits rel {:.2e}", rel(&b.1, &a.1));
+    println!("routers: {} vs {}", a.3.len(), b.3.len());
+    let k = dims.n_expert_used;
+    for (l, (x, y)) in a.3.iter().zip(&b.3).enumerate() {
+        for s in 0..x.len() / (2 * k) {
+            let ids = |v: &[f32]| {
+                let mut i: Vec<i64> = (0..k).map(|j| v[s * 2 * k + 2 * j] as i64).collect();
+                i.sort();
+                i
+            };
+            let (ix, iy) = (ids(x), ids(y));
+            if ix != iy {
+                let p = |v: &[f32], j: usize| v[s * 2 * k + 2 * j + 1];
+                println!(
+                    "  router {l} stream {s}: experts differ {ix:?} vs {iy:?}; p at the cut {:.6e} / {:.6e} (A), {:.6e} / {:.6e} (B)",
+                    p(x, k - 2), p(x, k - 1), p(y, k - 2), p(y, k - 1)
+                );
+            }
+        }
+    }
 }
