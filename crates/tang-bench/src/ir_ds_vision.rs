@@ -646,6 +646,17 @@ pub struct EncoderGraph {
     pub out: TensorId,
     /// The ViT output (after the final norm), `[N, dim]`.
     pub vit: TensorId,
+    /// The residual stream after each sublayer: a device lowering takes
+    /// these as outputs too (see [`EncoderGraph::lower_outputs`]).
+    pub keep: Vec<TensorId>,
+}
+
+impl EncoderGraph {
+    /// `[out, keep…]`: what a device lowering should materialize. The
+    /// aligner output is first.
+    pub fn lower_outputs(&self) -> Vec<TensorId> {
+        std::iter::once(self.out).chain(self.keep.iter().copied()).collect()
+    }
 }
 
 struct E {
@@ -976,6 +987,10 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
     let pw = e.input("vision.patch_embed.proj.weight".into(), &[c, vd.patch_len()]);
     let pb = e.input("vision.patch_embed.proj.bias".into(), &[c]);
     let mut x = e.linear(patches, pw, Some(pb));
+    // the residual stream, layer by layer: lowered as extra outputs so it
+    // is written out — fused into its readers (each reads it once per
+    // element), layer L would re-add every earlier layer's output
+    let mut keep = vec![x];
     for l in 0..vd.n_layers {
         let p = format!("vision.blocks.{l}");
         let n1 = e.input(format!("{p}.norm1.weight"), &[c]);
@@ -993,6 +1008,7 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         let o = e.attention(q, k, qkv, 2 * c, h, hd);
         let a = e.linear(o, wo, Some(bo));
         x = e.add(x, a);
+        keep.push(x);
         let xn = e.rms(x, n2, vd.eps);
         let gu = e.linear(xn, w1, None);
         let act = e
@@ -1010,6 +1026,7 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
             .unwrap();
         let m = e.linear(act, w2, None);
         x = e.add(x, m);
+        keep.push(x);
     }
     let nw = e.input("vision.norm.weight".into(), &[c]);
     let vit = e.rms(x, nw, vd.eps);
@@ -1053,6 +1070,7 @@ pub fn encoder_graph(vd: &VisionDims, n_h: usize, n_w: usize) -> EncoderGraph {
         inputs: e.inputs,
         out,
         vit,
+        keep,
     }
 }
 
@@ -1073,36 +1091,27 @@ pub fn prefill_schedule(g: &TensorGraph, outs: &[TensorId], bf16: Bf16) -> (Tens
     let (g, o) = g.merge_reduce_dims(&o);
     let (mut g, o) = g.split_reduce_dims(&o);
     g.schedule_auto(&o);
-    // maps read only by tensor-core tiles are recomputed while the tile
-    // stages its operand (RMSNorm's apply, SwiGLU, rope) instead of
-    // written and read back (`VISION_INLINE_MAPS=0`: keep them)
-    if std::env::var("VISION_INLINE_MAPS").as_deref() != Ok("0") {
+    // an inlined map with several readers is recomputed in each — and the
+    // residual stream `x + a` inlined layer after layer makes every
+    // reader re-add the whole chain: write those out
+    {
         let n = g.nodes().len();
-        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut readers = vec![0usize; n];
         for j in 0..n {
             if let Op::Comp(c) = &g.nodes()[j].op {
                 for a in &c.args {
-                    readers[a.src.index()].push(j);
+                    readers[a.src.index()] += 1;
                 }
             }
         }
-        let tiled = |j: usize| {
-            let nd = &g.nodes()[j];
-            nd.tile != (0, 0, 0) || matches!(&nd.op, Op::Comp(c) if c.monoid.is_some() && c.tuple == 1)
-        };
-        let maps: Vec<usize> = (0..n)
+        let shared: Vec<usize> = (0..n)
             .filter(|&i| {
                 let nd = &g.nodes()[i];
-                let Op::Comp(c) = &nd.op else { return false };
-                !nd.inline
-                    && c.monoid.is_none()
-                    && !o.iter().any(|t| t.index() == i)
-                    && !readers[i].is_empty()
-                    && readers[i].iter().all(|&j| tiled(j))
+                matches!(&nd.op, Op::Comp(c) if c.monoid.is_none()) && nd.inline && readers[i] > 1
             })
             .collect();
-        for i in maps {
-            g.set_inline(TensorId::from_index(i), true);
+        for i in shared {
+            g.set_inline(TensorId::from_index(i), false);
         }
     }
     // row reductions with few rows and long rows (RMSNorm's Σx², 1521 rows
@@ -1807,10 +1816,11 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn encoder_lowering_kernels() {
-        let vd = VisionDims { n_layers: 1, ..VisionDims::tiny(1) };
+        let nl = std::env::var("VISION_LOWER_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let vd = VisionDims { n_layers: nl, ..VisionDims::tiny(1) };
         let vd = VisionDims { dim: 1024, n_heads: 16, inter: 2816, patch: 14, llm_dim: 5120, ..vd };
         let eg = encoder_graph(&vd, 39, 39);
-        let (g, o) = eg.g.eliminate_common(&[eg.out]);
+        let (g, o) = eg.g.eliminate_common(&eg.lower_outputs());
         let kinds = |g: &TensorGraph| {
             let mut c = std::collections::BTreeMap::<String, usize>::new();
             for n in g.nodes() {

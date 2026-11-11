@@ -160,7 +160,7 @@ fn main() {
     });
     let want = eg.g.eval(&ins64, &[eg.out]).remove(0);
     let modes: Vec<String> = std::env::var("VISION_MODES")
-        .unwrap_or_else(|_| "bf16,bf16act,awg0,awg1,awg2,awg3,awg4".into())
+        .unwrap_or_else(|_| "prefill,bf16,bf16act".into())
         .split(',')
         .map(String::from)
         .collect();
@@ -169,7 +169,7 @@ fn main() {
         m if m.contains("act") || m.starts_with('a') => 5e-2,
         _ => 1e-2,
     };
-    let (g, outs) = eg.g.eliminate_common(&[eg.out]);
+    let (g, outs) = eg.g.eliminate_common(&eg.lower_outputs());
     let words: Vec<Vec<f32>> = ins64.iter().map(|v| v.iter().map(|&x| x as f32).collect()).collect();
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
     for m in &modes {
@@ -208,7 +208,7 @@ fn main() {
         words.iter().map(|w| w.len()).sum::<usize>() as f64 / 1e9,
         t0.elapsed()
     );
-    let (g, outs) = eg.g.eliminate_common(&[eg.out]);
+    let (g, outs) = eg.g.eliminate_common(&eg.lower_outputs());
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
     let n = pl.patches();
     // FLOPs: per block qkv + wo + mlp (2·N·C·(4C + 3I)) + attention 4·N²·C
