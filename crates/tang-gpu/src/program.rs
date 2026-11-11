@@ -768,6 +768,17 @@ impl Program {
         p
     }
 
+    /// Whether `t` has a device buffer (an unused input or a folded value doesn't).
+    pub fn has_buffer(&self, t: TensorId) -> bool {
+        let t = self.program.storage(t);
+        self.program.buffers.iter().any(|b| b.node == t)
+    }
+
+    /// Whether input `k` is bound to a buffer (an input no kernel reads isn't).
+    pub fn has_input(&self, k: usize) -> bool {
+        self.program.buffers.iter().any(|b| b.input == Some(k))
+    }
+
     fn buffer_index(&self, t: TensorId) -> usize {
         let t = self.program.storage(t);
         self.program

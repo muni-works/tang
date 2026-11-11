@@ -1420,6 +1420,14 @@ pub fn segments(p: &RankProgram) -> Segmented {
                 let d = t.n();
                 *t = match map.get(&d) {
                     Some(&m) if level[d] == s && !matches!(g.nodes[d].op, Op::Input(_)) => m,
+                    Some(&m) if matches!(g.nodes[d].op, Op::Iota(_)) => m,
+                    // an iota is rebuilt where it is read (it has no buffer to pass)
+                    _ if matches!(g.nodes[d].op, Op::Iota(_)) => {
+                        ng.nodes.push(g.nodes[d].clone());
+                        let m = TensorId(ng.nodes.len() as u32 - 1);
+                        map.insert(d, m);
+                        m
+                    }
                     _ => fed(&mut ng, &mut feeds, &mut map, d),
                 };
             };
@@ -1433,7 +1441,7 @@ pub fn segments(p: &RankProgram) -> Segmented {
             ng.nodes.push(node);
             let t = TensorId(ng.nodes.len() as u32 - 1);
             map.insert(i, t);
-            if used_later[i] {
+            if used_later[i] && !matches!(g.nodes[i].op, Op::Iota(_)) {
                 outputs.push(t);
                 defines.push(i);
             }

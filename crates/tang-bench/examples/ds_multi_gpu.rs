@@ -152,7 +152,13 @@ fn main() {
                                 })
                                 .collect();
                             let refs: Vec<&[f32]> = init.iter().map(|v| v.as_slice()).collect();
-                            Some((Program::new(&rt, dp.program, &refs), outs))
+                            let prog = Program::new(&rt, dp.program, &refs);
+                            for o in &outs {
+                                if !prog.has_buffer(*o) {
+                                    eprintln!("no buffer for {o:?}: {}", tang_compile::tensor::shard::describe(&g, *o));
+                                }
+                            }
+                            Some((prog, outs))
                         })
                         .collect();
                     let step = || -> Vec<Vec<f64>> {
@@ -170,12 +176,16 @@ fn main() {
                             let Some((prog, outs)) = &progs[si] else { continue };
                             for (k, f) in seg.feeds.iter().enumerate() {
                                 if let Feed::Value(n) = f {
+                                    if !prog.has_input(k) {
+                                        continue;
+                                    }
                                     let v: Vec<f32> = vals[n].iter().map(|&x| x as f32).collect();
                                     prog.write(&rt, prog.input(k), &v);
                                 }
                             }
                             prog.run(&rt);
                             for (d, o) in seg.defines.iter().zip(outs) {
+                                assert!(prog.has_buffer(*o), "segment {si} output {o:?} (node {d}) has no buffer");
                                 vals.insert(*d, prog.read(&rt, *o).iter().map(|&x| x as f64).collect());
                             }
                         }
@@ -183,7 +193,8 @@ fn main() {
                     };
                     #[cfg(feature = "nccl")]
                     if let Some(id) = nccl_id {
-                        let dev = nccl::Rank::new(ord, r, world, id);
+                        let mut dev = nccl::Rank::new(ord, r, world, id);
+                        dev.stage_inputs(&sg, &ins);
                         let dstep = || dev.step(&rt, &sg, &progs, &ins);
                         let out = dstep();
                         dev.comm_ms.set(0.0);
@@ -267,6 +278,8 @@ mod nccl {
         world: usize,
         // staging per collective (by its rank-program node): (send, recv, result)
         bufs: std::cell::RefCell<HashMap<usize, (DevBuf, DevBuf, DevBuf)>>,
+        /// Graph inputs read straight by a collective or another segment, on the device.
+        inputs: HashMap<usize, DevBuf>,
         /// Wall time in collectives (each bracketed by stream syncs).
         pub comm_ms: std::cell::Cell<f64>,
     }
@@ -304,10 +317,27 @@ mod nccl {
     }
 
     impl Rank {
+        /// Upload the graph inputs a collective or a fed value reads (once).
+        pub fn stage_inputs(&mut self, sg: &Segmented, ins: &[Vec<f64>]) {
+            let mut need: Vec<usize> = sg.before.iter().flatten().map(|b| b.src).collect();
+            for seg in &sg.segments {
+                need.extend(seg.feeds.iter().filter_map(|f| match f {
+                    Feed::Value(n) => Some(*n),
+                    _ => None,
+                }));
+            }
+            for &(i, k) in &sg.input_nodes {
+                if need.contains(&i) && !self.inputs.contains_key(&i) {
+                    let v: Vec<f32> = ins[k].iter().map(|&x| x as f32).collect();
+                    self.inputs.insert(i, DevBuf::from_slice(&v).unwrap());
+                }
+            }
+        }
+
         pub fn new(ordinal: usize, rank: usize, world: usize, id: UniqueId) -> Self {
             Gpu::at(ordinal).and_then(|g| g.bind()).expect("bind device");
             let comm = Comm::new(rank, world, id).expect("ncclCommInitRank");
-            Rank { comm, world, bufs: Default::default(), comm_ms: Default::default() }
+            Rank { comm, world, bufs: Default::default(), inputs: Default::default(), comm_ms: Default::default() }
         }
 
         pub fn step(
@@ -319,7 +349,8 @@ mod nccl {
         ) -> Vec<Vec<f64>> {
             // the runtime's stream, not owned here
             let s = ManuallyDrop::new(Stream(rt.cu_stream()));
-            let mut loc: HashMap<usize, Loc> = HashMap::new();
+            let mut loc: HashMap<usize, Loc> =
+                self.inputs.iter().map(|(&i, b)| (i, Loc::Buf(b.ptr, b.len / 4))).collect();
             let ptr = |l: Loc| -> (u64, usize) {
                 match l {
                     Loc::Prog(si, t) => progs[si].as_ref().unwrap().0.cuda_buffer(rt, t),
@@ -359,6 +390,9 @@ mod nccl {
                 let Some((prog, outs)) = &progs[si] else { continue };
                 for (k, f) in seg.feeds.iter().enumerate() {
                     if let Feed::Value(n) = f {
+                        if !prog.has_input(k) {
+                            continue;
+                        }
                         let (dst, dn) = prog.cuda_buffer(rt, prog.input(k));
                         let (src, sn) = ptr(loc[n]);
                         assert_eq!(dn, sn, "fed value length");
