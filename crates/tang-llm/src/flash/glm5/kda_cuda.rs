@@ -1088,6 +1088,60 @@ pub mod cuda {
             Ok(())
         }
 
+        /// The state buffers' slot count.
+        pub fn n_slots(&self) -> usize {
+            self.slots
+        }
+
+        /// Stage `slots` (row `i` steps slot `slots[i]`) for
+        /// [`Self::decode_dev_rows_staged`]. A synchronous host write: eager use only.
+        pub fn stage_slots(&mut self, slots: &[usize]) -> Result<()> {
+            ensure!(
+                !slots.is_empty() && slots.len() <= self.slots,
+                "k5 rows: {} rows",
+                slots.len()
+            );
+            let ids: Vec<u32> = slots.iter().map(|&s| s as u32).collect();
+            self.slots_dev.write(0, &ids)?;
+            Ok(())
+        }
+
+        /// [`Self::decode_dev_rows`] over `n` rows whose slot ids [`Self::stage_slots`]
+        /// already wrote. `kda_step` indexes the state by row, so row `i` must be slot `i`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn decode_dev_rows_staged(
+            &self,
+            k: &Kernels,
+            s: &Stream,
+            n: usize,
+            qkv: u64,
+            g: u64,
+            beta: u64,
+            o: u64,
+        ) -> Result<()> {
+            ensure!(n > 0 && n <= self.slots, "k5 rows: {n} rows");
+            let (nh, hd) = (self.nh, self.hd);
+            unsafe {
+                launch(
+                    k.step,
+                    (nh as u32, n as u32, 1),
+                    (hd as u32, 1, 1),
+                    (3 * hd * 4) as u32,
+                    s,
+                    args![qkv, self.h0.ptr, self.wconv.ptr, g, beta, self.st.ptr, o],
+                )?;
+                launch(
+                    k.conv_commit_rows,
+                    (self.ch_dim.div_ceil(256) as u32, n as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    s,
+                    args![self.h0.ptr, qkv, self.slots_dev.ptr],
+                )?;
+            }
+            Ok(())
+        }
+
         /// Read the conv history back (for a CPU fallback window or a checkpoint).
         pub fn read_conv(&self, conv: &mut ConvState) -> Result<()> {
             conv.0 = self.h0.read(0, conv.0.len())?;

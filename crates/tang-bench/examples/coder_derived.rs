@@ -64,6 +64,10 @@ fn main() {
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
     let st = derived_step(&pg, 1, ctx).unwrap();
+    // the device first: its tuning cache (tune/<gpu>.tsv) steers the lowering
+    let rt = runtime();
+    let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
+    eprintln!("runtime: {}; tuning cache: {tuned} entries", rt.name());
     let low = lower_real_step(&pg, &st, &tys);
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
@@ -74,8 +78,6 @@ fn main() {
         low.f32_inputs,
         t0.elapsed().as_secs_f64()
     );
-    let rt = runtime();
-    eprintln!("runtime: {}", rt.name());
     let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
     let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
     let RealStep {
@@ -237,6 +239,18 @@ fn main() {
             let (what, nat, head) = &kinfo[*i];
             println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
         }
+        // by shape: the same op in every layer, summed
+        let mut sh: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+        for (ms, i) in &t {
+            let e = sh.entry(kinfo[*i].0.as_str()).or_default();
+            e.0 += 1;
+            e.1 += ms;
+        }
+        let mut sh: Vec<_> = sh.into_iter().collect();
+        sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        for (k, (n, ms)) in sh.iter().take(30) {
+            println!("  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}", 1e3 * ms / *n as f64);
+        }
         // by kind: (native, int8, first line)
         let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
         for (ms, i) in &t {
@@ -255,6 +269,50 @@ fn main() {
         for (k, (n, ms)) in by.iter().take(12) {
             println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
         }
+    }
+    // --tune: the autotuner over this step on the live buffers (after the
+    // generation: variant steps write the shared caches), cache written to
+    // TANG_TUNE_OUT or tune/<gpu>.tsv
+    #[cfg(feature = "cuda")]
+    if args.iter().any(|a| a == "--tune") {
+        use tang_bench::autotune;
+        use tang_gpu::program::Shared;
+        // positions: the --bench lengths (default 128,4096)
+        let pos: Vec<usize> = opt("--bench")
+            .unwrap_or_else(|| "128,4096".into())
+            .split(',')
+            .map(|v| v.parse::<usize>().unwrap().min(ctx - 1))
+            .collect();
+        prog.write(&rt, prog.input(tok_in), &[ids[0] as f32]);
+        let set_pos = |q: usize| prog.write(&rt, prog.input(pos_in), &[q as f32]);
+        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let t = autotune::tune_step(
+            &rt,
+            "coder-next",
+            &[("TANG_STAGED_MAP", &["1"]), ("TANG_COKERNEL", &["1"])],
+            || {
+                let low = lower_real_step(&pg, &st, &tys);
+                let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
+                let shared: Vec<Shared> = (0..st.inputs.len())
+                    .map(|k| Shared {
+                        input: k,
+                        from: &prog,
+                        tensor: prog.input(k),
+                    })
+                    .collect();
+                Program::with_shared(&rt, low.program.program, &empty, &plan, &shared)
+            },
+            reps,
+            &pos,
+            &set_pos,
+            &|p: &Program| p.read(&rt, outs[0]),
+        );
+        autotune::report(&t);
+        let path = std::env::var("TANG_TUNE_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| tang_compile::tensor::tune::repo_file(rt.name()));
+        autotune::write_cache(&path, rt.name(), "coder-next", &t);
+        println!("tuning cache written: {}", path.display());
     }
     if let Some(ls) = opt("--bench") {
         for l in ls.split(',').map(|v| v.parse::<usize>().unwrap()) {

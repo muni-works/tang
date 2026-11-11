@@ -75,6 +75,25 @@ impl Comm {
         )
     }
 
+    /// All-gather: every rank's `n` f32s at `send` land in `recv` (`world · n` f32s,
+    /// rank-major: rank `r`'s chunk at `r · n`), on `s`.
+    pub fn all_gather_f32(&self, send: &DevBuf, recv: &DevBuf, n: usize, s: &Stream) -> Result<()> {
+        assert!(n * 4 <= send.len && n * 4 * self.world <= recv.len);
+        nccl(
+            unsafe {
+                result::all_gather(
+                    send.ptr as *const c_void,
+                    recv.ptr as *mut c_void,
+                    n,
+                    sys::ncclDataType_t::ncclFloat32,
+                    self.comm,
+                    Self::stream(s),
+                )
+            },
+            "ncclAllGather",
+        )
+    }
+
     /// In-place broadcast of `bytes` bytes at `buf` from `root` to every rank, on `s`.
     pub fn broadcast(&self, buf: &DevBuf, bytes: usize, root: usize, s: &Stream) -> Result<()> {
         assert!(bytes <= buf.len);

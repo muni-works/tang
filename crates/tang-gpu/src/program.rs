@@ -117,6 +117,24 @@ impl Runtime {
         CudaDevice::new(0).map(Self::Cuda)
     }
 
+    /// CUDA device `ordinal` (one rank of a multi-GPU program).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_on(ordinal: usize) -> Option<Self> {
+        if !CudaDevice::has_nvrtc() {
+            return None;
+        }
+        CudaDevice::new(ordinal).map(Self::Cuda)
+    }
+
+    /// The CUDA stream every launch and copy of this runtime goes on.
+    #[cfg(feature = "cuda")]
+    pub fn cu_stream(&self) -> cudarc::driver::sys::CUstream {
+        match self {
+            Self::Cuda(d) => d.stream.cu_stream(),
+            _ => panic!("cu_stream: not CUDA"),
+        }
+    }
+
     /// CUDA device 0 set up for [`Program::capture`]
     /// ([`CudaDevice::new_capturable`]).
     #[cfg(feature = "cuda")]
@@ -750,6 +768,17 @@ impl Program {
         p
     }
 
+    /// Whether `t` has a device buffer (an unused input or a folded value doesn't).
+    pub fn has_buffer(&self, t: TensorId) -> bool {
+        let t = self.program.storage(t);
+        self.program.buffers.iter().any(|b| b.node == t)
+    }
+
+    /// Whether input `k` is bound to a buffer (an input no kernel reads isn't).
+    pub fn has_input(&self, k: usize) -> bool {
+        self.program.buffers.iter().any(|b| b.input == Some(k))
+    }
+
     fn buffer_index(&self, t: TensorId) -> usize {
         let t = self.program.storage(t);
         self.program
@@ -1138,7 +1167,20 @@ impl Program {
             d.stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .expect("begin capture");
-            self.launch_all(d);
+            // independent kernels on side streams (a DAG graph, not a
+            // chain; TANG_GRAPH_DAG=0: the chain); TANG_GRAPH_STREAMS of them (default 2: 4 and 8 measured slower on an H200)
+            let dag = !std::env::var("TANG_GRAPH_DAG").is_ok_and(|v| v == "0");
+            let fused = matches!(&self.storage, Storage::Cuda { fused: Some(_), .. });
+            if dag && !fused {
+                let n = std::env::var("TANG_GRAPH_STREAMS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2usize)
+                    .max(1);
+                self.launch_dag(d, n);
+            } else {
+                self.launch_all(d);
+            }
             let g = d
                 .stream
                 .end_capture(
@@ -1213,6 +1255,108 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn run_cuda(&self, d: &CudaDevice, i: usize) {
+        self.run_cuda_on(&d.stream, i)
+    }
+
+    /// Kernel dependencies in launch order, from slot hazards: the last
+    /// writer of every slot it reads (RAW), and of every slot it writes
+    /// (WAW), and every reader of those since (WAR). Indices into `order`.
+    #[cfg(feature = "cuda")]
+    fn hazard_deps(&self) -> Vec<Vec<usize>> {
+        let mut last_w: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut readers: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        let mut deps = Vec::with_capacity(self.order.len());
+        for (n, &i) in self.order.iter().enumerate() {
+            let outs = 1 + self.program.kernels[i].writes.len();
+            let a = &self.args[i];
+            let (rd, wr) = a.split_at(a.len() - outs.min(a.len()));
+            let mut dv: Vec<usize> = Vec::new();
+            for s in rd {
+                dv.extend(last_w.get(s));
+            }
+            for s in wr {
+                dv.extend(last_w.get(s));
+                dv.extend(readers.get(s).into_iter().flatten());
+            }
+            dv.retain(|&j| j != n);
+            dv.sort_unstable();
+            dv.dedup();
+            for s in rd {
+                readers.entry(*s).or_default().push(n);
+            }
+            for s in wr {
+                last_w.insert(*s, n);
+                readers.remove(s);
+            }
+            deps.push(dv);
+        }
+        deps
+    }
+
+    /// [`launch_all`](Self::launch_all) over `streams` streams (the
+    /// device's plus side streams forked from it) for graph capture: a
+    /// kernel continues the stream whose tail it depends on, else takes
+    /// the stream with the oldest tail; a dependency on another stream is
+    /// an event recorded right after it. All streams join the device's
+    /// stream at the end, so the capture closes.
+    #[cfg(feature = "cuda")]
+    fn launch_dag(&self, d: &CudaDevice, streams: usize) {
+        let deps = self.hazard_deps();
+        let n = self.order.len();
+        // pass 1: a stream per kernel
+        let mut on = vec![0usize; n];
+        let mut tail: Vec<Option<usize>> = vec![None; streams];
+        for k in 0..n {
+            let cont = (0..streams)
+                .filter(|&s| tail[s].is_some_and(|t| deps[k].binary_search(&t).is_ok()))
+                .max_by_key(|&s| tail[s]);
+            let s = cont.unwrap_or_else(|| {
+                (0..streams).min_by_key(|&s| tail[s].map_or(-1, |t| t as i64)).unwrap()
+            });
+            on[k] = s;
+            tail[s] = Some(k);
+        }
+        // the latest dependency per other stream needs an event after it
+        let mut waits: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut evented = vec![false; n];
+        for k in 0..n {
+            let mut per: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &j in &deps[k] {
+                if on[j] != on[k] {
+                    let e = per.entry(on[j]).or_insert(j);
+                    *e = (*e).max(j);
+                }
+            }
+            for (_, j) in per {
+                waits[k].push(j);
+                evented[j] = true;
+            }
+        }
+        // pass 2: launches, events, joins
+        let mut ss = vec![d.stream.clone()];
+        for _ in 1..streams {
+            let s = d.ctx.new_stream().expect("side stream");
+            s.join(&d.stream).expect("fork into capture");
+            ss.push(s);
+        }
+        let mut ev: Vec<Option<cudarc::driver::CudaEvent>> = (0..n).map(|_| None).collect();
+        for k in 0..n {
+            let st = &ss[on[k]];
+            for &j in &waits[k] {
+                st.wait(ev[j].as_ref().expect("event before its waiter")).expect("wait");
+            }
+            self.run_cuda_on(st, self.order[k]);
+            if evented[k] {
+                ev[k] = Some(st.record_event(None).expect("event"));
+            }
+        }
+        for s in &ss[1..] {
+            d.stream.join(s).expect("join");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_cuda_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>, i: usize) {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let Storage::Cuda {
             slots, functions, ..
@@ -1229,7 +1373,7 @@ impl Program {
         let Storage::Cuda { host, .. } = &self.storage else {
             unreachable!()
         };
-        let mut launch = d.stream.launch_builder(&functions[i]);
+        let mut launch = stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
             match &host[s] {
                 Some(h) => launch.arg(&h.dev),
@@ -1337,6 +1481,23 @@ impl Program {
         match b.format {
             Format::F16 => unpack_f16(&raw, b.len),
             _ => raw[..b.len].to_vec(),
+        }
+    }
+
+    /// The raw device address and f32 length of `t`'s buffer, for code that
+    /// works on it in place outside the program (NCCL collectives). Valid
+    /// while the program lives; work on it must go on [`Runtime::cu_stream`].
+    #[cfg(feature = "cuda")]
+    pub fn cuda_buffer(&self, rt: &Runtime, t: TensorId) -> (u64, usize) {
+        use cudarc::driver::DevicePtr;
+        let b = &self.program.buffers[self.buffer_index(t)];
+        assert!(b.format == Format::F32, "cuda_buffer: an f32 buffer only");
+        match (rt, &self.storage) {
+            (Runtime::Cuda(d), Storage::Cuda { slots, .. }) => {
+                let (p, _sync) = slots[self.slot_of(t)].device_ptr(&d.stream);
+                (p, b.len)
+            }
+            _ => panic!("cuda_buffer: not a CUDA program"),
         }
     }
 
