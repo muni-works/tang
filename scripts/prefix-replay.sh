@@ -43,7 +43,7 @@ for mode in $MODES; do
   nvidia-smi --query-gpu=memory.used,memory.total --format=csv | tee "$OUT/vram-$mode.txt"
   LABEL=$mode OUT=$OUT URL=http://127.0.0.1:8931 python3 scripts/prefix-replay.py | tee -a "$OUT/summary.txt"
   grep -E "sequence slots fit|cache:" "$log" | tail -2 | tee -a "$OUT/summary.txt"
-  grep -c "spilled slot" "$log" | sed 's/^/spills logged: /' | tee -a "$OUT/summary.txt"
+  { grep -c "spilled slot" "$log" || true; } | sed 's/^/spills logged: /' | tee -a "$OUT/summary.txt"
   ps -o rss= -p $pid | awk '{printf "server RSS %.1f GB\n", $1/1048576}' | tee -a "$OUT/summary.txt"
   kill $pid; wait $pid 2>/dev/null || true
   rm -rf "$state"
