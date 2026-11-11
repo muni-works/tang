@@ -106,7 +106,12 @@ fn selftest(args: &[String]) -> anyhow::Result<()> {
         let again = greedy(&mut d, Some(0), p, n)?;
         let slots_same = per_slot.iter().all(|x| x.0 == per_slot[0].0) && again.0 == per_slot[0].0;
         if no_hand {
-            println!("prompt {i}: slots deterministic {slots_same}");
+            let l0 = &per_slot[0].1[0];
+            let (a, la, b, lb) = top2(l0);
+            println!(
+                "prompt {i}: slots deterministic {slots_same}; first step top2 {a}:{la:.6} {b}:{lb:.6}; tokens {:?}",
+                per_slot[0].0
+            );
             all_ok &= slots_same;
             continue;
         }
