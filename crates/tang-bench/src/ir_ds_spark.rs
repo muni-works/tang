@@ -755,7 +755,7 @@ pub fn generate_spark(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ir_ds_prefill::prefill_graph;
     use crate::ir_ds_prefill::tests::{
@@ -875,7 +875,8 @@ mod tests {
                 let a_pre: Vec<Vec<f64>> = am.iter().map(|m| m.0.clone()).collect();
                 let mut x = r.hc_pre(&h, &a_pre);
                 r.rms(&mut x, &format!("{p}.ffn_norm.weight"));
-                let y = r.moe_at(&p, 0, &x, dm.dspark_experts, dm.dspark_active);
+                // `load` sees the stage as its layer
+                let y = r.moe_at(&p, s, &x, dm.dspark_experts, dm.dspark_active);
                 h = r.hc_post(&y, &h, &fm);
                 pre = fm.into_iter().map(|m| m.0).collect();
             }

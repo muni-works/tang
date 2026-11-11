@@ -382,7 +382,10 @@ impl RealRun {
                 continue;
             }
             let shape: Vec<usize> = i.shape.iter().map(|d| d.n()).collect();
-            let v = if n.ends_with(".freqs") {
+            let v = if n.ends_with(".freqs") && n.starts_with("mtp.") {
+                // the MTP stages attend over a plain window: ratio 0
+                freqs_input(hd, &plain)
+            } else if n.ends_with(".freqs") {
                 let l: usize = n.split('.').nth(1).unwrap().parse().unwrap();
                 let rot = if dm.compress_ratios[l] > 0 {
                     &yarn
@@ -390,8 +393,9 @@ impl RealRun {
                     &plain
                 };
                 freqs_input(if n.contains("indexer") { ihd } else { hd }, rot)
-            } else if n == "embed.weight" || n == "head.weight" {
-                let mut v = Vec::with_capacity(self.vocab_ids.len() * dm.dim);
+            } else if n == "embed.weight" || n == "head.weight" || n.contains(".markov_head.") {
+                // vocab-indexed: only the kept rows
+                let mut v = Vec::with_capacity(self.vocab_ids.len() * shape[1]);
                 for &id in &self.vocab_ids {
                     v.extend(self.st.rows(n, id, id + 1)?);
                 }
@@ -467,6 +471,47 @@ impl RealRun {
         (w("w1"), w("w3"), w("w2"))
     }
 
+    /// Expert `e` under checkpoint prefix `p` (e.g. `mtp.1`).
+    pub fn expert_at(&self, p: &str, e: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let w = |k: &str| {
+            self.st
+                .f64(&format!("{p}.ffn.experts.{e}.{k}.weight"))
+                .unwrap()
+        };
+        (w("w1"), w("w3"), w("w2"))
+    }
+
+    /// The compact expert tensors of graph prefix `p` (checkpoint prefix
+    /// `ckpt`) holding `used`, padded to `rows`, and the slot map of `ne`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_tables_at(
+        &self,
+        p: &str,
+        ckpt: &str,
+        used: &[usize],
+        rows: usize,
+        ne: usize,
+        dm: &DsDims,
+        into: &mut HashMap<String, Vec<f64>>,
+    ) {
+        let (d, inter) = (dm.dim, dm.moe_inter);
+        let mut w1 = vec![0.0; rows * inter * d];
+        let mut w3 = vec![0.0; rows * inter * d];
+        let mut w2 = vec![0.0; rows * d * inter];
+        let mut slot = vec![0.0; ne];
+        for (r, &e) in used.iter().enumerate() {
+            let (a, b, c) = self.expert_at(ckpt, e);
+            w1[r * inter * d..(r + 1) * inter * d].copy_from_slice(&a);
+            w3[r * inter * d..(r + 1) * inter * d].copy_from_slice(&b);
+            w2[r * d * inter..(r + 1) * d * inter].copy_from_slice(&c);
+            slot[e] = r as f64;
+        }
+        into.insert(format!("{p}.ffn.experts.w1"), w1);
+        into.insert(format!("{p}.ffn.experts.w3"), w3);
+        into.insert(format!("{p}.ffn.experts.w2"), w2);
+        into.insert(format!("{p}.ffn.expert_slot"), slot);
+    }
+
     /// The compact expert tensors of graph layer `l` holding `used` (in
     /// order, padded with zero rows to `rows`) and the slot map.
     pub fn expert_tables(
@@ -525,6 +570,13 @@ impl RealRun {
             .collect();
         let mut vocab_ids: Vec<usize> = (0..2048).collect();
         vocab_ids.extend(PROMPT);
+        // DSpark's noise token: the drafter embeds it
+        if let Some(n) = load_config(p)
+            .ok()
+            .and_then(|c| c["dspark_noise_token_id"].as_u64())
+        {
+            vocab_ids.push(n as usize);
+        }
         vocab_ids.sort_unstable();
         vocab_ids.dedup();
         Some(RealRun {
@@ -818,5 +870,181 @@ mod tests {
         );
         assert!(e_pre < 1e-9, "prefill {e_pre:e}");
         assert!(e_step < 1e-9, "step {e_step:e}");
+    }
+
+    /// The DSpark drafter at real size on the checkpoint's three MTP
+    /// stages against the f64 reference: drafts, logits and confidences
+    /// after `DS_SPARK_T` main rows (default 1), then the drafter's derived
+    /// step for the next row. The main hiddens are stand-ins (the prompt's
+    /// embedding rows, one copy per target layer): real ones need all 40
+    /// main layers, which a CPU check doesn't hold. Each eval binds only
+    /// the experts its rows route to.
+    #[test]
+    #[ignore]
+    fn real_dspark_matches_reference() {
+        use crate::ir_ds_spark::tests::spark_ref;
+        use crate::ir_ds_spark::{spark_graph, spark_step};
+        let Some(mut run) = open() else { return };
+        if !run.st.has("mtp.0.main_proj.weight") {
+            eprintln!("no MTP stages in {}", ds_dir());
+            return;
+        }
+        run.layer_ids = vec![37, 38, 39];
+        let t_pre: usize = std::env::var("DS_SPARK_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let ids = prompt(t_pre + 2);
+        let toks = run.rows_of(&ids);
+        let mut dm0 = dims_from_config(
+            &run.cfg,
+            &run.layer_ids,
+            run.vocab_ids.len(),
+            0,
+            8.max(t_pre + 2),
+        );
+        dm0.dspark_noise = run.rows_of(&[dm0.dspark_noise])[0] as usize;
+        let (d, nt, blk) = (dm0.dim, dm0.dspark_targets.len(), dm0.dspark_block);
+        eprintln!(
+            "dspark real: {} stages, block {blk}, {} experts top {}, markov rank {}, targets {nt}",
+            dm0.n_mtp, dm0.dspark_experts, dm0.dspark_active, dm0.dspark_rank
+        );
+        let t0 = Instant::now();
+        let sg0 = spark_graph(&dm0);
+        let mut w = run.dense_inputs(&sg0.inputs, &dm0).unwrap();
+        eprintln!(
+            "dense inputs: {} tensors, {:.2} G values, {:.1?}",
+            w.len(),
+            w.values().map(|v| v.len()).sum::<usize>() as f64 / 1e9,
+            t0.elapsed()
+        );
+        // stand-in main hiddens: each row's token embedding, nt times
+        let n = t_pre + 1;
+        let emb = &w["embed.weight"];
+        let mut mains = Vec::with_capacity(n * nt * d);
+        for &r in &toks[..n] {
+            for _ in 0..nt {
+                mains.extend_from_slice(&emb[r as usize * d..(r as usize + 1) * d]);
+            }
+        }
+        let next: Vec<u32> = toks[1..=n].iter().map(|&x| x as u32).collect();
+        // the reference over n rows, recording each pick in order
+        let calls = std::cell::RefCell::new(Vec::new());
+        let load = |s: usize, e: usize| {
+            calls.borrow_mut().push((s, e));
+            run.expert_at(&format!("mtp.{s}"), e)
+        };
+        let t0 = Instant::now();
+        let r = Ref {
+            dm: &dm0,
+            w: &w,
+            bugs: Bugs::default(),
+            load: Some(&load),
+        };
+        let n0 = {
+            spark_ref(&r, &mains[..t_pre * nt * d], &next[..t_pre]);
+            calls.borrow().len()
+        };
+        calls.borrow_mut().clear();
+        let (rids, rlg, rcf) = spark_ref(&r, &mains, &next);
+        let calls = calls.into_inner();
+        eprintln!("reference: {n} rows in {:.1?}", t0.elapsed());
+        let used = |cs: &[(usize, usize)]| -> Vec<Vec<usize>> {
+            (0..dm0.n_mtp)
+                .map(|s| {
+                    let mut u: Vec<usize> = cs.iter().filter(|c| c.0 == s).map(|c| c.1).collect();
+                    u.sort_unstable();
+                    u.dedup();
+                    u
+                })
+                .collect()
+        };
+        let (u_pre, u_step) = (used(&calls[..n0]), used(&calls[n0..]));
+        let rows = u_pre.iter().chain(&u_step).map(|u| u.len()).max().unwrap();
+        eprintln!(
+            "experts per stage: prefill {:?}, step {:?}",
+            u_pre.iter().map(|u| u.len()).collect::<Vec<_>>(),
+            u_step.iter().map(|u| u.len()).collect::<Vec<_>>()
+        );
+        let dm = DsDims {
+            expert_rows: rows,
+            ..dm0.clone()
+        };
+        let sg = spark_graph(&dm);
+        let bind = |w: &mut HashMap<String, Vec<f64>>, u: &[Vec<usize>]| {
+            for (s, us) in u.iter().enumerate() {
+                let p = format!("mtp.{s}");
+                run.expert_tables_at(&p, &p, us, rows, dm.dspark_experts, &dm, w);
+            }
+        };
+        bind(&mut w, &u_pre);
+        let ins = |w: &HashMap<String, Vec<f64>>, m: &[f64], nx: &[u32]| -> Vec<Vec<f64>> {
+            sg.inputs
+                .iter()
+                .map(|s| match s.name.as_str() {
+                    "mains" => m.to_vec(),
+                    "next" => nx.iter().map(|&x| x as f64).collect(),
+                    k => w[k].clone(),
+                })
+                .collect()
+        };
+        let st = spark_step(&sg, &dm, 1).unwrap();
+        let t0 = Instant::now();
+        let g = sg.g.bind(&[(SEQ, t_pre)]).unwrap();
+        let mut outs = vec![sg.ids, sg.logits, sg.conf];
+        outs.extend(st.caches.iter().map(|c| c.node));
+        let got = g.eval(&ins(&w, &mains[..t_pre * nt * d], &next[..t_pre]), &outs);
+        let gids: Vec<u32> = got[0].iter().map(|&x| x as u32).collect();
+        let want_ids: Vec<u32> = rids[..t_pre].concat();
+        let el = rel(&got[1], &rlg[..t_pre].concat());
+        let ec = rel(&got[2], &rcf[..t_pre].concat());
+        eprintln!(
+            "graph prefill T={t_pre}: drafts {:?} (reference {:?}), logits err {el:.2e}, conf err {ec:.2e}, {:.1?}, peak RSS {:.1} GB",
+            gids, want_ids, t0.elapsed(), rss_gb()
+        );
+        assert_eq!(gids, want_ids);
+        // the derived step for row t_pre, with the step rows' experts bound
+        let caches: Vec<Vec<f64>> = st
+            .caches
+            .iter()
+            .zip(&got[3..])
+            .map(|(c, val)| {
+                let shape: Vec<usize> =
+                    sg.g.shape(c.node)
+                        .iter()
+                        .map(|x| {
+                            if *x == tang_compile::tensor::Dim::Sym(SEQ) {
+                                t_pre
+                            } else {
+                                x.n()
+                            }
+                        })
+                        .collect();
+                seed_cache(c, &shape, val, t_pre, dm.ctx)
+            })
+            .collect();
+        drop(got);
+        bind(&mut w, &u_step);
+        let step_ins = ins(&w, &mains[t_pre * nt * d..], &next[t_pre..]);
+        let sins: Vec<Vec<f64>> = st
+            .inputs
+            .iter()
+            .map(|&si| match si {
+                StepInput::Pos => vec![t_pre as f64],
+                StepInput::New(i) | StepInput::Same(i) => step_ins[i].clone(),
+                StepInput::Cache(c) => caches[c].clone(),
+            })
+            .collect();
+        let t0 = Instant::now();
+        let sgot = st.graph.eval(&sins, &st.outputs);
+        let sids: Vec<u32> = sgot[0].iter().map(|&x| x as u32).collect();
+        let esl = rel(&sgot[1], &rlg[t_pre]);
+        let esc = rel(&sgot[2], &rcf[t_pre]);
+        eprintln!(
+            "derived step at row {t_pre}: drafts {:?} (reference {:?}), logits err {esl:.2e}, conf err {esc:.2e}, {:.1?}, peak RSS {:.1} GB",
+            sids, rids[t_pre], t0.elapsed(), rss_gb()
+        );
+        assert_eq!(sids, rids[t_pre]);
+        assert!(el < 1e-9 && ec < 1e-9 && esl < 1e-9 && esc < 1e-9);
     }
 }
