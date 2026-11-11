@@ -673,6 +673,77 @@ pub struct FlashServe {
     requests: usize,
     line: Line,
     drafts_mode: &'static str,
+    /// Prefix-cache hits under batching, by where the reused tokens came from.
+    cache: CacheStats,
+}
+
+/// Where a batched request's reused prompt tokens came from (`take_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hit {
+    /// Nothing reused: the whole prompt prefilled.
+    Miss,
+    /// A parked slot whose tokens the prompt extends (KV and GDN state already on the GPU).
+    Parked,
+    /// A parked slot that diverges from the prompt, rewound to a saved GDN/conv state at a
+    /// prefix boundary inside the shared part: its KV rows below the boundary are kept, only
+    /// the recurrent state is copied up.
+    Rewound,
+    /// A saved state in host RAM (or read from disk) restored into a fresh slot: recurrent
+    /// state and K/V rows copied up.
+    Host,
+}
+
+impl Hit {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Hit::Miss => "miss",
+            Hit::Parked => "parked",
+            Hit::Rewound => "rewound",
+            Hit::Host => "host",
+        }
+    }
+}
+
+/// Cumulative prefix-cache counters (requests and reused tokens by [`Hit`]).
+#[derive(Default)]
+pub(super) struct CacheStats {
+    pub requests: [u64; 4],
+    pub reused: [u64; 4],
+    pub prompt: u64,
+    /// Parked slots spilled to host RAM when evicted, and their tokens.
+    pub spills: u64,
+    pub spilled_tokens: u64,
+}
+
+impl CacheStats {
+    pub(super) fn note(&mut self, hit: Hit, prompt: usize, reused: usize) {
+        self.requests[hit as usize] += 1;
+        self.reused[hit as usize] += reused as u64;
+        self.prompt += prompt as u64;
+    }
+
+    /// `hit rate 87.1% (parked 40/31.2k, rewound ..., host ..., miss ...)`: tokens reused over
+    /// prompt tokens since start.
+    pub(super) fn line(&self) -> String {
+        let reused: u64 = self.reused.iter().sum();
+        let rate = 100.0 * reused as f64 / self.prompt.max(1) as f64;
+        let by = [Hit::Parked, Hit::Rewound, Hit::Host, Hit::Miss]
+            .iter()
+            .map(|&h| {
+                format!(
+                    "{} {}/{}",
+                    h.name(),
+                    self.requests[h as usize],
+                    self.reused[h as usize]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "cache: {reused}/{} prompt tokens reused = {rate:.1}% ({by}; spills {} = {} tokens)",
+            self.prompt, self.spills, self.spilled_tokens
+        )
+    }
 }
 
 /// Tool-call arguments as objects (the template wants mappings; OpenAI clients send strings).
@@ -898,6 +969,7 @@ impl FlashServe {
             shape,
             gdn_layers,
             requests: 0,
+            cache: CacheStats::default(),
             line: Line::default(),
         };
         // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.
@@ -2277,6 +2349,21 @@ pub fn resume_test(args: &[String]) -> Result<()> {
 /// The routing-count profile in the state directory.
 const ROUTING: &str = "routing.bin";
 
+/// Bytes of host RAM available (`MemAvailable`), 0 when unknown.
+fn mem_available() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<f64>()
+                .ok()
+        })
+        .map_or(0.0, |kb| kb * 1024.0)
+}
+
 /// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
 /// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR] [--batch N]`: the Flash engine (`flash::serve`):
 /// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
@@ -2296,10 +2383,13 @@ pub fn serve_cli(args: &[String], hardware: crate::node::Probe) -> Result<()> {
         suffix: true,
         warm_dir: None,
         batch: 0,
+        // Host RAM for saved prefix states: TANG_FLASH_SNAP_GB, else a third of what's
+        // available, 12..64 GB (under batching evicted slots spill here).
         snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .map_or(12e9, |g| g * 1e9) as usize,
+            .map_or_else(|| (mem_available() / 3.0).clamp(12e9, 64e9), |g| g * 1e9)
+            as usize,
         dump: None,
     };
     let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
@@ -2359,6 +2449,11 @@ pub fn serve_cli(args: &[String], hardware: crate::node::Probe) -> Result<()> {
         dtype: crate::Dtype::Q4,
         hardware,
     };
+    // Under batching every session's last turn boundary (and each evicted slot) is a saved
+    // state: keep a few per slot unless `--snapshots` says otherwise.
+    if s.batch > 1 && !args.iter().any(|a| a == "--snapshots") {
+        s.snapshots = s.snapshots.max(4 * s.batch);
+    }
     crate::server::serve(opts, move |_name: &str| FlashServe::load(&s))
 }
 

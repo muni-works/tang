@@ -268,6 +268,7 @@ pub mod ir_coder_prefill;
 pub mod ir_ds_prefill;
 pub mod ir_ds_real;
 pub mod ir_ds_spark;
+pub mod ir_ds_vision;
 /// Run tang-compile tensor graphs on the GPU, for the kernels-vs-IR benches.
 #[cfg(feature = "metal")]
 #[path = "ir_msl.rs"]
@@ -284,6 +285,8 @@ pub mod coder_serve;
 pub mod cuda_cpu;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Per-rank native weight loading for the sharded DeepSeek step.
+pub mod ds_shard_load;
 /// DS pieces on a CUDA device: the top-k block select, the Engram table
 /// in host-mapped memory.
 #[cfg(all(test, feature = "cuda"))]

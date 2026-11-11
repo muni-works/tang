@@ -207,7 +207,7 @@ impl Deriver<'_> {
 
 /// `m` is [`Monoid::topk`] of some `k` (pairs `(index, value)`).
 pub(crate) fn is_topk(m: &Monoid) -> bool {
-    if m.width < 2 || m.width % 2 != 0 {
+    if m.width < 2 || !m.width.is_multiple_of(2) {
         return false;
     }
     // cheap reject before building the k² reference combine

@@ -181,8 +181,8 @@ fn spark_attention(
                 let mut den = v[1] + (sk - m).exp();
                 for s in 0..blk {
                     let e = (v[4 + 2 * s] - m).exp();
-                    num = num + e * v[5 + 2 * s];
-                    den = den + e;
+                    num += e * v[5 + 2 * s];
+                    den += e;
                 }
                 vec![num / den]
             })
@@ -246,6 +246,7 @@ pub fn spark_graph(dm: &DsDims) -> SparkGraph {
         named: Vec::new(),
         eps: dm.eps,
         ws: Default::default(),
+        image_mask: None,
     };
     let mains = b.input("mains".into(), &[T, fx(nt * d)]);
     let next = b.input("next".into(), &[T]);

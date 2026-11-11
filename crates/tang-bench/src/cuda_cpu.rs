@@ -847,4 +847,139 @@ mod tests {
         );
         assert!(worst < 1e-4, "{worst}");
     }
+
+    /// Chunked prefill from an empty cache, then decode, with every step
+    /// run as its CUDA program on the CPU: each chunk is the derived step
+    /// with `k = chunk` (it writes the caches), each decode step `k = 1`
+    /// reads them. The logits of every step against the full prefill on
+    /// the interpreter: `(worst rel err, kernels per step)`.
+    pub(crate) fn chunked_then_decode(m: &Model, ks: &[usize]) -> (f64, Vec<usize>) {
+        let w = weights(m);
+        let total: usize = ks.iter().sum();
+        assert!(total <= m.cap);
+        let toks: Vec<f64> = (0..total)
+            .map(|i| ((37 * i + 5) % vocab(m)) as f64)
+            .collect();
+        let ins = |t: &[f64]| -> Vec<Vec<f64>> {
+            m.inputs
+                .iter()
+                .map(|(n, _)| {
+                    if n == "tokens" {
+                        t.to_vec()
+                    } else {
+                        w[n].clone()
+                    }
+                })
+                .collect()
+        };
+        let mut caches: Option<Vec<Vec<f32>>> = None;
+        let (mut pos, mut worst, mut nks) = (0usize, 0.0f64, vec![]);
+        let vocab = vocab(m);
+        for &k in ks {
+            let st = derive(m, k, Rows::All).unwrap();
+            let cs = caches.get_or_insert_with(|| {
+                // empty session: zero rows (masked) and zero states
+                st.caches
+                    .iter()
+                    .map(|c| {
+                        let n: usize = concrete(st.graph.shape(c.input), 1).iter().product();
+                        vec![0.0f32; n]
+                    })
+                    .collect()
+            });
+            let step_ins: Vec<Vec<f32>> = st
+                .inputs
+                .iter()
+                .map(|&x| match x {
+                    StepInput::Pos => vec![pos as f32],
+                    StepInput::New(_) => toks[pos..pos + k].iter().map(|&t| t as f32).collect(),
+                    StepInput::Same(i) => w[&m.inputs[i].0].iter().map(|&v| v as f32).collect(),
+                    StepInput::Cache(c) => cs[c].clone(),
+                })
+                .collect();
+            let mut ids = st.outputs.clone();
+            ids.extend(st.caches.iter().map(|c| c.updated));
+            let (g, outs) = st.graph.substitute_maps(&ids);
+            let (g, outs) = g.eliminate_common(&outs);
+            let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+            nks.push(dp.program.kernels.len());
+            let fused = dp
+                .program
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("fused delta step"))
+                .count();
+            if fused > 0 {
+                eprintln!("  k = {k}: {fused} fused delta-step kernels");
+            }
+            let got = super::run(&dp, &step_ins, &outs);
+            let grown = pos + k;
+            let want =
+                m.g.bind(&[("T", grown)])
+                    .unwrap()
+                    .eval(&ins(&toks[..grown]), &[m.logits]);
+            let g64: Vec<f64> = got[0].iter().map(|&x| x as f64).collect();
+            worst = worst.max(rel(&g64, &want[0][pos * vocab..grown * vocab]));
+            *cs = got[1..].to_vec();
+            pos = grown;
+        }
+        (worst, nks)
+    }
+
+    /// The many-row contraction split (`split_bilinear`) on the tiny coder
+    /// chunk step, thresholds at 1: the interpreter gives the same logits
+    /// and caches before and after.
+    #[test]
+    fn split_bilinear_keeps_the_step() {
+        let m = coder();
+        let w = weights(&m);
+        let k = 8;
+        let st = derive(&m, k, Rows::All).unwrap();
+        let toks: Vec<f64> = (0..k).map(|i| ((37 * i + 5) % vocab(&m)) as f64).collect();
+        let ins: Vec<Vec<f64>> = st
+            .inputs
+            .iter()
+            .map(|&x| match x {
+                StepInput::Pos => vec![3.0],
+                StepInput::New(_) => toks.clone(),
+                StepInput::Same(i) => w[&m.inputs[i].0].clone(),
+                StepInput::Cache(c) => {
+                    let n: usize = concrete(st.graph.shape(st.caches[c].input), 1)
+                        .iter()
+                        .product();
+                    (0..n).map(|j| ((j * 13 % 7) as f64 - 3.0) * 0.05).collect()
+                }
+            })
+            .collect();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let g = st
+            .graph
+            .split_bilinear_min(&ids, 1, 1)
+            .expect("something splits");
+        let a = st.graph.eval(&ins, &ids);
+        // (the factors come after their readers: evaluate in dependency order)
+        let (g, gids) = g.eliminate_dead(&ids);
+        let b = g.eval(&ins, &gids);
+        let mut worst = 0.0f64;
+        for (x, y) in a.iter().zip(&b) {
+            worst = worst.max(rel(y, x));
+        }
+        eprintln!("split_bilinear on the tiny coder k = {k} step: rel err {worst:.2e}");
+        assert!(worst < 1e-9, "{worst}");
+    }
+
+    #[test]
+    fn chunked_prefill_then_decode_on_the_cpu() {
+        for m in [qwen(), coder()] {
+            for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
+                let (e, nk) = chunked_then_decode(&m, ks);
+                eprintln!(
+                    "{} chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}",
+                    m.name
+                );
+                assert!(e < 1e-4, "{} {ks:?}: {e}", m.name);
+            }
+        }
+    }
 }

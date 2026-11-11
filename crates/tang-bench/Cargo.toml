@@ -96,6 +96,10 @@ name = "ds_real_gpu"
 required-features = ["cuda"]
 
 [[example]]
+name = "ds_vision_gpu"
+required-features = ["cuda"]
+
+[[example]]
 name = "ds_multi_gpu"
 required-features = ["cuda"]
 
@@ -113,6 +117,9 @@ metal       = { version = "0.33", optional = true }
 # qwen_session: the MLX checkpoint (mapped), config.json and the tokenizer
 memmap2 = "0.9"
 serde_json = "1"
+# ir_ds_vision: image decode and the embedding-cache key
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+sha2 = "0.10"
 tokenizers = { workspace = true }
 tang-otel = { workspace = true, optional = true }
 tang-llm = { workspace = true, optional = true }
@@ -125,6 +132,7 @@ nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
 rayon     = "1"
+libm      = "0.2"
 tang-derive-wasm = { path = "../tang-derive-wasm" }
 # ir_glm_prefill tests (flash::glm5) and ir_coder_prefill (flash::reference):
 # tang-llm's CPU references as oracles

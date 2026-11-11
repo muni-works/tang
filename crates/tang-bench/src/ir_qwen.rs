@@ -1200,14 +1200,15 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         (g, outs)
     };
-    // a short window's GEMVs split-K as decode's (enough warps in flight:
-    // a [k, rows] GEMV tiled k × 8 a lane has rows / 8 groups), the target
-    // in points scaled by k
+    // a short window's GEMVs stay whole: split-K (the target in points
+    // scaled by k) made window-4 3.2× slower on the 6000 (19.8 ms against
+    // 6.1 whole), the combine and partials re-reading k rows each.
+    // `TANG_WIN_SPLIT_ROWS=N` splits them as decode's (target N·k)
     if gemv {
-        let target = std::env::var("TANG_SPLIT_ROWS")
+        let target = std::env::var("TANG_WIN_SPLIT_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(if half_tiles { 16384 } else { 0 });
+            .unwrap_or(0);
         if target > 0 {
             (g, outs) = split_gemvs(g, outs, dg, target * dg.seq);
         }

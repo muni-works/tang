@@ -102,7 +102,7 @@ fn node_reports_its_shape() {
     assert_eq!(status, 401, "/node wants the key");
     let (status, v) = call(&addr, "GET", "/node", Some(KEY), "");
     assert_eq!(status, 200, "{v}");
-    assert_eq!(v["schema"], 1);
+    assert_eq!(v["schema"], tang_llm::node::SCHEMA);
     let id = v["node_id"].as_str().unwrap();
     assert!(
         id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),

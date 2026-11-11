@@ -878,8 +878,21 @@ mod tests {
                 .program
                 .kernels
                 .iter()
-                .filter(|kn| kn.source.contains("for (int e4 = 0;"))
+                .filter(|kn| {
+                    // f32 activations held per token: streamed (`e4`) or
+                    // preloaded as `float4 v{i}[k][vec/4]` (the window tile)
+                    kn.source.contains("for (int e4 = 0;")
+                        || kn.source.lines().any(|l| {
+                            let l = l.trim();
+                            l.starts_with("float4 v") && l.matches('[').count() == 2
+                        })
+                })
                 .count();
+            if let Ok(dir) = std::env::var("TANG_DUMP_WIN") {
+                for (j, kn) in dp.program.kernels.iter().enumerate() {
+                    std::fs::write(format!("{dir}/w{k}_{j}.cu"), &kn.source).unwrap();
+                }
+            }
             let words: Vec<Vec<f32>> = ins
                 .iter()
                 .zip(&dg.inputs)
@@ -911,7 +924,7 @@ mod tests {
                 rel(&emu, &want)
             );
             eprintln!(
-                "window {k}: {} CUDA kernels ({tiled} streamed register-tile GEMVs) on the CPU vs interpreter: rel err {e:.2e}",
+                "window {k}: {} CUDA kernels ({tiled} register-tile GEMVs) on the CPU vs interpreter: rel err {e:.2e}",
                 dp.program.kernels.len()
             );
             assert!(k == 1 || tiled > 0, "no register-tiled window GEMV");
