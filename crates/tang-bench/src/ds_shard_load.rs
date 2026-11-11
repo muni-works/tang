@@ -313,6 +313,9 @@ pub struct RankLoad {
     pub native: usize,
     pub demoted: Vec<String>,
     pub host: Vec<String>,
+    /// Per step input: the native buffer (codes, then scales) when the box
+    /// loaded natively.
+    pub shards: Vec<Option<(Format, Vec<u8>)>>,
 }
 
 /// Rank `p`'s inputs: step input `k` named `names[k]` (a weight) loaded
@@ -327,11 +330,12 @@ pub fn load_rank(
     full: &[Vec<f64>],
     check: Option<&[Vec<f64>]>,
 ) -> Result<RankLoad, String> {
-    let mut out = RankLoad { ins: Vec::new(), native_bytes: 0, value_elems: 0, native: 0, demoted: Vec::new(), host: Vec::new() };
+    let mut out = RankLoad { ins: Vec::new(), native_bytes: 0, value_elems: 0, native: 0, demoted: Vec::new(), host: Vec::new(), shards: Vec::new() };
     for k in 0..shapes.len() {
         let bx = &p.boxes[k];
         let Some(name) = &names[k] else {
             out.ins.push(cut(&full[k], &shapes[k], bx));
+            out.shards.push(None);
             continue;
         };
         let s = ld.load(name, &shapes[k], bx)?;
@@ -356,6 +360,10 @@ pub fn load_rank(
             }
         }
         out.ins.push(v);
+        out.shards.push(match s {
+            Shard::Native { format, bytes, .. } => Some((format, bytes)),
+            _ => None,
+        });
     }
     Ok(out)
 }
