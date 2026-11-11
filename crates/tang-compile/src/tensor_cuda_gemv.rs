@@ -2252,7 +2252,9 @@ impl Lowering<'_> {
                             let best = [8usize, 4, 2]
                                 .into_iter()
                                 .filter(|&a| pts[d1].is_multiple_of(a))
-                                .flat_map(|a| [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b)))
+                                .flat_map(|a| {
+                                    [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b))
+                                })
                                 .filter(|&(a, b)| pts[d2].is_multiple_of(b) && a * b <= cap)
                                 .min_by(|x, y| traffic(x.0, x.1).total_cmp(&traffic(y.0, y.1)));
                             if let Some((a, b)) = best {
