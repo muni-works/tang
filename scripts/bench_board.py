@@ -10,6 +10,14 @@
 Row fields: date, commit, branch, gpu, model, context, hand_ms, hand_tok_s,
 derived_ms, derived_tok_s, ids_matched (true/false/null), ids (e.g. "64/64"),
 kernels (derived step, null when the run didn't print it), source.
+Optional: kind ("step" when absent, "window": a k-token derived window,
+"spec": prompt-lookup speculation end to end), window (k), config (the
+non-default knobs the run used, e.g. "TANG_STAGED_MAP=0"; a knob whose
+default has since changed is spelled out with "(default then)"), prompt,
+greedy_tok_s and acceptance (spec rows), note.
+
+    bench_board.py add --model M --gpu G --commit C --set derived_ms=2.42 ...
+        print one hand-entered row (a result only a PR body records)
 Units: ms per decode step (device time) and tok/s. Hand rows of the coder
 engine are flash-bench wall tok/s; hand_ctx says what context it ran at.
 """
@@ -23,6 +31,12 @@ import sys
 LEN_RE = re.compile(
     r"decode step at len (\d+) \((hand|derived)\): ([\d.]+) ms device \(([\d.]+) tok/s\)")
 DER_RE = re.compile(r"derived decode step at len (\d+): ([\d.]+) ms device \(([\d.]+) tok/s\)")
+WIN_RE = re.compile(
+    r"window of (\d+) at len (\d+) \(derived\): ([\d.]+) ms device \(([\d.]+) tok/s\)")
+GREEDY_RE = re.compile(r"^\s*decode (\d+) tokens in [\d.]+s: ([\d.]+) tok/s end to end", re.M)
+SPEC_RE = re.compile(r"spec k=(\d+): \d+ tokens in [\d.]+s: ([\d.]+) tok/s end to end;.*?"
+                     r"acceptance (\d+)%")
+SPEC_EQ_RE = re.compile(r"spec k=\d+: first (\d+)/(\d+) tokens equal")
 HAND_RE = re.compile(r"hand \(ctx (\d+)\):\s+decode\s+([\d.]+) tok/s")
 
 
@@ -35,7 +49,17 @@ def read(path):
             if os.path.exists(p):
                 parts.append(f"### {name}\n" + open(p, errors="replace").read())
         return "\n".join(parts)
-    return open(path, errors="replace").read()
+    text = open(path, errors="replace").read()
+    d = os.path.dirname(path)
+    head = ""
+    c, g = os.path.join(d, "commit.txt"), os.path.join(d, "gpu.txt")
+    if "commit: " not in text and os.path.exists(c):
+        head += "commit: " + open(c, errors="replace").read().strip() + "\n"
+    if "GPU: " not in text and os.path.exists(g):
+        lines = [l for l in open(g, errors="replace").read().splitlines() if l.startswith("NVIDIA")]
+        if lines:
+            head += "GPU: " + lines[0] + "\n"
+    return head + text
 
 
 def meta(text):
@@ -132,15 +156,40 @@ def parse(text, model):
             "ids_matched": matched, "ids": n, "kernels": k,
             **({"hand_ctx": r["hand_ctx"]} if "hand_ctx" in r else {}),
         })
+    base = {"commit": commit, "gpu": gpu, "model": model}
+    seen = set()
+    for w, ctx, ms, ts in WIN_RE.findall(text):
+        if (w, ctx) in seen:
+            continue
+        seen.add((w, ctx))
+        out.append(dict(base, kind="window", window=int(w), context=int(ctx),
+                        derived_ms=float(ms), derived_tok_s=float(ts), kernels=None))
+    spec = SPEC_RE.search(text)
+    if spec:
+        g = GREEDY_RE.search(text)
+        eq = SPEC_EQ_RE.search(text)
+        out.append(dict(base, kind="spec", window=int(spec.group(1)), context=None,
+                        derived_tok_s=float(spec.group(2)), acceptance=int(spec.group(3)) / 100,
+                        greedy_tok_s=float(g.group(2)) if g else None,
+                        ids_matched=(eq.group(1) == eq.group(2)) if eq else None,
+                        ids=f"{eq.group(1)}/{eq.group(2)}" if eq else None))
     return out
 
 
-def stamp(rows, date, branch, source):
-    keys = ["date", "commit", "branch", "gpu", "model", "context", "hand_ms", "hand_tok_s",
-            "derived_ms", "derived_tok_s", "ids_matched", "ids", "kernels", "hand_ctx", "source"]
+KEYS = ["date", "commit", "branch", "gpu", "model", "kind", "window", "context", "config",
+        "prompt", "hand_ms", "hand_tok_s", "derived_ms", "derived_tok_s", "greedy_tok_s",
+        "acceptance", "ids_matched", "ids", "kernels", "hand_ctx", "note", "source"]
+
+
+def stamp(rows, date, branch, source, config=None, prompt=None):
+    keys = KEYS
     done = []
     for r in rows:
         r = dict(r, date=date, branch=r.get("branch") or branch, source=source)
+        if config:
+            r.setdefault("config", config)
+        if prompt:
+            r.setdefault("prompt", prompt)
         done.append({k: r[k] for k in keys if k in r})
     return done
 
@@ -150,8 +199,29 @@ def mtime_date(path):
     return datetime.date.fromtimestamp(os.path.getmtime(p)).isoformat()
 
 
+# race dirs named for the knob they ran with; the default then is spelled out
+# where it has since changed (staged maps and cokernels are opt-in on main)
+CONFIG = {
+    "cdr-037e3984": "TANG_STAGED_MAP=1 (default then)",
+    "cdr-037e3984-staged0": "TANG_STAGED_MAP=0",
+    "cdr-multiout": "TANG_STAGED_MAP=1 TANG_COKERNEL=1 (defaults then)",
+    "cdr-multiout-cokernel0": "TANG_STAGED_MAP=1 (default then) TANG_COKERNEL=0",
+    "cdr-multiout-rules-a": "TANG_STAGED_MAP=1 TANG_COKERNEL=1 (defaults then) TANG_COKERNEL_RULES=a",
+}
+
+
+def file_config(name):
+    """bench-gemv8-w4.txt -> TANG_WINDOW_GEMV=8; knob-K=V.txt -> K=V"""
+    m = re.match(r"bench-gemv(\d+)-w\d+\.txt$", name)
+    if m:
+        # 8 (the tiled window GEMV) is the default
+        return None if m.group(1) == "8" else f"TANG_WINDOW_GEMV={m.group(1)}"
+    m = re.match(r"knob-(.+)\.txt$", name)
+    return m.group(1) if m else None
+
+
 def backfill_sources(repo, artifacts):
-    """(path, model, date or None, branch, commit override)"""
+    """(path, model, date or None, branch, commit override[, config, prompt])"""
     # oldest first: the board orders runs by date, then by line
     dr = os.path.join(repo, "bench/results/derived-race")
     a = lambda *x: os.path.join(artifacts or "", *x)
@@ -175,7 +245,23 @@ def backfill_sources(repo, artifacts):
         cdr = [a("abd-6000", n) for n in os.listdir(a("abd-6000")) if n.startswith("cdr-")]
         cdr = [p for p in cdr if os.path.exists(os.path.join(p, "summary.txt"))]
         for p in sorted(cdr, key=lambda p: os.path.getmtime(os.path.join(p, "summary.txt"))):
-            src.append((p, "coder-next", None, "claude/derive-integrate", None))
+            branch = "claude/multi-out" if "multiout" in p else "claude/fuse-gdn-norm" \
+                if "037e3984" in p or "5f930c7c" in p else "claude/derive-integrate"
+            src.append((p, "coder-next", None, branch, None, CONFIG.get(os.path.basename(p))))
+        # prompt lookup: one file a bench config or a prompt
+        for run in ("prompt-lookup", "prompt-lookup-2"):
+            d = a("abd-6000", run)
+            if not os.path.isdir(d):
+                continue
+            for name in sorted(os.listdir(d)):
+                p = os.path.join(d, name)
+                if name.startswith(("bench-", "knob-")):
+                    src.append((p, "qwen3-8b", None, "claude/prompt-lookup", None,
+                                file_config(name)))
+                m = re.match(r"spec-(.+)-k\d+\.txt$", name)
+                if m:
+                    src.append((p, "qwen3-8b", None, "claude/prompt-lookup", None, None,
+                                m.group(1)))
     return src
 
 
@@ -188,6 +274,16 @@ def main():
     p.add_argument("--branch")
     p.add_argument("--date")
     p.add_argument("--source", default="bench-all")
+    p.add_argument("--config", help="non-default knobs, e.g. TANG_COKERNEL=1")
+    p.add_argument("--prompt")
+    ad = sub.add_parser("add")
+    for k in ("model", "gpu", "commit"):
+        ad.add_argument(f"--{k}", required=True)
+    ad.add_argument("--branch")
+    ad.add_argument("--date")
+    ad.add_argument("--source", default="manual")
+    ad.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="any row field; numbers, true/false and null are parsed")
     b = sub.add_parser("backfill")
     b.add_argument("--repo", default=".")
     b.add_argument("--board", default="bench/results/board.jsonl")
@@ -197,9 +293,21 @@ def main():
     if args.cmd == "parse":
         rows = parse(read(args.path), args.model)
         date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-        for r in stamp(rows, date, args.branch, args.source):
+        for r in stamp(rows, date, args.branch, args.source, args.config, args.prompt):
             print(json.dumps(r))
         return 0 if rows else 1
+
+    if args.cmd == "add":
+        r = {"model": args.model, "gpu": args.gpu, "commit": args.commit}
+        for kv in args.set:
+            k, v = kv.split("=", 1)
+            try:
+                r[k] = json.loads(v)
+            except ValueError:
+                r[k] = v
+        date = args.date or datetime.date.today().isoformat()
+        print(json.dumps(stamp([r], date, args.branch, args.source)[0]))
+        return 0
 
     kept = []
     if os.path.exists(args.board):
@@ -208,16 +316,24 @@ def main():
             if line and not json.loads(line).get("source", "").startswith("backfill"):
                 kept.append(line)
     new = []
-    for path, model, date, branch, commit in backfill_sources(args.repo, args.race_artifacts):
+    for path, model, date, branch, commit, *rest in backfill_sources(args.repo, args.race_artifacts):
+        config, prompt = (rest + [None, None])[:2]
         if not os.path.exists(path):
             print(f"skip (missing): {path}", file=sys.stderr)
             continue
         rows = parse(read(path), model)
+        name = os.path.basename(path)
+        # every bench file reruns the plain decode step: keep one copy (a
+        # knob file keeps its own: the knob changes the step too)
+        if name.startswith("bench-") and name != "bench-gemv8-w4.txt":
+            rows = [r for r in rows if r.get("kind")]
         if commit:
             for r in rows:
                 r["commit"] = r["commit"] or commit
         rel = os.path.relpath(path, args.repo) if path.startswith(os.path.abspath(args.repo)) else os.path.basename(path)
-        rows = stamp(rows, date or mtime_date(path), branch, f"backfill:{rel}")
+        if os.path.dirname(os.path.dirname(path)).endswith("abd-6000") and not os.path.isdir(path):
+            rel = os.path.join(os.path.basename(os.path.dirname(path)), os.path.basename(path))
+        rows = stamp(rows, date or mtime_date(path), branch, f"backfill:{rel}", config, prompt)
         print(f"{len(rows)} rows: {path}", file=sys.stderr)
         new += [json.dumps(r) for r in rows]
     os.makedirs(os.path.dirname(args.board) or ".", exist_ok=True)
