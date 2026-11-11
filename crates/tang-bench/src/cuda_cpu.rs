@@ -12,10 +12,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use tang_compile::tensor::cuda_gemv::DecodeProgram;
+use tang_compile::tensor::cuda_mega::{megakernel, Mega, MegaOpts, MegaStage, HEADER as MEGA_HEADER};
 use tang_compile::tensor::TensorId;
 
 const HEADER: &str = r#"
+#include <atomic>
 #include <barrier>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +30,7 @@ const HEADER: &str = r#"
 using std::sqrt; using std::exp; using std::log; using std::round; using std::floor;
 using std::ceil; using std::fabs; using std::exp2; using std::log2; using std::tanh;
 struct tang_dim3 { unsigned x, y, z; };
-static thread_local tang_dim3 threadIdx;
-static tang_dim3 blockIdx, blockDim, gridDim;
+static thread_local tang_dim3 threadIdx, blockIdx, blockDim, gridDim;
 struct float4 { float x, y, z, w; };
 struct float2 { float x, y; };
 static inline float2 make_float2(float x, float y) { return {x, y}; }
@@ -75,18 +78,26 @@ static inline unsigned short tang_sw_f2h(float f) {
     if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) r++;
     return (unsigned short)(s | r);
 }
-static std::barrier<>* tang_block;
-static std::barrier<>* tang_warp[32];
-static uint64_t tang_xch[32][32];
-static inline void __syncthreads() { tang_block->arrive_and_wait(); }
-static inline void __syncwarp(unsigned = 0xffffffffu) { tang_warp[threadIdx.x >> 5]->arrive_and_wait(); }
+// one block's synchronization state; every thread points at its block's
+struct tang_blk {
+    std::barrier<>* block;
+    std::barrier<>* warp[32];
+    uint64_t xch[32][32];
+    // named barriers (`bar.sync id, n`), made on first use
+    std::mutex mu;
+    std::map<std::pair<unsigned, unsigned>, std::barrier<>*> named;
+    char* smem;
+};
+static thread_local tang_blk* tang_b;
+static inline void __syncthreads() { tang_b->block->arrive_and_wait(); }
+static inline void __syncwarp(unsigned = 0xffffffffu) { tang_b->warp[threadIdx.x >> 5]->arrive_and_wait(); }
 template <class T> static inline T tang_shfl(T v, int src_lane) {
     unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     uint64_t bits = 0; std::memcpy(&bits, &v, sizeof(T));
-    tang_xch[w][lane] = bits;
-    tang_warp[w]->arrive_and_wait();
-    T r; uint64_t got = tang_xch[w][src_lane & 31]; std::memcpy(&r, &got, sizeof(T));
-    tang_warp[w]->arrive_and_wait();
+    tang_b->xch[w][lane] = bits;
+    tang_b->warp[w]->arrive_and_wait();
+    T r; uint64_t got = tang_b->xch[w][src_lane & 31]; std::memcpy(&r, &got, sizeof(T));
+    tang_b->warp[w]->arrive_and_wait();
     return r;
 }
 template <class T> static inline T __shfl_xor_sync(unsigned, T v, int off, int = 32) { return tang_shfl(v, (int)(threadIdx.x & 31) ^ off); }
@@ -99,31 +110,79 @@ template <class T> static inline T __shfl_up_sync(unsigned, T v, unsigned off, i
 template <class T> static inline T __shfl_sync(unsigned, T v, int src, int width = 32) {
     int base = (int)(threadIdx.x & 31) & ~(width - 1); return tang_shfl(v, base + (src % width));
 }
-template <class F> static void tang_launch(unsigned blocks, unsigned threads, F f) {
-    gridDim = {blocks, 1, 1};
-    blockDim = {threads, 1, 1};
-    for (unsigned b = 0; b < blocks; b++) {
-        blockIdx = {b, 0, 0};
-        std::barrier<> block((std::ptrdiff_t)threads);
-        tang_block = &block;
-        std::vector<std::barrier<>*> ws;
-        for (unsigned w = 0; w * 32 < threads; w++) {
-            unsigned n = threads - w * 32 < 32 ? threads - w * 32 : 32;
-            ws.push_back(new std::barrier<>((std::ptrdiff_t)n));
-            tang_warp[w] = ws.back();
-        }
-        std::vector<std::thread> ts;
+static tang_blk* tang_new_blk(unsigned threads, unsigned smem) {
+    tang_blk* b = new tang_blk();
+    b->block = new std::barrier<>((std::ptrdiff_t)threads);
+    for (unsigned w = 0; w * 32 < threads; w++) {
+        unsigned n = threads - w * 32 < 32 ? threads - w * 32 : 32;
+        b->warp[w] = new std::barrier<>((std::ptrdiff_t)n);
+    }
+    b->smem = smem ? (char*)std::calloc(smem + 16, 1) : nullptr;
+    return b;
+}
+static void tang_free_blk(tang_blk* b, unsigned threads) {
+    delete b->block;
+    for (unsigned w = 0; w * 32 < threads; w++) delete b->warp[w];
+    for (auto& kv : b->named) delete kv.second;
+    std::free(b->smem);
+    delete b;
+}
+// `blocks` blocks of `threads` threads; `together`: every block's threads
+// at once (a cooperative launch: grid barriers work), else block by block
+template <class F> static void tang_run(unsigned blocks, unsigned threads, unsigned smem, bool together, F f) {
+    std::vector<tang_blk*> bs;
+    std::vector<std::thread> ts;
+    auto spawn = [&](unsigned b) {
+        tang_blk* blk = bs[b];
         for (unsigned t = 0; t < threads; t++) {
-            ts.emplace_back([t, &f] {
+            ts.emplace_back([t, b, blocks, threads, blk, &f] {
                 threadIdx = {t, 0, 0};
+                blockIdx = {b, 0, 0};
+                blockDim = {threads, 1, 1};
+                gridDim = {blocks, 1, 1};
+                tang_b = blk;
                 f();
-                tang_warp[t >> 5]->arrive_and_drop();
-                tang_block->arrive_and_drop();
+                blk->warp[t >> 5]->arrive_and_drop();
+                blk->block->arrive_and_drop();
             });
         }
-        for (auto& t : ts) t.join();
-        for (auto* w : ws) delete w;
+    };
+    for (unsigned b = 0; b < blocks; b++) bs.push_back(tang_new_blk(threads, smem));
+    for (unsigned b = 0; b < blocks; b++) {
+        spawn(b);
+        if (!together) { for (auto& t : ts) t.join(); ts.clear(); }
     }
+    for (auto& t : ts) t.join();
+    for (auto* b : bs) tang_free_blk(b, threads);
+}
+template <class F> static void tang_launch(unsigned blocks, unsigned threads, F f) {
+    tang_run(blocks, threads, 0, false, f);
+}
+"#;
+
+/// What stands in for the megakernel prelude on the CPU: named barriers
+/// per block, the grid barrier on host atomics (all blocks run at once),
+/// the dynamic pool per block.
+const MEGA_HOST: &str = r#"
+template <class T> static inline T tang_ld(const T* p) { return *p; }
+static inline std::barrier<>* tang_named(unsigned id, unsigned n) {
+    std::lock_guard<std::mutex> g(tang_b->mu);
+    auto& b = tang_b->named[{id, n}];
+    if (!b) b = new std::barrier<>((std::ptrdiff_t)n);
+    return b;
+}
+template <unsigned ID, unsigned N> static inline void tang_bar() { tang_named(ID, N)->arrive_and_wait(); }
+#define tang_dyn (tang_b->smem)
+static inline void tang_prefetch(unsigned long long, unsigned long long) {}
+static inline void __threadfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+static inline unsigned atomicAdd(unsigned* p, unsigned v) { return std::atomic_ref<unsigned>(*p).fetch_add(v); }
+static inline void tang_grid_sync(unsigned* s, unsigned target) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        atomicAdd(s, 1u);
+        while (std::atomic_ref<unsigned>(*s).load() < target) std::this_thread::yield();
+    }
+    __syncthreads();
 }
 "#;
 
@@ -160,6 +219,105 @@ fn host_source(src: &str) -> String {
 /// other buffer zero) and returns the values of `outs`.
 pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Vec<f32>> {
     let p = &dp.program;
+    let mut defs = String::new();
+    for (j, k) in p.kernels.iter().enumerate() {
+        writeln!(defs, "namespace k{j} {{\n{}\n}}", host_source(&k.source)).unwrap();
+    }
+    run_with(dp, inputs, outs, &defs, |cpp, bi| {
+        for (j, k) in p.kernels.iter().enumerate() {
+            let mut args: Vec<String> = k
+                .reads
+                .iter()
+                .map(|&t| format!("B[{}].data()", bi(t)))
+                .collect();
+            for t in k.outputs() {
+                args.push(format!("B[{}].data()", bi(t)));
+            }
+            args.push(format!("{}u", k.points));
+            let blocks = k.count.div_ceil(k.workgroup_size);
+            writeln!(
+                cpp,
+                "    tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }});",
+                k.workgroup_size,
+                args.join(", ")
+            )
+            .unwrap();
+        }
+    })
+}
+
+/// [`run`] with the whole program fused into one persistent kernel
+/// (`cuda_mega::megakernel`, kernels in launch order, one slot per
+/// buffer) and launched once over `grid` blocks that all run at once, so
+/// the grid barriers between phases are real: a block racing ahead of a
+/// barrier, or reading through a missing one, shows up as wrong values.
+/// Returns the values and the megakernel (phases, source).
+pub fn run_mega(
+    dp: &DecodeProgram,
+    inputs: &[Vec<f32>],
+    outs: &[TensorId],
+    opts: &MegaOpts,
+    grid: u32,
+) -> (Vec<Vec<f32>>, Mega) {
+    let p = &dp.program;
+    let bi = |t: TensorId| {
+        let t = p.storage(t);
+        p.buffers
+            .iter()
+            .position(|b| b.node == t)
+            .expect("tensor has no buffer")
+    };
+    let stages: Vec<MegaStage> = p
+        .kernels
+        .iter()
+        .map(|k| MegaStage {
+            source: &k.source,
+            threads: k.workgroup_size,
+            blocks: k.count.div_ceil(k.workgroup_size),
+            count: k.points,
+            args: k.reads.iter().copied().chain(k.outputs()).map(bi).collect(),
+            outs: 1 + k.writes.len(),
+        })
+        .collect();
+    let mut opts = opts.clone();
+    opts.slot_bytes = p.buffers.iter().map(|b| 4 * b.len).collect();
+    let m = megakernel(&stages, &opts);
+    let body = m
+        .source
+        .strip_prefix(MEGA_HEADER)
+        .expect("megakernel prelude");
+    let defs = format!("{MEGA_HOST}namespace mk {{\n{}\n}}\n", host_source(body));
+    let got = run_with(dp, inputs, outs, &defs, |cpp, _| {
+        writeln!(
+            cpp,
+            "    std::vector<unsigned long long> tab = {{{}}};",
+            m.table
+                .iter()
+                .map(|&s| format!("(unsigned long long)B[{s}].data()"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .unwrap();
+        writeln!(
+            cpp,
+            "    std::vector<unsigned> sync({}, 0u);\n    tang_run({grid}u, {}u, {}u, true, [&] {{ mk::main0(tab.data(), sync.data()); }});\n    if (sync[0] || sync[1]) {{ std::fprintf(stderr, \"barrier state not reset\\n\"); return 3; }}",
+            2 + 2 * (m.phases.len() + 1),
+            m.threads,
+            m.smem,
+        )
+        .unwrap();
+    });
+    (got, m)
+}
+
+fn run_with(
+    dp: &DecodeProgram,
+    inputs: &[Vec<f32>],
+    outs: &[TensorId],
+    defs: &str,
+    launches: impl FnOnce(&mut String, &dyn Fn(TensorId) -> usize),
+) -> Vec<Vec<f32>> {
+    let p = &dp.program;
     let bi = |t: TensorId| {
         let t = p.storage(t);
         p.buffers
@@ -168,9 +326,7 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
             .expect("tensor has no buffer")
     };
     let mut cpp = String::from(HEADER);
-    for (j, k) in p.kernels.iter().enumerate() {
-        writeln!(cpp, "namespace k{j} {{\n{}\n}}", host_source(&k.source)).unwrap();
-    }
+    cpp.push_str(defs);
     cpp.push_str("int main(int argc, char** argv) {\n");
     writeln!(
         cpp,
@@ -194,25 +350,7 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         }
     }
     cpp.push_str("    std::fclose(in);\n");
-    for (j, k) in p.kernels.iter().enumerate() {
-        let mut args: Vec<String> = k
-            .reads
-            .iter()
-            .map(|&t| format!("B[{}].data()", bi(t)))
-            .collect();
-        for t in k.outputs() {
-            args.push(format!("B[{}].data()", bi(t)));
-        }
-        args.push(format!("{}u", k.points));
-        let blocks = k.count.div_ceil(k.workgroup_size);
-        writeln!(
-            cpp,
-            "    tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }});",
-            k.workgroup_size,
-            args.join(", ")
-        )
-        .unwrap();
-    }
+    launches(&mut cpp, &bi);
     cpp.push_str("    FILE* o = std::fopen(argv[2], \"wb\");\n");
     for &t in outs {
         let j = bi(t);
@@ -281,6 +419,7 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
 #[cfg(test)]
 mod tests {
     use crate::derive_all::*;
+    use tang_compile::tensor::cuda_mega::MegaOpts;
     use tang_compile::tensor::cuda_gemv::DecodeOpts;
     use tang_compile::tensor::step::{Rows, StepInput};
     use tang_compile::tensor::TensorId;
@@ -294,7 +433,19 @@ mod tests {
         staged: bool,
         cokernels: bool,
     ) -> (f64, usize) {
-        let m = coder();
+        step_on_cpu(&coder(), opts, keep_residual, staged, cokernels, None)
+    }
+
+    /// [`coder_step_on_cpu`] for any tiny model, the program run as
+    /// kernels or (`mega`: options, grid) as one persistent kernel.
+    pub(crate) fn step_on_cpu(
+        m: &Model,
+        opts: &DecodeOpts,
+        keep_residual: bool,
+        staged: bool,
+        cokernels: bool,
+        mega: Option<(&MegaOpts, u32)>,
+    ) -> (f64, usize) {
         let w = weights(&m);
         let p0 = 5;
         let k = 1;
@@ -352,7 +503,8 @@ mod tests {
             let k = g.schedule_staged_stats(&outs, &[]);
             assert!(k > 0, "no statistic staged");
             let m = g.schedule_small_maps(&outs, &[]);
-            assert!(m > 0, "no small map inlined");
+            // (the small maps are the GDN gates: coder only)
+            assert!(m > 0 || !keep_residual, "no small map inlined");
         }
         if cokernels {
             let (a, b) = g.schedule_cokernels(&outs, opts);
@@ -388,7 +540,19 @@ mod tests {
                     .collect()
             })
             .collect();
-        let got = super::run(&dp, &words, &outs);
+        let got = match mega {
+            None => super::run(&dp, &words, &outs),
+            Some((mo, grid)) => {
+                let (got, mk) = super::run_mega(&dp, &words, &outs, mo, grid);
+                eprintln!(
+                    "megakernel: {nk} kernels ({} multi-output) as {} phases, grid {grid} x {}",
+                    dp.program.kernels.iter().filter(|k| !k.writes.is_empty()).count(),
+                    mk.phases.len(),
+                    mk.threads
+                );
+                got
+            }
+        };
         let mut worst = 0.0f64;
         for (oi, (gv, wv)) in got.iter().zip(&want).enumerate() {
             let (gk, wk): (Vec<f64>, Vec<f64>) = gv
@@ -420,6 +584,27 @@ mod tests {
         );
         assert!(e1 < 1e-4, "{e1}");
         assert!(n1 < n0, "{n1} >= {n0}");
+    }
+
+    /// The tiny coder-next and Qwen3 steps, multi-output kernels and
+    /// all, as one persistent kernel on the CPU (every block a set of OS
+    /// threads running at once, grid barriers on host atomics) against
+    /// the interpreter: a grid smaller than most stages (virtual blocks
+    /// strided over it), 2 stage blocks per physical block, replication
+    /// on and off.
+    #[test]
+    fn megakernel_steps_run_on_the_cpu() {
+        for (name, m, resid) in [("coder", coder(), true), ("qwen3", qwen(), false)] {
+            for (threads, dup, grid) in [(256u32, 0u32, 3u32), (512, 2, 2)] {
+                let mo = MegaOpts { threads, dup, ..Default::default() };
+                let (e, nk) =
+                    step_on_cpu(&m, &DecodeOpts::default(), resid, true, true, Some((&mo, grid)));
+                eprintln!(
+                    "tiny {name} step: {nk} kernels as one megakernel ({threads} threads, dup {dup}, grid {grid}): rel err {e:.2e}"
+                );
+                assert!(e < 1e-4, "{name}: {e}");
+            }
+        }
     }
 
     #[test]

@@ -36,9 +36,11 @@ fn main() {
                 args: k
                     .reads
                     .iter()
-                    .chain(std::iter::once(&k.node))
-                    .map(|&t| slot(t))
+                    .copied()
+                    .chain(k.outputs())
+                    .map(slot)
                     .collect(),
+                outs: 1 + k.writes.len(),
             }
         })
         .collect();

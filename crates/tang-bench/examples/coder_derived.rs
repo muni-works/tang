@@ -125,6 +125,33 @@ fn main() {
         bytes_up as f64 / 1e9,
         t1.elapsed().as_secs_f64()
     );
+    // TANG_MEGA=1: the step as one persistent kernel (knobs as in
+    // qwen_session: TANG_MEGA_THREADS, _DUP, _MINB, _PREFETCH KiB,
+    // _PER_SM, _MAX_BLOCKS)
+    #[cfg(feature = "cuda")]
+    if tang_bench::qwen_session::env("TANG_MEGA") == 1 {
+        use tang_bench::qwen_session::env;
+        let tm = Instant::now();
+        let (launches, phases, grid) = prog.megakernel(
+            &rt,
+            &tang_compile::tensor::cuda_mega::MegaOpts {
+                threads: env("TANG_MEGA_THREADS") as u32,
+                dup: env("TANG_MEGA_DUP") as u32,
+                min_blocks: env("TANG_MEGA_MINB") as u32,
+                prefetch: env("TANG_MEGA_PREFETCH") << 10,
+                slot_bytes: Vec::new(),
+                trace: false,
+            },
+            env("TANG_MEGA_PER_SM") as u32,
+            env("TANG_MEGA_MAX_BLOCKS") as u32,
+        );
+        eprintln!(
+            "megakernel: {} kernels ({} multi-output) as {launches} launches, {phases} phases, grid {grid}, built in {:.1}s",
+            prog.program.kernels.len(),
+            prog.program.kernels.iter().filter(|k| !k.writes.is_empty()).count(),
+            tm.elapsed().as_secs_f64()
+        );
+    }
     // one CUDA graph a step (writes and cache copies stay outside it)
     if !args.iter().any(|a| a == "--no-graph") {
         prog.capture(&rt);

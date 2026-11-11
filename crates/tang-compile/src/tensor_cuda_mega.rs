@@ -43,8 +43,11 @@ pub struct MegaStage<'a> {
     pub blocks: u32,
     /// The kernel's `count` argument.
     pub count: u32,
-    /// Buffer slot per pointer parameter: reads in order, then `out`.
+    /// Buffer slot per pointer parameter: reads in order, then the
+    /// outputs (`out`, then a multi-output kernel's further writes).
     pub args: Vec<usize>,
+    /// How many of `args` (the last ones) the kernel writes; 0 reads as 1.
+    pub outs: usize,
 }
 
 /// What [`megakernel`] produced.
@@ -91,8 +94,8 @@ pub fn replicated(stages: &[MegaStage], dup: u32) -> Vec<bool> {
     stages
         .iter()
         .map(|st| {
-            let (r, w) = split(&st.args);
-            st.blocks <= dup && !r.contains(&w)
+            let (r, w) = split(st);
+            st.blocks <= dup && !w.iter().any(|s| r.contains(s))
         })
         .collect()
 }
@@ -104,12 +107,13 @@ pub fn replicated(stages: &[MegaStage], dup: u32) -> Vec<bool> {
 pub fn phases(stages: &[MegaStage], dup: &[bool]) -> Vec<Vec<usize>> {
     let mut level = vec![0usize; stages.len()];
     for k in 0..stages.len() {
-        let (kr, kw) = split(&stages[k].args);
+        let (kr, kw) = split(&stages[k]);
         let mut lv = 0;
         for j in 0..k {
-            let (jr, jw) = split(&stages[j].args);
-            let raw = kr.contains(&jw);
-            let other = jr.contains(&kw) || jw == kw;
+            let (jr, jw) = split(&stages[j]);
+            let hit = |a: &[usize], b: &[usize]| a.iter().any(|s| b.contains(s));
+            let raw = hit(kr, jw);
+            let other = hit(jr, kw) || hit(jw, kw);
             if other || (raw && !dup[j]) {
                 lv = lv.max(level[j] + 1);
             } else if raw {
@@ -126,12 +130,15 @@ pub fn phases(stages: &[MegaStage], dup: &[bool]) -> Vec<Vec<usize>> {
     out
 }
 
-fn split(args: &[usize]) -> (&[usize], usize) {
-    let (w, r) = args.split_last().expect("a kernel writes out");
-    (r, *w)
+/// A stage's (read slots, written slots).
+fn split<'s>(st: &'s MegaStage) -> (&'s [usize], &'s [usize]) {
+    let n = st.outs.max(1);
+    assert!(st.args.len() >= n, "a kernel writes out");
+    st.args.split_at(st.args.len() - n)
 }
 
-const HEADER: &str = r#"// tang megakernel
+/// The megakernel prelude (helpers every source starts with).
+pub const HEADER: &str = r#"// tang megakernel
 template <class T> __device__ __forceinline__ T tang_ld(const T* p) { return *p; }
 // barrier ids are immediates: with a register id ptxas reserves all 16
 // hardware barriers per block, which caps blocks per SM below what the
@@ -282,7 +289,7 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
     let threads = if opts.threads == 0 { 256 } else { opts.threads };
     let dup = replicated(stages, opts.dup);
     let phases = phases(stages, &dup);
-    let written: Vec<usize> = stages.iter().map(|st| split(&st.args).1).collect();
+    let written: Vec<usize> = stages.iter().flat_map(|st| split(st).1.iter().copied()).collect();
     let mut table: Vec<usize> = Vec::new();
     for st in stages {
         for &s in &st.args {
@@ -301,7 +308,7 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
                 break;
             }
             for &k in ks {
-                for &s in split(&stages[k].args).0 {
+                for &s in split(&stages[k]).0 {
                     if !written.contains(&s) && !want.iter().any(|w| w.0 == s) {
                         let b = opts.slot_bytes.get(s).copied().unwrap_or(0);
                         want.push((s, b));
@@ -328,7 +335,7 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
             "megakernel: stage {i} has {} threads, block has {threads}",
             st.threads
         );
-        let konst: Vec<bool> = split(&st.args)
+        let konst: Vec<bool> = split(st)
             .0
             .iter()
             .map(|s| !written.contains(s))
@@ -373,7 +380,7 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
                 .iter()
                 .enumerate()
                 .map(|(a, &s)| {
-                    let ty = if a + 1 == st.args.len() {
+                    let ty = if a + st.outs.max(1) >= st.args.len() {
                         "float*"
                     } else {
                         "const float*"
@@ -450,6 +457,7 @@ mod tests {
             blocks,
             count: 128 * blocks,
             args: args.to_vec(),
+            outs: 1,
         }
     }
 
@@ -467,6 +475,21 @@ mod tests {
         // a replicated one-block producer lets its reader share its phase
         let s = [st(&[10, 1], 1), st(&[1, 2], 4)];
         assert_eq!(phases(&s, &replicated(&s, 1)), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn multi_output_hazards() {
+        // 0 writes 1 and 2 (a multi-output kernel); 1 reads 2; 2 reads
+        // neither; 3 overwrites 1 (WAW with 0's second output)
+        let mut s = vec![st(&[10, 1, 2], 4), st(&[2, 3], 4), st(&[11, 4], 4), st(&[12, 1], 4)];
+        s[0].outs = 2;
+        let none = vec![false; 4];
+        assert_eq!(phases(&s, &none), vec![vec![0, 2], vec![1, 3]]);
+        // a replicated multi-output stage reading one of its outputs is not
+        s[0].args = vec![2, 1, 2];
+        assert_eq!(replicated(&s, 4), vec![false, true, true, true]);
+        let m = megakernel(&s[..1], &MegaOpts::default());
+        assert!(m.source.contains("k0::run<1>((const float*)tab[0], (float*)tab[1], (float*)tab[0]"));
     }
 
     #[test]

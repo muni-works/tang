@@ -862,6 +862,7 @@ impl Program {
                 blocks: k.count.div_ceil(k.workgroup_size),
                 count: k.points,
                 args: self.args[i].clone(),
+                outs: 1 + k.writes.len(),
             }
         };
         // segments: maximal runs of fusible kernels (at most `max_blocks`
@@ -874,8 +875,6 @@ impl Program {
                 && threads.is_multiple_of(k.workgroup_size)
                 && threads / k.workgroup_size <= 15
                 && crate::cuda::dynamic_smem(&k.source) == 0
-                // the megakernel's stages write one buffer (the last arg)
-                && k.writes.is_empty()
         };
         let mut runs: Vec<Vec<usize>> = Vec::new();
         for &i in &self.order {
