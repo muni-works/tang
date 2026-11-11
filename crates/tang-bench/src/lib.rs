@@ -268,6 +268,7 @@ pub mod ir_qwen;
 /// DeepSeek-V4.1-Flash as one prefill graph over symbolic T (decode derived by derive_step).
 pub mod ir_ds_prefill;
 pub mod ir_ds_real;
+pub mod ir_ds_vision;
 pub mod ir_ds_spark;
 /// Qwen3-Coder-Next as one prefill graph, checked against tang-llm's CPU reference.
 pub mod ir_coder_prefill;
