@@ -288,7 +288,10 @@ fn main() {
             .collect();
         prog.write(&rt, prog.input(tok_in), &[ids[0] as f32]);
         let set_pos = |q: usize| prog.write(&rt, prog.input(pos_in), &[q as f32]);
-        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let reps: usize = std::env::var("TUNE_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
         let t = autotune::tune_step(
             &rt,
             "coder-next",

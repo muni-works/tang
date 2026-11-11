@@ -488,7 +488,12 @@ impl Program {
     /// read them zero-copy, so a step that gathers a few rows of a huge
     /// table moves only those rows over the bus.
     #[cfg(feature = "cuda")]
-    pub fn with_host(rt: &Runtime, program: WgslProgram, inputs: &[&[f32]], host: &[usize]) -> Self {
+    pub fn with_host(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        host: &[usize],
+    ) -> Self {
         let Runtime::Cuda(d) = rt else {
             panic!("host-mapped inputs need the CUDA runtime")
         };
@@ -505,10 +510,16 @@ impl Program {
             .enumerate()
             .filter_map(|(i, b)| {
                 let k = b.input.filter(|k| host.contains(k))?;
-                Some((p.slot[i], HostMapped::new(d, &pack_words(b.format, inputs[k]))))
+                Some((
+                    p.slot[i],
+                    HostMapped::new(d, &pack_words(b.format, inputs[k])),
+                ))
             })
             .collect();
-        let Storage::Cuda { slots, host: hs, .. } = &mut p.storage else {
+        let Storage::Cuda {
+            slots, host: hs, ..
+        } = &mut p.storage
+        else {
             unreachable!()
         };
         for (s, h) in mapped {
@@ -1264,7 +1275,8 @@ impl Program {
     #[cfg(feature = "cuda")]
     fn hazard_deps(&self) -> Vec<Vec<usize>> {
         let mut last_w: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        let mut readers: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+        let mut readers: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
         let mut deps = Vec::with_capacity(self.order.len());
         for (n, &i) in self.order.iter().enumerate() {
             let outs = 1 + self.program.kernels[i].writes.len();
@@ -1311,7 +1323,9 @@ impl Program {
                 .filter(|&s| tail[s].is_some_and(|t| deps[k].binary_search(&t).is_ok()))
                 .max_by_key(|&s| tail[s]);
             let s = cont.unwrap_or_else(|| {
-                (0..streams).min_by_key(|&s| tail[s].map_or(-1, |t| t as i64)).unwrap()
+                (0..streams)
+                    .min_by_key(|&s| tail[s].map_or(-1, |t| t as i64))
+                    .unwrap()
             });
             on[k] = s;
             tail[s] = Some(k);
@@ -1343,7 +1357,8 @@ impl Program {
         for k in 0..n {
             let st = &ss[on[k]];
             for &j in &waits[k] {
-                st.wait(ev[j].as_ref().expect("event before its waiter")).expect("wait");
+                st.wait(ev[j].as_ref().expect("event before its waiter"))
+                    .expect("wait");
             }
             self.run_cuda_on(st, self.order[k]);
             if evented[k] {

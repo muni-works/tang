@@ -540,7 +540,8 @@ impl FlashServe {
                 })
                 .map_err(|e| StepFailure::lanes(group.to_vec(), e))?;
             let share = policy.share_for(ready.len() + constrained.len(), self.batch, oldest);
-            self.sched.decoded(t.elapsed().as_secs_f64(), share, &policy);
+            self.sched
+                .decoded(t.elapsed().as_secs_f64(), share, &policy);
             for (k, &i) in group.iter().enumerate() {
                 let l = &mut lanes[i];
                 let s = l.stream.downcast_mut::<Stream>().unwrap();
@@ -548,13 +549,12 @@ impl FlashServe {
                 s.windows += 1;
                 let pos = (s.ids.len() + s.out.len()) as u64;
                 let row = &mut logits[k * v..(k + 1) * v];
-                let tok = s.constraint.as_mut().unwrap().choose(
-                    out[k],
-                    row,
-                    &s.host,
-                    pos,
-                )
-                .map_err(|e| StepFailure::lanes(vec![i], e))?;
+                let tok = s
+                    .constraint
+                    .as_mut()
+                    .unwrap()
+                    .choose(out[k], row, &s.host, pos)
+                    .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 self.batch_take(s, tok, l.on)
                     .map_err(|e| StepFailure::lanes(vec![i], e))?;
                 if s.finish.is_none() {

@@ -50,9 +50,6 @@ pub mod cuda_gemv;
 mod cuda_int8;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
-/// Measured schedule choices (the tuning cache) behind the lowering knobs.
-#[path = "tensor_tune.rs"]
-pub mod tune;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
@@ -77,6 +74,9 @@ mod grad;
 pub mod int8_sched;
 #[path = "tensor_io.rs"]
 pub mod io;
+/// Measured schedule choices (the tuning cache) behind the lowering knobs.
+#[path = "tensor_tune.rs"]
+pub mod tune;
 pub use io::{IoReport, KernelIo};
 #[path = "tensor_io_lp.rs"]
 pub mod io_lp;
@@ -106,15 +106,15 @@ pub mod precision;
 #[path = "tensor_scan.rs"]
 pub mod scan;
 pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
+/// Multi-GPU decode: placements, collectives and per-rank programs.
+#[path = "tensor_shard.rs"]
+pub mod shard;
 #[path = "tensor_space.rs"]
 pub mod space;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
-/// Multi-GPU decode: placements, collectives and per-rank programs.
-#[path = "tensor_shard.rs"]
-pub mod shard;
 /// Decode as the finite difference of prefill: the `T → T + k` step and
 /// its KV cache, derived from the full-sequence graph.
 #[path = "tensor_step.rs"]
@@ -532,9 +532,8 @@ impl Monoid {
             return None;
         }
         let k = self.width / 2;
-        let id_ok = (0..k).all(|r| {
-            self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64)
-        });
+        let id_ok = (0..k)
+            .all(|r| self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64));
         (id_ok && self.matches(&Monoid::topk(k))).then_some(k)
     }
 
