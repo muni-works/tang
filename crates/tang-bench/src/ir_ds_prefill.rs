@@ -161,6 +161,12 @@ pub struct DsDims {
     pub dspark_rank: usize,
     pub dspark_experts: usize,
     pub dspark_active: usize,
+    /// Image input ([`crate::ir_ds_vision`]): the graph takes
+    /// `image_rows [T, dim]` and `image_mask [T]` (1 inside an image span).
+    /// Masked positions take their row instead of the token embedding,
+    /// route with `ffn.gate.bias_vl` instead of `ffn.gate.bias`, and get no
+    /// Engram contribution. `false` builds the text-only graph unchanged.
+    pub vision: bool,
 }
 
 impl DsDims {
@@ -203,6 +209,7 @@ impl DsDims {
             engram_cols: 0,
             engram_head_dim: 0,
             engram_rows: 0,
+            vision: false,
             dspark_targets: Vec::new(),
             n_mtp: 0,
             dspark_block: 0,
@@ -232,6 +239,7 @@ impl DsDims {
             engram_cols: 6,
             engram_head_dim: 8,
             engram_rows: 97,
+            vision: false,
             dspark_targets: vec![3, 4, 5],
             n_mtp: 3,
             dspark_block: 4,
@@ -290,6 +298,8 @@ pub(crate) struct B {
     pub(crate) eps: f64,
     /// Weights by name: a weight asked for twice is one input.
     pub(crate) ws: std::collections::HashMap<String, TensorId>,
+    /// `[T]`, 1 inside an image span (`DsDims::vision` graphs only).
+    pub(crate) image_mask: Option<TensorId>,
 }
 
 impl B {
@@ -708,6 +718,20 @@ impl B {
                 },
             )
             .unwrap();
+        // image-span positions pass through untouched (gate shut)
+        let gate = match self.image_mask {
+            None => gate,
+            Some(mask) => self
+                .g
+                .comp(
+                    &[T, fx(hc)],
+                    &[],
+                    vec![arg(gate, ident(2)), arg(mask, vec![unit(2, 0)])],
+                    None,
+                    |v| vec![select(v[1] - lit(0.5), lit(0.0), v[0])],
+                )
+                .unwrap(),
+        };
         let out = self
             .g
             .comp(
@@ -841,6 +865,28 @@ pub(crate) fn moe_graph(
     let (d, inter) = (dm.dim, dm.moe_inter);
     let gate = b.w(format!("{p}.ffn.gate.weight"), &[ne, d]);
     let bias = b.w(format!("{p}.ffn.gate.bias"), &[ne]);
+    // image-span tokens pick experts with `bias_vl` (training's
+    // `noaux_tc_for_vl`): the bias per (token, expert)
+    let bias_arg = match b.image_mask {
+        None => arg(bias, vec![unit(2, 1)]),
+        Some(mask) => {
+            let bvl = b.w(format!("{p}.ffn.gate.bias_vl"), &[ne]);
+            let bt =
+                b.g.comp(
+                    &[T, fx(ne)],
+                    &[],
+                    vec![
+                        arg(mask, vec![unit(2, 0)]),
+                        arg(bvl, vec![unit(2, 1)]),
+                        arg(bias, vec![unit(2, 1)]),
+                    ],
+                    None,
+                    |v| vec![select(v[0] - lit(0.5), v[1], v[2])],
+                )
+                .unwrap();
+            arg(bt, ident(2))
+        }
+    };
     let rows = if expert_rows > 0 { expert_rows } else { ne };
     let w1 = b.w(format!("{p}.ffn.experts.w1"), &[rows, inter, d]);
     let w3 = b.w(format!("{p}.ffn.experts.w3"), &[rows, inter, d]);
@@ -862,11 +908,7 @@ pub(crate) fn moe_graph(
         b.g.comp_tuple(
             &[T, fx(2 * ka)],
             &[fx(ne)],
-            vec![
-                arg(sc, ident(2)),
-                arg(bias, vec![unit(2, 1)]),
-                arg(ei, ident(2)),
-            ],
+            vec![arg(sc, ident(2)), bias_arg, arg(ei, ident(2))],
             Some(Monoid::topk(ka)),
             |v| {
                 let mut o = vec![v[2], v[0] + v[1]];
@@ -1027,7 +1069,7 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
     let (d, h, hd, hc) = (dm.dim, dm.n_heads, dm.head_dim, dm.hc);
     let (ql, g, ol) = (dm.q_lora_rank, dm.o_groups, dm.o_lora_rank);
     let (nh, ihd, kk) = (dm.index_n_heads, dm.index_head_dim, dm.index_topk);
-    let (ne, ka, inter) = (dm.n_experts, dm.n_active, dm.moe_inter);
+    let (ne, ka, _inter) = (dm.n_experts, dm.n_active, dm.moe_inter);
     let win = dm.window as f64;
     let mut b = B {
         g: TensorGraph::new(),
@@ -1035,11 +1077,32 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         named: Vec::new(),
         eps: dm.eps,
         ws: Default::default(),
+        image_mask: None,
     };
     let tokens = b.input("tokens".into(), &[T]);
     let emb = b.w("embed.weight".into(), &[dm.vocab, d]);
     // the embedding row by token id, copied to every stream
-    let e = b.g.gather(emb, 0, tokens, false).unwrap();
+    let mut e = b.g.gather(emb, 0, tokens, false).unwrap();
+    if dm.vision {
+        // image spans: the encoder's rows (and the span delimiters' learned
+        // rows) replace the `image_token_id` embedding
+        let rows = b.input("image_rows".into(), &[T, fx(d)]);
+        let mask = b.input("image_mask".into(), &[T]);
+        e =
+            b.g.comp(
+                &[T, fx(d)],
+                &[],
+                vec![
+                    arg(e, ident(2)),
+                    arg(rows, ident(2)),
+                    arg(mask, vec![unit(2, 0)]),
+                ],
+                None,
+                |v| vec![select(v[2] - lit(0.5), v[1], v[0])],
+            )
+            .unwrap();
+        b.image_mask = Some(mask);
+    }
     let x3 =
         b.g.comp(
             &[T, fx(hc), fx(d)],
@@ -1561,16 +1624,32 @@ impl EngramMeta {
     /// forward.rs `engram_hash`: the table rows `[layer][t][cols]` of the
     /// 2…n-grams ending at each position of `ids` (the whole sequence).
     pub fn hashes(&self, ids: &[usize]) -> Vec<Vec<Vec<i64>>> {
+        self.hashes_masked(ids, &[])
+    }
+
+    /// [`Self::hashes`] with `dead[pos]` true for positions that take no
+    /// part in an n-gram (image spans): look-back stops at one, as at the
+    /// start of the sequence (`NgramHashState`'s `DEAD`). Empty: none dead.
+    pub fn hashes_masked(&self, ids: &[usize], dead: &[bool]) -> Vec<Vec<Vec<i64>>> {
         let n = self.multipliers[0].len();
         let toks: Vec<i64> = ids.iter().map(|&i| self.token_map[i]).collect();
+        let is_dead = |p: usize| dead.get(p).copied().unwrap_or(false);
         self.multipliers
             .iter()
             .enumerate()
             .map(|(l, mult)| {
                 (0..ids.len())
                     .map(|pos| {
+                        let mut blocked = false;
                         let g: Vec<i64> = (0..n)
-                            .map(|s| if pos < s { self.pad } else { toks[pos - s] })
+                            .map(|s| {
+                                blocked = blocked || pos < s || is_dead(pos - s);
+                                if blocked {
+                                    self.pad
+                                } else {
+                                    toks[pos - s]
+                                }
+                            })
                             .collect();
                         let mut rolling = g[0].wrapping_mul(mult[0]);
                         let mut cols = Vec::new();
@@ -1716,8 +1795,19 @@ pub(crate) mod tests {
     /// The Engram hashes of `toks` (the whole run) as weights
     /// `layers.{l}.engram.hash`, `[T · cols]`.
     pub(crate) fn with_hashes(dm: &DsDims, meta: &EngramMeta, w: &mut Weights, toks: &[f64]) {
+        with_hashes_masked(dm, meta, w, toks, &[]);
+    }
+
+    /// [`with_hashes`] with image-span positions `dead` (no n-grams).
+    pub(crate) fn with_hashes_masked(
+        dm: &DsDims,
+        meta: &EngramMeta,
+        w: &mut Weights,
+        toks: &[f64],
+        dead: &[bool],
+    ) {
         let ids: Vec<usize> = toks.iter().map(|&t| t as usize).collect();
-        for (j, hs) in meta.hashes(&ids).into_iter().enumerate() {
+        for (j, hs) in meta.hashes_masked(&ids, dead).into_iter().enumerate() {
             let l = dm.engram_layers[j];
             let flat: Vec<f64> = hs.into_iter().flatten().map(|v| v as f64).collect();
             assert!(flat.iter().all(|&r| (r as usize) < dm.engram_rows));
@@ -2205,7 +2295,7 @@ pub(crate) mod tests {
         }
 
         /// forward.rs `engram`, in f64 (no bf16 rounding of the rows).
-        fn engram(&self, l: usize, h: &[f64]) -> Vec<f64> {
+        fn engram(&self, l: usize, h: &[f64], mask: Option<&[f64]>) -> Vec<f64> {
             let dm = self.dm;
             let p = format!("layers.{l}");
             let (hc, d, ec, ehd) = (dm.hc, dm.dim, dm.engram_cols, dm.engram_head_dim);
@@ -2237,7 +2327,10 @@ pub(crate) mod tests {
                         dot += x[i] * (qw[ci * d + i] * kw[ci * d + i]) * key[i];
                     }
                     let dot = dot * rstd * (d as f64).powf(-0.5);
-                    let gate = sig(dot.abs().max(1e-6).sqrt().copysign(dot));
+                    let mut gate = sig(dot.abs().max(1e-6).sqrt().copysign(dot));
+                    if mask.is_some_and(|m| m[ti] > 0.5) {
+                        gate = 0.0;
+                    }
                     for i in 0..d {
                         out[(ti * hc + ci) * d + i] = x[i] + gate * val[i];
                     }
@@ -2278,14 +2371,35 @@ pub(crate) mod tests {
             mm(&hh, t, w2, d, inter)
         }
 
-        fn moe(&self, l: usize, x: &[f64]) -> Vec<f64> {
+        fn moe(&self, l: usize, x: &[f64], mask: Option<&[f64]>) -> Vec<f64> {
             let dm = self.dm;
-            self.moe_at(&format!("layers.{l}"), l, x, dm.n_experts, dm.n_active)
+            self.moe_at_vl(
+                &format!("layers.{l}"),
+                l,
+                x,
+                dm.n_experts,
+                dm.n_active,
+                mask,
+            )
         }
 
         /// The MoE under `p` (`ne` experts, top `k`); `l` names the layer
         /// for `load`.
         pub(crate) fn moe_at(&self, p: &str, l: usize, x: &[f64], ne: usize, k: usize) -> Vec<f64> {
+            self.moe_at_vl(p, l, x, ne, k, None)
+        }
+
+        /// [`Self::moe_at`]; tokens with `mask[t] = 1` pick experts with
+        /// `bias_vl` (the routing weights stay the unbiased scores).
+        pub(crate) fn moe_at_vl(
+            &self,
+            p: &str,
+            l: usize,
+            x: &[f64],
+            ne: usize,
+            k: usize,
+            mask: Option<&[f64]>,
+        ) -> Vec<f64> {
             let dm = self.dm;
             let (d, inter) = (dm.dim, dm.moe_inter);
             let t = x.len() / d;
@@ -2294,7 +2408,8 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|s| (if s > 20.0 { s } else { s.exp().ln_1p() }).sqrt())
                 .collect();
-            let bias = self.w(&format!("{p}.ffn.gate.bias"));
+            let bias_t = self.w(&format!("{p}.ffn.gate.bias"));
+            let bias_vl = mask.map(|_| self.w(&format!("{p}.ffn.gate.bias_vl")));
             let fused = |k: &str| -> &[f64] {
                 if self.load.is_some() {
                     &[]
@@ -2307,6 +2422,10 @@ pub(crate) mod tests {
             let mut y = vec![0.0; t * d];
             for ti in 0..t {
                 let row = &sc[ti * ne..(ti + 1) * ne];
+                let bias = match (mask, bias_vl) {
+                    (Some(m), Some(bv)) if m[ti] > 0.5 => bv,
+                    _ => bias_t,
+                };
                 let biased: Vec<f64> = row.iter().zip(bias).map(|(a, b)| a + b).collect();
                 let sel = topk_stable(&biased, k);
                 let mut wv: Vec<f64> = sel.iter().map(|&e| row[e]).collect();
@@ -2354,13 +2473,30 @@ pub(crate) mod tests {
 
         /// Every position's logits and the DSpark target hiddens `[T, n·dim]`.
         pub(crate) fn forward_full(&self, toks: &[f64]) -> (Vec<f64>, Vec<f64>) {
+            self.forward_vl(toks, None)
+        }
+
+        /// [`Self::forward_full`] with image spans (`model.py`'s
+        /// `merge_image_embeddings`): `(rows [T, dim], mask [T])`, rows
+        /// replacing the embedding where the mask is 1, which also selects
+        /// the VL routing bias and shuts the Engram gate.
+        pub(crate) fn forward_vl(
+            &self,
+            toks: &[f64],
+            image: Option<(&[f64], &[f64])>,
+        ) -> (Vec<f64>, Vec<f64>) {
             let dm = self.dm;
             let (hc, d, t) = (dm.hc, dm.dim, toks.len());
             let e = self.w("embed.weight");
+            let mask = image.map(|(_, m)| m);
             let mut h = Vec::with_capacity(t * hc * d);
-            for &id in toks {
+            for (ti, &id) in toks.iter().enumerate() {
+                let row = match image {
+                    Some((rows, m)) if m[ti] > 0.5 => &rows[ti * d..(ti + 1) * d],
+                    _ => &e[id as usize * d..(id as usize + 1) * d],
+                };
                 for _ in 0..hc {
-                    h.extend_from_slice(&e[id as usize * d..(id as usize + 1) * d]);
+                    h.extend_from_slice(row);
                 }
             }
             let mut pre_mix: Vec<Vec<f64>> = (0..t)
@@ -2371,7 +2507,7 @@ pub(crate) mod tests {
             for l in 0..dm.n_layers {
                 let p = format!("layers.{l}");
                 if dm.engram_layers.contains(&l) && !self.bugs.no_engram {
-                    h = self.engram(l, &h);
+                    h = self.engram(l, &h, mask);
                 }
                 if dm.dspark_targets.contains(&l) {
                     let mut m = vec![0.0; t * d];
@@ -2394,7 +2530,7 @@ pub(crate) mod tests {
                 let a_pre: Vec<Vec<f64>> = am.iter().map(|m| m.0.clone()).collect();
                 let mut x = self.hc_pre(&h, &a_pre);
                 self.rms(&mut x, &format!("{p}.ffn_norm.weight"));
-                let y = self.moe(l, &x);
+                let y = self.moe(l, &x, mask);
                 h = self.hc_post(&y, &h, &fm);
                 pre_mix = fm.into_iter().map(|m| m.0).collect();
             }
@@ -2530,7 +2666,13 @@ pub(crate) mod tests {
         dm: &DsDims,
         p0: usize,
         k: usize,
-    ) -> (StepGraph, Vec<Vec<f64>>, Vec<TensorId>, Vec<Vec<f64>>, Vec<usize>) {
+    ) -> (
+        StepGraph,
+        Vec<Vec<f64>>,
+        Vec<TensorId>,
+        Vec<Vec<f64>>,
+        Vec<usize>,
+    ) {
         let pg = prefill_graph(dm);
         let (w, all) = setup(dm, &pg, p0 + k);
         let st = derived_step(&pg, dm, k).unwrap();

@@ -654,6 +654,77 @@ pub struct FlashServe {
     requests: usize,
     line: Line,
     drafts_mode: &'static str,
+    /// Prefix-cache hits under batching, by where the reused tokens came from.
+    cache: CacheStats,
+}
+
+/// Where a batched request's reused prompt tokens came from (`take_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hit {
+    /// Nothing reused: the whole prompt prefilled.
+    Miss,
+    /// A parked slot whose tokens the prompt extends (KV and GDN state already on the GPU).
+    Parked,
+    /// A parked slot that diverges from the prompt, rewound to a saved GDN/conv state at a
+    /// prefix boundary inside the shared part: its KV rows below the boundary are kept, only
+    /// the recurrent state is copied up.
+    Rewound,
+    /// A saved state in host RAM (or read from disk) restored into a fresh slot: recurrent
+    /// state and K/V rows copied up.
+    Host,
+}
+
+impl Hit {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Hit::Miss => "miss",
+            Hit::Parked => "parked",
+            Hit::Rewound => "rewound",
+            Hit::Host => "host",
+        }
+    }
+}
+
+/// Cumulative prefix-cache counters (requests and reused tokens by [`Hit`]).
+#[derive(Default)]
+pub(super) struct CacheStats {
+    pub requests: [u64; 4],
+    pub reused: [u64; 4],
+    pub prompt: u64,
+    /// Parked slots spilled to host RAM when evicted, and their tokens.
+    pub spills: u64,
+    pub spilled_tokens: u64,
+}
+
+impl CacheStats {
+    pub(super) fn note(&mut self, hit: Hit, prompt: usize, reused: usize) {
+        self.requests[hit as usize] += 1;
+        self.reused[hit as usize] += reused as u64;
+        self.prompt += prompt as u64;
+    }
+
+    /// `hit rate 87.1% (parked 40/31.2k, rewound ..., host ..., miss ...)`: tokens reused over
+    /// prompt tokens since start.
+    pub(super) fn line(&self) -> String {
+        let reused: u64 = self.reused.iter().sum();
+        let rate = 100.0 * reused as f64 / self.prompt.max(1) as f64;
+        let by = [Hit::Parked, Hit::Rewound, Hit::Host, Hit::Miss]
+            .iter()
+            .map(|&h| {
+                format!(
+                    "{} {}/{}",
+                    h.name(),
+                    self.requests[h as usize],
+                    self.reused[h as usize]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "cache: {reused}/{} prompt tokens reused = {rate:.1}% ({by}; spills {} = {} tokens)",
+            self.prompt, self.spills, self.spilled_tokens
+        )
+    }
 }
 
 /// Tool-call arguments as objects (the template wants mappings; OpenAI clients send strings).
@@ -867,6 +938,7 @@ impl FlashServe {
             shape,
             gdn_layers,
             requests: 0,
+            cache: CacheStats::default(),
             line: Line::default(),
         };
         // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.

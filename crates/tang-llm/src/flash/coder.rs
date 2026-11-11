@@ -7617,6 +7617,10 @@ impl Coder {
             p.ctx.sync().expect("GPU 1 sync");
         }
         self.dev.sync();
+        // A rewound parked slot's MTP chain belongs to its old tail.
+        if slot > 0 {
+            self.slot_chain[slot].clear();
+        }
         let toks = self.slot_tokens_mut(slot)?;
         toks.clear();
         toks.extend_from_slice(prefix);

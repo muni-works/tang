@@ -126,7 +126,15 @@ pub fn batch_graph(
                         ring,
                         bands: None,
                         form,
-                    } => ng.affine_scan(ins.clone(), dim, exclusive, reverse, form.clone(), *ring, None)?,
+                    } => ng.affine_scan(
+                        ins.clone(),
+                        dim,
+                        exclusive,
+                        reverse,
+                        form.clone(),
+                        *ring,
+                        None,
+                    )?,
                     ScanKind::Affine {
                         ring,
                         bands: Some(bands),

@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use tang_bench::qwen_session::{St, dims_for};
+use tang_bench::qwen_session::{dims_for, St};
 
 const GROUP: usize = 64;
 

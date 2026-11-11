@@ -1009,11 +1009,7 @@ fn moe(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
     let ids = b.sum(
         &[T, fx(ka)],
         &[fx(e)],
-        vec![
-            a(rank, vec![u(3, 0), u(3, 2)]),
-            a(ks, id(3)),
-            a(ke, id(3)),
-        ],
+        vec![a(rank, vec![u(3, 0), u(3, 2)]), a(ks, id(3)), a(ke, id(3))],
         |v| pick(v[0], v[1], v[2]),
     );
     b.name(format!("{p}.expert_ids"), ids);

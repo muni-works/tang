@@ -224,7 +224,12 @@ impl TensorGraph {
             .unwrap_or_default();
         let rd: Vec<String> = reads
             .iter()
-            .map(|&r| format!("{:?}/{:?}", self.nodes[r].shape, self.nodes[r].precision.storage))
+            .map(|&r| {
+                format!(
+                    "{:?}/{:?}",
+                    self.nodes[r].shape, self.nodes[r].precision.storage
+                )
+            })
             .collect();
         super::tune::hash_hex(&format!(
             "{:?}|{:?}|{red}|{:?}|{}",
@@ -453,7 +458,7 @@ impl TensorGraph {
                 None => (target == DecodeTarget::Cuda)
                     .then(|| lw.topk_select(root).or_else(|| lw.topk_warp(root)))
                     .flatten()
-                    .or_else(|| mma())
+                    .or_else(mma)
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
@@ -2209,8 +2214,7 @@ impl Lowering<'_> {
                 // lane loads k·32 f32 activations per 16 bytes of weight
                 // and a window is bound by those loads, not by DRAM. Up
                 // to `TANG_WIN_TILE` (32) points a lane
-                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE")
-                    .unwrap_or(32);
+                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE").unwrap_or(32);
                 let w4: Vec<&Leaf> = leaves
                     .iter()
                     .filter(|l| l.pack == Some(Packing::U4))
@@ -2225,6 +2229,56 @@ impl Lowering<'_> {
                         })
                         .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
                         .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                    // then the token and row tiles together, by the bytes
+                    // all groups load per reduce element (L2 traffic):
+                    // each group loads every leaf once per register point
+                    // it depends on; a 4-bit row re-read by k/t1 groups
+                    // vs k f32 activations re-read by rows/t2 groups.
+                    // 8×4 at k=8 is 8.5 B per weight element, 2×16 is 4
+                    // (H200: window time tracks it). TANG_WIN_JOINT=0 off
+                    // (only past 4 tokens: on the H200 2×16 took window-8
+                    // from 17.9 to 13.4 ms but window-4 from 6.9 to 9.0)
+                    if let Some((d2, _)) = reg2.filter(|_| pts[d1] > 4) {
+                        if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
+                            let bytes = |l: &Leaf| match l.pack {
+                                Some(Packing::U4) => 0.5,
+                                Some(Packing::Bf16 | Packing::F16) => 2.0,
+                                None => 4.0,
+                            };
+                            let traffic = |a: usize, b: usize| -> f64 {
+                                let groups = (pts[d1] / a * (pts[d2] / b)) as f64;
+                                groups
+                                    * leaves
+                                        .iter()
+                                        // (per-group scales, constant along
+                                        // the innermost reduce dim, amortize)
+                                        .filter(|l| l.addr.coefs[rank - 1] != 0)
+                                        .map(|l| {
+                                            let mut n = bytes(l);
+                                            if l.addr.coefs[d1] != 0 {
+                                                n *= a as f64;
+                                            }
+                                            if l.addr.coefs[d2] != 0 {
+                                                n *= b as f64;
+                                            }
+                                            n
+                                        })
+                                        .sum::<f64>()
+                            };
+                            let best = [8usize, 4, 2]
+                                .into_iter()
+                                .filter(|&a| pts[d1].is_multiple_of(a))
+                                .flat_map(|a| {
+                                    [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b))
+                                })
+                                .filter(|&(a, b)| pts[d2].is_multiple_of(b) && a * b <= cap)
+                                .min_by(|x, y| traffic(x.0, x.1).total_cmp(&traffic(y.0, y.1)));
+                            if let Some((a, b)) = best {
+                                reg = Some((d1, a));
+                                reg2 = Some((d2, b));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2935,7 +2989,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -2965,7 +3021,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    __shared__ float si[{p}];").unwrap();
         writeln!(s, "    __shared__ float sv[{p}];").unwrap();
         writeln!(s, "    const int tid = threadIdx.x;").unwrap();
@@ -2979,7 +3040,11 @@ impl Lowering<'_> {
         writeln!(s, "    for (int i = tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "    if (tid == 0) cnt = 0;").unwrap();
         writeln!(s, "    __syncthreads();").unwrap();
-        writeln!(s, "    for (int base = 0; base < {n_red}; base += {threads}) {{").unwrap();
+        writeln!(
+            s,
+            "    for (int base = 0; base < {n_red}; base += {threads}) {{"
+        )
+        .unwrap();
         writeln!(s, "      {{").unwrap();
         writeln!(s, "        const int r = base + tid;").unwrap();
         writeln!(s, "        float ej = 0.0f, ew = -3.40282347e38f;").unwrap();
@@ -2999,14 +3064,29 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         // only what beats the current k-th survives to the next sort
-        writeln!(s, "        const float tv = sv[{}], tj = si[{}];", k - 1, k - 1).unwrap();
-        writeln!(s, "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{").unwrap();
+        writeln!(
+            s,
+            "        const float tv = sv[{}], tj = si[{}];",
+            k - 1,
+            k - 1
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{"
+        )
+        .unwrap();
         writeln!(s, "          const int q = atomicAdd(&cnt, 1);").unwrap();
         writeln!(s, "          si[{k} + q] = ej; sv[{k} + q] = ew;").unwrap();
         writeln!(s, "        }}").unwrap();
@@ -3014,19 +3094,40 @@ impl Lowering<'_> {
         writeln!(s, "      __syncthreads();").unwrap();
         writeln!(s, "      const int c = cnt;").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
-        writeln!(s, "      if (c > {} || base + {threads} >= {n_red}) {{", chunk - threads).unwrap();
+        writeln!(
+            s,
+            "      if (c > {} || base + {threads} >= {n_red}) {{",
+            chunk - threads
+        )
+        .unwrap();
         writeln!(s, "      for (int i = {k} + c + tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
         // bitonic sort of all P, best first
         writeln!(s, "      for (int size = 2; size <= {p}; size <<= 1) {{").unwrap();
-        writeln!(s, "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{").unwrap();
+        writeln!(
+            s,
+            "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{"
+        )
+        .unwrap();
         writeln!(s, "          for (int i = tid; i < {p}; i += {threads}) {{").unwrap();
         writeln!(s, "            const int j = i ^ stride;").unwrap();
         writeln!(s, "            if (j > i) {{").unwrap();
-        writeln!(s, "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);").unwrap();
-        writeln!(s, "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);").unwrap();
+        writeln!(
+            s,
+            "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);"
+        )
+        .unwrap();
         writeln!(s, "              if ((i & size) == 0 ? jb : ib) {{").unwrap();
-        writeln!(s, "                float a = si[i]; si[i] = si[j]; si[j] = a;").unwrap();
+        writeln!(
+            s,
+            "                float a = si[i]; si[i] = si[j]; si[j] = a;"
+        )
+        .unwrap();
         writeln!(s, "                a = sv[i]; sv[i] = sv[j]; sv[j] = a;").unwrap();
         writeln!(s, "              }}").unwrap();
         writeln!(s, "            }}").unwrap();
@@ -3793,7 +3894,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -3824,7 +3927,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    const int lane = threadIdx.x;").unwrap();
         writeln!(s, "    const int pt = blockIdx.x;").unwrap();
         let mut rem = "pt".to_string();
@@ -3853,9 +3961,14 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        vj[e] = ej; vw[e] = ew;").unwrap();
@@ -3870,9 +3983,21 @@ impl Lowering<'_> {
         writeln!(s, "        int bl = lane;").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int o = 16; o > 0; o >>= 1) {{").unwrap();
-        writeln!(s, "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);").unwrap();
-        writeln!(s, "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);").unwrap();
-        writeln!(s, "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);").unwrap();
+        writeln!(
+            s,
+            "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);"
+        )
+        .unwrap();
         writeln!(s, "            if (ow > bw || (ow == bw && (oj < bj || (oj == bj && ol < bl)))) {{ bj = oj; bw = ow; bl = ol; }}").unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        if (lane == bl) {{").unwrap();
@@ -3915,8 +4040,16 @@ fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[Str
         "{indent}    float ai = ta[2 * ia], av = ta[2 * ia + 1], bi = tb[2 * ib], bv = tb[2 * ib + 1];"
     )
     .unwrap();
-    writeln!(s, "{indent}    bool fa = av > bv || (av == bv && ai <= bi);").unwrap();
-    writeln!(s, "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;").unwrap();
+    writeln!(
+        s,
+        "{indent}    bool fa = av > bv || (av == bv && ai <= bi);"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;"
+    )
+    .unwrap();
     writeln!(s, "{indent}    if (fa) ia++; else ib++;").unwrap();
     writeln!(s, "{indent}  }}").unwrap();
     for i in 0..w {
@@ -3934,8 +4067,8 @@ impl TensorGraph {
 }
 
 impl Lowering<'_> {
-    /// A small reduction (at most 64 elements a point, Sum or Max, width
-    /// 1) as one thread per point looping over its reduce space: for a
+    /// A small reduction (at most 64 elements a point, Sum or Max, of
+    /// width 1) as one thread per point looping over its reduce space: for a
     /// kernel that hosts inlined nodes or side jobs (`TNode::host`) and
     /// has no warp lowering (a depthwise conv over a short window).
     fn thread_reduction(&self, root: usize) -> Option<Kernel> {
@@ -4050,7 +4183,7 @@ impl Lowering<'_> {
             || c.tuple != 0
             || g.nodes[u].precision.storage != super::Format::F32
             || self.packed.contains_key(&u)
-            || threads % 32 != 0
+            || !threads.is_multiple_of(32)
         {
             return None;
         }

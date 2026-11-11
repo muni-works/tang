@@ -137,7 +137,16 @@ fn main() {
                 ),
                 None => format!("{:?} (not a comp)", nd.shape),
             };
-            (what, k.source.lines().next().unwrap_or("").chars().take(60).collect())
+            (
+                what,
+                k.source
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect(),
+            )
         })
         .collect();
     // `--no-plan`: every buffer its own allocation (no aliasing)
@@ -285,7 +294,8 @@ fn main() {
         for &k in &cache_ins {
             prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
         }
-        let prompt = |s: usize| -> Vec<usize> { base.iter().map(|&t| (t + 7 * s) % vocab).collect() };
+        let prompt =
+            |s: usize| -> Vec<usize> { base.iter().map(|&t| (t + 7 * s) % vocab).collect() };
         let prompts: Vec<Vec<usize>> = (0..nb).map(prompt).collect();
         let mut out: Vec<Vec<usize>> = vec![Vec::new(); nb];
         let mut lines: Vec<Vec<String>> = vec![Vec::new(); nb.min(nlp)];
@@ -320,7 +330,12 @@ fn main() {
         }
         let secs = t.elapsed().as_secs_f64();
         for b in 0..nb {
-            let s = |v: &[usize]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
+            let s = |v: &[usize]| {
+                v.iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             // (newline-terminated: `cat prompt ids` must not join two ids)
             std::fs::write(format!("{dir}/prompt-{b}.txt"), s(&prompts[b]) + "\n").unwrap();
             std::fs::write(format!("{dir}/ids-{b}.txt"), s(&out[b]) + "\n").unwrap();
@@ -358,7 +373,10 @@ fn main() {
                     .collect();
                 let total: f64 = t.iter().map(|x| x.0).sum();
                 t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                println!("profile B={nb} len {l}: {} kernels, sum {total:.3} ms", t.len());
+                println!(
+                    "profile B={nb} len {l}: {} kernels, sum {total:.3} ms",
+                    t.len()
+                );
                 for (ms, i) in t.iter().take(15) {
                     println!("  {ms:8.4} ms  k{i:<5} {} | {}", kinfo[*i].0, kinfo[*i].1);
                 }
@@ -369,7 +387,15 @@ fn main() {
                     let key = if let Some(p) = w.find("int8 Some") {
                         w[p..].to_string()
                     } else {
-                        format!("{} {}", if w.contains("gathers 0") { "plain" } else { "gather" }, kinfo[*i].1)
+                        format!(
+                            "{} {}",
+                            if w.contains("gathers 0") {
+                                "plain"
+                            } else {
+                                "gather"
+                            },
+                            kinfo[*i].1
+                        )
                     };
                     let e = by.entry(key).or_default();
                     e.0 += 1;

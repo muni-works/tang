@@ -142,16 +142,37 @@ pub struct Int8Dims {
 
 impl Int8Dims {
     pub fn tiny() -> Self {
-        Self { q5: false, ne: 6, rows: 32, k: 512, nb: 5, ns: 2 }
+        Self {
+            q5: false,
+            ne: 6,
+            rows: 32,
+            k: 512,
+            nb: 5,
+            ns: 2,
+        }
     }
     /// coder-next's routed gate (512 experts, 512 rows, d = 2048, top-10)
     /// and a dense `[512, 2048]` Q8_0 weight, at `nb` streams.
     pub fn coder(nb: usize) -> Self {
-        Self { q5: false, ne: 512, rows: 512, k: 2048, nb, ns: 10 }
+        Self {
+            q5: false,
+            ne: 512,
+            rows: 512,
+            k: 2048,
+            nb,
+            ns: 10,
+        }
     }
     /// coder-next's routed down projection (Q5_K, 2048 rows, k = 512).
     pub fn coder_down(nb: usize) -> Self {
-        Self { q5: true, ne: 512, rows: 2048, k: 512, nb, ns: 10 }
+        Self {
+            q5: true,
+            ne: 512,
+            rows: 2048,
+            k: 512,
+            nb,
+            ns: 10,
+        }
     }
 }
 
@@ -172,7 +193,10 @@ impl Int8Case {
     /// `(routed, dense)` rel errs of outputs `got`.
     pub fn errors(&self, got: &[Vec<f32>]) -> (f64, f64) {
         let f = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
-        (rel(&f(&got[0]), &self.want[0]), rel(&f(&got[1]), &self.want[1]))
+        (
+            rel(&f(&got[0]), &self.want[0]),
+            rel(&f(&got[1]), &self.want[1]),
+        )
     }
 }
 
@@ -182,8 +206,19 @@ pub fn int8_case(
     group: usize,
 ) -> Int8Case {
     use tang_compile::tensor::{gguf, Arg, Format, Monoid, Precision, View};
-    let Int8Dims { q5, ne, rows, k, nb, ns } = *d;
-    let (rf, rb) = if q5 { (Format::Q5K, 176) } else { (Format::Q4K, 144) };
+    let Int8Dims {
+        q5,
+        ne,
+        rows,
+        k,
+        nb,
+        ns,
+    } = *d;
+    let (rf, rb) = if q5 {
+        (Format::Q5K, 176)
+    } else {
+        (Format::Q4K, 144)
+    };
     let mut seed = 0x2545F491u64;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -524,10 +559,15 @@ mod tests {
                 StepInput::Pos => (0..nb).map(|b| b as f32).collect(),
                 StepInput::New(_) => (0..nb).map(|b| (5 + 9 * b) as f32).collect(),
                 StepInput::Cache(c) => {
-                    let n: usize = st.graph.shape(st.caches[c].input).iter().map(|d| match d {
-                        Dim::Sym(_) => nb,
-                        d => d.n(),
-                    }).product();
+                    let n: usize = st
+                        .graph
+                        .shape(st.caches[c].input)
+                        .iter()
+                        .map(|d| match d {
+                            Dim::Sym(_) => nb,
+                            d => d.n(),
+                        })
+                        .product();
                     vec![0.0; n]
                 }
                 StepInput::Same(i) => {
@@ -546,9 +586,13 @@ mod tests {
                         }
                         crate::ir_ds_real::words_of(&b)
                     } else if inp.name.contains("norm") {
-                        (0..n).map(|_| 1.0 + ((rnd() % 1000) as f32 - 500.0) * 1e-4).collect()
+                        (0..n)
+                            .map(|_| 1.0 + ((rnd() % 1000) as f32 - 500.0) * 1e-4)
+                            .collect()
                     } else {
-                        (0..n).map(|_| ((rnd() % 2001) as f32 - 1000.0) * 1e-4).collect()
+                        (0..n)
+                            .map(|_| ((rnd() % 2001) as f32 - 1000.0) * 1e-4)
+                            .collect()
                     }
                 }
             };

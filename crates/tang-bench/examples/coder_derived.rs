@@ -249,7 +249,10 @@ fn main() {
         let mut sh: Vec<_> = sh.into_iter().collect();
         sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
         for (k, (n, ms)) in sh.iter().take(30) {
-            println!("  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}", 1e3 * ms / *n as f64);
+            println!(
+                "  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}",
+                1e3 * ms / *n as f64
+            );
         }
         // by kind: (native, int8, first line)
         let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
@@ -285,7 +288,10 @@ fn main() {
             .collect();
         prog.write(&rt, prog.input(tok_in), &[ids[0] as f32]);
         let set_pos = |q: usize| prog.write(&rt, prog.input(pos_in), &[q as f32]);
-        let reps: usize = std::env::var("TUNE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let reps: usize = std::env::var("TUNE_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
         let t = autotune::tune_step(
             &rt,
             "coder-next",
