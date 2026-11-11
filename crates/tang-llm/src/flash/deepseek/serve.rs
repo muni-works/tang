@@ -229,6 +229,10 @@ pub(crate) struct SlotSeq {
     /// Every token the slot holds, in order (the prompt as fed, then the fed outputs): what
     /// a later request can continue from.
     pub fed: Vec<usize>,
+    /// Temperature / top-p sampling with its own seeded RNG (`None`: greedy). Each token is
+    /// one `sample` call on that row's logits, as `forward::generate` makes them, so a
+    /// seed gives the same tokens batched or alone.
+    pub pick: Option<SpecSampler>,
 }
 
 impl SlotSeq {
@@ -249,6 +253,20 @@ impl SlotSeq {
             max_new,
             done: None,
             fed,
+            pick: None,
+        }
+    }
+
+    /// Sample with `pick` (temperature > 0) instead of greedy.
+    pub fn sampled(mut self, pick: SpecSampler) -> Self {
+        self.pick = (!pick.greedy()).then_some(pick);
+        self
+    }
+
+    fn choose(&mut self, logits: &[f32]) -> usize {
+        match self.pick.as_mut() {
+            Some(p) => p.sample(logits),
+            None => forward::argmax(logits),
         }
     }
 
@@ -283,6 +301,11 @@ pub(crate) trait SlotModel {
     fn forward_last(&mut self, ids: &[usize], sp: usize) -> Result<Vec<f32>>;
     fn slot_cap(&self, s: usize) -> usize;
     fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>>;
+    /// [`Self::forward_rows`] with every row's logits `[rows][vocab]` (sampled rows).
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)>;
 }
 
 impl SlotModel for GpuModel {
@@ -301,6 +324,12 @@ impl SlotModel for GpuModel {
     fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
         GpuModel::forward_rows(self, rows)
     }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        GpuModel::forward_rows_logits(self, rows)
+    }
 }
 
 impl SlotModel for super::ep::EpGroup {
@@ -318,6 +347,12 @@ impl SlotModel for super::ep::EpGroup {
     }
     fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
         super::ep::EpGroup::forward_rows(self, rows)
+    }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        super::ep::EpGroup::forward_rows_logits(self, rows)
     }
 }
 
@@ -351,6 +386,16 @@ impl SlotModel for Engine {
             Engine::Single(g) => SlotModel::forward_rows(g, rows),
             #[cfg(feature = "ep")]
             Engine::Ep(g) => SlotModel::forward_rows(g, rows),
+        }
+    }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        match self {
+            Engine::Single(g) => SlotModel::forward_rows_logits(g, rows),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::forward_rows_logits(g, rows),
         }
     }
 }
@@ -393,7 +438,8 @@ pub(crate) fn slots_step(
             left = left.saturating_sub(1);
             if !q.prefilling() {
                 let cap = m.slot_cap(q.slot);
-                q.take(forward::argmax(&lg), eos, cap, &mut out[i]);
+                let cand = q.choose(&lg);
+                q.take(cand, eos, cap, &mut out[i]);
             }
         }
     }
@@ -407,13 +453,24 @@ pub(crate) fn slots_step(
         .iter()
         .map(|&i| (seqs[i].slot, seqs[i].feed.unwrap(), seqs[i].pos))
         .collect();
-    let next = m.forward_rows(&rows)?;
+    // the logits come back only when a row samples
+    let sampled = live.iter().any(|&i| seqs[i].pick.is_some());
+    let (next, lg) = if sampled {
+        m.forward_rows_logits(&rows)?
+    } else {
+        (m.forward_rows(&rows)?, Vec::new())
+    };
+    let nv = if sampled { lg.len() / rows.len() } else { 0 };
     for (j, &i) in live.iter().enumerate() {
         let q = &mut *seqs[i];
         q.fed.push(q.feed.take().unwrap());
         q.pos += 1;
         let cap = m.slot_cap(q.slot);
-        q.take(next[j], eos, cap, &mut out[i]);
+        let cand = match q.pick.as_mut() {
+            Some(p) => p.sample(&lg[j * nv..(j + 1) * nv]),
+            None => next[j],
+        };
+        q.take(cand, eos, cap, &mut out[i]);
     }
     Ok(out)
 }
@@ -838,9 +895,6 @@ impl Backend for DsServe {
     }
 
     fn admit(&mut self, req: &Request, _prompt: Option<(String, Vec<u32>)>) -> Result<Inflight> {
-        if req.sampling.temperature > 0.0 {
-            bail!("deepseek batching is greedy only for now (temperature 0)");
-        }
         let think = req.think.unwrap_or(true);
         let prompt = self
             .tpl
@@ -867,7 +921,11 @@ impl Backend for DsServe {
         let mut usage = Usage::default();
         usage.cached_tokens = held;
         Ok(Box::new(DsStream {
-            seq: SlotSeq::resume(slot, ids, held, max_new),
+            seq: SlotSeq::resume(slot, ids, held, max_new).sampled(SpecSampler::new(
+                req.sampling.temperature,
+                req.sampling.top_p,
+                req.sampling.seed ^ 0x5eed,
+            )),
             think,
             out: Vec::new(),
             detok: Detok::default(),
@@ -1415,6 +1473,115 @@ mod tests {
             eprintln!("ep slot {k}: batched {:?} alone {:?}", batched[k], alone[k]);
         }
         assert_eq!(batched, alone, "ep batched != alone");
+    }
+
+    /// Sampled batching: rows at different temperatures / top-p / seeds (and one greedy),
+    /// batched, give each request's tokens from `forward::generate` alone with the same
+    /// seeded sampler (no drafts); the same seed twice gives the same tokens.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slots_step_sampled_matches_generate() {
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        // (temperature, top-p, seed); rows 3 and 4 share a seed and prompt
+        let params = [
+            (0.0f32, 1.0f32, 1u64),
+            (0.8, 1.0, 7),
+            (1.0, 0.9, 11),
+            (0.6, 0.95, 5),
+            (0.6, 0.95, 5),
+        ];
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let v = a.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = (0..params.len())
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 && k < 4 {
+                    let j = p.len() - 1 - k;
+                    p[j] = (p[j] + 7919 * k) % v;
+                }
+                if k == 4 {
+                    p = {
+                        let mut q = ids.clone();
+                        let j = q.len() - 4;
+                        q[j] = (q[j] + 7919 * 3) % v;
+                        q
+                    };
+                }
+                p
+            })
+            .collect();
+        let mut want = Vec::new();
+        for (k, &(t, tp, seed)) in params.iter().enumerate() {
+            a.reset().unwrap();
+            let mut got = Vec::new();
+            let mut pick = SpecSampler::new(t, tp, seed);
+            let mut u = Usage::default();
+            forward::generate(
+                &mut a,
+                &prompts[k],
+                10,
+                &mut pick,
+                false,
+                &[],
+                &mut u,
+                &mut |x| {
+                    got.push(x);
+                    None
+                },
+            )
+            .unwrap();
+            want.push(got);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        m.add_slots(params.len(), m.cpu.cfg.max_seq_len.min(512))
+            .unwrap();
+        let mut seqs: Vec<SlotSeq> = params
+            .iter()
+            .enumerate()
+            .map(|(k, &(t, tp, seed))| {
+                SlotSeq::new(k, prompts[k].clone(), 10).sampled(SpecSampler::new(t, tp, seed))
+            })
+            .collect();
+        let mut got = vec![Vec::new(); seqs.len()];
+        while seqs.iter().any(|q| q.done.is_none()) {
+            let idx: Vec<usize> = (0..seqs.len())
+                .filter(|&i| seqs[i].done.is_none())
+                .collect();
+            let mut r: Vec<&mut SlotSeq> = seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+            let out = slots_step(&mut m, &mut r, &[]).unwrap();
+            for (j, o) in out.into_iter().enumerate() {
+                got[idx[j]].extend(o);
+            }
+        }
+        for k in 0..params.len() {
+            eprintln!(
+                "sampled {k} {:?}: batched {:?} alone {:?}",
+                params[k], got[k], want[k]
+            );
+        }
+        assert_eq!(got, want, "sampled batched != alone");
+        assert_eq!(got[3], got[4], "same seed and prompt, same tokens");
+        assert_ne!(got[1], got[0], "a sampled row should leave the greedy path");
     }
 
     /// A conversation's next turn continues its parked slot ([`SlotSeq::resume`]): only the

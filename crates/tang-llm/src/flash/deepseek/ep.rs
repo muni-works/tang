@@ -82,6 +82,7 @@ enum Cmd {
     AddSlots(usize, usize),
     Select(usize),
     Rows(Vec<(usize, usize, usize)>),
+    RowsLogits(Vec<(usize, usize, usize)>),
 }
 
 enum Reply {
@@ -91,6 +92,7 @@ enum Reply {
     Done,
     Misses(usize),
     Rows(Vec<usize>),
+    RowsLogits(Vec<usize>, Vec<f32>),
 }
 
 struct Rank {
@@ -202,6 +204,9 @@ impl EpGroup {
                             Cmd::AddSlots(n, cap) => m.add_slots(n, cap).map(|_| Reply::Done),
                             Cmd::Select(s) => m.select_slot(s).map(|_| Reply::Done),
                             Cmd::Rows(rows) => m.forward_rows(&rows).map(Reply::Rows),
+                            Cmd::RowsLogits(rows) => m
+                                .forward_rows_logits(&rows)
+                                .map(|(a, l)| Reply::RowsLogits(a, l)),
                         };
                         if let Err(e) = &r {
                             // the peers are in (or heading into) this step's collectives and
@@ -394,6 +399,17 @@ impl EpGroup {
     pub fn forward_rows(&self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
         match self.send(|| Cmd::Rows(rows.to_vec()))?.swap_remove(0) {
             Reply::Rows(v) => Ok(v),
+            _ => Err(anyhow!("ep: unexpected reply to a rows step")),
+        }
+    }
+
+    /// [`GpuModel::forward_rows_logits`] on every rank; rank 0's ids and logits.
+    pub fn forward_rows_logits(
+        &self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        match self.send(|| Cmd::RowsLogits(rows.to_vec()))?.swap_remove(0) {
+            Reply::RowsLogits(a, l) => Ok((a, l)),
             _ => Err(anyhow!("ep: unexpected reply to a rows step")),
         }
     }
