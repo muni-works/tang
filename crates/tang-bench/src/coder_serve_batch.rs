@@ -5,18 +5,19 @@
 //!
 //! - **Caches**: the batched step owns them, `[B, …]` with the stream axis outermost, so
 //!   slot `s`'s cache is one contiguous block (`s · W/B .. (s+1) · W/B` words).
-//! - **Idle streams** step too (one launch does all `B`): their K/V write lands at their
-//!   own next position, which nothing reads before the slot writes it again; their ring
-//!   and state updates are not copied back (only the active streams' blocks are).
-//! - **Sampling**: [`append_sampler_topk`] with per-stream params; when every active stream
-//!   is greedy, a batched step without the sampler (sharing weights and caches) runs and
-//!   the host takes each row's first maximum.
-//! - **Prefill**: a single-stream step (no sampler) with its own caches: the slot's block is
-//!   copied in, the prompt but its last token stepped, the block copied back; the last token
-//!   goes through the batched step (so it is sampled like any decode token). #234's chunked
-//!   step replaces the single-stream one when it lands.
+//! - **Idle streams** step too (one launch does all `B`): an `active [B]` input gates every
+//!   ring and state update in the graph (an idle stream's update is its old value), and the
+//!   K/V write of an idle stream lands at its own next row, which nothing reads before the
+//!   slot writes it again.
+//! - **Tokens on the device**: the sampled step ends in [`append_sampler_topk`] (per-stream
+//!   params); when every active stream is greedy a batched step without the sampler runs
+//!   and [`append_argmax`] picks each row's first maximum. Only `[B]` ids are read back.
+//! - **One stream at a time** (a lone greedy decode row, and prefill): a single-stream step
+//!   per slot bound in place to that slot's block of the batched caches
+//!   ([`Program::with_shared_at`]): no B-wide step for one row, no cache copies.
 //! - **Snapshots**: a slot's ring/state blocks (running) and its K/V rows (positional).
 use std::cell::Cell;
+use tang::Scalar;
 use std::path::Path;
 use std::time::Instant;
 
@@ -25,7 +26,7 @@ use tang_compile::tensor::int8_sched::BlockOpts;
 use tang_compile::tensor::step::{
     batch_graph, derive_step, derive_step_with, Rows, StepGraph, StepInput, StepOptions, StepSpec,
 };
-use tang_compile::tensor::{Dim, TensorId};
+use tang_compile::tensor::{Arg, Dim, Form, TensorId, View};
 use tang_gpu::program::{Program, Runtime, Shared};
 use tang_llm::flash::engine::{Positional, RunningState, WinStats};
 use tang_llm::flash::sampler::{RowSampling, Sampler};
@@ -34,7 +35,7 @@ use tang_llm::gguf::{GgmlType, Gguf};
 
 use crate::ir_coder_prefill::{prefill_graph, CoderInput, SEQ};
 use crate::ir_coder_real::{bind, dims_from_gguf, lower_real_step, lower_real_step_with, RealOpts};
-use crate::ir_sample::{append_sampler_topk, SEED, TEMPERATURE, TOP_K, TOP_P};
+use crate::ir_sample::{append_argmax, append_sampler_topk, SEED, TEMPERATURE, TOP_K, TOP_P};
 use crate::qwen_session::{runtime, slot_plan};
 
 fn words_of_bytes(b: &[u8]) -> Vec<f32> {
@@ -53,10 +54,9 @@ struct Step {
     pos_in: usize,
     tok_in: usize,
     params_in: Option<usize>,
-    /// `[logits, token?, updated caches…]`.
+    active_in: Option<usize>,
+    /// `[logits, token, updated caches…]`.
     outs: Vec<TensorId>,
-    /// Outputs before the caches.
-    nout: usize,
     /// Cache `c`'s step input.
     cache_in: Vec<usize>,
 }
@@ -66,7 +66,7 @@ impl Step {
         self.prog.input(self.cache_in[c])
     }
     fn updated(&self, c: usize) -> TensorId {
-        self.outs[self.nout + c]
+        self.outs[2 + c]
     }
 }
 
@@ -85,23 +85,29 @@ enum Kind {
     Running,
 }
 
+/// Which program ran a slot's last step (for `logits()`).
+#[derive(Clone, Copy)]
+enum Ran {
+    Batched { greedy: bool },
+    Solo,
+}
+
 pub struct BatchedCoder {
     g: Gguf,
     rt: Runtime,
     b: usize,
     ctx: usize,
     vocab: usize,
-    /// The batched step with the sampler.
+    /// The batched step with the sampler; owns the weights and the caches.
     sampled: Step,
-    /// The batched step without it (weights and caches bound to `sampled`'s).
+    /// The batched step with the device argmax (weights and caches bound to `sampled`'s).
     greedy: Step,
-    /// The single-stream prefill step (no sampler; weights bound, own caches).
-    solo: Step,
+    /// Per slot: the single-stream greedy step, its caches bound to the slot's block.
+    solo: Vec<Step>,
     /// Per cache: its kind and one stream's words.
     caches: Vec<(Kind, usize)>,
     slots: Vec<Slot>,
-    /// The last step: whether it ran the greedy program, and which slot `logits()` reads.
-    last_greedy: Cell<bool>,
+    ran: Cell<Ran>,
     logits_slot: usize,
     last: WinStats,
     presence_noted: Cell<bool>,
@@ -109,6 +115,52 @@ pub struct BatchedCoder {
 
 fn find(st: &StepGraph, want: StepInput) -> Option<usize> {
     st.inputs.iter().position(|s| *s == want)
+}
+
+fn plain(src: TensorId, r: usize) -> Arg {
+    Arg {
+        src,
+        view: View {
+            gather: None,
+            guard: false,
+            forms: (0..r).map(|d| Form::unit(r, d)).collect(),
+        },
+    }
+}
+
+/// Gate a batched step's ring and state updates by a new `active [B]` input (prefill input
+/// `active_k`): an idle stream's "update" is its old value. Returns the input's index.
+fn gate_running(st: &mut StepGraph, active_k: usize) -> Result<usize> {
+    let k = st.inputs.len();
+    let sh = st.graph.shape(st.pos).to_vec();
+    let a = st.graph.input(&sh);
+    st.inputs.push(StepInput::New(active_k));
+    for c in 0..st.caches.len() {
+        let cs = &st.caches[c];
+        if !(cs.state || cs.ring.is_some()) {
+            continue;
+        }
+        let (u, old) = (cs.updated, cs.input);
+        let shape = st.graph.shape(u).to_vec();
+        let r = shape.len();
+        let av = Arg {
+            src: a,
+            view: View {
+                gather: None,
+                guard: false,
+                forms: vec![Form::unit(r, 0)],
+            },
+        };
+        let gated = st
+            .graph
+            .comp(&shape, &[], vec![plain(u, r), plain(old, r), av], None, |v| {
+                let c = v[2] - tang_expr::ExprId::from_f64(0.5);
+                vec![tang_expr::with_graph(|g| g.select(c, v[0], v[1]))]
+            })
+            .map_err(|e| anyhow::anyhow!("gate cache {c}: {e:?}"))?;
+        st.caches[c].updated = gated;
+    }
+    Ok(k)
 }
 
 impl BatchedCoder {
@@ -124,23 +176,34 @@ impl BatchedCoder {
             shape: vec![Dim::Sym(SEQ), Dim::Fixed(4)],
         });
         tys.push(None);
-        let (tokens_k, params_k) = (pg.input("tokens"), pg.input("sample.params"));
+        let gtok = append_argmax(&mut pg.g, pg.logits);
+        // the gate's input: not in the prefill graph (added to the batched steps after
+        // derivation), named here so its step input has a prefill index
+        pg.inputs.push(CoderInput {
+            name: "active".into(),
+            shape: vec![Dim::Sym(SEQ)],
+        });
+        tys.push(None);
+        let (tokens_k, params_k, active_k) =
+            (pg.input("tokens"), pg.input("sample.params"), pg.input("active"));
         let spec = StepSpec {
             seq: SEQ,
             new: 1,
             capacity: ctx,
         };
-        let (bg, bouts) =
-            batch_graph(&pg.g, &[pg.logits, s.token], SEQ, "B").map_err(|e| anyhow::anyhow!("batch_graph: {}", e.0))?;
+        let (bg, bouts) = batch_graph(&pg.g, &[pg.logits, s.token, gtok], SEQ, "B")
+            .map_err(|e| anyhow::anyhow!("batch_graph: {}", e.0))?;
         let opts = StepOptions {
             rows: Rows::All,
             batch: Some("B"),
         };
-        let st_s = derive_step_with(&bg, &bouts, &spec, &opts)
+        let mut st_s = derive_step_with(&bg, &bouts[..2], &spec, &opts)
             .map_err(|e| anyhow::anyhow!("batched step: {}", e.0))?;
-        let st_g = derive_step_with(&bg, &bouts[..1], &spec, &opts)
+        let mut st_g = derive_step_with(&bg, &[bouts[0], bouts[2]], &spec, &opts)
             .map_err(|e| anyhow::anyhow!("batched greedy step: {}", e.0))?;
-        let st_1 = derive_step(&pg.g, &[pg.logits], &spec)
+        let act_s = gate_running(&mut st_s, active_k)?;
+        let act_g = gate_running(&mut st_g, active_k)?;
+        let st_1 = derive_step(&pg.g, &[pg.logits, gtok], &spec)
             .map_err(|e| anyhow::anyhow!("solo step: {}", e.0))?;
         let group = std::env::var("TANG_BATCH_GROUP")
             .ok()
@@ -155,7 +218,7 @@ impl BatchedCoder {
         let low_g = lower_real_step_with(&pg, &st_g, &tys, &ro);
         let low_1 = lower_real_step(&pg, &st_1, &tys);
         eprintln!(
-            "coder derived (batched): B={nb}: {} kernels sampled, {} greedy, {} solo prefill; built in {:.1} s",
+            "coder derived (batched): B={nb}: {} kernels sampled, {} greedy, {} solo; built in {:.1} s",
             low_s.program.program.kernels.len(),
             low_g.program.program.kernels.len(),
             low_1.program.program.kernels.len(),
@@ -189,77 +252,41 @@ impl BatchedCoder {
             bytes as f64 / 1e9,
             t1.elapsed().as_secs_f64()
         );
-        let mk = |st: &StepGraph, prog: Program, outs: Vec<TensorId>, sampled: bool| -> Result<Step> {
+        let mk = |st: &StepGraph, prog: Program, outs: Vec<TensorId>, sampled: bool, active: Option<usize>| -> Result<Step> {
             Ok(Step {
                 prog,
                 pos_in: find(st, StepInput::Pos).context("pos input")?,
                 tok_in: find(st, StepInput::New(tokens_k)).context("token input")?,
                 params_in: if sampled { find(st, StepInput::New(params_k)) } else { None },
-                nout: if sampled { 2 } else { 1 },
+                active_in: active,
                 cache_in: (0..st.caches.len())
                     .map(|c| find(st, StepInput::Cache(c)).expect("cache input"))
                     .collect(),
                 outs,
             })
         };
-        let sampled = mk(&st_s, prog, low_s.outs, true)?;
+        let mut sampled = mk(&st_s, prog, low_s.outs, true, Some(act_s))?;
         ensure!(sampled.params_in.is_some(), "no per-stream params input");
 
-        // step-2 input -> sampled input: weights by GGUF input; caches by order (both
-        // derived from the same batch graph)
-        let bind_to = |st: &StepGraph, caches: bool| -> Vec<(usize, usize)> {
-            st.inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(k, si)| match *si {
-                    StepInput::Same(i) => find(&st_s, StepInput::Same(i)).map(|k1| (k, k1)),
-                    StepInput::Cache(c) if caches => Some((k, sampled.cache_in[c])),
-                    _ => None,
-                })
+        // per cache: the solo step's must be one stream's block of the batched one
+        let w1s: Vec<usize> = {
+            let p1 = Program::with_plan(
+                &rt,
+                low_1.program.program.clone(),
+                &vec![&[][..]; st_1.inputs.len()],
+                &slot_plan(&low_1.program.program, &low_1.outs, &low_1.inplace),
+            );
+            (0..st_1.caches.len())
+                .map(|c| p1.words_of(p1.input(find(&st_1, StepInput::Cache(c)).unwrap())))
                 .collect()
         };
-        let share = |map: &[(usize, usize)]| -> Vec<Shared<'_>> {
-            map.iter()
-                .map(|&(k, k1)| Shared {
-                    input: k,
-                    from: &sampled.prog,
-                    tensor: sampled.prog.input(k1),
-                })
-                .collect()
-        };
-        let map_g = bind_to(&st_g, true);
-        let plan_g = slot_plan(&low_g.program.program, &low_g.outs, &low_g.inplace);
-        let prog_g = Program::with_shared(
-            &rt,
-            low_g.program.program,
-            &vec![&[][..]; st_g.inputs.len()],
-            &plan_g,
-            &share(&map_g),
-        );
-        let map_1 = bind_to(&st_1, false);
-        let plan_1 = slot_plan(&low_1.program.program, &low_1.outs, &low_1.inplace);
-        let prog_1 = Program::with_shared(
-            &rt,
-            low_1.program.program,
-            &vec![&[][..]; st_1.inputs.len()],
-            &plan_1,
-            &share(&map_1),
-        );
-        let mut greedy = mk(&st_g, prog_g, low_g.outs, false)?;
-        let mut solo = mk(&st_1, prog_1, low_1.outs, false)?;
-
-        // caches: the solo step's must be one stream's block of the batched one
         let mut caches = Vec::new();
         for (c, (cb, c1)) in st_s.caches.iter().zip(&st_1.caches).enumerate() {
             let wb = sampled.prog.words_of(sampled.cache(c));
-            let w1 = solo.prog.words_of(solo.cache(c));
+            let w1 = w1s[c];
             ensure!(
                 wb == nb * w1 && cb.state == c1.state && cb.ring == c1.ring,
-                "cache {c}: batched {wb} words vs {nb} × {w1} solo (state {} / {}, ring {:?} / {:?})",
-                cb.state,
-                c1.state,
-                cb.ring,
-                c1.ring
+                "cache {c}: batched {wb} words vs {nb} × {w1} solo"
             );
             let kind = if c1.state || c1.ring.is_some() {
                 Kind::Running
@@ -269,15 +296,83 @@ impl BatchedCoder {
             };
             caches.push((kind, w1));
         }
-        let graphs = std::env::var("TANG_CODER_DERIVED_GRAPH").as_deref() != Ok("0");
-        if graphs {
-            for st in [&mut greedy, &mut solo] {
+
+        let weights = |st: &StepGraph| -> Vec<(usize, usize)> {
+            st.inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(k, si)| match *si {
+                    StepInput::Same(i) => find(&st_s, StepInput::Same(i)).map(|k1| (k, k1)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // the greedy batched step: weights and caches bound whole
+        let greedy = {
+            let mut sh: Vec<Shared<'_>> = weights(&st_g)
+                .into_iter()
+                .map(|(k, k1)| Shared {
+                    input: k,
+                    from: &sampled.prog,
+                    tensor: sampled.prog.input(k1),
+                })
+                .collect();
+            for c in 0..st_g.caches.len() {
+                sh.push(Shared {
+                    input: find(&st_g, StepInput::Cache(c)).unwrap(),
+                    from: &sampled.prog,
+                    tensor: sampled.cache(c),
+                });
+            }
+            let plan_g = slot_plan(&low_g.program.program, &low_g.outs, &low_g.inplace);
+            let prog = Program::with_shared(
+                &rt,
+                low_g.program.program,
+                &vec![&[][..]; st_g.inputs.len()],
+                &plan_g,
+                &sh,
+            );
+            mk(&st_g, prog, low_g.outs, false, Some(act_g))?
+        };
+        // per slot: the solo step, its caches at the slot's block
+        let plan_1 = slot_plan(&low_1.program.program, &low_1.outs, &low_1.inplace);
+        let mut solo = Vec::new();
+        for s in 0..nb {
+            let mut sh: Vec<Shared<'_>> = weights(&st_1)
+                .into_iter()
+                .map(|(k, k1)| Shared {
+                    input: k,
+                    from: &sampled.prog,
+                    tensor: sampled.prog.input(k1),
+                })
+                .collect();
+            let mut offsets = Vec::new();
+            for (c, &(_, w)) in caches.iter().enumerate() {
+                let k = find(&st_1, StepInput::Cache(c)).unwrap();
+                sh.push(Shared {
+                    input: k,
+                    from: &sampled.prog,
+                    tensor: sampled.cache(c),
+                });
+                offsets.push((k, s * w));
+            }
+            let prog = Program::with_shared_at(
+                &rt,
+                low_1.program.program.clone(),
+                &vec![&[][..]; st_1.inputs.len()],
+                &plan_1,
+                &sh,
+                &offsets,
+            );
+            solo.push(mk(&st_1, prog, low_1.outs.clone(), false, None)?);
+        }
+        let mut greedy = greedy;
+        if std::env::var("TANG_CODER_DERIVED_GRAPH").as_deref() != Ok("0") {
+            sampled.prog.capture(&rt);
+            greedy.prog.capture(&rt);
+            for st in &mut solo {
                 st.prog.capture(&rt);
             }
-        }
-        let mut sampled = sampled;
-        if graphs {
-            sampled.prog.capture(&rt);
         }
         let mut me = BatchedCoder {
             g,
@@ -296,7 +391,7 @@ impl BatchedCoder {
                     allocated: false,
                 })
                 .collect(),
-            last_greedy: Cell::new(true),
+            ran: Cell::new(Ran::Solo),
             logits_slot: 0,
             last: WinStats::default(),
             presence_noted: Cell::new(false),
@@ -306,7 +401,10 @@ impl BatchedCoder {
         }
         let dev_s = me.sampled.prog.time(&me.rt, 10);
         let dev_g = me.greedy.prog.time(&me.rt, 10);
-        let dev_1 = me.solo.prog.time(&me.rt, 10);
+        let dev_1 = me.solo[0].prog.time(&me.rt, 10);
+        for s in 0..nb {
+            me.clear_slot(s);
+        }
         let kv_mb: usize = me
             .caches
             .iter()
@@ -316,35 +414,35 @@ impl BatchedCoder {
             >> 20;
         eprintln!(
             "coder derived (batched): B={nb} step {dev_s:.3} ms sampled / {dev_g:.3} ms greedy device, \
-             solo prefill step {dev_1:.3} ms; ctx {ctx}, {kv_mb} MB of K/V a slot; ready in {:.1} s",
+             solo step {dev_1:.3} ms; ctx {ctx}, {kv_mb} MB of K/V a slot; ready in {:.1} s",
             t0.elapsed().as_secs_f64()
         );
         Ok(me)
     }
 
-    /// Zero slot `s`'s running blocks and the K/V rows it wrote.
+    /// Zero slot `s`'s running blocks and the K/V rows it wrote (the timing runs above
+    /// wrote rows below 1 as well).
     fn clear_slot(&mut self, s: usize) {
-        let n = self.slots[s].tokens.len();
+        let n = self.slots[s].tokens.len().max(1);
         let p = &self.sampled.prog;
         for (c, &(kind, w)) in self.caches.iter().enumerate() {
             let t = self.sampled.cache(c);
             match kind {
                 Kind::Running => p.write_words(&self.rt, t, s * w, &vec![0.0; w]),
-                Kind::Rows { row } if n > 0 => {
+                Kind::Rows { row } => {
                     p.write_words(&self.rt, t, s * w, &vec![0.0; n.min(self.ctx) * row])
                 }
-                Kind::Rows { .. } => {}
             }
         }
         self.slots[s].tokens.clear();
     }
 
     /// One batched step: `rows` (slot, token) advance; every other stream computes at its own
-    /// next position and keeps its running state. Returns each row's next token.
-    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
-        let t0 = Instant::now();
+    /// next position with its running state gated off. Returns each row's next token.
+    fn step_batched(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
         let mut pos = vec![0f32; self.b];
         let mut tok = vec![0f32; self.b];
+        let mut act = vec![0f32; self.b];
         let mut params = vec![0f32; self.b * 4];
         for s in 0..self.b {
             pos[s] = self.slots[s].tokens.len().min(self.ctx - 1) as f32;
@@ -354,6 +452,7 @@ impl BatchedCoder {
         for &(s, t) in rows {
             ensure!(self.slots[s].tokens.len() < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
             tok[s] = t as f32;
+            act[s] = 1.0;
             params[4 * s..4 * s + 4].copy_from_slice(&self.slots[s].params);
             all_greedy &= self.slots[s].params[TEMPERATURE] <= 0.0;
         }
@@ -361,42 +460,60 @@ impl BatchedCoder {
         let p = &st.prog;
         p.write(&self.rt, p.input(st.pos_in), &pos);
         p.write(&self.rt, p.input(st.tok_in), &tok);
+        p.write(&self.rt, p.input(st.active_in.unwrap()), &act);
         if let Some(k) = st.params_in {
             p.write(&self.rt, p.input(k), &params);
         }
         p.run(&self.rt);
-        // the active streams' running blocks back into the caches
+        for (c, &(kind, _)) in self.caches.iter().enumerate() {
+            if kind == Kind::Running {
+                p.copy(&self.rt, st.cache(c), p, st.updated(c));
+            }
+        }
+        let t = p.read(&self.rt, st.outs[1]);
+        for &(s, tk) in rows {
+            self.slots[s].tokens.push(tk);
+        }
+        self.ran.set(Ran::Batched { greedy: all_greedy });
+        Ok(rows.iter().map(|&(s, _)| t[s] as u32).collect())
+    }
+
+    /// One single-stream greedy step of slot `s` in place on its block; `read`: return the
+    /// next token.
+    fn step_solo(&mut self, s: usize, tok: u32, read: bool) -> Result<Option<u32>> {
+        let pos = self.slots[s].tokens.len();
+        ensure!(pos < self.ctx, "slot {s} is past its context ({} tokens)", self.ctx);
+        let (st, bp) = (&self.solo[s], &self.sampled);
+        let p = &st.prog;
+        p.write(&self.rt, p.input(st.pos_in), &[pos as f32]);
+        p.write(&self.rt, p.input(st.tok_in), &[tok as f32]);
+        p.run(&self.rt);
         for (c, &(kind, w)) in self.caches.iter().enumerate() {
-            if kind != Kind::Running {
-                continue;
-            }
-            for &(s, _) in rows {
-                p.copy_words(&self.rt, st.cache(c), s * w, p, st.updated(c), s * w, w);
+            if kind == Kind::Running {
+                bp.prog
+                    .copy_words(&self.rt, bp.cache(c), s * w, p, st.updated(c), 0, w);
             }
         }
-        let out: Vec<u32> = if all_greedy {
-            let l = p.read(&self.rt, st.outs[0]);
-            let v = self.vocab;
-            rows.iter()
-                .map(|&(s, _)| {
-                    let r = &l[s * v..(s + 1) * v];
-                    let mut a = 0;
-                    for (i, &x) in r.iter().enumerate() {
-                        if x > r[a] {
-                            a = i;
-                        }
-                    }
-                    a as u32
-                })
-                .collect()
+        self.slots[s].tokens.push(tok);
+        self.ran.set(Ran::Solo);
+        Ok(read.then(|| p.read(&self.rt, st.outs[1])[0] as u32))
+    }
+
+    fn greedy_slot(&self, s: usize) -> bool {
+        self.slots[s].params[TEMPERATURE] <= 0.0
+    }
+
+    /// Decode rows: a lone greedy row on its slot's solo step, else one batched step.
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
+        let t0 = Instant::now();
+        let out = if rows.len() == 1 && self.greedy_slot(rows[0].0) {
+            vec![self.step_solo(rows[0].0, rows[0].1, true)?.unwrap()]
         } else {
-            let t = p.read(&self.rt, st.outs[1]);
-            rows.iter().map(|&(s, _)| t[s] as u32).collect()
+            self.step_batched(rows)?
         };
-        for &(s, t) in rows {
-            self.slots[s].tokens.push(t);
+        if rows.len() == 1 {
+            self.logits_slot = rows[0].0;
         }
-        self.last_greedy.set(all_greedy);
         self.last = WinStats {
             t: rows.len(),
             wall_ms: t0.elapsed().as_secs_f64() * 1e3,
@@ -405,35 +522,26 @@ impl BatchedCoder {
         Ok(out)
     }
 
-    /// Prefill `ids` into slot `s`: all but the last through the solo step on a copy of the
-    /// slot's block, the last through the batched step.
+    /// Prefill `ids` into slot `s` on its solo step; the last token decides the next one
+    /// (greedy there, or a sampled batched step).
     fn feed(&mut self, s: usize, ids: &[u32]) -> Result<u32> {
         ensure!(!ids.is_empty(), "empty prefill");
-        let n0 = self.slots[s].tokens.len();
-        ensure!(n0 + ids.len() <= self.ctx, "prompt past the context ({} tokens)", self.ctx);
-        let head = &ids[..ids.len() - 1];
-        if !head.is_empty() {
-            let (bp, sp) = (&self.sampled.prog, &self.solo.prog);
-            for (c, &(_, w)) in self.caches.iter().enumerate() {
-                sp.copy_words(&self.rt, self.solo.cache(c), 0, bp, self.sampled.cache(c), s * w, w);
-            }
-            for (i, &id) in head.iter().enumerate() {
-                sp.write(&self.rt, sp.input(self.solo.pos_in), &[(n0 + i) as f32]);
-                sp.write(&self.rt, sp.input(self.solo.tok_in), &[id as f32]);
-                sp.run(&self.rt);
-                for (c, &(kind, _)) in self.caches.iter().enumerate() {
-                    if kind == Kind::Running {
-                        sp.copy(&self.rt, self.solo.cache(c), sp, self.solo.updated(c));
-                    }
-                }
-            }
-            for (c, &(_, w)) in self.caches.iter().enumerate() {
-                bp.copy_words(&self.rt, self.sampled.cache(c), s * w, sp, self.solo.cache(c), 0, w);
-            }
-            self.slots[s].tokens.extend_from_slice(head);
+        ensure!(
+            self.slots[s].tokens.len() + ids.len() <= self.ctx,
+            "prompt past the context ({} tokens)",
+            self.ctx
+        );
+        let t0 = Instant::now();
+        for &id in &ids[..ids.len() - 1] {
+            self.step_solo(s, id, false)?;
         }
         let t = self.step(&[(s, ids[ids.len() - 1])])?[0];
         self.logits_slot = s;
+        self.last = WinStats {
+            t: ids.len(),
+            wall_ms: t0.elapsed().as_secs_f64() * 1e3,
+            ..WinStats::default()
+        };
         Ok(t)
     }
 
@@ -524,10 +632,18 @@ impl ServeEngine for BatchedCoder {
         self.verify_slot(0, cur, drafts)
     }
     fn logits(&self, t: usize) -> Vec<f32> {
-        let st = if self.last_greedy.get() { &self.greedy } else { &self.sampled };
-        let l = st.prog.read(&self.rt, st.outs[0]);
         let v = self.vocab;
-        let row = &l[self.logits_slot * v..(self.logits_slot + 1) * v];
+        let row: Vec<f32> = match self.ran.get() {
+            Ran::Solo => {
+                let st = &self.solo[self.logits_slot];
+                st.prog.read(&self.rt, st.outs[0])
+            }
+            Ran::Batched { greedy } => {
+                let st = if greedy { &self.greedy } else { &self.sampled };
+                let l = st.prog.read(&self.rt, st.outs[0]);
+                l[self.logits_slot * v..(self.logits_slot + 1) * v].to_vec()
+            }
+        };
         (0..t).flat_map(|_| row.iter().copied()).collect()
     }
     fn set_sampling(&mut self, temperature: f32, seed: u32) {

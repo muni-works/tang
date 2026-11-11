@@ -464,6 +464,9 @@ pub struct Program {
     order: Vec<usize>,
     /// wgpu: the run recorded by [`capture`](Self::capture).
     recording: Option<WgpuRecording>,
+    /// Per slot: the word offset its kernels see it at (CUDA; 0 but for inputs bound to
+    /// part of another program's buffer, [`with_shared_at`](Self::with_shared_at)).
+    slot_off: Vec<usize>,
 }
 
 /// What [`Program::tuned`] did.
@@ -546,6 +549,48 @@ impl Program {
         Self::with_shared(rt, program, inputs, plan, &[])
     }
 
+    /// [`with_shared`](Self::with_shared) with some shared inputs bound to a word range of
+    /// the other program's buffer: `offsets` lists `(input, word offset)`; the input's
+    /// kernels read and write its buffer from that offset (one stream's block of a batched
+    /// cache, say). CUDA only; this program's own `read` / `write` / `copy` of such an input
+    /// are not offset (go through the owner).
+    #[cfg(feature = "cuda")]
+    pub fn with_shared_at(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        plan: &BufferPlan,
+        shared: &[Shared<'_>],
+        offsets: &[(usize, usize)],
+    ) -> Self {
+        // the plain binding checks equal sizes: give it full-size stand-ins of the right
+        // length by binding first and patching the offsets after
+        assert!(matches!(rt, Runtime::Cuda(_)), "with_shared_at: CUDA only");
+        for &(k, off) in offsets {
+            let sh = shared.iter().find(|s| s.input == k).expect("offset of an unshared input");
+            let i = program.buffers.iter().position(|b| b.input == Some(k)).expect("input not bound");
+            let (b, theirs) = (
+                &program.buffers[i],
+                &sh.from.program.buffers[sh.from.buffer_index(sh.tensor)],
+            );
+            assert_eq!(b.format, theirs.format, "shared input {k}: format");
+            assert!(
+                off + words(b) <= words(theirs),
+                "shared input {k}: {} words at {off} past {}",
+                words(b),
+                words(theirs)
+            );
+        }
+        let mut p = Self::with_shared_sized(rt, program, inputs, plan, shared, offsets);
+        for &(k, off) in offsets {
+            let i = p.program.buffers.iter().position(|b| b.input == Some(k)).unwrap();
+            let sl = p.slot[i];
+            let sh = shared.iter().find(|s| s.input == k).unwrap();
+            p.slot_off[sl] = sh.from.slot_off[sh.from.slot_of(sh.tensor)] + off;
+        }
+        p
+    }
+
     /// [`with_plan`](Self::with_plan) with some inputs bound to other
     /// programs' buffers (same runtime): nothing is allocated or uploaded
     /// for them (their `inputs` entries may be empty), and writes either
@@ -557,6 +602,17 @@ impl Program {
         inputs: &[&[f32]],
         plan: &BufferPlan,
         shared: &[Shared<'_>],
+    ) -> Self {
+        Self::with_shared_sized(rt, program, inputs, plan, shared, &[])
+    }
+
+    fn with_shared_sized(
+        rt: &Runtime,
+        program: WgslProgram,
+        inputs: &[&[f32]],
+        plan: &BufferPlan,
+        shared: &[Shared<'_>],
+        offsets: &[(usize, usize)],
     ) -> Self {
         let ks: Vec<usize> = shared.iter().map(|s| s.input).collect();
         check_plan(&program, inputs, plan, &ks);
@@ -572,12 +628,14 @@ impl Program {
                 &program.buffers[i],
                 &sh.from.program.buffers[sh.from.buffer_index(sh.tensor)],
             );
-            assert_eq!(
-                (words(b), b.format),
-                (words(theirs), theirs.format),
-                "shared input {} differs from its buffer",
-                sh.input
-            );
+            if !offsets.iter().any(|&(k, _)| k == sh.input) {
+                assert_eq!(
+                    (words(b), b.format),
+                    (words(theirs), theirs.format),
+                    "shared input {} differs from its buffer",
+                    sh.input
+                );
+            }
             borrowed[plan.slot[i]] = Some((sh.from, sh.from.slot_of(sh.tensor)));
         }
         let own = |k: usize| !ks.contains(&k);
@@ -750,6 +808,7 @@ impl Program {
             args: Vec::new(),
             order: plan.order.clone(),
             recording: None,
+            slot_off: vec![0; plan.slot_len.len()],
         };
         p.args = p
             .program
@@ -1373,11 +1432,17 @@ impl Program {
         let Storage::Cuda { host, .. } = &self.storage else {
             unreachable!()
         };
+        // slots bound at an offset into another program's buffer: views from there
+        let views: Vec<Option<cudarc::driver::CudaView<'_, f32>>> = self.args[i]
+            .iter()
+            .map(|&s| (self.slot_off[s] > 0).then(|| slots[s].slice(self.slot_off[s]..)))
+            .collect();
         let mut launch = stream.launch_builder(&functions[i]);
-        for &s in &self.args[i] {
-            match &host[s] {
-                Some(h) => launch.arg(&h.dev),
-                None => launch.arg(&*slots[s]),
+        for (j, &s) in self.args[i].iter().enumerate() {
+            match (&host[s], &views[j]) {
+                (Some(h), _) => launch.arg(&h.dev),
+                (None, Some(v)) => launch.arg(v),
+                (None, None) => launch.arg(&*slots[s]),
             };
         }
         launch.arg(&k.points);
