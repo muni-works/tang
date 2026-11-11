@@ -700,6 +700,9 @@ fn model(args: &[String]) {
                 }
                 p0 += seq;
                 total += pre.bytes;
+                // only the last chunk's program is read afterwards: drop
+                // the others (each holds its own activations)
+                steps.clear();
                 steps.push(pre);
             }
             // the last chunk's next-token logits
