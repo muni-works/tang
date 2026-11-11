@@ -403,6 +403,15 @@ mod tests {
             let (g, outs) = g.eliminate_common(&outs);
             let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
             nks.push(dp.program.kernels.len());
+            let fused = dp
+                .program
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("fused delta step"))
+                .count();
+            if fused > 0 {
+                eprintln!("  k = {k}: {fused} fused delta-step kernels");
+            }
             let got = super::run(&dp, &step_ins, &outs);
             let grown = pos + k;
             let want = m

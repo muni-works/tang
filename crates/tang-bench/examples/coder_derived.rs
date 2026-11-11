@@ -41,6 +41,45 @@ fn words_of_bytes(b: &[u8]) -> Vec<f32> {
     w
 }
 
+macro_rules! profile {
+    ($prog:expr, $rt:expr, $kinfo:expr) => {{
+        let prog = &$prog;
+        let rt = &$rt;
+        let kinfo = &$kinfo;
+        // every kernel timed alone at the last position, then grouped
+        let mut t: Vec<(f64, usize)> = prog
+            .order()
+            .iter()
+            .map(|&i| (prog.time_kernel(rt, i, 5), i))
+            .collect();
+        let total: f64 = t.iter().map(|x| x.0).sum();
+        t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        println!("profile: {} kernels, sum {total:.3} ms", t.len());
+        for (ms, i) in t.iter().take(25) {
+            let (what, nat, head) = &kinfo[*i];
+            println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
+        }
+        // by kind: (native, int8, first line)
+        let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+        for (ms, i) in &t {
+            let (what, nat, head) = &kinfo[*i];
+            let key = format!(
+                "native={nat} int8={} gather={} {head}",
+                what.contains("int8 true"),
+                !what.contains("gathers 0")
+            );
+            let e = by.entry(key).or_default();
+            e.0 += 1;
+            e.1 += ms;
+        }
+        let mut by: Vec<_> = by.into_iter().collect();
+        by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        for (k, (n, ms)) in by.iter().take(12) {
+            println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
+        }
+    }};
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |k: &str| {
@@ -197,6 +236,9 @@ fn main() {
             n as f64 / s,
             s * 1e3 / (n / chunk) as f64
         );
+        if args.iter().any(|a| a == "--profile") {
+            profile!(prog, rt, kinfo);
+        }
         return;
     }
     let mut lines = Vec::new();
@@ -254,37 +296,7 @@ fn main() {
         std::fs::write(p, lines.join("\n") + "\n").unwrap();
     }
     if args.iter().any(|a| a == "--profile") {
-        // every kernel timed alone at the last position, then grouped
-        let mut t: Vec<(f64, usize)> = prog
-            .order()
-            .iter()
-            .map(|&i| (prog.time_kernel(&rt, i, 5), i))
-            .collect();
-        let total: f64 = t.iter().map(|x| x.0).sum();
-        t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        println!("profile: {} kernels, sum {total:.3} ms", t.len());
-        for (ms, i) in t.iter().take(25) {
-            let (what, nat, head) = &kinfo[*i];
-            println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
-        }
-        // by kind: (native, int8, first line)
-        let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
-        for (ms, i) in &t {
-            let (what, nat, head) = &kinfo[*i];
-            let key = format!(
-                "native={nat} int8={} gather={} {head}",
-                what.contains("int8 true"),
-                !what.contains("gathers 0")
-            );
-            let e = by.entry(key).or_default();
-            e.0 += 1;
-            e.1 += ms;
-        }
-        let mut by: Vec<_> = by.into_iter().collect();
-        by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
-        for (k, (n, ms)) in by.iter().take(12) {
-            println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
-        }
+        profile!(prog, rt, kinfo);
     }
     if let Some(ls) = opt("--bench") {
         for l in ls.split(',').map(|v| v.parse::<usize>().unwrap()) {

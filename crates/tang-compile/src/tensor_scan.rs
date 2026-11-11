@@ -51,6 +51,45 @@ pub struct DeltaForm {
     pub k: usize,
     pub v: usize,
     pub delta: bool,
+    /// The initial state `S_{−1}` (`[P…\dim, n, m]`), when the scan
+    /// starts from one: a derived step's scan from a cached state. `A`
+    /// and `U` already fold it in (`U'_0 = A_0·S + U_0`); the form keeps
+    /// it so a fused lowering can start from it ([`ScanKind::Delta`]).
+    pub init: Option<usize>,
+}
+
+/// [`ScanKind::Delta`]: the delta-rule recurrence of a [`DeltaForm`] from
+/// an initial state, kept in registers, with only its readout or its
+/// final state as the output (the per-step states never stored). Inputs
+/// `[k, v, (α), (β), init, (q)]`: `k`, `q` `[P…, n]`, `v` `[P…, m]`, `α`,
+/// `β` `[P…]`, `init` `[P…\dim, n, m]`. With `readout: Some(scale)` the
+/// output is `o[P…, c] = scale·Σᵢ S_t[i, c]·q[P…, i]`; with `None` it is
+/// the last state `[P…\dim, n, m]`. Built by the CUDA decode lowering
+/// from a scan with an initial state and its consumers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeltaStep {
+    pub delta: bool,
+    pub alpha: bool,
+    pub beta: bool,
+    pub readout: Option<f64>,
+}
+
+impl DeltaStep {
+    /// Input positions `(k, v, α, β, init, q)`.
+    pub fn slots(&self) -> (usize, usize, Option<usize>, Option<usize>, usize, Option<usize>) {
+        let mut i = 2;
+        let mut next = |on: bool| {
+            on.then(|| {
+                i += 1;
+                i - 1
+            })
+        };
+        let a = next(self.alpha);
+        let b = next(self.beta);
+        let init = next(true).unwrap();
+        let q = next(self.readout.is_some());
+        (0, 1, a, b, init, q)
+    }
 }
 
 #[derive(Clone)]
@@ -70,6 +109,8 @@ pub enum ScanKind {
         ring: Semiring,
         bands: Option<Vec<i64>>,
     },
+    /// A fused delta-rule step ([`DeltaStep`]); CUDA decode only.
+    Delta(DeltaStep),
 }
 
 /// The scalar semiring an affine scan's `A_t ⊗ S_{t−1} ⊕ U_t` is taken in.
@@ -164,6 +205,7 @@ impl Scan {
         let ps: &[usize] = match &self.kind {
             ScanKind::Monoid(_) => &shapes[0],
             ScanKind::Affine { .. } => &shapes[0][..shapes[0].len() - 2],
+            ScanKind::Delta(d) => return self.eval_delta(d, ins, shapes),
         };
         let tn = ps[self.dim];
         let outer: usize = ps[..self.dim].iter().product();
@@ -203,6 +245,7 @@ impl Scan {
                 }
                 out
             }
+            ScanKind::Delta(_) => unreachable!(),
             ScanKind::Affine { ring, bands, .. } => {
                 let n = shapes[1][shapes[1].len() - 2];
                 let k = shapes[0][shapes[0].len() - 1];
@@ -252,7 +295,56 @@ impl Scan {
         match &self.kind {
             ScanKind::Monoid(_) => s.to_vec(),
             ScanKind::Affine { .. } => s[..s.len() - 2].to_vec(),
+            ScanKind::Delta(_) => s[..s.len() - 1].to_vec(),
         }
+    }
+
+    /// [`ScanKind::Delta`] on the interpreter: the recurrence from `init`,
+    /// the readout at every step or the last state.
+    fn eval_delta(&self, d: &DeltaStep, ins: &[&[f64]], shapes: &[Vec<usize>]) -> Vec<f64> {
+        let (ik, iv, ia, ib, ii, iq) = d.slots();
+        let ps = &shapes[ik][..shapes[ik].len() - 1];
+        let n = shapes[ik][ps.len()];
+        let m = shapes[iv][ps.len()];
+        let tn = ps[self.dim];
+        let lo: usize = ps[self.dim + 1..].iter().product();
+        let heads: usize = ps.iter().product::<usize>() / tn.max(1);
+        let mut out = match d.readout {
+            Some(_) => vec![0.0; heads * tn * m],
+            None => vec![0.0; heads * n * m],
+        };
+        let mut s = vec![0.0; n * m];
+        let mut ks = vec![0.0; m];
+        for h in 0..heads {
+            let (hi, l) = (h / lo, h % lo);
+            s.copy_from_slice(&ins[ii][h * n * m..(h + 1) * n * m]);
+            for t in 0..tn {
+                let p = (hi * tn + t) * lo + l;
+                let k = &ins[ik][p * n..(p + 1) * n];
+                let v = &ins[iv][p * m..(p + 1) * m];
+                let al = ia.map_or(1.0, |i| ins[i][p]);
+                let be = ib.map_or(1.0, |i| ins[i][p]);
+                for c in 0..m {
+                    ks[c] = if d.delta { (0..n).map(|i| k[i] * s[i * m + c]).sum() } else { 0.0 };
+                }
+                for i in 0..n {
+                    for c in 0..m {
+                        let x = &mut s[i * m + c];
+                        *x = al * (*x - be * k[i] * ks[c]) + be * k[i] * v[c];
+                    }
+                }
+                if let (Some(sc), Some(iq)) = (d.readout, iq) {
+                    let q = &ins[iq][p * n..(p + 1) * n];
+                    for c in 0..m {
+                        out[p * m + c] = sc * (0..n).map(|i| q[i] * s[i * m + c]).sum::<f64>();
+                    }
+                }
+            }
+            if d.readout.is_none() {
+                out[h * n * m..(h + 1) * n * m].copy_from_slice(&s);
+            }
+        }
+        out
     }
 }
 
@@ -406,7 +498,7 @@ impl TensorGraph {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn affine_scan(
+    pub(crate) fn affine_scan(
         &mut self,
         inputs: Vec<TensorId>,
         dim: usize,
@@ -594,6 +686,7 @@ impl TensorGraph {
             k: 2,
             v: 3,
             delta,
+            init: None,
         };
         self.affine_scan(inputs, dim, false, false, Some(form), Semiring::Real, None)
     }
@@ -734,6 +827,7 @@ impl TensorGraph {
                 gs.resize(sc.inputs.len(), None);
                 Ok(gs)
             }
+            ScanKind::Delta(_) => err("scan backward: a fused delta step has no backward"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 let tn = ps[dim]
@@ -1158,6 +1252,26 @@ impl TensorGraph {
     /// chunked schedule is the fast path for delta-rule scans on CUDA.
     pub(super) fn scan_kernel(&self, j: usize) -> WgslKernel {
         let sc = self.scan_at(TensorId(j as u32)).unwrap();
+        if matches!(sc.kind, ScanKind::Delta(_)) {
+            // native only (the CUDA decode lowering replaces it)
+            return WgslKernel {
+                source: "// fused delta step: CUDA decode only\n".into(),
+                node: TensorId(j as u32),
+                reads: {
+                    let mut r: Vec<TensorId> = Vec::new();
+                    for t in &sc.inputs {
+                        let st = self.storage(*t);
+                        if !r.contains(&st) {
+                            r.push(st);
+                        }
+                    }
+                    r
+                },
+                points: 0,
+                count: 0,
+                workgroup_size: 64,
+            };
+        }
         let ps = fixed(&sc.points(self));
         let tn = ps[sc.dim];
         let outer: usize = ps[..sc.dim].iter().product();
@@ -1214,6 +1328,7 @@ impl TensorGraph {
         };
         let lines;
         match &sc.kind {
+            ScanKind::Delta(_) => unreachable!("returned above"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 super::wgsl::emit_combine(&mut s, j, m, Format::F32);

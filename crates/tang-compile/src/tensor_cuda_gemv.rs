@@ -51,7 +51,7 @@ use tang_expr::{ExprGraph, ExprId, Node};
 use super::msl_mma::Addr;
 use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
-use super::{fixed, numel, Arg, Form, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Form, Monoid, Op, Scan, ScanKind, TensorGraph, TensorId};
 
 /// How a graph input is stored on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +243,13 @@ impl TensorGraph {
         target: DecodeTarget,
         tiles: &[usize],
     ) -> DecodeProgram {
+        // a k-row delta step's scan, readout and last state as fused
+        // kernels (no per-step states; see `tensor_cuda_delta.rs`)
+        if target == DecodeTarget::Cuda {
+            if let Some(g) = self.fuse_delta_steps(outputs) {
+                return g.to_decode_with(outputs, opts, target, tiles);
+            }
+        }
         // Block formats (GGUF weights, Q8x32 activations) on CUDA: laid out
         // as f32, then the buffers get their formats back; the int8 GEMV
         // (`IntMma`) reads them and Q8x32 writers store them (see
@@ -294,6 +301,18 @@ impl TensorGraph {
         for k in &mut program.kernels {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
+            if let Op::Scan(Scan {
+                kind: ScanKind::Delta(_),
+                ..
+            }) = &self.nodes[root].op
+            {
+                let (src, threads, blocks) = self.cuda_delta_kernel(root, &reads);
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = (threads * blocks) as u32;
+                native.push(true);
+                continue;
+            }
             if any_block {
                 if let Some(s) = self.nodes[root].int_mma {
                     let (src, threads, blocks) = self

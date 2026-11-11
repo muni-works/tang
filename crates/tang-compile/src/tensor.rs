@@ -43,6 +43,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
+#[path = "tensor_cuda_delta.rs"]
+mod cuda_delta;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
@@ -102,7 +104,7 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
-pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
+pub use scan::{DeltaForm, DeltaStep, Scan, ScanKind, Semiring};
 #[path = "tensor_space.rs"]
 pub mod space;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /

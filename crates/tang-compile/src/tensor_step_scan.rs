@@ -212,10 +212,41 @@ impl Deriver<'_> {
                 // (the chunked schedule's DeltaForm no longer describes U')
                 // one new row: its state is U'_0 itself (the scan of one
                 // element from zero), so no scan kernel
-                let out = if k == 1 {
-                    u0
-                } else {
-                    self.sg.linear_scan(a, u0, dim, false, false)?
+                let out = match &sc.kind {
+                    _ if k == 1 => u0,
+                    // the form, with the cached state as the start, rides
+                    // along for the fused CUDA lowering (`ScanKind::Delta`)
+                    ScanKind::Affine { form: Some(f), .. } => {
+                        let mut ins = vec![a, u0];
+                        let mut slot = |d: &mut Self, t: TensorId| -> Result<usize, ShapeError> {
+                            ins.push(new_in(d, t)?);
+                            Ok(ins.len() - 1)
+                        };
+                        let fk = slot(self, sc.inputs[f.k])?;
+                        let fv = slot(self, sc.inputs[f.v])?;
+                        let fa = f.alpha.map(|i| slot(self, sc.inputs[i])).transpose()?;
+                        let fb = f.beta.map(|i| slot(self, sc.inputs[i])).transpose()?;
+                        ins.push(input);
+                        let init = Some(ins.len() - 1);
+                        let form = DeltaForm {
+                            alpha: fa,
+                            beta: fb,
+                            k: fk,
+                            v: fv,
+                            delta: f.delta,
+                            init,
+                        };
+                        self.sg.affine_scan(
+                            ins,
+                            dim,
+                            false,
+                            false,
+                            Some(form),
+                            Semiring::Real,
+                            None,
+                        )?
+                    }
+                    _ => self.sg.linear_scan(a, u0, dim, false, false)?,
                 };
                 let updated = self.last_row(out, dim, false)?;
                 self.state_slot(n, dim, input, updated);
