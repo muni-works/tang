@@ -8,7 +8,7 @@
 //!    hurricane webp), `VISION_ITERS` timed runs (default 10): ms per image.
 //!
 //! Each `VISION_MODES` lowering (default `mma,prefill`; see [`lower_as`])
-//! is checked, timed and profiled (`VISION_PROFILE=0`: no per-kernel
+//! (`prefill`, `bf16`, `wgN`, `mma`, `f32`) is checked, timed and profiled (`VISION_PROFILE=0`: no per-kernel
 //! profile). Tensor-core modes pass under 1e-2 (TF32), `f32` under 1e-3.
 //!
 //! ```text
@@ -30,7 +30,18 @@ use tang_gpu::program::{Program, Runtime};
 /// `mma` its tensor-core tile.
 fn lower_as(rt: &Runtime, g: &TensorGraph, outs: &[TensorId], how: &str) -> (WgslProgram, Vec<TensorId>) {
     match how {
-        "prefill" => lower_prefill(g, outs),
+        "prefill" => lower_prefill(g, outs, false),
+        "bf16" => lower_prefill(g, outs, true),
+        // bf16 weights, contraction tiles in Hopper wgmma shape h (and
+        // flash shape h / |wgmma shapes|), the to_cuda_variant numbering
+        // Program::tuned uses
+        m if m.starts_with("wg") => {
+            use tang_compile::tensor::cuda::{with_cuda_sm, MMA_SHAPES};
+            let h: usize = m[2..].parse().unwrap();
+            let (sg, o) = prefill_schedule(g, outs, true);
+            let p = with_cuda_sm(90, || sg.to_cuda_variant(&o, Some(MMA_SHAPES.len() + h)));
+            (p, o)
+        }
         _ => {
             let opts = DecodeOpts { mma: how == "mma", ..Default::default() };
             (lower(rt, g, outs, &opts).program, outs.to_vec())
@@ -145,7 +156,7 @@ fn main() {
     });
     let want = eg.g.eval(&ins64, &[eg.out]).remove(0);
     let modes: Vec<String> = std::env::var("VISION_MODES")
-        .unwrap_or_else(|_| "mma,prefill".into())
+        .unwrap_or_else(|_| "prefill,bf16,wg0,wg1,wg2".into())
         .split(',')
         .map(String::from)
         .collect();
