@@ -1,0 +1,8 @@
+<|im_start|>user
+What were the main causes of the French Revolution? Answer in a few paragraphs.
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

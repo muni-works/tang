@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a Python function `merge_intervals(intervals)` that merges overlapping intervals, with a docstring and three pytest tests.
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
