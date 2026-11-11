@@ -120,7 +120,12 @@ fn main() {
         storage,
         ..
     } = low;
-    let mut prog = Program::with_plan(&rt, program.program, &empty, &plan);
+    // `--no-plan`: every buffer its own allocation (no aliasing)
+    let mut prog = if args.iter().any(|a| a == "--no-plan") {
+        Program::new(&rt, program.program, &empty)
+    } else {
+        Program::with_plan(&rt, program.program, &empty, &plan)
+    };
     let t1 = Instant::now();
     let mut bytes_up = 0usize;
     for (k, si) in st.inputs.iter().enumerate() {

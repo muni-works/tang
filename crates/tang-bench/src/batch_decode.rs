@@ -409,4 +409,115 @@ mod tests {
         );
         assert!(ey < 1e-5 && ez < 1e-5, "{ey} {ez}");
     }
+
+    /// The real-size lowering (`lower_real_step_with`) of a coder step with
+    /// int8-sized dims (d = 256, 8 experts top-4, Q4_K experts) at B = 4:
+    /// routed experts grouped by expert against ungrouped, both run on the
+    /// CPU. The grouping is a permutation of the same dot products.
+    #[test]
+    fn grouped_real_lowering_matches_ungrouped() {
+        use crate::ir_coder_prefill::*;
+        use crate::ir_coder_real::*;
+        use tang_compile::tensor::int8_sched::BlockOpts;
+        use tang_llm::gguf::GgmlType;
+        let dims = CoderDims {
+            d_model: 256,
+            vocab: 64,
+            recurrent: vec![true, false],
+            eps: 1e-6,
+            n_head: 4,
+            n_head_kv: 2,
+            head_dim: 64,
+            n_rot: 32,
+            rope_base: 1e4,
+            ssm_d_conv: 4,
+            ssm_d_state: 32,
+            ssm_k_heads: 2,
+            ssm_v_heads: 4,
+            n_expert: 8,
+            n_expert_used: 4,
+            n_ff_exp: 256,
+            n_ff_shexp: 256,
+        };
+        let pg = prefill_graph(&dims);
+        let tys: Vec<Option<GgmlType>> = pg
+            .inputs
+            .iter()
+            .map(|i| {
+                if i.name == "tokens" {
+                    None
+                } else if i.name.contains("_exps") {
+                    Some(GgmlType::Q4K)
+                } else {
+                    Some(GgmlType::F32)
+                }
+            })
+            .collect();
+        let st = derived_step_batched(&pg, 8).unwrap();
+        let nb = 4;
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // inputs in the step's order, per input: (f32 values | raw block words)
+        let mut vals: Vec<Vec<f32>> = Vec::new();
+        for si in &st.inputs {
+            let v = match *si {
+                StepInput::Pos => (0..nb).map(|b| b as f32).collect(),
+                StepInput::New(_) => (0..nb).map(|b| (5 + 9 * b) as f32).collect(),
+                StepInput::Cache(c) => {
+                    let n: usize = st.graph.shape(st.caches[c].input).iter().map(|d| match d {
+                        Dim::Sym(_) => nb,
+                        d => d.n(),
+                    }).product();
+                    vec![0.0; n]
+                }
+                StepInput::Same(i) => {
+                    let inp = &pg.inputs[i];
+                    let n: usize = inp.shape.iter().map(|d| d.n()).product();
+                    if tys[i] == Some(GgmlType::Q4K) {
+                        let mut b = Vec::new();
+                        for _ in 0..n / 256 {
+                            let mut blk = vec![0u8; 144];
+                            blk[..2].copy_from_slice(&0x2000u16.to_le_bytes());
+                            blk[2..4].copy_from_slice(&0x1c00u16.to_le_bytes());
+                            for x in &mut blk[4..] {
+                                *x = rnd() as u8;
+                            }
+                            b.extend(blk);
+                        }
+                        crate::ir_ds_real::words_of(&b)
+                    } else if inp.name.contains("norm") {
+                        (0..n).map(|_| 1.0 + ((rnd() % 1000) as f32 - 500.0) * 1e-4).collect()
+                    } else {
+                        (0..n).map(|_| ((rnd() % 2001) as f32 - 1000.0) * 1e-4).collect()
+                    }
+                }
+            };
+            vals.push(v);
+        }
+        let run = |group: usize| {
+            let low = lower_real_step_with(
+                &pg,
+                &st,
+                &tys,
+                &RealOpts {
+                    batch: Some(nb),
+                    group,
+                    block: BlockOpts::default(),
+                },
+            );
+            crate::cuda_cpu::run(&low.program, &vals, &low.outs[..1]).remove(0)
+        };
+        let a = run(0);
+        let b = run(2);
+        let ad: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+        let bd: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+        let e = rel(&bd, &ad);
+        eprintln!("real lowering B={nb}: grouped vs ungrouped logits rel err {e:.2e}");
+        assert!(e < 1e-5, "{e}");
+    }
 }
