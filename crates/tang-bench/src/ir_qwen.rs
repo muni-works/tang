@@ -1200,6 +1200,18 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     } else {
         (g, outs)
     };
+    // a short window's GEMVs split-K as decode's (enough warps in flight:
+    // a [k, rows] GEMV tiled k × 8 a lane has rows / 8 groups), the target
+    // in points scaled by k
+    if gemv {
+        let target = std::env::var("TANG_SPLIT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if half_tiles { 16384 } else { 0 });
+        if target > 0 {
+            (g, outs) = split_gemvs(g, outs, dg, target * dg.seq);
+        }
+    }
     // decode split-K of the 4-bit GEMVs (see `split_gemvs`)
     if dg.seq == 1 {
         // CUDA default: 16384 (q|k|v and o split 4 ways, down 4)
