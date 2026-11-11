@@ -31,6 +31,7 @@ fn children(node: Node) -> [Option<ExprId>; 3] {
         | Node::Recip(a)
         | Node::Sqrt(a)
         | Node::Sin(a)
+        | Node::Floor(a)
         | Node::Exp2(a)
         | Node::Log2(a) => [Some(a), None, None],
         Node::Select(c, a, b) => [Some(c), Some(a), Some(b)],

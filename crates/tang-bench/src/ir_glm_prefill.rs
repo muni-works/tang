@@ -33,8 +33,7 @@
 //! in the PR). Top-k selection (indexer pools, MoE experts) is a rank count:
 //! `rank(x) = #{y : y > x or (y = x and id(y) < id(x))}`, `selected ⇔ rank
 //! < k` — a masked-sum comprehension, no new IR. Modular position facts
-//! (pool ends) are written as affine masked sums over a second `T` axis,
-//! since a body cannot `floor` a non-literal.
+//! (pool ends, the tail pool) use `floor`: [`idiv`].
 use tang::Scalar;
 use tang_compile::tensor::step::{derive_step, StepGraph, StepSpec};
 use tang_compile::tensor::{Arg, Dim, Form, Monoid, TensorGraph, TensorId, View};
@@ -233,6 +232,13 @@ fn silu(x: ExprId) -> ExprId {
 fn pick(a: ExprId, b: ExprId, x: ExprId) -> ExprId {
     let z = lit(0.0);
     select(a - b + lit(0.5), select(b - a + lit(0.5), x, z), z)
+}
+
+/// `⌊x / k⌋` for integer-valued `x` and a positive integer `k`; the half
+/// offset keeps the quotient off integers, so rounding in `1/k` (or f32)
+/// cannot flip it.
+fn idiv(x: ExprId, k: f64) -> ExprId {
+    ((x + lit(0.5)) * lit(1.0 / k)).floor()
 }
 
 /// 1 when `(y, iy)` ranks above `(x, ix)`: `y > x`, or a tie and `iy < ix`.
@@ -580,17 +586,13 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
         move |v| grp(v[4], v[5], (v[0] - v[1]).exp() / v[2] * v[3], 0.0),
     );
     b.name(format!("{p}.indexer.pool_key"), pk);
-    // pe[e] = 1 iff e + 1 is a multiple of kp (an affine masked sum over m)
+    // pe[e] = 1 iff e + 1 is a multiple of kp
     let sp = [T, T];
-    let (ie, im) = (b.g.iota(&sp, 0), b.g.iota(&sp, 1));
+    let ie = b.g.iota(&[T], 0);
     let kpf = kp as f64;
-    // (m ≤ e at the top: the causal form derive_step recognizes)
-    let pe = b.sum(&[T], &[T], vec![a(ie, id(2)), a(im, id(2))], move |v| {
-        select(
-            v[0] - v[1] + lit(0.5),
-            pick(v[0] + lit(1.0), lit(kpf) * v[1] + lit(kpf), lit(1.0)),
-            lit(0.0),
-        )
+    let pe = b.map(&[T], vec![a(ie, id(1))], move |v| {
+        let e1 = v[0] + lit(1.0);
+        pick(e1, lit(kpf) * idiv(e1, kpf), lit(1.0))
     });
     // scores[i, e] = Σ_h w_h(x_i)/√ih · relu(iq_h(i)·pk(e)/√idd)
     let iq = b.linear(qr, wqb);

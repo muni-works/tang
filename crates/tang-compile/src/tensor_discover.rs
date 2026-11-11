@@ -162,6 +162,10 @@ pub fn inline(g: &ExprGraph, outs: &[ExprId], vars: &[ExprId]) -> Vec<ExprId> {
                 let a = m[a.index() as usize];
                 w(&mut |g| g.sin(a))
             }
+            Node::Floor(a) => {
+                let a = m[a.index() as usize];
+                w(&mut |g| g.floor(a))
+            }
             Node::Exp2(a) => {
                 let a = m[a.index() as usize];
                 w(&mut |g| g.exp2(a))

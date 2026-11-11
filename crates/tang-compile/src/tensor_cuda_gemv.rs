@@ -994,6 +994,7 @@ impl Lowering<'_> {
                     | Node::Recip(a)
                     | Node::Sqrt(a)
                     | Node::Sin(a)
+                    | Node::Floor(a)
                     | Node::Exp2(a)
                     | Node::Log2(a) => stack.push(a),
                     Node::Select(c, a, b) => stack.extend([c, a, b]),

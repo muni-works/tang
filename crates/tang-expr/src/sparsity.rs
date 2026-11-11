@@ -26,6 +26,7 @@ impl ExprGraph {
                 | Node::Recip(a)
                 | Node::Sqrt(a)
                 | Node::Sin(a)
+                | Node::Floor(a)
                 | Node::Exp2(a)
                 | Node::Log2(a) => masks[a.0 as usize],
                 Node::Select(c, a, b) => {
@@ -68,6 +69,7 @@ impl ExprGraph {
                 | Node::Recip(a)
                 | Node::Sqrt(a)
                 | Node::Sin(a)
+                | Node::Floor(a)
                 | Node::Exp2(a)
                 | Node::Log2(a) => masks[a.0 as usize],
                 Node::Select(c, a, b) => {

@@ -125,6 +125,13 @@ impl OptimizationPass for FoldConstants {
                         const_val[i] = const_val[ai].sin();
                     }
                 }
+                Node::Floor(a) => {
+                    let ai = a.index() as usize;
+                    if is_const[ai] {
+                        is_const[i] = true;
+                        const_val[i] = const_val[ai].floor();
+                    }
+                }
                 Node::Exp2(a) => {
                     let ai = a.index() as usize;
                     if is_const[ai] {
@@ -184,6 +191,7 @@ impl OptimizationPass for FoldConstants {
                     Node::Recip(a) => new_g.recip(remap[a.index() as usize]),
                     Node::Sqrt(a) => new_g.sqrt(remap[a.index() as usize]),
                     Node::Sin(a) => new_g.sin(remap[a.index() as usize]),
+                    Node::Floor(a) => new_g.floor(remap[a.index() as usize]),
                     Node::Exp2(a) => new_g.exp2(remap[a.index() as usize]),
                     Node::Log2(a) => new_g.log2(remap[a.index() as usize]),
                     Node::Atan2(a, b) => {
@@ -235,6 +243,7 @@ impl OptimizationPass for EliminateDeadCode {
                 | Node::Recip(a)
                 | Node::Sqrt(a)
                 | Node::Sin(a)
+                | Node::Floor(a)
                 | Node::Exp2(a)
                 | Node::Log2(a) => {
                     stack.push(a.index() as usize);
@@ -264,6 +273,7 @@ impl OptimizationPass for EliminateDeadCode {
                 Node::Recip(a) => new_g.recip(remap[a.index() as usize]),
                 Node::Sqrt(a) => new_g.sqrt(remap[a.index() as usize]),
                 Node::Sin(a) => new_g.sin(remap[a.index() as usize]),
+                Node::Floor(a) => new_g.floor(remap[a.index() as usize]),
                 Node::Exp2(a) => new_g.exp2(remap[a.index() as usize]),
                 Node::Log2(a) => new_g.log2(remap[a.index() as usize]),
                 Node::Atan2(a, b) => {

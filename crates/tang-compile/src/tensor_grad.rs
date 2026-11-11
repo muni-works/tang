@@ -988,7 +988,7 @@ fn go_degree(
             Deg::Lin(x) => Some(Deg::Hom(-x * std::f64::consts::LN_2)),
             d => d.is_clean().then_some(clean),
         },
-        Node::Sin(a) | Node::Log2(a) => go(a)?.is_clean().then_some(clean),
+        Node::Sin(a) | Node::Floor(a) | Node::Log2(a) => go(a)?.is_clean().then_some(clean),
         Node::Atan2(a, b) => (go(a)?.is_clean() && go(b)?.is_clean()).then_some(clean),
         Node::Select(c, a, b) => {
             if !go(c)?.is_clean() {

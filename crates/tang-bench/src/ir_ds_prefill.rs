@@ -23,8 +23,8 @@
 //!   each query attends to its `index_topk` best groups on top of its
 //!   window. Group `g` lives at row `t = g·r + r − 1` of a `T`-long node
 //!   (the row that completes it), so everything stays over `T`; rows that
-//!   complete no group are masked (`cos(2π(t+1)/r) = 1`, see the gap list
-//!   in the PR). Non-source layers read the source layer's compressed KV
+//!   complete no group are masked (`(t + 1) mod r ≠ 0`, with `floor`).
+//!   Non-source layers read the source layer's compressed KV
 //!   and top-k, as the hand path's `Shared` does.
 //! - **MoE**: `sqrt(softplus(gate·x))` scores, top-k on `score + bias`
 //!   ([`Monoid::topk`]), weights renormalized and scaled, SwiGLU with the
@@ -722,8 +722,9 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
                                 let (s, t, j) = (v[0], v[1], v[2]);
                                 let causal = t - j + lit(0.5);
                                 // group end: (j + 1) mod r == 0
-                                let ang = (j + lit(1.0)) * lit(2.0 * std::f64::consts::PI / rf);
-                                let end = ang.cos() - lit(1.0 - 1e-9);
+                                let m = j + lit(1.0);
+                                let q = ((m + lit(0.5)) * lit(1.0 / rf)).floor();
+                                let end = lit(0.5) - (m - lit(rf) * q);
                                 let mut o = vec![
                                     select(causal, j, lit(0.0)),
                                     select(causal, select(end, s, lit(fmax)), lit(fmax)),
