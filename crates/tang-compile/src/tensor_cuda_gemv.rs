@@ -1920,7 +1920,9 @@ impl Lowering<'_> {
                     // vs k f32 activations re-read by rows/t2 groups.
                     // 8×4 at k=8 is 8.5 B per weight element, 2×16 is 4
                     // (H200: window time tracks it). TANG_WIN_JOINT=0 off
-                    if let Some((d2, _)) = reg2 {
+                    // (only past 4 tokens: on the H200 2×16 took window-8
+                    // from 17.9 to 13.4 ms but window-4 from 6.9 to 9.0)
+                    if let Some((d2, _)) = reg2.filter(|_| pts[d1] > 4) {
                         if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
                             let bytes = |l: &Leaf| match l.pack {
                                 Some(Packing::U4) => 0.5,
