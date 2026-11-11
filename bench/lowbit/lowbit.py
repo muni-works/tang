@@ -39,6 +39,18 @@ FORMATS = {
     "vq4d256": ("vq", dict(d=4, k=256, g=128), 2.125),
     "vq4d2048h": ("vq", dict(d=4, k=2048, g=128, had=True), 2.875),
     "vq4d256h": ("vq", dict(d=4, k=256, g=128, had=True), 2.125),
+    "a4g128h": ("affine", dict(bits=4, g=128, had=True), 4.25),
+    "vq2d128h": ("vq", dict(d=2, k=128, g=128, had=True), 3.625),
+    "vq2d256h": ("vq", dict(d=2, k=256, g=128, had=True), 4.125),
+    "vq4d4096h": ("vq", dict(d=4, k=4096, g=128, had=True), 3.125),
+    "vq4d8192h": ("vq", dict(d=4, k=8192, g=128, had=True), 3.375),
+    # GPTQ (Hessian-aware, error feedback; `calib` builds the Hessians)
+    "g3g64h": ("affine", dict(bits=3, g=64, had=True, gptq=True), 3.5),
+    "g3g128h": ("affine", dict(bits=3, g=128, had=True, gptq=True), 3.25),
+    "g4g128h": ("affine", dict(bits=4, g=128, had=True, gptq=True), 4.25),
+    "gvq4d2048h": ("vq", dict(d=4, k=2048, g=128, had=True, gptq=True), 2.875),
+    "gvq4d4096h": ("vq", dict(d=4, k=4096, g=128, had=True, gptq=True), 3.125),
+    "gvq4d8192h": ("vq", dict(d=4, k=8192, g=128, had=True, gptq=True), 3.375),
     "vq8d4096h": ("vq", dict(d=8, k=4096, g=128, had=True), 1.625),
 }
 
@@ -115,13 +127,98 @@ def vq(w, d, k, g):
     return (c[assign(v, c)].reshape(o, i // g, g) * sc).reshape(o, i)
 
 
-def quantize(w, fmt, seed):
+HESS = os.path.expanduser("~/lowbit/hess")
+# the projection whose input each projection sees (q/k/v and gate/up share one)
+HIN = {"self_attn.q_proj": "q", "self_attn.k_proj": "q", "self_attn.v_proj": "q",
+       "self_attn.o_proj": "o", "mlp.gate_proj": "gate", "mlp.up_proj": "gate", "mlp.down_proj": "down"}
+
+
+def hessian(name, seed, had):
+    """E[x x^T] of the projection's input over the calibration set, rotated
+    like the weight (R^T H R, R = D Hblk), so GPTQ runs in the stored basis."""
+    layer, proj = name.split(".")[2], ".".join(name.split(".")[3:5])
+    h = torch.load(f"{HESS}/{layer}.{HIN[proj]}.pt").double()
+    if had:
+        h = rotate(rotate(h.float(), seed).T.contiguous(), seed).T.double()
+    return h
+
+
+def gptq_inv(h, damp=0.01):
+    h = h.clone()
+    dead = torch.diag(h) == 0
+    h[dead, dead] = 1
+    h += damp * torch.diag(h).mean() * torch.eye(h.shape[0], dtype=h.dtype)
+    l = torch.linalg.cholesky(h)
+    return torch.linalg.cholesky(torch.cholesky_inverse(l), upper=True).float()
+
+
+def gptq_affine(w, h, bits, g, blk=128):
+    """GPTQ (Frantar et al.) with per-group min/max affine params, fixed
+    when the sweep enters each group (from the error-updated weights)."""
+    w = w.clone()
+    u = gptq_inv(h)
+    q = torch.zeros_like(w)
+    qmax = 2 ** bits - 1
+    o, n = w.shape
+    for b0 in range(0, n, blk):
+        b1 = min(b0 + blk, n)
+        wb, eb = w[:, b0:b1].clone(), torch.zeros(o, b1 - b0)
+        for j in range(b1 - b0):
+            c = b0 + j
+            if c % g == 0:
+                grp = torch.cat([wb[:, j:], w[:, b1:]], 1)[:, :g]
+                lo, hi = grp.amin(1), grp.amax(1)
+                sc = ((hi - lo) / qmax).clamp_min(1e-8).half().float()
+                lo = lo.half().float()
+            x = wb[:, j]
+            qc = ((x - lo) / sc).round().clamp(0, qmax) * sc + lo
+            q[:, c] = qc
+            e = (x - qc) / u[c, c]
+            wb[:, j:] -= e.unsqueeze(1) * u[c, c:b1].unsqueeze(0)
+            eb[:, j] = e
+        w[:, b1:] -= eb @ u[b0:b1, b1:]
+    return q
+
+
+def gptq_vq(w, h, d, k, g, blk=128):
+    """GPTQ-VQ: group RMS scales and the k-means codebook come from the
+    plain fit; the sweep then assigns one d-vector at a time against the
+    error-updated weights and feeds each column's residual forward."""
+    o, n = w.shape
+    x = w.reshape(o, n // g, g)
+    sc = x.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-8).half().float()
+    book = kmeans((x / sc).reshape(-1, d), k)
+    sc = sc.reshape(o, n // g)
+    w = w.clone()
+    u = gptq_inv(h)
+    q = torch.zeros_like(w)
+    for b0 in range(0, n, blk):
+        b1 = min(b0 + blk, n)
+        wb, eb = w[:, b0:b1].clone(), torch.zeros(o, b1 - b0)
+        for j in range(0, b1 - b0, d):
+            c = b0 + j
+            s = sc[:, c // g].unsqueeze(1)
+            qv = book[assign(wb[:, j:j + d] / s, book)] * s
+            for t in range(d):
+                q[:, c + t] = qv[:, t]
+                e = (wb[:, j + t] - qv[:, t]) / u[c + t, c + t]
+                wb[:, j + t:] -= e.unsqueeze(1) * u[c + t, c + t:b1].unsqueeze(0)
+                eb[:, j + t] = e
+        w[:, b1:] -= eb @ u[b0:b1, b1:]
+    return q
+
+
+def quantize(w, fmt, seed, name=None):
     kind, p, _ = FORMATS[fmt]
     w = w.float()
     had = p.get("had", False)
     if had:
         w = rotate(w, seed)
-    q = affine(w, p["bits"], p["g"]) if kind == "affine" else vq(w, p["d"], p["k"], p["g"])
+    if p.get("gptq"):
+        h = hessian(name, seed, had)
+        q = gptq_affine(w, h, p["bits"], p["g"]) if kind == "affine" else gptq_vq(w, h, p["d"], p["k"], p["g"])
+    else:
+        q = affine(w, p["bits"], p["g"]) if kind == "affine" else vq(w, p["d"], p["k"], p["g"])
     if had:
         q = rotate(q, seed, inverse=True)
     return q.bfloat16()
@@ -164,8 +261,8 @@ def cached(name, fmt, layer):
     path = f"{CACHE}/{fmt}/{name}.pt"
     if os.path.exists(path):
         return torch.load(path)
-    q = quantize(bf16_tensor(name), fmt, seed=zlib.crc32(name.encode()) & 0xFFFF)
-    if FORMATS[fmt][0] == "vq":
+    q = quantize(bf16_tensor(name), fmt, seed=zlib.crc32(name.encode()) & 0xFFFF, name=name)
+    if FORMATS[fmt][0] == "vq" or FORMATS[fmt][1].get("gptq"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(q, path)
     return q
@@ -255,6 +352,39 @@ def agreement(m, refs):
     return hit / tot
 
 
+@torch.no_grad()
+def calib(path, nseq, seqlen, first=0, last=99):
+    """Accumulate E[x x^T] at the inputs of q/o/gate/down in every block of
+    the bf16 model over `nseq` windows of `seqlen` tokens from `path` (text
+    disjoint from the eval set), for blocks [first, last) (the f32
+    Hessians of all 36 blocks are ~28 GB: split passes on small hosts). Saved f32 to ~/lowbit/hess/<layer>.<in>.pt."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(BF16)
+    ids = tok(open(path).read())["input_ids"]
+    stride = max(seqlen, (len(ids) - seqlen) // nseq)
+    seqs = [ids[i:i + seqlen] for i in range(0, len(ids) - seqlen, stride)][:nseq]
+    print("calib", len(seqs), "x", seqlen, "of", len(ids), "tokens", flush=True)
+    m = load_model("bf16")
+    acc, hooks = {}, []
+    for l in range(first, min(last, nblocks(m))):
+        for p, key in [("self_attn.q_proj", "q"), ("self_attn.o_proj", "o"),
+                       ("mlp.gate_proj", "gate"), ("mlp.down_proj", "down")]:
+            def hook(mod, inp, _out, k=f"{l}.{key}"):
+                x = inp[0].reshape(-1, inp[0].shape[-1]).float()
+                acc[k] = acc.get(k, 0) + x.T @ x
+            hooks.append(m.get_submodule(f"model.layers.{l}.{p}").register_forward_hook(hook))
+    t = time.time()
+    for i, s in enumerate(seqs):
+        m(torch.tensor([s]))
+        if i % 16 == 0:
+            print("seq", i, round(time.time() - t), flush=True)
+    os.makedirs(HESS, exist_ok=True)
+    n = len(seqs) * seqlen
+    for k, v in acc.items():
+        torch.save(v / n, f"{HESS}/{k}.pt")
+    print("saved", len(acc), "hessians", flush=True)
+
+
 def nblocks(m):
     return m.config.num_hidden_layers
 
@@ -268,6 +398,9 @@ def main():
     cmd = sys.argv[1]
     if cmd == "texts":
         return texts()
+    if cmd == "calib":  # Hessians for GPTQ: calib <calib.txt> [nseq] [seqlen]
+        a = sys.argv + [None] * 6
+        return calib(a[2], int(a[3] or 128), int(a[4] or 256), int(a[5] or 0), int(a[6] or 99))
     if cmd == "cache":  # fill the VQ cache: cache <fmt> <first> <last>
         for l in range(int(sys.argv[3]), int(sys.argv[4])):
             for p in PROJ:

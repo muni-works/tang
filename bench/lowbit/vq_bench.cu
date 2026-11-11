@@ -1,5 +1,6 @@
-// Decode-GEMV speed of the VQ format (bench/lowbit) against a bf16 GEMV
-// of the same shape. vq.cu is generated from tang-compile:
+// Decode-GEMV speed of the low-bit formats (bench/lowbit): packed 3-bit
+// affine (g3g64h, the GPTQ winner) and VQ, against 4-bit affine (the MLX a4
+// layout) and a bf16 GEMV of the same shape. vq.cu is generated from tang-compile:
 //   VQ_CU_OUT=bench/lowbit/vq.cu cargo test -p tang-compile --lib vq_cuda_src_dump -- --ignored
 //   nvcc -O3 -arch=native -I bench/lowbit bench/lowbit/vq_bench.cu -o /tmp/vq_bench && /tmp/vq_bench
 // Random codes/book (speed only; correctness is the CPU test against the
@@ -57,8 +58,27 @@ int main() {
     });
     float tb = time_us([&] { bf16_gemv<<<(rows + 7) / 8, 256>>>(dw, dx, dy, rows, cols); });
     double vb = nwords * 4.0 + hs.size() * 2.0 + hb.size() * 2.0, bb = n * 2.0;
-    printf("%5dx%-5d  vq %7.1f us %6.0f GB/s (%.3f bpw)   bf16 %7.1f us %6.0f GB/s   speedup %.2fx\n",
-           rows, cols, tv, vb / tv / 1e3, 8 * vb / n, tb, bb / tb / 1e3, tb / tv);
+    // packed affine: 3-bit (g3g64h, rotated) and 4-bit (the MLX a4 layout, no rotation)
+    float ta[5]; double ab[5];
+    for (int bits = 3; bits <= 4; ++bits) {
+      size_t aw = (n * bits + 31) / 32 + 1, ng = n / 64;
+      std::vector<unsigned> hac(aw); for (auto& v : hac) v = rand() * 2654435761u;
+      std::vector<__half> hp(ng, __float2half(0.01f));
+      unsigned* dac; __half *dsc, *dbi;
+      cudaMalloc(&dac, aw * 4); cudaMalloc(&dsc, ng * 2); cudaMalloc(&dbi, ng * 2);
+      cudaMemcpy(dac, hac.data(), aw * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(dsc, hp.data(), ng * 2, cudaMemcpyHostToDevice);
+      cudaMemcpy(dbi, hp.data(), ng * 2, cudaMemcpyHostToDevice);
+      ta[bits] = bits == 3 ? time_us([&] {
+        vq_rotate<<<cols / 128, 128>>>(dx, dsg, dxr);
+        aff3_gemv<<<(rows + 7) / 8, 256>>>(dac, dsc, dbi, dxr, dy, rows, cols);
+      }) : time_us([&] { aff4_gemv<<<(rows + 7) / 8, 256>>>(dac, dsc, dbi, dx, dy, rows, cols); });
+      ab[bits] = aw * 4.0 + ng * 4.0;
+      cudaFree(dac); cudaFree(dsc); cudaFree(dbi);
+    }
+    printf("%5dx%-5d  bf16 %7.1f us %5.0f GB/s | a4 %6.1f us %5.0f GB/s | g3 %6.1f us %5.0f GB/s (%.2fx a4) | vq %6.1f us %5.0f GB/s (%.2fx a4)\n",
+           rows, cols, tb, bb / tb / 1e3, ta[4], ab[4] / ta[4] / 1e3, ta[3], ab[3] / ta[3] / 1e3, ta[4] / ta[3],
+           tv, vb / tv / 1e3, ta[4] / tv);
     cudaError_t e = cudaGetLastError(); if (e) { printf("CUDA error %s\n", cudaGetErrorString(e)); return 1; }
     cudaFree(dc); cudaFree(ds); cudaFree(db); cudaFree(dx); cudaFree(dxr); cudaFree(dsg); cudaFree(dy); cudaFree(dw);
   }
