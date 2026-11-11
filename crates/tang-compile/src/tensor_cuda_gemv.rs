@@ -2250,8 +2250,19 @@ impl Lowering<'_> {
         // f32 vector leaves tiled along a register dim (a window's
         // activations, one copy per token) stream a float4 at a time inside
         // the chunk instead of all `vec` up front: k·vec registers spill
+        // Only without a second register dim: a window's rows × tokens
+        // tile (reg2) keeps its activations preloaded. Streamed, the q
+        // loop sits outside the rt tile, so every packed word is unpacked
+        // vec/4 times and the loads can't be hoisted (4× the window at
+        // k=4); decode's one-token tiles want the stream.
+        // TANG_WIN_STREAM=0 off everywhere, =1 on everywhere
+        let stream_knob = std::env::var("TANG_WIN_STREAM");
         let stream = vec % 4 == 0
-            && std::env::var("TANG_WIN_STREAM").as_deref() != Ok("0")
+            && match stream_knob.as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => reg2.is_none(),
+            }
             && leaves.iter().any(|l| l.pack == Some(Packing::U4))
             && leaves
                 .iter()
