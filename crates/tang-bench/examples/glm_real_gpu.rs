@@ -70,9 +70,10 @@ fn build(rt: &Runtime, st: &StepGraph, inputs: &[Vec<f32>]) -> (Program, Vec<Ten
     let (g, outs) = g.eliminate_common(&outs);
     let dp = lower(rt, &g, &outs, &DecodeOpts::default());
     eprintln!(
-        "lowered: {} kernels ({} native)",
+        "lowered: {} kernels ({} native, {} top-k block select)",
         dp.program.kernels.len(),
-        dp.native.iter().filter(|n| **n).count()
+        dp.native.iter().filter(|n| **n).count(),
+        dp.program.kernels.iter().filter(|k| k.source.contains("block select")).count()
     );
     let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
     (Program::new(rt, dp.program, &refs), outs)

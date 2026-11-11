@@ -3740,7 +3740,8 @@ const TOPK_UNROLL_MAX: usize = 8;
 /// `acc ← top-k(acc ∪ el)` as a plain two-pointer merge of the two sorted
 /// lists (same order as [`Monoid::topk`]: larger value, then smaller
 /// index). Minimal and looped so nvrtc compiles it; a dedicated top-k
-/// kernel replaces it.
+/// kernel replaces it ([`Lowering::topk_select`] for k ≥ 32; this
+/// remains for 8 < k < 32).
 fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[String]) {
     let w = 2 * k;
     writeln!(s, "{indent}{{ float ta[{w}], tb[{w}], to[{w}];").unwrap();
