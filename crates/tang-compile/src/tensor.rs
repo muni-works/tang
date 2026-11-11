@@ -2526,6 +2526,7 @@ impl TensorGraph {
     pub fn schedule_inline_up_to(&mut self, outputs: &[TensorId], factor: usize) {
         let live = self.live(outputs);
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
         let mut consumer_space = vec![0usize; n];
@@ -2585,6 +2586,7 @@ impl TensorGraph {
                 && uses[i] == 1
                 && !is_output(i)
                 && !reshaped[i]
+                && !scan_input[i]
                 && (c.monoid.is_none() || consumer_reduces[i])
                 && consumer_space[i] <= factor * numel(c.points())
             {
@@ -2706,6 +2708,7 @@ impl TensorGraph {
             })
             .collect();
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         // a map every one of whose consumers reduces may be recomputed in
         // each of them (flash backward recomputes dS in dQ and dK alike)
@@ -2767,7 +2770,7 @@ impl TensorGraph {
                         .iter()
                         .filter(|a| !a.view.depends_on(lane) && recomputable[a.src.n()])
                         .map(|a| a.src.n())
-                        .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
+                        .filter(|&p| !is_output(p) && !scan_input[p] && self.comp_at(p).is_some())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -3027,7 +3030,7 @@ impl TensorGraph {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // (consumer, arg index) pairs per producer; a reshape reader
+        // (consumer, arg index) pairs per producer; a reshape or scan reader
         // pins the layout
         let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
         let mut pinned = vec![false; n];
@@ -3039,6 +3042,7 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => pinned[src.n()] = true,
+                Op::Scan(s) => s.inputs.iter().for_each(|t| pinned[t.n()] = true),
                 _ => {}
             }
         }
