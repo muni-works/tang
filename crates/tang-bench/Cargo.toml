@@ -94,7 +94,8 @@ nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
 tang-derive-wasm = { path = "../tang-derive-wasm" }
-# ir_glm_prefill tests: the GLM-5.3 hand CPU reference (flash::glm5)
+# ir_glm_prefill tests (flash::glm5) and ir_coder_prefill (flash::reference):
+# tang-llm's CPU references as oracles
 tang-llm = { workspace = true }
 
 [[example]]
