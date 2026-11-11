@@ -345,7 +345,7 @@ impl Deriver<'_> {
             let mut v = x[0];
             if delta {
                 let kk = x[1] * x[2];
-                v = v - ib.map_or(kk, |b| x[b] * kk);
+                v -= ib.map_or(kk, |b| x[b] * kk);
             }
             vec![ia.map_or(v, |a| x[a] * v)]
         })

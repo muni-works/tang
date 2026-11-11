@@ -528,7 +528,7 @@ impl Monoid {
     /// `Some(k)` when this is [`Monoid::topk`]`(k)` (same identity, same
     /// combine at probe points).
     pub fn topk_k(&self) -> Option<usize> {
-        if self.width < 2 || self.width % 2 != 0 {
+        if self.width < 2 || !self.width.is_multiple_of(2) {
             return None;
         }
         let k = self.width / 2;

@@ -442,7 +442,7 @@ impl TensorGraph {
                 None => (target == DecodeTarget::Cuda)
                     .then(|| lw.topk_select(root).or_else(|| lw.topk_warp(root)))
                     .flatten()
-                    .or_else(|| mma())
+                    .or_else(mma)
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
@@ -4001,8 +4001,8 @@ impl TensorGraph {
 }
 
 impl Lowering<'_> {
-    /// A small reduction (at most 64 elements a point, Sum or Max, width
-    /// 1) as one thread per point looping over its reduce space: for a
+    /// A small reduction (at most 64 elements a point, Sum or Max, of
+    /// width 1) as one thread per point looping over its reduce space: for a
     /// kernel that hosts inlined nodes or side jobs (`TNode::host`) and
     /// has no warp lowering (a depthwise conv over a short window).
     fn thread_reduction(&self, root: usize) -> Option<Kernel> {
@@ -4117,7 +4117,7 @@ impl Lowering<'_> {
             || c.tuple != 0
             || g.nodes[u].precision.storage != super::Format::F32
             || self.packed.contains_key(&u)
-            || threads % 32 != 0
+            || !threads.is_multiple_of(32)
         {
             return None;
         }
