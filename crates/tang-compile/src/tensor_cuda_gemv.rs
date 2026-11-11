@@ -51,7 +51,7 @@ use tang_expr::{ExprGraph, ExprId, Node};
 use super::msl_mma::Addr;
 use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
-use super::{fixed, numel, Arg, Form, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Form, IntMma, Monoid, Op, Stage, TensorGraph, TensorId};
 
 /// How a graph input is stored on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,8 +304,24 @@ impl TensorGraph {
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             if any_block {
                 if let Some(s) = self.nodes[root].int_mma {
+                    // a batched schedule (tensor cores, tiled positions) this
+                    // contraction has no kernel for falls back to the decode GEMV
+                    let gemv = IntMma {
+                        stage: Stage::Gemv,
+                        ksplit: 1,
+                        pos_tile: 1,
+                    };
                     let (src, threads, blocks) = self
                         .cuda_int8_kernel(root, &reads, s)
+                        .or_else(|e| {
+                            if s == gemv {
+                                return Err(e);
+                            }
+                            if std::env::var("TANG_BATCH_LOG").is_ok() {
+                                eprintln!("int8 node {root}: {s:?} -> Gemv ({e})");
+                            }
+                            self.cuda_int8_kernel(root, &reads, gemv)
+                        })
                         .unwrap_or_else(|e| panic!("int8 GEMV schedule on node {root}: {e}"));
                     k.source = src;
                     k.workgroup_size = threads as u32;

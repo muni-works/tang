@@ -289,6 +289,7 @@ pub mod prompt_lookup;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
 /// without a GPU.
 pub mod cuda_cpu;
+pub mod batch_decode;
 /// DS pieces on a CUDA device: the top-k block select, the Engram table
 /// in host-mapped memory.
 #[cfg(all(test, feature = "cuda"))]
