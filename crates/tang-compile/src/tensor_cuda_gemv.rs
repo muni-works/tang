@@ -2501,6 +2501,9 @@ impl Lowering<'_> {
         el: &[String],
     ) {
         let accs: Vec<String> = (0..w).map(&acc).collect();
+        if w > 2 * TOPK_UNROLL_MAX && super::step::gather::is_topk(m) {
+            return topk_merge(s, w / 2, indent, &accs, el);
+        }
         let out = emit(s, &m.combine, &m.outs, "m_", indent, &|v| {
             let v = v as usize;
             if v < w {
@@ -3207,4 +3210,37 @@ impl Lowering<'_> {
             blocks,
         })
     }
+}
+
+/// Above this k a [`Monoid::topk`] combine is a loop, not the unrolled
+/// k²/2 compare-select network (k = 512 is 2M lines nvrtc never finishes).
+const TOPK_UNROLL_MAX: usize = 8;
+
+/// `acc ← top-k(acc ∪ el)` as a plain two-pointer merge of the two sorted
+/// lists (same order as [`Monoid::topk`]: larger value, then smaller
+/// index). Minimal and looped so nvrtc compiles it; a dedicated top-k
+/// kernel replaces it.
+fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[String]) {
+    let w = 2 * k;
+    writeln!(s, "{indent}{{ float ta[{w}], tb[{w}], to[{w}];").unwrap();
+    for i in 0..w {
+        writeln!(s, "{indent}  ta[{i}] = {}; tb[{i}] = {};", accs[i], el[i]).unwrap();
+    }
+    // ia + ib = q < k, so neither runs past its list
+    writeln!(s, "{indent}  int ia = 0, ib = 0;").unwrap();
+    writeln!(s, "{indent}  #pragma unroll 1").unwrap();
+    writeln!(s, "{indent}  for (int q = 0; q < {k}; q++) {{").unwrap();
+    writeln!(
+        s,
+        "{indent}    float ai = ta[2 * ia], av = ta[2 * ia + 1], bi = tb[2 * ib], bv = tb[2 * ib + 1];"
+    )
+    .unwrap();
+    writeln!(s, "{indent}    bool fa = av > bv || (av == bv && ai <= bi);").unwrap();
+    writeln!(s, "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;").unwrap();
+    writeln!(s, "{indent}    if (fa) ia++; else ib++;").unwrap();
+    writeln!(s, "{indent}  }}").unwrap();
+    for i in 0..w {
+        writeln!(s, "{indent}  {} = to[{i}];", accs[i]).unwrap();
+    }
+    writeln!(s, "{indent}}}").unwrap();
 }
