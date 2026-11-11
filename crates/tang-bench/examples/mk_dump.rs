@@ -56,6 +56,7 @@ fn main() {
             prefetch: prefetch << 10,
             slot_bytes,
             trace: false,
+            counters: false,
         },
     );
     eprintln!(

@@ -61,6 +61,8 @@ pub struct Mega {
     pub phases: Vec<Vec<usize>>,
     /// Slot behind each entry of the launch's pointer table.
     pub table: Vec<usize>,
+    /// u32 words of the `sync` buffer (zero before the first launch).
+    pub sync_words: usize,
 }
 
 /// Knobs of [`megakernel`].
@@ -85,6 +87,12 @@ pub struct MegaOpts {
     /// the end) as u64 at `sync + 2` (the sync buffer then needs
     /// `2 + 2 · (phases + 1)` words).
     pub trace: bool,
+    /// Dependency counters instead of grid barriers: a completion counter
+    /// per stage (bumped per virtual block it finishes; per block for a
+    /// replicated stage), and before each stage a block waits only on the
+    /// stages it has a hazard with, so independent stages overlap instead
+    /// of the whole grid stopping at every phase boundary.
+    pub counters: bool,
 }
 
 /// Stages small enough to replicate: at most `dup` blocks and not
@@ -152,6 +160,12 @@ __device__ __forceinline__ void tang_prefetch(unsigned long long base, unsigned 
     const unsigned long long step = (unsigned long long)gridDim.x * blockDim.x * 128ull;
     for (unsigned long long o = ((unsigned long long)blockIdx.x * blockDim.x + threadIdx.x) * 128ull; o < bytes; o += step)
         asm volatile("prefetch.global.L2 [%0];" :: "l"(base + o));
+}
+__device__ __forceinline__ void tang_wait(const unsigned* c, unsigned target) {
+    unsigned v;
+    do {
+        asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(c) : "memory");
+    } while (v < target);
 }
 __device__ __forceinline__ void tang_grid_sync(unsigned* s, unsigned target) {
     __syncthreads();
@@ -326,6 +340,20 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
             .filter(|w| w.1 > 0)
             .collect()
     };
+    // counters: stage k waits on the earlier stages it has a hazard with
+    let cbase = 2 + 2 * (phases.len() + 1);
+    let deps: Vec<Vec<usize>> = (0..stages.len())
+        .map(|k| {
+            let (kr, kw) = split(&stages[k]);
+            let hit = |a: &[usize], b: &[usize]| a.iter().any(|s| b.contains(s));
+            (0..k)
+                .filter(|&j| {
+                    let (jr, jw) = split(&stages[j]);
+                    (hit(kr, jw) && !dup[j]) || hit(jr, kw) || hit(jw, kw)
+                })
+                .collect()
+        })
+        .collect();
     let mut src = String::from(HEADER);
     let mut smem = 0usize;
     let mut pools = Vec::with_capacity(stages.len());
@@ -365,14 +393,32 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
                     writeln!(src, "    tang_prefetch(tab[{}], {bytes}ull);", local(slot)).unwrap();
                 }
             }
-            writeln!(src, "    tang_grid_sync(sync, {p}u * gridDim.x);").unwrap();
+            if !opts.counters {
+                writeln!(src, "    tang_grid_sync(sync, {p}u * gridDim.x);").unwrap();
+            }
         }
-        stamp(&mut src, p);
+        if !opts.counters {
+            stamp(&mut src, p);
+        }
         for (n, &k) in ks.iter().enumerate() {
             let st = &stages[k];
             let w = st.threads;
             let per = threads / w;
-            if n > 0 {
+            if opts.counters {
+                src.push_str("    __syncthreads();\n");
+                if !deps[k].is_empty() {
+                    src.push_str("    if (tid == 0) {\n");
+                    for &j in &deps[k] {
+                        let target = if dup[j] {
+                            "gridDim.x".to_string()
+                        } else {
+                            format!("{}u", stages[j].blocks)
+                        };
+                        writeln!(src, "        tang_wait(sync + {}, {target});", cbase + j).unwrap();
+                    }
+                    src.push_str("        __threadfence();\n    }\n    __syncthreads();\n");
+                }
+            } else if n > 0 {
                 src.push_str("    __syncthreads();\n");
             }
             let ptrs: Vec<String> = st
@@ -413,18 +459,36 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
                     )
                 };
                 let bar = slot + 1;
+                // a finished virtual block (not replicated) counts once
+                let done = if opts.counters && !dup[k] {
+                    format!(
+                        "\n        if (tid % {w}u == 0) {{ __threadfence(); atomicAdd(sync + {}, 1u); }}",
+                        cbase + k
+                    )
+                } else {
+                    String::new()
+                };
                 writeln!(
                     src,
-                    "{guard}\n    for (unsigned vb = {first}; vb < {nb}u; vb += {stride}) {{\n        k{k}::run<{bar}>({args}, {count}u, vb, tid % {w}u, {nb}u, {pool});\n        tang_bar<{bar}, {w}>();\n    }} }}",
+                    "{guard}\n    for (unsigned vb = {first}; vb < {nb}u; vb += {stride}) {{\n        k{k}::run<{bar}>({args}, {count}u, vb, tid % {w}u, {nb}u, {pool});\n        tang_bar<{bar}, {w}>();{done}\n    }} }}",
                     nb = st.blocks,
                     args = ptrs.join(", "),
                     count = st.count,
                 )
                 .unwrap();
             }
+            if opts.counters && dup[k] {
+                // a replicated stage counts once per block
+                writeln!(
+                    src,
+                    "    __syncthreads();\n    if (tid == 0) {{ __threadfence(); atomicAdd(sync + {}, 1u); }}",
+                    cbase + k
+                )
+                .unwrap();
+            }
         }
     }
-    if opts.trace {
+    if opts.trace && !opts.counters {
         writeln!(
             src,
             "    tang_grid_sync(sync, {}u * gridDim.x);",
@@ -433,14 +497,19 @@ pub fn megakernel(stages: &[MegaStage], opts: &MegaOpts) -> Mega {
         .unwrap();
         stamp(&mut src, phases.len());
     }
-    // the last block out resets the barrier state for the next launch
-    src.push_str(
-        "    __syncthreads();\n    if (tid == 0) {\n        __threadfence();\n        if (atomicAdd(sync + 1, 1u) == gridDim.x - 1) { sync[0] = 0; sync[1] = 0; __threadfence(); }\n    }\n}\n",
-    );
+    // the last block out resets the barrier state (and counters) for the
+    // next launch
+    let ncount = if opts.counters { stages.len() } else { 0 };
+    writeln!(
+        src,
+        "    __syncthreads();\n    if (tid == 0) {{\n        __threadfence();\n        if (atomicAdd(sync + 1, 1u) == gridDim.x - 1) {{ sync[0] = 0; sync[1] = 0; for (unsigned c = 0; c < {ncount}u; c++) sync[{cbase} + c] = 0; __threadfence(); }}\n    }}\n}}",
+    )
+    .unwrap();
     Mega {
         source: src,
         threads,
         smem: smem as u32,
+        sync_words: cbase + ncount,
         phases,
         table,
     }

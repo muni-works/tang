@@ -176,6 +176,9 @@ template <unsigned ID, unsigned N> static inline void tang_bar() { tang_named(ID
 static inline void tang_prefetch(unsigned long long, unsigned long long) {}
 static inline void __threadfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 static inline unsigned atomicAdd(unsigned* p, unsigned v) { return std::atomic_ref<unsigned>(*p).fetch_add(v); }
+static inline void tang_wait(const unsigned* c, unsigned target) {
+    while (std::atomic_ref<unsigned>(*const_cast<unsigned*>(c)).load() < target) std::this_thread::yield();
+}
 static inline void tang_grid_sync(unsigned* s, unsigned target) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -300,8 +303,8 @@ pub fn run_mega(
         .unwrap();
         writeln!(
             cpp,
-            "    std::vector<unsigned> sync({}, 0u);\n    tang_run({grid}u, {}u, {}u, true, [&] {{ mk::main0(tab.data(), sync.data()); }});\n    if (sync[0] || sync[1]) {{ std::fprintf(stderr, \"barrier state not reset\\n\"); return 3; }}",
-            2 + 2 * (m.phases.len() + 1),
+            "    std::vector<unsigned> sync({}, 0u);\n    tang_run({grid}u, {}u, {}u, true, [&] {{ mk::main0(tab.data(), sync.data()); }});\n    for (unsigned w : sync) if (w) {{ std::fprintf(stderr, \"barrier state not reset\\n\"); return 3; }}",
+            m.sync_words,
             m.threads,
             m.smem,
         )
@@ -595,12 +598,14 @@ mod tests {
     #[test]
     fn megakernel_steps_run_on_the_cpu() {
         for (name, m, resid) in [("coder", coder(), true), ("qwen3", qwen(), false)] {
-            for (threads, dup, grid) in [(256u32, 0u32, 3u32), (512, 2, 2)] {
-                let mo = MegaOpts { threads, dup, ..Default::default() };
+            for (threads, dup, grid, counters) in
+                [(256u32, 0u32, 3u32, false), (512, 2, 2, false), (256, 0, 3, true), (512, 2, 2, true)]
+            {
+                let mo = MegaOpts { threads, dup, counters, ..Default::default() };
                 let (e, nk) =
                     step_on_cpu(&m, &DecodeOpts::default(), resid, true, true, Some((&mo, grid)));
                 eprintln!(
-                    "tiny {name} step: {nk} kernels as one megakernel ({threads} threads, dup {dup}, grid {grid}): rel err {e:.2e}"
+                    "tiny {name} step: {nk} kernels as one megakernel ({threads} threads, dup {dup}, grid {grid}, counters {counters}): rel err {e:.2e}"
                 );
                 assert!(e < 1e-4, "{name}: {e}");
             }

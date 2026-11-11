@@ -935,7 +935,7 @@ impl Program {
             let table = d.stream.memcpy_stod(&ptrs).expect("pointer table");
             let sync = d
                 .stream
-                .alloc_zeros::<u32>(2 + 2 * (mega.phases.len() + 1))
+                .alloc_zeros::<u32>(mega.sync_words)
                 .expect("barrier state");
             phases += mega.phases.len();
             grid = grid.max(g);
