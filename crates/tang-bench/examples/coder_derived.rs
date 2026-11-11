@@ -239,6 +239,18 @@ fn main() {
             let (what, nat, head) = &kinfo[*i];
             println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
         }
+        // by shape: the same op in every layer, summed
+        let mut sh: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+        for (ms, i) in &t {
+            let e = sh.entry(kinfo[*i].0.as_str()).or_default();
+            e.0 += 1;
+            e.1 += ms;
+        }
+        let mut sh: Vec<_> = sh.into_iter().collect();
+        sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        for (k, (n, ms)) in sh.iter().take(30) {
+            println!("  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}", 1e3 * ms / *n as f64);
+        }
         // by kind: (native, int8, first line)
         let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
         for (ms, i) in &t {
