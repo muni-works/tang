@@ -23,7 +23,8 @@
 # (estimate 20-40 min for 85 positions of an 80B-A3B model).
 #
 # Env: MODEL_DIR [/root/models/coder-next], OUT [/root/coder-derived-race],
-# LENS [128,4096], CTX [4352], SKIP_REF=1 skips flash-ref.
+# LENS [128,4096], CTX [4352], SKIP_REF=1 skips flash-ref, SKIP_HAND=1 reuses the
+# hand results already in $OUT.
 set -euo pipefail
 
 REPO=${REPO:-$PWD}
@@ -70,20 +71,25 @@ DER=target/release/examples/coder_derived
 echo "785 6722 315 9625 374 12095 13 576 6722 315 9856 374 19846 13 576 6722 315 15344 374 21718 13" \
   >"$OUT/prompt.ids"
 
+if [ "${SKIP_HAND:-0}" != 1 ]; then
 log "hand coder engine: greedy 64 and decode speed after the prompt (flash-bench)"
 # (flash-generate runs the Flash-Next engine; flash-bench picks the qwen3next Coder)
 "$LLM" flash-bench "$GGUF" --ids-file "$OUT/prompt.ids" -n 64 --draft none \
   2>&1 | tee "$OUT/hand-bench.txt" || echo "hand bench failed"
 grep -E '^ids:' "$OUT/hand-bench.txt" | sed 's/^ids: //' >"$OUT/ids-hand.txt" || true
 
+fi
+
 log "derived step: greedy 64, logprobs, device step time"
 "$DER" "$GGUF" --ids-file "$OUT/prompt.ids" -n 64 --ctx "$CTX" --top 5 \
   --logprobs "$OUT/derived.jsonl" --out "$OUT/ids-derived.txt" --bench "$LENS" \
   2>&1 | tee "$OUT/derived.txt" || echo "derived run failed"
 
+if [ "${SKIP_HAND:-0}" != 1 ]; then
 log "hand decode speed at 4096 context"
 "$LLM" flash-bench "$GGUF" --ids-file "$OUT/prompt.ids" --ctx 4096 -n 64 --draft none \
   2>&1 | tee "$OUT/hand-bench-4096.txt" || echo "hand bench 4096 failed"
+fi
 
 if [ "${SKIP_REF:-0}" != 1 ] && [ -s "$OUT/ids-derived.txt" ]; then
   log "flash-ref (CPU f32) over prompt + derived tokens"
