@@ -30,15 +30,19 @@ use tang_gpu::program::{Program, Runtime};
 /// `mma` its tensor-core tile.
 fn lower_as(rt: &Runtime, g: &TensorGraph, outs: &[TensorId], how: &str) -> (WgslProgram, Vec<TensorId>) {
     match how {
-        "prefill" => lower_prefill(g, outs, false),
-        "bf16" => lower_prefill(g, outs, true),
+        "prefill" => lower_prefill(g, outs, Bf16::Off),
+        "bf16" => lower_prefill(g, outs, Bf16::Weights),
+        "bf16act" => lower_prefill(g, outs, Bf16::Activations),
         // bf16 weights, contraction tiles in Hopper wgmma shape h (and
         // flash shape h / |wgmma shapes|), the to_cuda_variant numbering
         // Program::tuned uses
-        m if m.starts_with("wg") => {
+        // wgN: bf16 weights; awgN: bf16 weights and activations
+        m if m.starts_with("wg") || m.starts_with("awg") => {
             use tang_compile::tensor::cuda::{with_cuda_sm, MMA_SHAPES};
-            let h: usize = m[2..].parse().unwrap();
-            let (sg, o) = prefill_schedule(g, outs, true);
+            let act = m.starts_with('a');
+            let h: usize = m.trim_start_matches('a')[2..].parse().unwrap();
+            let bf = if act { Bf16::Activations } else { Bf16::Weights };
+            let (sg, o) = prefill_schedule(g, outs, bf);
             let p = with_cuda_sm(90, || sg.to_cuda_variant(&o, Some(MMA_SHAPES.len() + h)));
             (p, o)
         }
@@ -156,11 +160,15 @@ fn main() {
     });
     let want = eg.g.eval(&ins64, &[eg.out]).remove(0);
     let modes: Vec<String> = std::env::var("VISION_MODES")
-        .unwrap_or_else(|_| "prefill,bf16,wg0,wg1,wg2".into())
+        .unwrap_or_else(|_| "bf16,bf16act,awg0,awg1,awg2,awg3,awg4".into())
         .split(',')
         .map(String::from)
         .collect();
-    let tol = |m: &str| if m == "f32" { 1e-3 } else { 1e-2 };
+    let tol = |m: &str| match m {
+        "f32" => 1e-3,
+        m if m.contains("act") || m.starts_with('a') => 5e-2,
+        _ => 1e-2,
+    };
     let (g, outs) = eg.g.eliminate_common(&[eg.out]);
     let words: Vec<Vec<f32>> = ins64.iter().map(|v| v.iter().map(|&x| x as f32).collect()).collect();
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
