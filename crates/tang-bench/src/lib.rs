@@ -276,6 +276,8 @@ pub mod ir_glm_prefill;
 pub mod ring_ports;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Qwen3-Coder-Next at real size from its derived graph (GGUF binding).
+pub mod ir_coder_real;
 
 /// Precision search through `tang_gpu::program::Program` (CUDA or wgpu).
 #[path = "ir_precision.rs"]

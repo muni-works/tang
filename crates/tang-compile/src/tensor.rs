@@ -66,6 +66,9 @@ mod gather_tests;
 pub mod glsl_gemv;
 #[path = "tensor_grad.rs"]
 mod grad;
+/// GGUF block formats on the CPU: the values a block-format input stands for.
+#[path = "tensor_gguf.rs"]
+pub mod gguf;
 #[path = "tensor_io.rs"]
 pub mod io;
 pub use io::{IoReport, KernelIo};
