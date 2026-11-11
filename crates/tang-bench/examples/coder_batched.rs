@@ -321,8 +321,9 @@ fn main() {
         let secs = t.elapsed().as_secs_f64();
         for b in 0..nb {
             let s = |v: &[usize]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
-            std::fs::write(format!("{dir}/prompt-{b}.txt"), s(&prompts[b])).unwrap();
-            std::fs::write(format!("{dir}/ids-{b}.txt"), s(&out[b])).unwrap();
+            // (newline-terminated: `cat prompt ids` must not join two ids)
+            std::fs::write(format!("{dir}/prompt-{b}.txt"), s(&prompts[b]) + "\n").unwrap();
+            std::fs::write(format!("{dir}/ids-{b}.txt"), s(&out[b]) + "\n").unwrap();
         }
         for (b, l) in lines.iter().enumerate() {
             std::fs::write(format!("{dir}/{b}.jsonl"), l.join("\n") + "\n").unwrap();
