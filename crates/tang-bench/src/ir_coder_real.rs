@@ -157,7 +157,7 @@ pub fn lower_real_step(
     // whole stream back to the (gathered) embedding
     keep.extend(residual_stream(&graph, pg));
     let (graph, keep) = graph.substitute_maps(&keep);
-    let (graph, keep) = graph.eliminate_common(&keep);
+    let (mut graph, keep) = graph.eliminate_common(&keep);
     let outs = keep[..n].to_vec();
     let storage: Vec<Option<Format>> = (0..st.inputs.len())
         .map(|k| {
@@ -188,6 +188,14 @@ pub fn lower_real_step(
             .collect(),
         ..Default::default()
     };
+    // norms' and gates' statistics recomputed inside their maps (one
+    // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
+    // evaluated in their readers; TANG_STAGED_MAP=0: off
+    if std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+        let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
+        graph.schedule_staged_stats(&outs, &inplace);
+        graph.schedule_small_maps(&outs, &inplace);
+    }
     let program = graph.to_cuda_decode(&outs, &opts);
     RealStep {
         graph,
@@ -253,6 +261,51 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    /// The tiny coder step through the real-size lowering's map passes
+    /// (residual stream kept), every kernel listed (`--nocapture`).
+    #[test]
+    fn tiny_step_kernels() {
+        use crate::ir_coder_prefill::*;
+        let pg = prefill_graph(&CoderDims::tiny());
+        let st = derived_step(&pg, 1, 21).unwrap();
+        let mut outs = st.outputs.clone();
+        outs.extend(st.caches.iter().map(|c| c.updated));
+        let n = outs.len();
+        let mut keep = outs.clone();
+        keep.extend(residual_stream(&st.graph, &pg));
+        let (g, keep) = st.graph.substitute_maps(&keep);
+        let (g, keep) = g.eliminate_common(&keep);
+        let dp = g.to_cuda_decode(&keep[..n], &Default::default());
+        for (k, nat) in dp.program.kernels.iter().zip(&dp.native) {
+            let i = k.node.index();
+            let what = match g.comp_at(i) {
+                Some(c) => format!(
+                    "red {:?} args {:?}",
+                    c.red,
+                    c.args
+                        .iter()
+                        .map(|a| (a.src.index(), g.nodes()[a.src.index()].shape.clone()))
+                        .collect::<Vec<_>>()
+                ),
+                None => "not a comp".into(),
+            };
+            eprintln!(
+                "K n{i} {:?} nat {nat} {what} | {}",
+                g.nodes()[i].shape,
+                k.source
+                    .lines()
+                    .find(|l| l.contains("tang-") || l.starts_with("//"))
+                    .unwrap_or("")
+            );
+        }
+        if let Ok(dir) = std::env::var("DUMP_KERNELS") {
+            for (j, k) in dp.program.kernels.iter().enumerate() {
+                std::fs::write(format!("{dir}/k{j:03}_n{}.cu", k.node.index()), &k.source).unwrap();
+            }
+        }
+        eprintln!("{} kernels", dp.program.kernels.len());
+    }
 
     fn open() -> Option<Gguf> {
         let p = gguf_path();
@@ -398,6 +451,33 @@ mod tests {
         let tys = bind(&pg, &g).unwrap();
         let st = crate::ir_coder_prefill::derived_step(&pg, 1, 4096).unwrap();
         let low = lower_real_step(&pg, &st, &tys);
+        if std::env::var("LIST").is_ok() {
+            let g = &low.graph;
+            for (k, nat) in low
+                .program
+                .program
+                .kernels
+                .iter()
+                .zip(&low.program.native)
+                .take(60)
+            {
+                let i = k.node.index();
+                let what = g.comp_at(i).map_or("-".to_string(), |c| {
+                    format!(
+                        "red {:?} args {:?} st {:?}",
+                        c.red,
+                        c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(),
+                        g.nodes()[i].precision.storage
+                    )
+                });
+                eprintln!(
+                    "K n{i} {:?} nat {nat} int8 {} {what} | {}",
+                    g.nodes()[i].shape,
+                    g.nodes()[i].int_mma.is_some(),
+                    k.source.lines().next().unwrap_or("")
+                );
+            }
+        }
         eprintln!(
             "real coder step, GGUF formats: {} kernels, {} native, {} int8 GEMVs, {} Q8x32 copies; \
              f32-uploaded block inputs: {:?}",

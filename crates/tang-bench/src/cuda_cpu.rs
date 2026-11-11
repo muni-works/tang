@@ -30,6 +30,8 @@ static thread_local tang_dim3 threadIdx;
 static tang_dim3 blockIdx, blockDim, gridDim;
 struct float4 { float x, y, z, w; };
 struct float2 { float x, y; };
+static inline float2 make_float2(float x, float y) { return {x, y}; }
+static inline float4 make_float4(float x, float y, float z, float w) { return {x, y, z, w}; }
 struct uint4 { unsigned x, y, z, w; };
 struct uint2 { unsigned x, y; };
 struct int4 { int x, y, z, w; };
@@ -284,7 +286,11 @@ mod tests {
     /// The tiny coder-next step (prefill 5 tokens on the interpreter, one
     /// derived step) as its CUDA decode program run on the CPU, against
     /// the interpreter's step: `(worst rel err, kernels)`.
-    pub(crate) fn coder_step_on_cpu(opts: &DecodeOpts, keep_residual: bool) -> (f64, usize) {
+    pub(crate) fn coder_step_on_cpu(
+        opts: &DecodeOpts,
+        keep_residual: bool,
+        staged: bool,
+    ) -> (f64, usize) {
         let m = coder();
         let w = weights(&m);
         let p0 = 5;
@@ -337,8 +343,14 @@ mod tests {
             keep.extend(crate::ir_coder_real::residual_stream(&st.graph, &pg));
         }
         let (g, keep) = st.graph.substitute_maps(&keep);
-        let (g, keep) = g.eliminate_common(&keep);
+        let (mut g, keep) = g.eliminate_common(&keep);
         let outs = keep[..n].to_vec();
+        if staged {
+            let k = g.schedule_staged_stats(&outs, &[]);
+            assert!(k > 0, "no statistic staged");
+            let m = g.schedule_small_maps(&outs, &[]);
+            assert!(m > 0, "no small map inlined");
+        }
         let dp = g.to_cuda_decode(&outs, opts);
         let nk = dp.program.kernels.len();
         // NaN in unwritten cache rows: zero for the run (masked anyway),
@@ -367,8 +379,68 @@ mod tests {
 
     #[test]
     fn coder_step_kernels_run_on_the_cpu() {
-        let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true);
-        eprintln!("tiny coder step, {nk} CUDA kernels on the CPU vs interpreter: rel err {e:.2e}");
-        assert!(e < 1e-4, "{e}");
+        for staged in [false, true] {
+            let (e, nk) = coder_step_on_cpu(&DecodeOpts::default(), true, staged);
+            eprintln!(
+                "tiny coder step (staged stats {staged}): {nk} CUDA kernels on the CPU vs \
+                 interpreter: rel err {e:.2e}"
+            );
+            assert!(e < 1e-4, "{e}");
+        }
+    }
+
+    /// An RMSNorm stored as Q8x32 (what an int8 GEMV reads): the sum of
+    /// squares staged into the norm's kernel (`schedule_staged_stats`,
+    /// one launch) against its own warp kernel plus the transpiled Q8x32
+    /// writer (two launches), on the CPU: the same bytes, codes and
+    /// scales.
+    #[test]
+    fn staged_q8_norm_matches_two_kernels() {
+        use tang::Scalar;
+        use tang_compile::tensor::{Dim, Format, Monoid, Precision, TensorGraph};
+        for f in [Format::Q8x32, Format::Q8x32F] {
+            let d = 256;
+            let mut g = TensorGraph::new();
+            let x = g.input(&[Dim::Fixed(2), Dim::Fixed(d)]);
+            let w = g.input(&[Dim::Fixed(1), Dim::Fixed(d)]);
+            let sq = g.map(&[x], |v| v[0] * v[0]).unwrap();
+            let ss = g.reduce(sq, 1, Monoid::sum()).unwrap();
+            let ssb = g.broadcast(ss, &[Dim::Fixed(2), Dim::Fixed(d)]).unwrap();
+            let wb = g.broadcast(w, &[Dim::Fixed(2), Dim::Fixed(d)]).unwrap();
+            let y = g
+                .map(&[x, ssb, wb], |v| {
+                    let one = tang_expr::ExprId::ONE;
+                    let k = tang_expr::ExprId::from_f64(1.0 / d as f64);
+                    let eps = tang_expr::ExprId::from_f64(1e-6);
+                    v[0] * (one / (v[1] * k + eps).sqrt()) * v[2]
+                })
+                .unwrap();
+            g.set_precision(y, Precision::storage(f));
+            let (g, outs) = g.substitute_maps(&[y]);
+            let xs: Vec<f32> = (0..2 * d)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let ws: Vec<f32> = (0..d).map(|i| 0.5 + (i % 7) as f32 / 9.0).collect();
+            let run = |g: &TensorGraph| {
+                let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+                let nk = dp.program.kernels.len();
+                (
+                    super::run(&dp, &[xs.clone(), ws.clone()], &outs).remove(0),
+                    nk,
+                )
+            };
+            let (two, n2) = run(&g);
+            let mut sg = g.clone();
+            assert_eq!(sg.schedule_staged_stats(&outs, &[]), 1);
+            let (one, n1) = run(&sg);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            eprintln!(
+                "{f:?} norm: {n2} kernels unfused, {n1} staged; bytes identical: {}",
+                bits(&two) == bits(&one)
+            );
+            assert_eq!((n2, n1), (2, 1));
+            assert!(two.iter().any(|&x| x != 0.0));
+            assert_eq!(bits(&two), bits(&one), "{f:?}");
+        }
     }
 }
