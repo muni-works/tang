@@ -384,3 +384,79 @@ mod tests {
         }
     }
 }
+
+/// [`plan_auto`](tang_compile::tensor::shard::plan_auto) through a file
+/// cache: with `TANG_PLAN_CACHE=<dir>`, a plan is kept under a hash of the
+/// graph's structure (op kind and shape of every node), the outputs, the
+/// weights with their element sizes, the caches, the world and the cost
+/// model, and read back instead of planned (a 40-layer DS plan is minutes
+/// of CPU). Without the variable it just plans.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_auto_cached(
+    g: &tang_compile::tensor::TensorGraph,
+    outputs: &[TensorId],
+    weights: &HashSet<TensorId>,
+    caches: &[(TensorId, usize)],
+    world: usize,
+    elem: &dyn Fn(TensorId) -> f64,
+    cm: &tang_compile::tensor::shard::CostModel,
+) -> ShardPlan {
+    use std::hash::{Hash, Hasher};
+    use tang_compile::tensor::shard::plan_auto;
+    let Ok(dir) = std::env::var("TANG_PLAN_CACHE") else {
+        return plan_auto(g, outputs, weights, caches, world, elem, cm);
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for n in g.nodes() {
+        std::mem::discriminant(&n.op).hash(&mut h);
+        for d in &n.shape {
+            d.fixed().hash(&mut h);
+        }
+    }
+    outputs.iter().map(|t| t.index()).collect::<Vec<_>>().hash(&mut h);
+    let mut ws: Vec<usize> = weights.iter().map(|t| t.index()).collect();
+    ws.sort();
+    for &w in &ws {
+        w.hash(&mut h);
+        elem(TensorId::from_index(w)).to_bits().hash(&mut h);
+    }
+    caches.iter().map(|(t, o)| (t.index(), *o)).collect::<Vec<_>>().hash(&mut h);
+    world.hash(&mut h);
+    format!("{cm:?}").hash(&mut h);
+    let path = std::path::Path::new(&dir).join(format!("plan-{:016x}.txt", h.finish()));
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let mut plan = ShardPlan { world, inputs: Default::default(), caches: caches.to_vec() };
+        for line in text.lines() {
+            let (n, p) = line.split_once(' ').expect("plan cache line");
+            let t = TensorId::from_index(n.parse().expect("node"));
+            let place = match p {
+                "E" => WeightPlace::Experts,
+                "R" => WeightPlace::Replicated,
+                s => WeightPlace::Split(s.strip_prefix('S').expect("S<dim>").parse().expect("dim")),
+            };
+            plan.inputs.insert(t, place);
+        }
+        eprintln!("plan cache: read {}", path.display());
+        return plan;
+    }
+    let plan = plan_auto(g, outputs, weights, caches, world, elem, cm);
+    let mut lines: Vec<String> = plan
+        .inputs
+        .iter()
+        .map(|(t, p)| {
+            let s = match p {
+                WeightPlace::Experts => "E".to_string(),
+                WeightPlace::Replicated => "R".to_string(),
+                WeightPlace::Split(d) => format!("S{d}"),
+            };
+            format!("{} {s}", t.index())
+        })
+        .collect();
+    lines.sort();
+    std::fs::create_dir_all(&dir).ok();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, lines.join("\n")).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+        eprintln!("plan cache: wrote {}", path.display());
+    }
+    plan
+}

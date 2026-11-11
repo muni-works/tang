@@ -122,7 +122,7 @@ fn main() {
     eprintln!("{model}: step + interpreter reference in {:.1?}", t0.elapsed());
     let elem = |t: TensorId| names.get(&t).map_or(1.0, |n| native_bytes(n));
     let cm = if eager { CostModel::eager() } else { CostModel::h200() };
-    let plan = plan_auto(&c.st.graph, &c.outs, &c.weights, &c.caches, world, &elem, &cm);
+    let plan = tang_bench::ir_shard::plan_auto_cached(&c.st.graph, &c.outs, &c.weights, &c.caches, world, &elem, &cm);
     let an = analyze(&c.st.graph, &c.outs, &plan);
     let s = summary(&plan, &an);
     eprintln!(

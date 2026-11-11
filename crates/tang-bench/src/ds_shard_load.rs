@@ -825,7 +825,7 @@ mod tests {
         for n in worlds {
             let t0 = std::time::Instant::now();
             let elem = |t: TensorId| by_node.get(&t).map_or(1.0, |s| native_bytes(s));
-            let plan = plan_auto(&st.graph, &outs, &ws, &crate::ir_shard::cache_pairs(&st), n, &elem, &CostModel::h200());
+            let plan = crate::ir_shard::plan_auto_cached(&st.graph, &outs, &ws, &crate::ir_shard::cache_pairs(&st), n, &elem, &CostModel::h200());
             let an = analyze(&st.graph, &outs, &plan);
             let s = summary(&plan, &an);
             eprintln!(
