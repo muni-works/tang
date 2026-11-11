@@ -377,12 +377,28 @@ impl TensorGraph {
             int_mma: None,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             segment: None,
             sorted: false,
             detach: false,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
+    }
+
+    /// Which nodes a live scan reads. A scan kernel reads each input as a
+    /// buffer in the layout the scan was built with, so these stay
+    /// materialized and keep their dim order.
+    pub(super) fn scan_inputs(&self, live: &[bool]) -> Vec<bool> {
+        let mut read = vec![false; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let (true, Op::Scan(s)) = (live[i], &node.op) {
+                for t in &s.inputs {
+                    read[t.n()] = true;
+                }
+            }
+        }
+        read
     }
 
     /// The [`Scan`] at `t`, if it is one.
@@ -1490,6 +1506,7 @@ impl TensorGraph {
             points: lines as u32,
             count: lines.div_ceil(64) as u32 * 64,
             workgroup_size: 64,
+            writes: Vec::new(),
         }
     }
 }
@@ -1620,6 +1637,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A map read by a scan and, transposed, by a reduction: `relayout`
+    /// would lay it out for the reduction, but a scan reads its inputs as
+    /// buffers in the layout it was built with.
+    #[test]
+    fn relayout_keeps_a_scan_inputs_layout() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[3usize, 5]);
+        let m = g.map(&[x], |v| v[0] * v[0] + v[0]).unwrap();
+        let s = g.scan(&[m], 1, Monoid::sum(), false, false).unwrap();
+        let t = g.transpose(m, &[1, 0]).unwrap();
+        let r = g.reduce(t, 0, Monoid::sum()).unwrap();
+        let ins = vec![ramp(15, 0.1, -0.4)];
+        let want = g.eval(&ins, &[s, r]);
+        let (rg, ro) = g.relayout(&[s, r]);
+        assert_eq!(rg.shape(m), g.shape(m));
+        assert_eq!(rg.eval(&ins, &ro), want);
+    }
+
+    /// A map read only by a scan stays materialized: the scan kernel reads
+    /// a buffer, it cannot recompute the map.
+    #[test]
+    fn schedules_materialize_a_scan_input() {
+        let mut g = TensorGraph::new();
+        let x = g.input(&[3usize, 5]);
+        let m = g.map(&[x], |v| v[0] * v[0] + v[0]).unwrap();
+        let s = g.scan(&[m], 1, Monoid::sum(), false, false).unwrap();
+        g.schedule_auto(&[s]);
+        assert!(!g.nodes()[m.n()].inline);
+        let p = g.to_wgsl(&[s]);
+        assert!(p.kernels.len() >= 2, "the map gets its own kernel");
     }
 
     #[test]

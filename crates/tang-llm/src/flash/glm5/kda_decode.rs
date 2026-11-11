@@ -1484,6 +1484,17 @@ fn rows_fast() -> bool {
     *F.get_or_init(|| std::env::var("TANG_GLM5_KDA_ROWS_FAST").map_or(true, |v| v != "0"))
 }
 
+/// How [`DevLayer::rows_generic`] runs the recurrent core over its rows.
+#[derive(Clone, Copy)]
+enum RowCore<'a> {
+    /// `t` consecutive tokens of slot 0 (an MTP / verify window), row by row.
+    Slot0,
+    /// row `i` = slot `i`, ids staged in the core's `slots_dev`: one launch pair.
+    Batched,
+    /// row `i` = slot `v[i]`: one decode per row.
+    PerRow(&'a [usize]),
+}
+
 impl DevLayer {
     /// [`Self::rows_enqueue`] on the tuned t=1 kernels, bit-equal per row to t serial
     /// decode steps (NOTES 2026-10-28 kda4 round 3): k5_q8 over the t rows of x, ONE
@@ -2108,6 +2119,39 @@ impl DevLayer {
         if self.rows_fast_ok(t) {
             return unsafe { self.rows_fast(s, t, ck) };
         }
+        self.rows_generic(s, t, ck, RowCore::Slot0)
+    }
+
+    /// `xb` holds `slots.len()` decode rows, row `i` = ONE token of sequence `slots[i]`
+    /// (distinct slots): the batched-serving form of [`Self::rows_enqueue`]. Projections,
+    /// gates, gated norm and o_proj run once over the rows; the core steps each row's own
+    /// slot state — ONE `kda_step` + ONE conv commit for all rows when `slots == 0..n`
+    /// (`kda_step` indexes the state by row), else one decode per row. Eager only (the
+    /// slot ids are staged with a host write). `outb` holds y `[t][hidden]`.
+    pub fn rows_enqueue_slots(&mut self, s: &Stream, slots: &[usize]) -> Result<()> {
+        let t = slots.len();
+        ensure!(
+            self.pf2 && t >= 1 && t <= self.max_t && t <= self.core.n_slots(),
+            "kda rows_enqueue_slots: pf2 {} t {t}",
+            self.pf2
+        );
+        for (i, &a) in slots.iter().enumerate() {
+            ensure!(!slots[..i].contains(&a), "kda rows: slot {a} twice");
+        }
+        if slots.iter().enumerate().all(|(i, &sl)| sl == i) {
+            self.core.stage_slots(slots)?;
+            return self.rows_generic(s, t, None, RowCore::Batched);
+        }
+        self.rows_generic(s, t, None, RowCore::PerRow(slots))
+    }
+
+    fn rows_generic(
+        &self,
+        s: &Stream,
+        t: usize,
+        ck: Option<(u64, usize)>,
+        core: RowCore<'_>,
+    ) -> Result<()> {
         let (nh, hd, di, hidden) = (self.nh, self.hd, self.d_inner, self.hidden);
         let lb = self.cfg.gate_lower_bound.unwrap_or(f32::NAN);
         let f = std::mem::size_of::<f32>() as u64;
@@ -2271,13 +2315,28 @@ impl DevLayer {
                 }
             }
         }
-        // the core, row by row on slot 0
+        // the core: row by row on slot 0 (a window), or one row per slot (serving)
         let regs = self.core.slot_state_regions(0);
-        for i in 0..t as u64 {
+        if let RowCore::Batched = core {
+            self.core.decode_dev_rows_staged(
+                &self.kers,
+                s,
+                t,
+                qkv,
+                self.gb_out.ptr,
+                self.bb.ptr,
+                self.ob.ptr,
+            )?;
+        }
+        for i in (0..t as u64).filter(|_| !matches!(core, RowCore::Batched)) {
+            let slot = match core {
+                RowCore::PerRow(v) => v[i as usize],
+                _ => 0,
+            };
             self.core.decode_dev(
                 &self.kers,
                 s,
-                0,
+                slot,
                 qkv + i * (3 * di) as u64 * f,
                 self.gb_out.ptr + i * di as u64 * f,
                 self.bb.ptr + i * nh as u64 * f,

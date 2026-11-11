@@ -157,7 +157,7 @@ pub fn lower_real_step(
     // whole stream back to the (gathered) embedding
     keep.extend(residual_stream(&graph, pg));
     let (graph, keep) = graph.substitute_maps(&keep);
-    let (graph, keep) = graph.eliminate_common(&keep);
+    let (mut graph, keep) = graph.eliminate_common(&keep);
     let outs = keep[..n].to_vec();
     let storage: Vec<Option<Format>> = (0..st.inputs.len())
         .map(|k| {
@@ -188,6 +188,23 @@ pub fn lower_real_step(
             .collect(),
         ..Default::default()
     };
+    // norms' and gates' statistics recomputed inside their maps (one
+    // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
+    // evaluated in their readers; opt-in with TANG_STAGED_MAP=1 (measured
+    // slower on coder-next: 6.18 vs 5.885 ms)
+    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref() == Some("1") {
+        let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
+        graph.schedule_staged_stats(&outs, &inplace);
+        graph.schedule_small_maps(&outs, &inplace);
+    }
+    // multi-output kernels: residual adds folded into their norms (and
+    // norms into their Q8x32 copies), conv windows into the convs, ring
+    // and state updates as side jobs of earlier launches. Opt-in with TANG_COKERNEL=1 (measured
+    // slower on coder-next: 6.43 vs 6.18 ms); the megakernel builds on it
+    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_COKERNEL").as_deref() == Some("1") {
+        let (a, b) = graph.schedule_cokernels(&outs, &opts);
+        eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
+    }
     let program = graph.to_cuda_decode(&outs, &opts);
     RealStep {
         graph,
@@ -443,6 +460,39 @@ mod tests {
         let tys = bind(&pg, &g).unwrap();
         let st = crate::ir_coder_prefill::derived_step(&pg, 1, 4096).unwrap();
         let low = lower_real_step(&pg, &st, &tys);
+        if std::env::var("LIST").is_ok() {
+            let g = &low.graph;
+            for (k, nat) in low
+                .program
+                .program
+                .kernels
+                .iter()
+                .zip(&low.program.native)
+                .take(
+                    std::env::var("LIST")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(60),
+                )
+            {
+                let i = k.node.index();
+                let what = g.comp_at(i).map_or("-".to_string(), |c| {
+                    format!(
+                        "red {:?} args {:?} st {:?}",
+                        c.red,
+                        c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(),
+                        g.nodes()[i].precision.storage
+                    )
+                });
+                eprintln!(
+                    "K n{i} {:?} nat {nat} int8 {} {what} writes {:?} | {}",
+                    g.nodes()[i].shape,
+                    g.nodes()[i].int_mma.is_some(),
+                    k.writes.iter().map(|t| t.index()).collect::<Vec<_>>(),
+                    k.source.lines().next().unwrap_or("")
+                );
+            }
+        }
         eprintln!(
             "real coder step, GGUF formats: {} kernels, {} native, {} int8 GEMVs, {} Q8x32 copies; \
              f32-uploaded block inputs: {:?}",

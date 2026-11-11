@@ -206,8 +206,16 @@ impl Deriver<'_> {
 }
 
 /// `m` is [`Monoid::topk`] of some `k` (pairs `(index, value)`).
-fn is_topk(m: &Monoid) -> bool {
+pub(crate) fn is_topk(m: &Monoid) -> bool {
     if m.width < 2 || m.width % 2 != 0 {
+        return false;
+    }
+    // cheap reject before building the k² reference combine
+    let id_ok = m
+        .identity
+        .chunks(2)
+        .all(|p| p[0] == 0.0 && p[1] == -(f32::MAX as f64));
+    if !id_ok {
         return false;
     }
     let t = Monoid::topk(m.width / 2);

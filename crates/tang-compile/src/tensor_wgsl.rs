@@ -127,6 +127,17 @@ pub struct WgslKernel {
     /// Threads to launch (`points`, padded or multiplied for workgroup schedules).
     pub count: u32,
     pub workgroup_size: u32,
+    /// Further nodes this launch writes (multi-output kernels, see
+    /// `TNode::host`): bound read-write after `out`, in this order,
+    /// before the uniform. Empty for a one-output kernel.
+    pub writes: Vec<TensorId>,
+}
+
+impl WgslKernel {
+    /// Every node this launch writes: `node`, then `writes`.
+    pub fn outputs(&self) -> impl Iterator<Item = TensorId> + '_ {
+        std::iter::once(self.node).chain(self.writes.iter().copied())
+    }
 }
 
 /// A buffer the program needs.
@@ -376,11 +387,28 @@ impl TensorGraph {
         let kernels = (0..n)
             .filter(|&i| {
                 needs_buffer(i)
+                    && self.nodes[i].host.is_none()
                     && (self.comp_at(i).is_some() || matches!(self.nodes[i].op, Op::Scan(_)))
             })
-            .map(|i| match self.nodes[i].op {
-                Op::Scan(_) => self.scan_kernel(i),
-                _ => self.kernel_for(i, target),
+            .map(|i| {
+                let mut k = match self.nodes[i].op {
+                    Op::Scan(_) => self.scan_kernel(i),
+                    _ => self.kernel_for(i, target),
+                };
+                // multi-output: the nodes this kernel also stores (its
+                // side jobs), their buffers read through its own bindings
+                for u in
+                    (0..n).filter(|&u| live[u] && self.nodes[u].host == Some(TensorId(i as u32)))
+                {
+                    k.writes.push(TensorId(u as u32));
+                    for j in self.host_reads(u, i) {
+                        let t = TensorId(j as u32);
+                        if !k.reads.contains(&t) {
+                            k.reads.push(t);
+                        }
+                    }
+                }
+                k
             })
             .collect();
 
@@ -389,6 +417,33 @@ impl TensorGraph {
             buffers,
             aliases,
         }
+    }
+
+    /// Whether `j` is evaluated inline in the kernel of `root`: an
+    /// inlined node, or one hosted by `root` (`TNode::host`).
+    pub(super) fn inlined_in(&self, j: usize, root: usize) -> bool {
+        self.nodes[j].inline || self.nodes[j].host == Some(TensorId(root as u32))
+    }
+
+    /// The buffer-backed nodes side job `u` of kernel `host` reads: `u`'s
+    /// inline closure as seen from that kernel.
+    pub(super) fn host_reads(&self, u: usize, host: usize) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut stack = self.deps(u);
+        while let Some(j) = stack.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            match &self.nodes[j].op {
+                Op::Iota(_) => {}
+                Op::Reshape(_) => stack.extend(self.deps(j)),
+                Op::Comp(_) if self.inlined_in(j, host) => stack.extend(self.deps(j)),
+                _ => out.push(j),
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Nodes reachable from `i` through inlined comps, including `i`,
@@ -407,7 +462,7 @@ impl TensorGraph {
             }
             stack.push((j, true));
             let descend = match &self.nodes[j].op {
-                Op::Comp(_) => j == i || self.nodes[j].inline,
+                Op::Comp(_) => j == i || self.inlined_in(j, i),
                 Op::Reshape(_) => true,
                 Op::Input(_) | Op::Iota(_) | Op::Scan(_) => false,
                 Op::Operator(o) => panic!(
@@ -431,7 +486,7 @@ impl TensorGraph {
             .copied()
             .filter(|&j| {
                 j != root
-                    && !self.nodes[j].inline
+                    && !self.inlined_in(j, root)
                     && !matches!(self.nodes[j].op, Op::Iota(_) | Op::Reshape(_))
             })
             .collect();
@@ -526,6 +581,7 @@ impl TensorGraph {
                 points,
                 count: points,
                 workgroup_size: 256,
+                writes: Vec::new(),
             };
         }
 
@@ -666,6 +722,7 @@ impl TensorGraph {
             points,
             count: points * split,
             workgroup_size: split,
+            writes: Vec::new(),
         }
     }
 
@@ -1185,7 +1242,9 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1198,7 +1257,14 @@ pub(super) fn elem_ty(f: Format) -> &'static str {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1235,7 +1301,9 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1248,7 +1316,14 @@ pub(super) fn load(f: Format, buf: &str, idx: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1271,7 +1346,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1289,7 +1366,9 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1306,7 +1385,14 @@ pub(super) fn store(f: Format, idx: &str, v: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }
@@ -1330,7 +1416,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
         };
@@ -1345,7 +1433,9 @@ pub(super) fn quant(f: Format, e: &str) -> String {
             | Format::Q6K
             | Format::Q8_0
             | Format::Q8x32
-            | Format::Q8x32F => {
+            | Format::Q8x32F
+            | Format::Fp8B32
+            | Format::Mxfp4 => {
                 unreachable!("block formats lower only through the int8 MMA kernel")
             }
             // only the FP8 tile reads it; this fallback body is replaced
@@ -1360,7 +1450,14 @@ pub(super) fn quant(f: Format, e: &str) -> String {
         Format::E4M3(_) | Format::E5M2(_) | Format::Fp8Accum => {
             panic!("fp8 storage lowers only on sm90 CUDA tensor-core tiles")
         }
-        Format::Q4K | Format::Q5K | Format::Q6K | Format::Q8_0 | Format::Q8x32 | Format::Q8x32F => {
+        Format::Q4K
+        | Format::Q5K
+        | Format::Q6K
+        | Format::Q8_0
+        | Format::Q8x32
+        | Format::Q8x32F
+        | Format::Fp8B32
+        | Format::Mxfp4 => {
             unreachable!("block formats lower only through the int8 MMA kernel")
         }
     }

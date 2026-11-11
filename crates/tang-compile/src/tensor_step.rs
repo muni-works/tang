@@ -80,7 +80,7 @@ pub use ring::seed_cache;
 mod state_tests;
 // derive-gather: gathers along the sequence (top-k attention)
 #[path = "tensor_step_gather.rs"]
-mod gather;
+pub(crate) mod gather;
 #[cfg(test)]
 #[path = "tensor_step_gather_tests.rs"]
 mod gather_tests;

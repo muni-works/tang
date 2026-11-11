@@ -54,6 +54,9 @@ pub mod cuda_gemv;
 mod cuda_int8;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
+/// Measured schedule choices (the tuning cache) behind the lowering knobs.
+#[path = "tensor_tune.rs"]
+pub mod tune;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
@@ -113,6 +116,9 @@ pub mod space;
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
+/// Multi-GPU decode: placements, collectives and per-rank programs.
+#[path = "tensor_shard.rs"]
+pub mod shard;
 /// Decode as the finite difference of prefill: the `T → T + k` step and
 /// its KV cache, derived from the full-sequence graph.
 #[path = "tensor_step.rs"]
@@ -523,6 +529,19 @@ impl Monoid {
         })
     }
 
+    /// `Some(k)` when this is [`Monoid::topk`]`(k)` (same identity, same
+    /// combine at probe points).
+    pub fn topk_k(&self) -> Option<usize> {
+        if self.width < 2 || self.width % 2 != 0 {
+            return None;
+        }
+        let k = self.width / 2;
+        let id_ok = (0..k).all(|r| {
+            self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64)
+        });
+        (id_ok && self.matches(&Monoid::topk(k))).then_some(k)
+    }
+
     /// State `(m, acc₁…accₖ)`, element `(s, g₁…gₖ)`:
     /// `m' = max(m, s)`, `accᵢ' = accᵢ·exp(m−m') + gᵢ·exp(s−m')`.
     pub fn online_softmax(k: usize) -> Self {
@@ -796,6 +815,13 @@ pub struct TNode {
     /// backend's default. Ignored unless `fragment` is set and the node
     /// has an attention plan.
     pub frag_cfg: [u8; 4],
+    /// Schedule (decode, CUDA): no kernel of its own. The kernel of node
+    /// `host` evaluates it inline wherever its own tree reads it, and
+    /// also stores it to this node's buffer (a side job of that launch),
+    /// so other readers read the buffer as usual. Set by
+    /// [`TensorGraph::schedule_cokernels`]; passes that rebuild the graph
+    /// drop it.
+    pub host: Option<TensorId>,
     /// Schedule: number formats — storage of a materialized buffer (or
     /// input) and the running accumulator of a reduction. Default all
     /// f32. See [`Precision`].
@@ -1098,6 +1124,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1120,6 +1147,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1157,6 +1185,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         Ok(TensorId(self.nodes.len() as u32 - 1))
@@ -1186,6 +1215,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
         });
         TensorId(self.nodes.len() as u32 - 1)
@@ -1337,6 +1367,7 @@ impl TensorGraph {
             detach: false,
             subgroup: false,
             frag_cfg: [0; 4],
+            host: None,
             precision: Precision::default(),
             op: Op::Comp(comp),
         });
@@ -1932,6 +1963,7 @@ impl TensorGraph {
                 detach: node.detach,
                 subgroup: node.subgroup,
                 frag_cfg: node.frag_cfg,
+                host: None,
                 precision: node.precision,
             });
             remap[i] = Some(ng.nodes.len() - 1);
@@ -2498,6 +2530,7 @@ impl TensorGraph {
     pub fn schedule_inline_up_to(&mut self, outputs: &[TensorId], factor: usize) {
         let live = self.live(outputs);
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         let n = self.nodes.len();
         let mut consumer_space = vec![0usize; n];
@@ -2557,6 +2590,7 @@ impl TensorGraph {
                 && uses[i] == 1
                 && !is_output(i)
                 && !reshaped[i]
+                && !scan_input[i]
                 && (c.monoid.is_none() || consumer_reduces[i])
                 && consumer_space[i] <= factor * numel(c.points())
             {
@@ -2678,6 +2712,7 @@ impl TensorGraph {
             })
             .collect();
         let uses = self.use_counts(outputs, &live);
+        let scan_input = self.scan_inputs(&live);
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
         // a map every one of whose consumers reduces may be recomputed in
         // each of them (flash backward recomputes dS in dQ and dK alike)
@@ -2739,7 +2774,7 @@ impl TensorGraph {
                         .iter()
                         .filter(|a| !a.view.depends_on(lane) && recomputable[a.src.n()])
                         .map(|a| a.src.n())
-                        .filter(|&p| !is_output(p) && self.comp_at(p).is_some())
+                        .filter(|&p| !is_output(p) && !scan_input[p] && self.comp_at(p).is_some())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -2999,7 +3034,7 @@ impl TensorGraph {
         let live = self.live(outputs);
         let n = self.nodes.len();
         let is_output = |i: usize| outputs.iter().any(|o| o.n() == i);
-        // (consumer, arg index) pairs per producer; a reshape reader
+        // (consumer, arg index) pairs per producer; a reshape or scan reader
         // pins the layout
         let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
         let mut pinned = vec![false; n];
@@ -3011,6 +3046,7 @@ impl TensorGraph {
                     }
                 }
                 Op::Reshape(src) => pinned[src.n()] = true,
+                Op::Scan(s) => s.inputs.iter().for_each(|t| pinned[t.n()] = true),
                 _ => {}
             }
         }
@@ -3199,6 +3235,7 @@ impl TensorGraph {
                 detach: false,
                 subgroup: false,
                 frag_cfg: [0; 4],
+                host: None,
                 precision: Precision::default(),
                 op: Op::Comp(inner),
             });
@@ -3835,6 +3872,7 @@ impl TensorGraph {
                     detach: false,
                     subgroup: false,
                     frag_cfg: [0; 4],
+                    host: None,
                     inline: false,
                     split: 0,
                     tile: (0, 0, 0),
@@ -4300,6 +4338,10 @@ impl TensorGraph {
                     Op::Comp(c) => Some(Compiled {
                         body: Prog::new(&c.body, &c.body_outs),
                         combine: c.monoid.as_ref().map(|m| Prog::new(&m.combine, &m.outs)),
+                        topk: c
+                            .monoid
+                            .as_ref()
+                            .and_then(|m| if emulate { None } else { m.topk_k() }),
                         direct: c
                             .args
                             .iter()
@@ -4355,6 +4397,7 @@ impl TensorGraph {
                     .map_or(1, |t| t.get())
                     .min(work.div_ceil(1 << 15))
                     .min(n)
+                    .min(max_threads())
                     .max(1);
                 let per = n.div_ceil(threads);
                 let ev_ref = &ev;
@@ -4401,6 +4444,18 @@ impl TensorGraph {
         }
         outputs.iter().map(|o| ev.tensor(*o)).collect()
     }
+}
+
+// Test-only cap on interpreter threads, so tests can force the inline path.
+#[cfg(test)]
+thread_local!(static MAX_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
+#[cfg(test)]
+fn max_threads() -> usize {
+    MAX_THREADS.with(|m| m.get())
+}
+#[cfg(not(test))]
+fn max_threads() -> usize {
+    usize::MAX
 }
 
 /// `out` as `Σ_t coef_t · var a_t · var b_t`, or `None` when it is not a
@@ -4581,6 +4636,9 @@ struct Scratch {
 struct Compiled {
     body: Prog,
     combine: Option<Prog>,
+    /// `Some(k)` when the monoid is [`Monoid::topk`]`(k)`: the reduce
+    /// merges natively (O(k) a combine instead of the k²/2 selects).
+    topk: Option<usize>,
     /// Per arg: a precomputed flat-address read, when the arg reads a
     /// plain buffer (see [`direct_read`]).
     direct: Vec<Option<Direct>>,
@@ -4863,6 +4921,10 @@ impl Evaluator<'_> {
                 }
                 continue;
             }
+            if let Some(kk) = k.topk {
+                topk_merge(vals, elem, kk, pair);
+                continue;
+            }
             pair[..w].copy_from_slice(vals);
             pair[w..].copy_from_slice(elem);
             combine.eval(pair, vals, cprog);
@@ -4872,6 +4934,38 @@ impl Evaluator<'_> {
             }
         }
     }
+}
+
+/// [`Monoid::topk`]'s combine, natively: merge the sorted `(index,
+/// value)` lists `acc` and `el` (value descending, smaller index first on
+/// a tie; an exact tie takes `el`'s pair, as the select form does) into
+/// `acc`, using `tmp` (≥ 2k) as scratch.
+fn topk_merge(acc: &mut [f64], el: &[f64], k: usize, tmp: &mut [f64]) {
+    let better = |x: (f64, f64), y: (f64, f64)| {
+        let d = x.1 - y.1;
+        if d > 0.0 {
+            true
+        } else if -d > 0.0 {
+            false
+        } else {
+            y.0 - x.0 > 0.0
+        }
+    };
+    let (mut i, mut j) = (0, 0);
+    for r in 0..k {
+        let a = (acc[2 * i], acc[2 * i + 1]);
+        let b = (el[2 * j], el[2 * j + 1]);
+        let (p, q) = if better(a, b) {
+            i += 1;
+            a
+        } else {
+            j += 1;
+            b
+        };
+        tmp[2 * r] = p;
+        tmp[2 * r + 1] = q;
+    }
+    acc[..2 * k].copy_from_slice(&tmp[..2 * k]);
 }
 
 /// Advance row-major coordinates `idx` in `shape` by one (last dim fastest).
@@ -5040,6 +5134,26 @@ mod tests {
         let (fg, outs) = g.substitute_maps_with(&[y], false);
         assert_eq!(fg.count_comps(&outs), 2);
         close(&fg.eval(&[data], &outs)[0], &want);
+    }
+
+    #[test]
+    fn eval_inline_matches_threaded_bitwise() {
+        // big enough that the threaded path splits into several chunks
+        let mut g = TensorGraph::new();
+        let a = g.input(&[256, 128]);
+        let b = g.input(&[128, 256]);
+        let c = g.matmul(a, b).unwrap();
+        let av = ramp(256 * 128, 0.37, -1.3);
+        let bv = ramp(128 * 256, -0.11, 0.7);
+        let threaded = g.eval(&[av.clone(), bv.clone()], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(1));
+        let inline = g.eval(&[av, bv], &[c]).remove(0);
+        MAX_THREADS.with(|m| m.set(usize::MAX));
+        assert_eq!(threaded.len(), inline.len());
+        assert!(threaded
+            .iter()
+            .zip(&inline)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
     }
 
     #[test]

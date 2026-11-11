@@ -1,0 +1,11 @@
+# tang tuning cache for NVIDIA A100-SXM4-80GB (CUDA sm_80): sig<TAB>knobs<TAB>tuned ms<TAB>default ms<TAB>note
+# written by the autotuner (crates/tang-bench/src/autotune.rs); TANG_TUNE=0 ignores it
+1f81124a9bceed12	TANG_GEMV_WARPS=4	0.00762	0.00827	coder-next x47
+289d5fcb1b1d9236	TANG_GEMV_WARPS=4	0.01082	0.01142	coder-next x47
+29e4810cdeae1c71	TANG_GEMV_WARPS=2	0.01323	0.01504	coder-next x94
+48d9610983d4add8	TANG_GEMV_WARPS=2	0.00794	0.01062	coder-next x36
+852f87bf667b5540	TANG_GEMV_UNROLL=1,TANG_GEMV_WARPS=4	0.01362	0.01563	coder-next x2
+a1e2d93ba7d49f37	TANG_STAGED_MAP=0	0.00683	0.00717	coder-next x12
+b529d99e6e5ce4cf	TANG_GEMV_WARPS=2	0.01329	0.01477	coder-next x48
+bb214262ceae34bc	TANG_GEMV_WARPS=2	0.01301	0.01412	coder-next x35
+eb72a37cba9b1e18	TANG_GEMV_WARPS=4	0.00810	0.00918	coder-next x118

@@ -465,7 +465,9 @@ impl TensorGraph {
                 | super::Format::Q5K
                 | super::Format::Q6K
                 | super::Format::Q8x32
-                | super::Format::Q8x32F => {
+                | super::Format::Q8x32F
+                | super::Format::Fp8B32
+                | super::Format::Mxfp4 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -1141,7 +1143,9 @@ impl TensorGraph {
                             | super::Format::Q5K
                             | super::Format::Q6K
                             | super::Format::Q8x32
-                            | super::Format::Q8x32F => {
+                            | super::Format::Q8x32F
+                            | super::Format::Fp8B32
+                            | super::Format::Mxfp4 => {
                                 unreachable!("block formats lower only through the int8 MMA kernel")
                             }
                             _ => unreachable!("fp8 has its own tile"),
@@ -1727,7 +1731,9 @@ impl TensorGraph {
                 | super::Format::Q5K
                 | super::Format::Q6K
                 | super::Format::Q8x32
-                | super::Format::Q8x32F => {
+                | super::Format::Q8x32F
+                | super::Format::Fp8B32
+                | super::Format::Mxfp4 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -3005,7 +3011,9 @@ impl TensorGraph {
                 | super::Format::Q5K
                 | super::Format::Q6K
                 | super::Format::Q8x32
-                | super::Format::Q8x32F => {
+                | super::Format::Q8x32F
+                | super::Format::Fp8B32
+                | super::Format::Mxfp4 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 // FP8 operands are staged by the tile; a stray scalar read
@@ -4367,7 +4375,9 @@ impl TensorGraph {
                 | super::Format::Q5K
                 | super::Format::Q6K
                 | super::Format::Q8x32
-                | super::Format::Q8x32F => {
+                | super::Format::Q8x32F
+                | super::Format::Fp8B32
+                | super::Format::Mxfp4 => {
                     unreachable!("block formats lower only through the int8 MMA kernel")
                 }
                 _ => unreachable!("fp8 has its own tile"),
@@ -4422,7 +4432,9 @@ impl TensorGraph {
                     | super::Format::Q5K
                     | super::Format::Q6K
                     | super::Format::Q8x32
-                    | super::Format::Q8x32F => {
+                    | super::Format::Q8x32F
+                    | super::Format::Fp8B32
+                    | super::Format::Mxfp4 => {
                         unreachable!("block formats lower only through the int8 MMA kernel")
                     }
                     _ => unreachable!("fp8 has its own tile"),

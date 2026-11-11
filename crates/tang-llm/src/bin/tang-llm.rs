@@ -3,7 +3,10 @@
 //! `tang-llm generate <model-dir> <token ids...> [-n N]` — greedy decode, print ids and speed.
 //! `tang-llm serve <model-dir | hf-repo-id> [--host H] [--port P] [--ctx N] [--api-key-file F]`
 //! — OpenAI-compatible server (on 127.0.0.1 unless `--host` says otherwise). With a key (from
-//! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`.
+//! the file, or `TANG_API_KEY`), requests need `Authorization: Bearer <key>`. Beyond loopback
+//! every route but `/health` and `/pair/*` needs a key: the static one or a paired client's.
+//! `tang-llm pair [--port P]` opens a 120 s pairing window on the running server and shows its
+//! code; `tang-llm unpair <client_id | all | list>` drops paired clients.
 //! For frog's scheduler it also serves `GET /node` (hardware, free memory, model, measured
 //! rates, queue, KV blocks), `POST /models/load` / `/models/unload` (swap the model, only into
 //! free memory) and takes `x-frog-priority: interactive | background` (see `docs/node.md`).
@@ -320,6 +323,11 @@ fn take_device(args: &mut Vec<String>) -> Result<Backend> {
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let backend = take_device(&mut args)?;
+    match args.first().map(String::as_str) {
+        Some("pair") => return tang_llm::pair::cli_pair(&args[1..]),
+        Some("unpair") => return tang_llm::pair::cli_unpair(&args[1..]),
+        _ => {}
+    }
     let (cmd, dir) = match args.as_slice() {
         [c, d, ..] => (c.as_str(), PathBuf::from(d)),
         _ => bail!("usage: tang-llm <logits|generate> <model-dir> <ids...> [-n N] [--f32]"),
@@ -615,7 +623,7 @@ fn serve_flash(args: &[String]) -> Result<()> {
     }
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let name = s
         .gguf
@@ -710,7 +718,7 @@ fn deepseek_serve(args: &[String]) -> Result<()> {
     }
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let name = dir
         .file_name()
@@ -752,10 +760,8 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     if args.first().is_some_and(|a| a.ends_with(".gguf")) {
         return serve_flash(args);
     }
-    let spec = args
-        .first()
-        .context("usage: tang-llm serve <model> [--host H] [--port P] [--ctx N] [--api-key-file F] [--f32 | --q4] [--no-speculate] [--draft-model M] [--kv-slots N|auto] [--kv-ttl SECS] [--otel-live]")?
-        .clone();
+    // No model starts empty; load one later with `POST /models/load` (frog nodes do this).
+    let (spec, flags) = split_model(args);
     let (mut port, mut ctx, mut dtype) = (8911u16, 32_768usize, Dtype::Bf16);
     let mut host = "127.0.0.1".to_string();
     let mut image_pipeline = None;
@@ -771,7 +777,7 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
     let mut draft_model = std::env::var("TANG_DRAFT_MODEL")
         .ok()
         .filter(|m| !m.is_empty());
-    let mut it = args[1..].iter();
+    let mut it = flags.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host = it.next().context("--host H")?.clone(),
@@ -805,18 +811,20 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
         _ => true,
     };
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    tang_llm::resolve_model(&spec)?;
+    if let Some(m) = &spec {
+        tang_llm::resolve_model(m)?;
+    }
     if let Some(m) = &draft_model {
         tang_llm::resolve_model(m)?;
     }
     let addr = format!("{host}:{port}");
     if key.is_none() && !host.starts_with("127.") && host != "localhost" {
-        eprintln!("tang-llm: warning: listening on {host} without an API key; anyone who can reach it can use it");
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
     }
     let opts = tang_llm::server::Options {
         addr,
         key,
-        model: Some(spec),
+        model: spec,
         dtype,
         hardware: probe(backend),
     };
@@ -833,6 +841,14 @@ fn serve(backend: Backend, args: &[String]) -> Result<()> {
             image_pipeline
         )
     )
+}
+
+/// `serve [<model>] [flags]`: the model, if the first argument isn't a flag, and the flags.
+fn split_model(args: &[String]) -> (Option<String>, &[String]) {
+    match args.first() {
+        Some(m) if !m.starts_with('-') => (Some(m.clone()), &args[1..]),
+        _ => (None, args),
+    }
 }
 
 /// Reads the device and its free memory, for `/node` and the fit check before a load.
@@ -1522,4 +1538,22 @@ fn calibrate_image_preview<D: ComputeDevice, F: Fn() -> Result<D>>(
         record.constant_baseline_mse
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_model;
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn serve_model_is_optional() {
+        let a = v(&["--host", "0.0.0.0", "--port", "8911"]);
+        assert_eq!(split_model(&a), (None, &a[..]));
+        let a = v(&["Qwen/Qwen3-0.6B", "--port", "8911"]);
+        assert_eq!(split_model(&a), (Some("Qwen/Qwen3-0.6B".into()), &a[1..]));
+        assert_eq!(split_model(&[]), (None, &[][..]));
+    }
 }
