@@ -157,7 +157,7 @@ pub fn lower_real_step(
     // whole stream back to the (gathered) embedding
     keep.extend(residual_stream(&graph, pg));
     let (graph, keep) = graph.substitute_maps(&keep);
-    let (graph, keep) = graph.eliminate_common(&keep);
+    let (mut graph, keep) = graph.eliminate_common(&keep);
     let outs = keep[..n].to_vec();
     let storage: Vec<Option<Format>> = (0..st.inputs.len())
         .map(|k| {
@@ -188,6 +188,12 @@ pub fn lower_real_step(
             .collect(),
         ..Default::default()
     };
+    // norms' and gates' statistics recomputed inside their maps (one
+    // kernel a norm, Q8x32 stores included); TANG_STAGED_MAP=0: off
+    if std::env::var("TANG_STAGED_MAP").as_deref() != Ok("0") {
+        let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
+        graph.schedule_staged_stats(&outs, &inplace);
+    }
     let program = graph.to_cuda_decode(&outs, &opts);
     RealStep {
         graph,
@@ -443,6 +449,14 @@ mod tests {
         let tys = bind(&pg, &g).unwrap();
         let st = crate::ir_coder_prefill::derived_step(&pg, 1, 4096).unwrap();
         let low = lower_real_step(&pg, &st, &tys);
+        if std::env::var("LIST").is_ok() {
+            let g = &low.graph;
+            for (k, nat) in low.program.program.kernels.iter().zip(&low.program.native).take(60) {
+                let i = k.node.index();
+                let what = g.comp_at(i).map_or("-".to_string(), |c| format!("red {:?} args {:?} st {:?}", c.red, c.args.iter().map(|a| a.src.index()).collect::<Vec<_>>(), g.nodes()[i].precision.storage));
+                eprintln!("K n{i} {:?} nat {nat} int8 {} {what} | {}", g.nodes()[i].shape, g.nodes()[i].int_mma.is_some(), k.source.lines().next().unwrap_or(""));
+            }
+        }
         eprintln!(
             "real coder step, GGUF formats: {} kernels, {} native, {} int8 GEMVs, {} Q8x32 copies; \
              f32-uploaded block inputs: {:?}",
