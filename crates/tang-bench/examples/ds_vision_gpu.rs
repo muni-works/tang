@@ -7,9 +7,9 @@
 //! 2. Time: the full encoder for the image (`argv[1]`, default the repo's
 //!    hurricane webp), `VISION_ITERS` timed runs (default 10): ms per image.
 //!
-//! Both run twice: the plain lowering, then with `DecodeOpts::mma` (the
-//! tensor-core tile for matmul-shaped kernels, TF32; `VISION_MMA_SHAPE`
-//! picks the block shape). The MMA check passes under 1e-2 (TF32).
+//! Each `VISION_MODES` lowering (default `mma,prefill`; see [`lower_as`])
+//! is checked, timed and profiled (`VISION_PROFILE=0`: no per-kernel
+//! profile). Tensor-core modes pass under 1e-2 (TF32), `f32` under 1e-3.
 //!
 //! ```text
 //! DS41_DIR=/models/ds41-flash-links ds_vision_gpu [image]
@@ -20,7 +20,44 @@ use tang_bench::ir_ds_real::{ds_dir, load_config, St};
 use tang_bench::ir_ds_vision::*;
 use tang_bench::qwen_session::{lower, runtime};
 use tang_compile::tensor::cuda_gemv::DecodeOpts;
-use tang_gpu::program::Program;
+use tang_compile::tensor::{TensorGraph, TensorId};
+use tang_compile::tensor::wgsl::WgslProgram;
+use tang_gpu::program::{Program, Runtime};
+
+/// `VISION_LOWER`: `prefill` (default) runs the training/prefill pipeline
+/// (softmax fusion to an online-softmax flash tile, TF32 MMA tiles,
+/// `schedule_auto`); `decode` the GEMV-oriented decode lowering, with
+/// `mma` its tensor-core tile.
+fn lower_as(rt: &Runtime, g: &TensorGraph, outs: &[TensorId], how: &str) -> (WgslProgram, Vec<TensorId>) {
+    match how {
+        "prefill" => {
+            let (g, o) = g.stabilize_softmax(outs);
+            let (g, o) = g.substitute_maps(&o);
+            let (g, o) = g.eliminate_common(&o);
+            let (g, o) = g.merge_siblings(&o);
+            let (g, o) = g.relayout(&o);
+            let (g, o) = g.merge_reduce_dims(&o);
+            let (mut g, o) = g.split_reduce_dims(&o);
+            g.schedule_auto(&o);
+            (g.to_cuda(&o), o)
+        }
+        _ => {
+            let opts = DecodeOpts { mma: how == "mma", ..Default::default() };
+            (lower(rt, g, outs, &opts).program, outs.to_vec())
+        }
+    }
+}
+
+/// The `n` slowest kernels: ms, points and the source's first comment.
+fn profile(rt: &Runtime, prog: &Program, tags: &[(u32, String)], n: usize) {
+    let mut t: Vec<(f64, usize)> = (0..tags.len()).map(|i| (prog.time_kernel(rt, i, 3), i)).collect();
+    let total: f64 = t.iter().map(|x| x.0).sum();
+    t.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!("profile: {} kernels, sum of single launches {total:.2} ms", t.len());
+    for (ms, i) in t.into_iter().take(n) {
+        eprintln!("  {ms:8.3} ms  k{i:<4} pts {:<9} {}", tags[i].0, tags[i].1);
+    }
+}
 
 fn rel(a: &[f64], b: &[f64]) -> f64 {
     let scale = b.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-300);
@@ -98,30 +135,24 @@ fn main() {
         weight(n).into_iter().map(|v| v as f64).collect()
     });
     let want = eg.g.eval(&ins64, &[eg.out]).remove(0);
-    let optss = [
-        ("f32", DecodeOpts::default(), 1e-3),
-        (
-            "mma",
-            DecodeOpts {
-                mma: true,
-                mma_shape: env("VISION_MMA_SHAPE", 0),
-                ..Default::default()
-            },
-            1e-2,
-        ),
-    ];
+    let modes: Vec<String> = std::env::var("VISION_MODES")
+        .unwrap_or_else(|_| "mma,prefill".into())
+        .split(',')
+        .map(String::from)
+        .collect();
+    let tol = |m: &str| if m == "f32" { 1e-3 } else { 1e-2 };
     let (g, outs) = eg.g.eliminate_common(&[eg.out]);
     let words: Vec<Vec<f32>> = ins64.iter().map(|v| v.iter().map(|&x| x as f32).collect()).collect();
     let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
-    for (name, opts, tol) in &optss {
-        let dp = lower(&rt, &g, &outs, opts);
-        let prog = Program::new(&rt, dp.program, &refs);
+    for m in &modes {
+        let (p, o) = lower_as(&rt, &g, &outs, m);
+        let prog = Program::new(&rt, p, &refs);
         prog.run(&rt);
-        let got: Vec<f64> = prog.read(&rt, outs[0]).iter().map(|&x| x as f64).collect();
+        let got: Vec<f64> = prog.read(&rt, o[0]).iter().map(|&x| x as f64).collect();
         let err = rel(&got, &want);
-        let ok = err < *tol;
+        let ok = err < tol(m);
         println!(
-            "check [{name}]: {sh} x {sw} patches, {check_layers} blocks, device vs f64 interpreter rel err {err:.2e}: {}",
+            "check [{m}]: {sh} x {sw} patches, {check_layers} blocks, device vs f64 interpreter rel err {err:.2e}: {}",
             if ok { "PASS" } else { "FAIL" }
         );
         if !ok {
@@ -158,32 +189,43 @@ fn main() {
     let flops = vd.n_layers as f64 * (2.0 * nf * c * (4.0 * c + 3.0 * i) + 4.0 * nf * nf * c)
         + 2.0 * pl.rows() as f64 * vd.llm_dim as f64 * (9.0 * c + vd.llm_dim as f64);
     let mut first: Option<Vec<f32>> = None;
-    for (name, opts, _) in &optss {
+    for m in &modes {
         let t0 = Instant::now();
-        let dp = lower(&rt, &g, &outs, opts);
-        let nk = dp.program.kernels.len();
-        let prog = Program::new(&rt, dp.program, &refs);
-        eprintln!("{} [{name}]: {nk} kernels, lowered + uploaded in {:.1?}", rt.name(), t0.elapsed());
+        let (p, o) = lower_as(&rt, &g, &outs, m);
+        let nk = p.kernels.len();
+        let tags: Vec<(u32, String)> = p
+            .kernels
+            .iter()
+            .map(|k| {
+                let t = k.source.lines().find(|l| l.contains("//")).unwrap_or("").trim();
+                (k.points, t.chars().take(110).collect())
+            })
+            .collect();
+        let prog = Program::new(&rt, p, &refs);
+        eprintln!("{} [{m}]: {nk} kernels, lowered + uploaded in {:.1?}", rt.name(), t0.elapsed());
         prog.run(&rt);
-        let out = prog.read(&rt, outs[0]);
+        let out = prog.read(&rt, o[0]);
         let finite = out.iter().all(|v| v.is_finite());
         let vs = match &first {
             None => String::new(),
             Some(f) => {
                 let a: Vec<f64> = out.iter().map(|&v| v as f64).collect();
                 let b: Vec<f64> = f.iter().map(|&v| v as f64).collect();
-                format!(", vs f32 lowering rel {:.2e}", rel(&a, &b))
+                format!(", vs first mode rel {:.2e}", rel(&a, &b))
             }
         };
         let iters = env("VISION_ITERS", 10);
         let ms = prog.time(&rt, iters);
         println!(
-            "ds41 vision encoder [{name}]: {n} patches → {} rows x {}, {nk} kernels, {ms:.2} ms per image \
+            "ds41 vision encoder [{m}]: {n} patches → {} rows x {}, {nk} kernels, {ms:.2} ms per image \
              ({:.1} TFLOP/s), finite: {finite}{vs}",
             pl.rows(),
             vd.llm_dim,
             flops / ms / 1e9
         );
+        if env("VISION_PROFILE", 1) > 0 {
+            profile(&rt, &prog, &tags, 12);
+        }
         first.get_or_insert(out);
     }
 }

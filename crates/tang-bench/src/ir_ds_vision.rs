@@ -799,7 +799,7 @@ impl E {
                 &[fx(hd)],
                 vec![arg(q, hcol(4, 1, 0, 3)), arg(k, hcol(4, 2, 0, 3))],
                 Some(Monoid::sum()),
-                |v| vec![v[0] * v[1]],
+                move |v| vec![v[0] * v[1] * lit(scale)],
             )
             .unwrap();
         let m = self
@@ -819,7 +819,7 @@ impl E {
                 &[fx(n)],
                 vec![arg(s, ident(3)), arg(m, vec![unit(3, 0), unit(3, 1)])],
                 Some(Monoid::sum()),
-                move |v| vec![((v[0] - v[1]) * lit(scale)).exp()],
+                |v| vec![(v[0] - v[1]).exp()],
             )
             .unwrap();
         // o[i, h, d] = Σ_j e[h, i, j]·v[j, h, d], space (i, h, d, j)
@@ -837,7 +837,7 @@ impl E {
                     ),
                 ],
                 Some(Monoid::sum()),
-                move |v| vec![((v[0] - v[1]) * lit(scale)).exp() * v[2]],
+                |v| vec![(v[0] - v[1]).exp() * v[2]],
             )
             .unwrap();
         let o = self
