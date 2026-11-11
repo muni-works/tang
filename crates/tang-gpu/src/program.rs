@@ -288,8 +288,9 @@ impl From<&MemoryPlan> for BufferPlan {
 /// `i` at half `i`: WGSL's packed words and CUDA's `unsigned short`
 /// buffers share the layout).
 ///
-/// Block formats (Q4K, Q5K, Q8x32) are passed in and read back as their
-/// raw device words, except that reading a Q8x32 buffer dequantizes it.
+/// Block formats (GGUF Q4K / Q5K / Q6K / Q8_0, DeepSeek Fp8B32 / Mxfp4,
+/// Q8x32) are passed in and read back as their raw device words, except
+/// that reading a Q8x32 buffer dequantizes it.
 fn words(b: &tang_compile::tensor::wgsl::BufferSpec) -> usize {
     b.format.words(b.len).max(1)
 }
@@ -1888,7 +1889,9 @@ fn unpack_words(format: Format, words: &[f32], n: usize) -> Vec<f32> {
                 .map(|i| bytes[i] as i8 as f32 * sc[i / 32 * 2])
                 .collect()
         }
-        Format::Q4K | Format::Q5K => words[..format.words(n)].to_vec(),
+        Format::Q4K | Format::Q5K | Format::Fp8B32 | Format::Mxfp4 => {
+            words[..format.words(n)].to_vec()
+        }
         Format::F16 => unpack_f16(words, n),
         f if f.is_fp8() => {
             let w: Vec<u32> = words.iter().map(|x| x.to_bits()).collect();

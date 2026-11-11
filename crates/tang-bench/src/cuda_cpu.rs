@@ -4,8 +4,11 @@
 //! (`__syncthreads` a block barrier, warp shuffles through a per-warp
 //! exchange with a warp barrier), blocks one after the other. A check of
 //! the lowering itself (the very kernel sources a GPU would run, fused
-//! ones included) against the interpreter without a GPU. f32 buffers
-//! only; small graphs only (one OS thread per CUDA thread).
+//! ones included) against the interpreter without a GPU. Block-format
+//! buffers (GGUF / DeepSeek weights, Q8x32 activations) hold their raw
+//! words as on the device; `dp4a`, `__byte_perm` and the f16 conversion are
+//! emulated (not the int8 MMA: the int8 GEMV's `Gemv` stage only). One OS
+//! thread per CUDA thread, blocks one after the other.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -15,6 +18,7 @@ use tang_compile::tensor::cuda_gemv::DecodeProgram;
 use tang_compile::tensor::TensorId;
 
 const HEADER: &str = r#"
+#pragma once
 #include <barrier>
 #include <cmath>
 #include <cstdint>
@@ -26,8 +30,8 @@ const HEADER: &str = r#"
 using std::sqrt; using std::exp; using std::log; using std::round; using std::floor;
 using std::ceil; using std::fabs; using std::exp2; using std::log2; using std::tanh;
 struct tang_dim3 { unsigned x, y, z; };
-static thread_local tang_dim3 threadIdx;
-static tang_dim3 blockIdx, blockDim, gridDim;
+inline thread_local tang_dim3 threadIdx;
+inline tang_dim3 blockIdx, blockDim, gridDim;
 struct float4 { float x, y, z, w; };
 struct float2 { float x, y; };
 static inline float2 make_float2(float x, float y) { return {x, y}; }
@@ -44,6 +48,19 @@ struct int4 { int x, y, z, w; };
 #define __restrict__ __restrict
 #define __noinline__
 template <class T> static inline T __ldg(const T* p) { return *p; }
+static inline int __dp4a(int a, int b, int c) {
+    for (int i = 0; i < 4; i++) c += (int)(signed char)(a >> (8 * i)) * (int)(signed char)(b >> (8 * i));
+    return c;
+}
+static inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {
+    const uint64_t v = ((uint64_t)y << 32) | x;
+    unsigned r = 0;
+    for (int i = 0; i < 4; i++) r |= (unsigned)((v >> (8 * ((s >> (4 * i)) & 7))) & 0xFF) << (8 * i);
+    return r;
+}
+static inline unsigned __funnelshift_r(unsigned lo, unsigned hi, unsigned sh) {
+    sh &= 31; return sh ? (lo >> sh) | (hi << (32 - sh)) : lo;
+}
 static inline float __uint_as_float(unsigned u) { float f; std::memcpy(&f, &u, 4); return f; }
 static inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 static inline int __float_as_int(float f) { int u; std::memcpy(&u, &f, 4); return u; }
@@ -75,9 +92,9 @@ static inline unsigned short tang_sw_f2h(float f) {
     if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) r++;
     return (unsigned short)(s | r);
 }
-static std::barrier<>* tang_block;
-static std::barrier<>* tang_warp[32];
-static uint64_t tang_xch[32][32];
+inline std::barrier<>* tang_block;
+inline std::barrier<>* tang_warp[32];
+inline uint64_t tang_xch[32][32];
 static inline void __syncthreads() { tang_block->arrive_and_wait(); }
 static inline void __syncwarp(unsigned = 0xffffffffu) { tang_warp[threadIdx.x >> 5]->arrive_and_wait(); }
 template <class T> static inline T tang_shfl(T v, int src_lane) {
@@ -140,7 +157,16 @@ fn host_source(src: &str) -> String {
             r#"asm("cvt.rn.f16.f32 %0, %1;" : "=h"(s) : "f"(f));"#,
             "s = tang_sw_f2h(f);",
         )
+        .replace(
+            r#"asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));"#,
+            "f = tang_sw_h2f(h);",
+        )
         .replace("extern \"C\" ", "");
+    // the int8 MMA (not emulated: only the Gemv stage runs here)
+    if let Some(i) = s.find("asm volatile(\"mma.sync") {
+        let end = i + s[i..].find(");\n").unwrap() + 2;
+        s.replace_range(i..end, "std::abort();");
+    }
     let smem = src
         .lines()
         .find_map(|l| l.strip_prefix("#define TANG_SMEM "))
@@ -157,7 +183,8 @@ fn host_source(src: &str) -> String {
 }
 
 /// Runs `dp` on the CPU with graph input `k` holding `inputs[k]` (every
-/// other buffer zero) and returns the values of `outs`.
+/// other buffer zero; a block-format input as its raw words, f32 bits) and
+/// returns the values of `outs` (f32 outputs).
 pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Vec<f32>> {
     let p = &dp.program;
     let bi = |t: TensorId| {
@@ -167,34 +194,19 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
             .position(|b| b.node == t)
             .expect("tensor has no buffer")
     };
-    let mut cpp = String::from(HEADER);
-    for (j, k) in p.kernels.iter().enumerate() {
-        writeln!(cpp, "namespace k{j} {{\n{}\n}}", host_source(&k.source)).unwrap();
-    }
-    cpp.push_str("int main(int argc, char** argv) {\n");
-    writeln!(
-        cpp,
-        "    std::vector<std::vector<float>> B({});",
-        p.buffers.len()
-    )
-    .unwrap();
-    for (j, b) in p.buffers.iter().enumerate() {
-        writeln!(cpp, "    B[{j}].assign({} + 4, 0.0f);", b.len.max(1)).unwrap();
-    }
-    cpp.push_str("    FILE* in = std::fopen(argv[1], \"rb\");\n");
-    for (j, b) in p.buffers.iter().enumerate() {
-        if let Some(k) = b.input {
-            let n = inputs[k].len();
-            assert!(n <= b.len.max(1), "input {k}: {n} values, buffer {}", b.len);
-            writeln!(
-                cpp,
-                "    if (std::fread(B[{j}].data(), 4, {n}, in) != {n}) return 2;"
-            )
-            .unwrap();
-        }
-    }
-    cpp.push_str("    std::fclose(in);\n");
-    for (j, k) in p.kernels.iter().enumerate() {
+    // kernels in translation units of `PER_TU`, compiled in parallel (one
+    // file of a few hundred kernels takes g++ more memory than a step's
+    // weights)
+    const PER_TU: usize = 8;
+    let dir: PathBuf = std::env::temp_dir().join(format!(
+        "tang-cuda-cpu-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tang_cpu.h"), HEADER).unwrap();
+    let launch = |j: usize| -> String {
+        let k = &p.kernels[j];
         let mut args: Vec<String> = k
             .reads
             .iter()
@@ -205,13 +217,60 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         }
         args.push(format!("{}u", k.points));
         let blocks = k.count.div_ceil(k.workgroup_size);
-        writeln!(
-            cpp,
-            "    tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }});",
+        format!(
+            "void run_k{j}(std::vector<std::vector<float>>& B) {{ tang_launch({blocks}u, {}u, [&] {{ k{j}::main0({}); }}); }}\n",
             k.workgroup_size,
             args.join(", ")
         )
-        .unwrap();
+    };
+    let nk = p.kernels.len();
+    let mut units = Vec::new();
+    for (u, j0) in (0..nk).step_by(PER_TU).enumerate() {
+        let mut cpp = String::from("#include \"tang_cpu.h\"\n");
+        for j in j0..(j0 + PER_TU).min(nk) {
+            writeln!(
+                cpp,
+                "namespace k{j} {{\n{}\n}}",
+                host_source(&p.kernels[j].source)
+            )
+            .unwrap();
+            cpp.push_str(&launch(j));
+        }
+        let f = dir.join(format!("k{u}.cpp"));
+        std::fs::write(&f, cpp).unwrap();
+        units.push(f);
+    }
+    let mut cpp = String::from("#include \"tang_cpu.h\"\n");
+    for j in 0..nk {
+        writeln!(cpp, "void run_k{j}(std::vector<std::vector<float>>& B);").unwrap();
+    }
+    cpp.push_str("int main(int argc, char** argv) {\n");
+    writeln!(
+        cpp,
+        "    std::vector<std::vector<float>> B({});",
+        p.buffers.len()
+    )
+    .unwrap();
+    for (j, b) in p.buffers.iter().enumerate() {
+        let words = b.format.words(b.len).max(1);
+        writeln!(cpp, "    B[{j}].assign({words} + 4, 0.0f);").unwrap();
+    }
+    cpp.push_str("    FILE* in = std::fopen(argv[1], \"rb\");\n");
+    for (j, b) in p.buffers.iter().enumerate() {
+        if let Some(k) = b.input {
+            let n = inputs[k].len();
+            let words = b.format.words(b.len).max(1);
+            assert!(n <= words, "input {k}: {n} words, buffer {words}");
+            writeln!(
+                cpp,
+                "    if (std::fread(B[{j}].data(), 4, {n}, in) != {n}) return 2;"
+            )
+            .unwrap();
+        }
+    }
+    cpp.push_str("    std::fclose(in);\n");
+    for j in 0..nk {
+        writeln!(cpp, "    run_k{j}(B);").unwrap();
     }
     cpp.push_str("    FILE* o = std::fopen(argv[2], \"wb\");\n");
     for &t in outs {
@@ -219,40 +278,56 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
         writeln!(
             cpp,
             "    std::fwrite(B[{j}].data(), 4, {}, o);",
-            p.buffers[j].len
+            p.buffers[j].format.words(p.buffers[j].len).max(1)
         )
         .unwrap();
     }
     cpp.push_str("    std::fclose(o);\n    return 0;\n}\n");
-
-    let dir: PathBuf = std::env::temp_dir().join(format!(
-        "tang-cuda-cpu-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (src, exe, fin, fout) = (
-        dir.join("prog.cpp"),
-        dir.join("prog"),
-        dir.join("in.bin"),
-        dir.join("out.bin"),
-    );
-    std::fs::write(&src, &cpp).unwrap();
-    let cc = Command::new("g++")
-        .args(["-std=c++20", "-O1", "-w", "-pthread", "-o"])
+    let main = dir.join("main.cpp");
+    std::fs::write(&main, &cpp).unwrap();
+    units.push(main);
+    let (exe, fin, fout) = (dir.join("prog"), dir.join("in.bin"), dir.join("out.bin"));
+    let jobs = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let objs: Vec<PathBuf> = units.iter().map(|u| u.with_extension("o")).collect();
+    for chunk in units.iter().zip(&objs).collect::<Vec<_>>().chunks(jobs) {
+        let kids: Vec<_> = chunk
+            .iter()
+            .map(|(u, o)| {
+                Command::new("g++")
+                    .args(["-std=c++20", "-O1", "-w", "-pthread", "-c", "-o"])
+                    .arg(o)
+                    .arg(u)
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("g++")
+            })
+            .collect();
+        for ((u, _), kid) in chunk.iter().zip(kids) {
+            let out = kid.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "g++ failed on {}:\n{}",
+                u.display(),
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+    let ld = Command::new("g++")
+        .args(["-pthread", "-o"])
         .arg(&exe)
-        .arg(&src)
+        .args(&objs)
         .output()
         .expect("g++");
     assert!(
-        cc.status.success(),
-        "g++ failed on {}:\n{}",
-        src.display(),
-        String::from_utf8_lossy(&cc.stderr)
-            .lines()
-            .take(40)
-            .collect::<Vec<_>>()
-            .join("\n")
+        ld.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&ld.stderr)
     );
     let mut bytes = Vec::new();
     for b in &p.buffers {
@@ -270,7 +345,9 @@ pub fn run(dp: &DecodeProgram, inputs: &[Vec<f32>], outs: &[TensorId]) -> Vec<Ve
     let got = outs
         .iter()
         .map(|&t| {
-            let n = p.buffers[bi(t)].len;
+            let b = &p.buffers[bi(t)];
+            // a block-format output comes back as its raw words
+            let n = b.format.words(b.len).max(1);
             (&mut words).take(n).collect()
         })
         .collect();
