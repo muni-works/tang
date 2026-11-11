@@ -131,6 +131,8 @@ pub fn lower(
 /// Shapes of [`int8_case`].
 #[derive(Clone, Copy, Debug)]
 pub struct Int8Dims {
+    /// The routed weights' format: Q4_K or Q5_K.
+    pub q5: bool,
     pub ne: usize,
     pub rows: usize,
     pub k: usize,
@@ -140,12 +142,16 @@ pub struct Int8Dims {
 
 impl Int8Dims {
     pub fn tiny() -> Self {
-        Self { ne: 6, rows: 32, k: 512, nb: 5, ns: 2 }
+        Self { q5: false, ne: 6, rows: 32, k: 512, nb: 5, ns: 2 }
     }
     /// coder-next's routed gate (512 experts, 512 rows, d = 2048, top-10)
     /// and a dense `[512, 2048]` Q8_0 weight, at `nb` streams.
     pub fn coder(nb: usize) -> Self {
-        Self { ne: 512, rows: 512, k: 2048, nb, ns: 10 }
+        Self { q5: false, ne: 512, rows: 512, k: 2048, nb, ns: 10 }
+    }
+    /// coder-next's routed down projection (Q5_K, 2048 rows, k = 512).
+    pub fn coder_down(nb: usize) -> Self {
+        Self { q5: true, ne: 512, rows: 2048, k: 512, nb, ns: 10 }
     }
 }
 
@@ -176,7 +182,8 @@ pub fn int8_case(
     group: usize,
 ) -> Int8Case {
     use tang_compile::tensor::{gguf, Arg, Format, Monoid, Precision, View};
-    let Int8Dims { ne, rows, k, nb, ns } = *d;
+    let Int8Dims { q5, ne, rows, k, nb, ns } = *d;
+    let (rf, rb) = if q5 { (Format::Q5K, 176) } else { (Format::Q4K, 144) };
     let mut seed = 0x2545F491u64;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -186,7 +193,7 @@ pub fn int8_case(
     };
     let mut w4 = Vec::new();
     for _ in 0..ne * rows * k / 256 {
-        let mut b = vec![0u8; 144];
+        let mut b = vec![0u8; rb];
         b[..2].copy_from_slice(&0x2000u16.to_le_bytes());
         b[2..4].copy_from_slice(&0x1c00u16.to_le_bytes());
         for x in &mut b[4..] {
@@ -208,7 +215,7 @@ pub fn int8_case(
         gguf::dequantize(f, b, &mut o).unwrap();
         o.into_iter().map(|v| v as f64).collect::<Vec<f64>>()
     };
-    let d4 = deq(Format::Q4K, &w4, ne * rows * k);
+    let d4 = deq(rf, &w4, ne * rows * k);
     let d8 = deq(Format::Q8_0, &w8, rows * k);
     // routed ids: some experts repeat across streams, distinct within one
     let idx: Vec<usize> = (0..nb * ns)
@@ -251,7 +258,7 @@ pub fn int8_case(
             |v| vec![v[0] * v[1]],
         )
         .unwrap();
-    g.set_precision(w, Precision::storage(Format::Q4K));
+    g.set_precision(w, Precision::storage(rf));
     g.set_precision(v, Precision::storage(Format::Q8_0));
     let (g, outs) = if group > 0 {
         let (g, o, _) = g.schedule_expert_groups(&[y, z], group);
