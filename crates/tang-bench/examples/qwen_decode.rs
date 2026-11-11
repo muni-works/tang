@@ -26,6 +26,11 @@
 //!     --bench-window K with --bench: also a K-token window (a draft verify)
 //!                      at each length
 //!     --profile        per-kernel times of a decode step
+//!     --spec K         with --derived: after the greedy decode, the same
+//!                      tokens again with prompt-lookup speculation (windows
+//!                      of K verified by the derived K-token step); prints
+//!                      tok/s, tokens per window and agreement with greedy
+//!     --ngram N        longest n-gram prompt lookup matches (default 3)
 //! qwen_decode reference <dir> <ids> <logits out> [--from P]
 //!                                       CPU f32 forward (f64 accumulation), the
 //!                                       checkpoint dequantized exactly
@@ -563,6 +568,117 @@ fn argmax_f64(v: &[f64]) -> usize {
     best
 }
 
+/// The derived steps as a [`Verifier`]: a window of one is the decode
+/// step, a longer one the derived `k`-token window padded to `k` (its
+/// padding rows are rejected drafts). Every cache is K/V rows by absolute
+/// position, so a partial accept only moves the position.
+struct GpuSpec<'a> {
+    rt: &'a Runtime,
+    dec: &'a Step,
+    win: &'a Step,
+    pos: usize,
+    ctx: usize,
+}
+
+impl tang_bench::prompt_lookup::Verifier for GpuSpec<'_> {
+    fn window(&mut self, tokens: &[u32]) -> Vec<u32> {
+        let rt = self.rt;
+        if tokens.len() == 1 {
+            self.dec.feed(rt, &[tokens[0] as usize], self.pos);
+            self.dec.prog.run(rt);
+            return vec![self.dec.next_token(rt) as u32];
+        }
+        let k = self.win.dg.seq;
+        let mut t: Vec<usize> = tokens.iter().map(|&x| x as usize).collect();
+        t.resize(k, *t.last().unwrap());
+        self.win.feed(rt, &t, self.pos);
+        self.win.prog.run(rt);
+        let l = self.win.logits(rt);
+        let vocab = l.len() / k;
+        l.chunks(vocab)
+            .take(tokens.len())
+            .map(|r| argmax(r) as u32)
+            .collect()
+    }
+
+    fn accept(&mut self, m: usize) {
+        self.pos += m;
+    }
+
+    fn room(&self) -> usize {
+        // a window writes all k rows
+        self.ctx.saturating_sub(self.pos + self.win.dg.seq)
+    }
+}
+
+/// `--spec K`: the greedy run's tokens again through prompt-lookup
+/// speculation from the same prompt (the caches past the prompt are
+/// rewritten before they are read).
+#[allow(clippy::too_many_arguments)]
+fn spec_decode(
+    rt: &Runtime,
+    dims: &QwenDims,
+    dec: &Step,
+    ids: &[usize],
+    first: usize,
+    greedy: &[usize],
+    k: usize,
+    ngram: usize,
+    ctx: usize,
+) {
+    use tang_bench::prompt_lookup::{draft, generate};
+    let win = Step::new(
+        rt,
+        dims,
+        k,
+        ctx,
+        &|dg| vec![Vec::new(); dg.inputs.len()],
+        Some(dec),
+    );
+    let mut v = GpuSpec {
+        rt,
+        dec,
+        win: &win,
+        pos: ids.len(),
+        ctx,
+    };
+    let prompt: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+    let t = Instant::now();
+    let (out, st) = generate(&mut v, &prompt, first as u32, greedy.len(), k, |c, mx| {
+        draft(c, ngram, mx)
+    });
+    let s = t.elapsed().as_secs_f64();
+    let agree = out
+        .iter()
+        .zip(greedy)
+        .take_while(|(a, b)| **a as usize == **b)
+        .count();
+    println!(
+        "spec k={k}: {} tokens in {s:.3}s: {:.1} tok/s end to end; {} windows ({} rows), \
+         {:.2} tokens per window, acceptance {:.0}% ({}/{} drafted)",
+        out.len() - 1,
+        (out.len() - 1) as f64 / s,
+        st.windows,
+        st.rows,
+        st.tokens_per_window(),
+        100.0 * st.acceptance(),
+        st.accepted,
+        st.drafted
+    );
+    println!(
+        "spec k={k}: first {agree}/{} tokens equal the greedy run{}",
+        out.len(),
+        if agree == out.len() { " (all)" } else { "" }
+    );
+    println!(
+        "spec ids: {}",
+        out.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}
+
 fn read_ids(path: &str) -> Vec<usize> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -771,6 +887,12 @@ fn model(args: &[String]) {
     if let Some(p) = opt("--out") {
         let s: Vec<String> = out.iter().map(|t| t.to_string()).collect();
         std::fs::write(p, s.join(" ")).unwrap();
+    }
+    if let Some(k) = opt("--spec") {
+        assert!(dec.is_derived(), "--spec needs --derived");
+        let k: usize = k.parse().unwrap();
+        let ngram: usize = opt("--ngram").map_or(3, |v| v.parse().unwrap());
+        spec_decode(&rt, &dims, &dec, &ids, first, &out, k, ngram, ctx);
     }
     // device time of one step at a few context lengths
     if let Some(ls) = opt("--bench") {

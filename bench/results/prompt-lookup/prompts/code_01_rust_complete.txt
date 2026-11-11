@@ -1,0 +1,27 @@
+use std::collections::HashMap;
+
+/// A least-recently-used cache with a fixed capacity.
+pub struct LruCache<K, V> {
+    cap: usize,
+    map: HashMap<K, (V, u64)>,
+    tick: u64,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> LruCache<K, V> {
+    pub fn new(cap: usize) -> Self {
+        Self { cap, map: HashMap::new(), tick: 0 }
+    }
+
+    pub fn get(&mut self, k: &K) -> Option<&V> {
+        self.tick += 1;
+        let t = self.tick;
+        match self.map.get_mut(k) {
+            Some(e) => {
+                e.1 = t;
+                Some(&e.0)
+            }
+            None => None,
+        }
+    }
+
+    pub fn put(&mut self, k: K, v: V) {

@@ -572,7 +572,10 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
         .iter()
         .filter_map(|t| step.rows.get(t).copied())
         .collect();
-    if seq > 1 {
+    // (a short window, `seq ≤ window_gemv_max()`, is lowered like decode:
+    // the dequantization stays inlined into the GEMV that loads the packed
+    // words, each word read once for all the window's rows)
+    if seq > super::window_gemv_max() {
         // a window reads every weight `seq` times: its dequantization is
         // materialized (stored f16 by `compiled_decode`), as `step_graph`
         // writes it for seq > 1, and `merge_reduce_dims_scaled` reads it
@@ -804,6 +807,118 @@ mod tests {
             .collect()
     }
 
+    /// Device words of a graph input from its logical values (packed as
+    /// `to_cuda_decode` reads it).
+    fn pack_words(v: &[f64], p: Option<Packing>) -> Vec<f32> {
+        match p {
+            None => v
+                .iter()
+                .map(|&x| if x.is_nan() { 0.0 } else { x as f32 })
+                .collect(),
+            Some(Packing::U4) => v
+                .chunks(8)
+                .map(|c| {
+                    let w = c
+                        .iter()
+                        .enumerate()
+                        .fold(0u32, |w, (i, &q)| w | ((q as u32 & 15) << (4 * i)));
+                    f32::from_bits(w)
+                })
+                .collect(),
+            Some(Packing::Bf16) => v
+                .chunks(2)
+                .map(|c| {
+                    let h = |x: f64| (x as f32).to_bits() >> 16;
+                    f32::from_bits(h(c[0]) | (c.get(1).map_or(0, |&x| h(x)) << 16))
+                })
+                .collect(),
+            Some(Packing::F16) => unimplemented!("f16 inputs"),
+        }
+    }
+
+    /// bf16 inputs rounded (truncated, as `pack_words` stores them) so the
+    /// interpreter sees what the device does.
+    fn bf16_exact(v: &mut [f64]) {
+        for x in v {
+            *x = f32::from_bits((*x as f32).to_bits() & 0xffff0000) as f64;
+        }
+    }
+
+    /// A short window's generated CUDA kernels (packed-weight GEMVs with
+    /// the rows and weight rows in registers, streamed activations) run on
+    /// the CPU (`cuda_cpu`) against the interpreter's window.
+    #[test]
+    fn short_window_kernels_run_on_the_cpu() {
+        let dims = tiny();
+        let pg = prefill_graph(&dims);
+        let mut w = weights(&pg, &dims);
+        for s in &pg.inputs {
+            if s.packing == Some(Packing::Bf16) {
+                bf16_exact(w.get_mut(&s.name).unwrap());
+            }
+        }
+        let all = tokens(dims.ctx, dims.vocab);
+        let p0 = 5;
+        let caches = prefilled_caches(&pg, &dims, &w, &all[..p0]);
+        for k in [1usize, 4, 8] {
+            let step = derived_step(&pg, &dims, k);
+            let ins = step_inputs(&pg, &step, &w, &caches, &all[p0..p0 + k], p0);
+            let want = step.graph.eval(&ins, &step.outputs[..1]).remove(0);
+            let dg = as_decode_graph(&pg, &step, &dims);
+            assert!(k == 1 || dg.gemv_window());
+            let (g, outs) = compiled_decode(&dg, true);
+            let mut opts = decode_opts(&dg, &outs);
+            opts.rows = 8;
+            opts.warps = 2;
+            // (cuda_cpu gives every buffer its own storage: no in-place
+            // aliasing, so the cache updates are written whole)
+            opts.inplace.clear();
+            let dp = g.to_cuda_decode(&outs, &opts);
+            let tiled = dp
+                .program
+                .kernels
+                .iter()
+                .filter(|kn| kn.source.contains("for (int e4 = 0;"))
+                .count();
+            let words: Vec<Vec<f32>> = ins
+                .iter()
+                .zip(&dg.inputs)
+                .map(|(v, s)| pack_words(v, s.packing))
+                .collect();
+            if std::env::var_os("WIN_DEBUG").is_some() {
+                let nodes: Vec<TensorId> = dp.program.kernels.iter().map(|kn| kn.node).collect();
+                let gall = crate::cuda_cpu::run(&dp, &words, &nodes);
+                let eall = g.eval_emulated(&ins, &nodes);
+                for (j, (a, b)) in gall.iter().zip(&eall).enumerate() {
+                    let a: Vec<f64> = a[..b.len()].iter().map(|&x| x as f64).collect();
+                    eprintln!(
+                        "  k{j} n{} {:?} err {:.2e} | {}",
+                        nodes[j].index(),
+                        g.shape(nodes[j]),
+                        rel(&a, b),
+                        dp.program.kernels[j].source.lines().next().unwrap()
+                    );
+                }
+            }
+            let got = crate::cuda_cpu::run(&dp, &words, &outs[..1]).remove(0);
+            let got: Vec<f64> = got[..want.len()].iter().map(|&x| x as f64).collect();
+            // against the compiled graph under its storage formats (the
+            // passes store some activations f16); the f64 step for scale
+            let emu = g.eval_emulated(&ins, &outs[..1]).remove(0);
+            let e = rel(&got, &emu);
+            eprintln!(
+                "window {k}: compiled graph (emulated) vs f64 step {:.2e}",
+                rel(&emu, &want)
+            );
+            eprintln!(
+                "window {k}: {} CUDA kernels ({tiled} streamed register-tile GEMVs) on the CPU vs interpreter: rel err {e:.2e}",
+                dp.program.kernels.len()
+            );
+            assert!(k == 1 || tiled > 0, "no register-tiled window GEMV");
+            assert!(e < 1e-4, "window {k}: {e:e}");
+        }
+    }
+
     /// The derived cache is exactly the hand graph's: per layer the roped,
     /// QK-normed K and the raw V, in the hand caches' layouts.
     #[test]
@@ -1032,6 +1147,18 @@ mod tests {
             if k == 1 {
                 // decode: every kernel has the native decode lowering
                 assert_eq!(native, p.native.len(), "transpiled decode kernels");
+            } else if k <= super::super::window_gemv_max() {
+                // a short window is lowered like decode: no tiles, and no
+                // kernel writes a dequantized weight (the GEMVs read the
+                // packed words, the window's rows in registers)
+                assert_eq!(mma, 0, "mma tiles in a short window");
+                assert!(
+                    !p.program
+                        .kernels
+                        .iter()
+                        .any(|kn| kn.source.contains("map over packed")),
+                    "a short window materializes a dequantized weight"
+                );
             } else {
                 // a window: every projection a tensor-core tile, as the hand
                 // prefill's, plus the LM head (logits of all k rows, which a
@@ -1123,7 +1250,12 @@ mod tests {
         // those run for the last row only here (the hand step computes all
         // k rows and keeps the last); no LM-head tile either
         let ht = tiles(&hp, &hg);
-        assert_eq!(tiles(&p, &g), ht[..ht.len() - 3]);
+        if k <= super::super::window_gemv_max() {
+            // (lowered like decode: no tiles)
+            assert!(tiles(&p, &g).is_empty());
+        } else {
+            assert_eq!(tiles(&p, &g), ht[..ht.len() - 3]);
+        }
     }
 
     /// Derived kernels whose (canonical) source is one of the hand
