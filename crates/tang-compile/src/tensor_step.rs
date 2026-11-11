@@ -74,6 +74,12 @@ pub use ring::seed_cache;
 #[cfg(test)]
 #[path = "tensor_step_state_tests.rs"]
 mod state_tests;
+// derive-gather: gathers along the sequence (top-k attention)
+#[path = "tensor_step_gather.rs"]
+mod gather;
+#[cfg(test)]
+#[path = "tensor_step_gather_tests.rs"]
+mod gather_tests;
 
 /// What the step derivation is asked for.
 #[derive(Clone, Copy, Debug)]
@@ -626,8 +632,16 @@ impl Deriver<'_> {
                     .enumerate()
                     .any(|(d, &k)| k != 0 && coord[d].is_some())
             };
+            // derive-gather: a gather over the sequence reads the source's cache
+            // when its index is provably causal (tensor_step_gather.rs)
             if a.view.is_gather() && (src_seq || a.view.forms.iter().any(touches_seq)) {
-                return err(format!("step: node {n} arg {ai} gathers over the sequence"));
+                let smodes = self.seq_gather(n, ai, c, &coord)?;
+                let src = self.get(a.src.n(), smodes)?;
+                args.push(Arg {
+                    src,
+                    view: a.view.clone(),
+                });
+                continue;
             }
             if a.view.guard && src_seq {
                 // ring caches (tensor_step_ring.rs): a read a bounded way back
@@ -1198,7 +1212,7 @@ mod tests {
     /// [`check_steps`] feeding the step `p0 + skew.0` as its position and
     /// carried states from a prefill of `p0 − skew.1` rows (negative
     /// controls when nonzero), and outputs for `rows`.
-    fn check_steps_with(
+    pub(super) fn check_steps_with(
         g: &TensorGraph,
         outs: &[TensorId],
         p0: usize,

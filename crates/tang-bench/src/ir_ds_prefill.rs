@@ -768,33 +768,51 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         let s3 = |src| arg(src, ident(3));
         let mut ms =
             vec![b.attn_reduce(&hsp, 2, vec![s3(sw)], Monoid::max(), NEG, in_win, |v| v[0])];
-        // the compressed rows query t picked: Σ_s [idx_s = j]·[val_s real]
-        let top_args = |tp: TensorId, rank: usize| -> Vec<Arg> {
-            (0..2 * kk)
-                .map(|s| arg(tp, vec![unit(rank, 0), konst(rank, s as i64)]))
-                .collect()
+        // the compressed rows query t picked, read by index (a gather over
+        // the sequence whose index is the causal top-k): slot s of row t is
+        // `(idx, val)` at `tp[t, 2s]`, `tp[t, 2s + 1]`, real iff val > −1e29
+        let kp = fx(kk);
+        let slot = |tp: TensorId, r: usize, sd: usize, off: i64| {
+            arg(tp, vec![unit(r, 0), form(r, &[(sd, 2)], off)])
         };
-        let member = move |j: ExprId, tv: &[ExprId]| -> ExprId {
-            let mut m = lit(0.0);
-            for s in 0..kk {
-                let real = tv[2 * s + 1] + lit(1e29);
-                m = m + select(real, pick(tv[2 * s], j, lit(1.0)), lit(0.0));
+        // the source row picked by arg `ix`, other source dims `rest`
+        let gathered = |src: TensorId, r: usize, c: usize, ix: usize| Arg {
+            src,
+            view: View {
+                forms: vec![konst(r, 0), unit(r, c)],
+                guard: false,
+                gather: None,
             }
-            m - lit(0.5)
+            .gather(0, ix, 1),
         };
-        let sc = comp_src.map(|(c, tp)| (scores_vs(&mut b, c), c, tp));
-        if let Some((scs, _, tp)) = sc {
-            let mut a = vec![s3(scs)];
-            a.extend(top_args(tp, 3));
-            ms.push(b.attn_reduce(
-                &hsp,
-                2,
-                a,
-                Monoid::max(),
-                NEG,
-                move |_, j, v| member(j, &v[1..]),
-                |v| v[0],
-            ));
+        // sg[t, h, s] = q[t, h]·c[idx(t, s)]·scale: space (t, h, s, c)
+        let sg = comp_src.map(|(c, tp)| {
+            let sg =
+                b.g.comp(
+                    &[T, fx(h), kp],
+                    &[fx(hd)],
+                    vec![
+                        arg(q, vec![unit(4, 0), form(4, &[(1, hd as i64), (3, 1)], 0)]),
+                        gathered(c, 4, 3, 2),
+                        slot(tp, 4, 2, 0),
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1] * lit(scale)],
+                )
+                .unwrap();
+            (sg, c, tp)
+        });
+        if let Some((sg, _, tp)) = sg {
+            ms.push(
+                b.g.comp(
+                    &hsp,
+                    &[kp],
+                    vec![s3(sg), slot(tp, 3, 2, 1)],
+                    Some(Monoid::max()),
+                    |v| vec![select(v[1] + lit(1e29), v[0], lit(NEG))],
+                )
+                .unwrap(),
+            );
         }
         // the stabilizer: max of the visible scores and the sink
         let mut margs: Vec<Arg> = ms.iter().map(|&m| arg(m, ident(2))).collect();
@@ -828,29 +846,40 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
             in_win,
             |v| (v[0] - v[1]).exp() * v[2],
         )];
-        if let Some((scs, c, tp)) = sc {
-            let mut a = vec![s3(scs), m3()];
-            a.extend(top_args(tp, 3));
-            dens.push(b.attn_reduce(
-                &hsp,
-                2,
-                a,
-                Monoid::sum(),
-                0.0,
-                move |_, j, v| member(j, &v[2..]),
-                |v| (v[0] - v[1]).exp(),
-            ));
-            let mut a = vec![s4(scs), m4(), k4(c)];
-            a.extend(top_args(tp, 4));
-            nums.push(b.attn_reduce(
-                &osp,
-                3,
-                a,
-                Monoid::sum(),
-                0.0,
-                move |_, j, v| member(j, &v[3..]),
-                |v| (v[0] - v[1]).exp() * v[2],
-            ));
+        if let Some((sg, c, tp)) = sg {
+            dens.push(
+                b.g.comp(
+                    &hsp,
+                    &[kp],
+                    vec![s3(sg), m3(), slot(tp, 3, 2, 1)],
+                    Some(Monoid::sum()),
+                    |v| vec![select(v[2] + lit(1e29), (v[0] - v[1]).exp(), lit(0.0))],
+                )
+                .unwrap(),
+            );
+            // o[t, h, c] over s: space (t, h, c, s); arg 3 the index
+            nums.push(
+                b.g.comp(
+                    &osp,
+                    &[kp],
+                    vec![
+                        s4(sg),
+                        m4(),
+                        gathered(c, 4, 2, 3),
+                        slot(tp, 4, 3, 0),
+                        slot(tp, 4, 3, 1),
+                    ],
+                    Some(Monoid::sum()),
+                    |v| {
+                        vec![select(
+                            v[4] + lit(1e29),
+                            (v[0] - v[1]).exp() * v[2],
+                            lit(0.0),
+                        )]
+                    },
+                )
+                .unwrap(),
+            );
         }
         let nd = nums.len();
         let mut oargs: Vec<Arg> = nums.iter().map(|&n| arg(n, ident(3))).collect();
@@ -1791,6 +1820,99 @@ mod tests {
             }
             eprintln!("ds tiny: derived steps {ks:?} from 5 vs prefill: max rel err {worst:.2e}");
             assert!(worst < 1e-10, "{ks:?}: {worst:e}");
+        }
+    }
+
+    /// The derived step's top-k attention reads the picked compressed rows
+    /// by gather (`index_topk` of them), not every cache row.
+    #[test]
+    fn derived_step_attention_reads_k_rows() {
+        use tang_compile::tensor::Op;
+        let dm = DsDims::tiny();
+        let pg = prefill_graph(&dm);
+        let st = derived_step(&pg, &dm, 1).unwrap();
+        let ckv: Vec<TensorId> = st
+            .caches
+            .iter()
+            .filter(|c| {
+                cache_name(
+                    &pg,
+                    &st,
+                    st.caches.iter().position(|x| x.node == c.node).unwrap(),
+                )
+                .ends_with("compressed_kv")
+            })
+            .map(|c| c.updated)
+            .collect();
+        let mut gathers = 0;
+        for nd in st.graph.nodes() {
+            let Op::Comp(c) = &nd.op else { continue };
+            for a in c.args.iter().filter(|a| a.view.is_gather()) {
+                gathers += 1;
+                eprintln!(
+                    "step gather: out {:?} red {:?} source shape {:?}",
+                    c.out,
+                    c.red,
+                    st.graph.shape(a.src)
+                );
+            }
+        }
+        // the compressed rows (the cache or a reshape of it) are read only
+        // through gathers
+        let mut srcs: Vec<usize> = ckv.iter().map(|t| t.index()).collect();
+        for (i, nd) in st.graph.nodes().iter().enumerate() {
+            if matches!(nd.op, Op::Reshape(r) if srcs.contains(&r.index())) {
+                srcs.push(i);
+            }
+        }
+        let dense_reads = st
+            .graph
+            .nodes()
+            .iter()
+            .filter_map(|nd| match &nd.op {
+                Op::Comp(c) => Some(c),
+                _ => None,
+            })
+            .filter(|c| {
+                c.args
+                    .iter()
+                    .any(|a| !a.view.is_gather() && srcs.contains(&a.src.index()))
+            })
+            .count();
+        eprintln!("ds step: {gathers} gather reads; reductions over the cache reading compressed_kv: {dense_reads}");
+        assert!(gathers >= 2);
+        assert_eq!(dense_reads, 0);
+    }
+
+    /// CUDA lowering of the derived step (source only, no device): the
+    /// kernels that read compressed_kv by gather, and their loops.
+    #[test]
+    fn derived_step_cuda_kernels() {
+        use tang_compile::tensor::Op;
+        let dm = DsDims::tiny();
+        let pg = prefill_graph(&dm);
+        let st = derived_step(&pg, &dm, 1).unwrap();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let prog = st.graph.to_cuda(&ids);
+        eprintln!("ds step cuda: {} kernels", prog.kernels.len());
+        for kn in &prog.kernels {
+            let Op::Comp(c) = &st.graph.nodes()[kn.node.index()].op else {
+                continue;
+            };
+            if !c.has_gather() {
+                continue;
+            }
+            let loops: Vec<&str> = kn
+                .source
+                .lines()
+                .filter(|l| l.trim_start().starts_with("for"))
+                .map(str::trim)
+                .collect();
+            eprintln!(
+                "gather kernel node {:?}: out {:?} red {:?} points {}; loops {loops:?}",
+                kn.node, c.out, c.red, kn.points
+            );
         }
     }
 }

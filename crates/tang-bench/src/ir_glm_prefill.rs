@@ -512,50 +512,85 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
     let gate = b.linear(x, gate_w);
     b.name(format!("{p}.indexer.k"), ik);
     b.name(format!("{p}.indexer.gate"), gate);
-    // the pool ending at token e: slots e − kp + 1 + j, gate-softmax over j
-    let back = 1 - kp as i64;
-    let lg = b.map(
-        &[T, fx(kp), fx(idd)],
+    // the pool ending at token e: slots f ∈ (e − kp, e], gate-softmax over
+    // them. Written as masked reductions over a second `T` axis (f ≤ e at
+    // the top) so derive_step reads `gate` and `ik` from caches; the
+    // position embedding `ape[f − e + kp − 1]` is a masked sum over its
+    // rows. (Rows e < kp − 1, never a pool end, drop the out-of-range slots
+    // instead of reading zeros there.)
+    let back = kp as f64 - 1.0;
+    let sp3 = [T, T, fx(kp)];
+    let (e3, f3, r3) = (b.g.iota(&sp3, 0), b.g.iota(&sp3, 1), b.g.iota(&sp3, 2));
+    let lg = b.sum(
+        &[T, T, fx(idd)],
+        &[fx(kp)],
         vec![
-            ag(gate, vec![fm(3, &[(0, 1), (1, 1)], back), u(3, 2)]),
-            a(ape, vec![u(3, 1), u(3, 2)]),
+            a(ape, vec![u(4, 3), u(4, 2)]),
+            a(e3, vec![u(4, 0), u(4, 1), u(4, 3)]),
+            a(f3, vec![u(4, 0), u(4, 1), u(4, 3)]),
+            a(r3, vec![u(4, 0), u(4, 1), u(4, 3)]),
+            a(gate, vec![u(4, 1), u(4, 2)]),
         ],
-        |v| v[0] + v[1],
+        move |v| {
+            let at = pick(v[3], v[2] - v[1] + lit(back), v[0]);
+            // the gate itself once (slot r = 0)
+            at + pick(v[3], lit(0.0), v[4])
+        },
     );
+    let spg = [T, fx(idd), T];
+    let (eg, fg) = (b.g.iota(&spg, 0), b.g.iota(&spg, 2));
+    let kpf = kp as f64;
+    let grp = move |e: ExprId, f: ExprId, x: ExprId, idv: f64| {
+        select(
+            e - f + lit(0.5),
+            select(f - e + lit(kpf - 0.5), x, lit(idv)),
+            lit(idv),
+        )
+    };
+    let lga = || a(lg, vec![u(3, 0), u(3, 2), u(3, 1)]);
     let gmax = b.comp(
         &[T, fx(idd)],
-        &[fx(kp)],
-        vec![a(lg, vec![u(3, 0), u(3, 2), u(3, 1)])],
+        &[T],
+        vec![lga(), a(eg, id(3)), a(fg, id(3))],
         Some(Monoid::max()),
-        |v| v[0],
+        move |v| grp(v[1], v[2], v[0], -1e30),
     );
     let gz = b.sum(
         &[T, fx(idd)],
-        &[fx(kp)],
+        &[T],
         vec![
-            a(lg, vec![u(3, 0), u(3, 2), u(3, 1)]),
+            lga(),
             a(gmax, vec![u(3, 0), u(3, 1)]),
+            a(eg, id(3)),
+            a(fg, id(3)),
         ],
-        |v| (v[0] - v[1]).exp(),
+        move |v| grp(v[2], v[3], (v[0] - v[1]).exp(), 0.0),
     );
     let pk = b.sum(
         &[T, fx(idd)],
-        &[fx(kp)],
+        &[T],
         vec![
-            a(lg, vec![u(3, 0), u(3, 2), u(3, 1)]),
+            lga(),
             a(gmax, vec![u(3, 0), u(3, 1)]),
             a(gz, vec![u(3, 0), u(3, 1)]),
-            ag(ik, vec![fm(3, &[(0, 1), (2, 1)], back), u(3, 1)]),
+            a(ik, vec![u(3, 2), u(3, 1)]),
+            a(eg, id(3)),
+            a(fg, id(3)),
         ],
-        |v| (v[0] - v[1]).exp() / v[2] * v[3],
+        move |v| grp(v[4], v[5], (v[0] - v[1]).exp() / v[2] * v[3], 0.0),
     );
     b.name(format!("{p}.indexer.pool_key"), pk);
     // pe[e] = 1 iff e + 1 is a multiple of kp (an affine masked sum over m)
     let sp = [T, T];
     let (ie, im) = (b.g.iota(&sp, 0), b.g.iota(&sp, 1));
     let kpf = kp as f64;
+    // (m ≤ e at the top: the causal form derive_step recognizes)
     let pe = b.sum(&[T], &[T], vec![a(ie, id(2)), a(im, id(2))], move |v| {
-        pick(v[0] + lit(1.0), lit(kpf) * v[1] + lit(kpf), lit(1.0))
+        select(
+            v[0] - v[1] + lit(0.5),
+            pick(v[0] + lit(1.0), lit(kpf) * v[1] + lit(kpf), lit(1.0)),
+            lit(0.0),
+        )
     });
     // scores[i, e] = Σ_h w_h(x_i)/√ih · relu(iq_h(i)·pk(e)/√idd)
     let iq = b.linear(qr, wqb);
@@ -591,8 +626,12 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
             a(f3, id(3)),
         ],
         |v| {
-            let cand = select(v[3] - v[5] + lit(0.5), v[2], lit(0.0));
-            cand * above(v[0], v[1], v[5], v[4])
+            // f ≤ i at the top (a product would leak 0·NaN from unused rows)
+            select(
+                v[3] - v[5] + lit(0.5),
+                v[2] * above(v[0], v[1], v[5], v[4]),
+                lit(0.0),
+            )
         },
     );
     let (i2, e2) = (b.g.iota(&sp, 0), b.g.iota(&sp, 1));
@@ -612,15 +651,24 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
     );
     // key j is in a selected pool: Σ_e sel[i, e]·[e − kp < j ≤ e]
     let (ij, jj, ej) = (b.g.iota(&sp3, 0), b.g.iota(&sp3, 1), b.g.iota(&sp3, 2));
-    let _ = ij;
+    // (e ≤ i at the top, implied by `sel`, for derive_step)
     let pooled = b.sum(
         &sp,
         &[T],
-        vec![a(sel, vec![u(3, 0), u(3, 2)]), a(jj, id(3)), a(ej, id(3))],
+        vec![
+            a(sel, vec![u(3, 0), u(3, 2)]),
+            a(jj, id(3)),
+            a(ej, id(3)),
+            a(ij, id(3)),
+        ],
         move |v| {
             select(
-                v[2] - v[1] + lit(0.5),
-                select(v[1] - v[2] + lit(kpf) - lit(0.5), v[0], lit(0.0)),
+                v[3] - v[2] + lit(0.5),
+                select(
+                    v[2] - v[1] + lit(0.5),
+                    select(v[1] - v[2] + lit(kpf) - lit(0.5), v[0], lit(0.0)),
+                    lit(0.0),
+                ),
                 lit(0.0),
             )
         },
@@ -637,8 +685,8 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
         ],
         |v| {
             select(
-                v[3] - v[2] + lit(0.5),
-                select(v[1] - v[3] + lit(0.5), v[0], lit(0.0)),
+                v[1] - v[3] + lit(0.5),
+                select(v[3] - v[2] + lit(0.5), v[0], lit(0.0)),
                 lit(0.0),
             )
         },
@@ -745,24 +793,27 @@ fn dsa(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
         v
     };
     let sparse = mask.is_some();
-    let cond = move |v: &[ExprId], at: usize| {
-        if sparse {
-            v[at + 2] - lit(0.5)
+    // visible(x): causal select at the top, the data mask inside it
+    let cond = move |v: &[ExprId], at: usize, x: ExprId, idv: f64| {
+        let causal = v[at] - v[at + 1] + lit(0.5);
+        let x = if sparse {
+            select(v[at + 2] - lit(0.5), x, lit(idv))
         } else {
-            v[at] - v[at + 1] + lit(0.5)
-        }
+            x
+        };
+        select(causal, x, lit(idv))
     };
     // softmax statistics over j: space (i, h, j)
     let sp = [T, fx(hh), T];
     let mut args = vec![a(sc, id(3))];
     args.extend(vis_args(b, &sp, 0, 2));
     let m = b.comp(&sp[..2], &[T], args, Some(Monoid::max()), move |v| {
-        select(cond(v, 1), v[0], lit(-1e30))
+        cond(v, 1, v[0], -1e30)
     });
     let mut args = vec![a(sc, id(3)), a(m, vec![u(3, 0), u(3, 1)])];
     args.extend(vis_args(b, &sp, 0, 2));
     let lsum = b.sum(&sp[..2], &[T], args, move |v| {
-        select(cond(v, 2), (v[0] - v[1]).exp(), lit(0.0))
+        cond(v, 2, (v[0] - v[1]).exp(), 0.0)
     });
     let attn = if absorbed_q {
         // weighted latent Σ_j p·lat[j]: space (i, h, l, j), then W_v
@@ -776,7 +827,7 @@ fn dsa(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
         ];
         args.extend(vis_args(b, &sp, 0, 3));
         let ol = b.sum(&sp[..3], &[T], args, move |v| {
-            select(cond(v, 4), (v[0] - v[1]).exp() / v[2] * v[3], lit(0.0))
+            cond(v, 4, (v[0] - v[1]).exp() / v[2] * v[3], 0.0)
         });
         b.sum(
             &[T, fx(hh), fx(dv)],
@@ -799,7 +850,7 @@ fn dsa(b: &mut B, d: &GlmDims, l: usize, x: TensorId) -> TensorId {
         ];
         args.extend(vis_args(b, &sp, 0, 3));
         b.sum(&sp[..3], &[T], args, move |v| {
-            select(cond(v, 4), (v[0] - v[1]).exp() / v[2] * v[3], lit(0.0))
+            cond(v, 4, (v[0] - v[1]).exp() / v[2] * v[3], 0.0)
         })
     };
     let attn = b.g.reshape(attn, &[T, fx(h * dv)]).unwrap();
