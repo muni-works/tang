@@ -611,98 +611,83 @@ fn indexer_mask(b: &mut B, d: &GlmDims, p: &str, x: TensorId, qr: TensorId) -> T
         vec![a(hw, vec![u(3, 0), u(3, 2)]), a(dots, id(3))],
         move |v| v[0] * lit(hs) * (v[1] * lit(ss)).max(lit(0.0)),
     );
-    // rank[i, e] among the pools visible to i (complete, end ≤ i)
-    let sp3 = [T, T, T];
-    let (i3, e3, f3) = (b.g.iota(&sp3, 0), b.g.iota(&sp3, 1), b.g.iota(&sp3, 2));
-    let rank = b.sum(
-        &[T, T],
-        &[T],
-        vec![
-            a(score, vec![u(3, 0), u(3, 2)]),
-            a(score, vec![u(3, 0), u(3, 1)]),
-            a(pe, vec![u(3, 2)]),
-            a(i3, id(3)),
-            a(e3, id(3)),
-            a(f3, id(3)),
-        ],
-        |v| {
-            // f ≤ i at the top (a product would leak 0·NaN from unused rows)
-            select(
-                v[3] - v[5] + lit(0.5),
-                v[2] * above(v[0], v[1], v[5], v[4]),
-                lit(0.0),
-            )
-        },
-    );
+    // the top `nsel` complete pools visible to query i (end e ≤ i, pe[e]),
+    // by score, ties to the lower end: one top-k reduction over e, O(T)
+    // per query. Slot s of row i is (end, score) at top[i, 2s], top[i, 2s+1];
+    // an empty slot has score −f32::MAX.
+    let nsel = d.topk / kp;
+    let fmax = -(f32::MAX as f64);
     let (i2, e2) = (b.g.iota(&sp, 0), b.g.iota(&sp, 1));
-    let nsel = (d.topk / kp) as f64;
-    let sel = b.map(
-        &sp,
-        vec![
-            a(rank, id(2)),
-            a(pe, vec![u(2, 1)]),
-            a(i2, id(2)),
-            a(e2, id(2)),
-        ],
-        move |v| {
-            let cand = select(v[2] - v[3] + lit(0.5), v[1], lit(0.0));
-            cand * select(lit(nsel) - v[0] - lit(0.5), lit(1.0), lit(0.0))
-        },
-    );
-    // key j is in a selected pool: Σ_e sel[i, e]·[e − kp < j ≤ e]
-    let (ij, jj, ej) = (b.g.iota(&sp3, 0), b.g.iota(&sp3, 1), b.g.iota(&sp3, 2));
-    // (e ≤ i at the top, implied by `sel`, for derive_step)
-    let pooled = b.sum(
-        &sp,
-        &[T],
-        vec![
-            a(sel, vec![u(3, 0), u(3, 2)]),
-            a(jj, id(3)),
-            a(ej, id(3)),
-            a(ij, id(3)),
-        ],
-        move |v| {
-            select(
-                v[3] - v[2] + lit(0.5),
-                select(
-                    v[2] - v[1] + lit(0.5),
-                    select(v[1] - v[2] + lit(kpf) - lit(0.5), v[0], lit(0.0)),
-                    lit(0.0),
-                ),
-                lit(0.0),
-            )
-        },
-    );
-    // the tail: j ≤ i with no pool end in [j, i]
-    let ends = b.sum(
-        &sp,
-        &[T],
-        vec![
-            a(pe, vec![u(3, 2)]),
-            a(i3, id(3)),
-            a(e3, id(3)),
-            a(f3, id(3)),
-        ],
-        |v| {
-            select(
-                v[1] - v[3] + lit(0.5),
-                select(v[3] - v[2] + lit(0.5), v[0], lit(0.0)),
-                lit(0.0),
-            )
-        },
-    );
-    let mask = b.map(
-        &sp,
-        vec![a(pooled, id(2)), a(ends, id(2)), a(i2, id(2)), a(e2, id(2))],
-        |v| {
-            let tail = select(
-                v[2] - v[3] + lit(0.5),
-                select(lit(0.5) - v[1], lit(1.0), lit(0.0)),
+    let top =
+        b.g.comp_tuple(
+            &[T, fx(2 * nsel)],
+            &[T],
+            vec![
+                a(score, id(2)),
+                a(pe, vec![u(2, 1)]),
+                a(i2, id(2)),
+                a(e2, id(2)),
+            ],
+            Some(Monoid::topk(nsel)),
+            move |v| {
+                let (s, pend, i, e) = (v[0], v[1], v[2], v[3]);
+                let causal = i - e + lit(0.5);
+                let mut o = vec![
+                    select(causal, e, lit(0.0)),
+                    select(causal, select(pend - lit(0.5), s, lit(fmax)), lit(fmax)),
+                ];
+                for _ in 1..nsel {
+                    o.push(select(causal, lit(0.0), lit(0.0)));
+                    o.push(select(causal, lit(fmax), lit(fmax)));
+                }
+                o
+            },
+        )
+        .unwrap();
+    b.name(format!("{p}.indexer.topk"), top);
+    // the last complete pool end ≤ i (−1 if none): the tail starts after it
+    let lend =
+        b.g.comp(
+            &[T],
+            &[T],
+            vec![a(pe, vec![u(2, 1)]), a(i2, id(2)), a(e2, id(2))],
+            Some(Monoid::max()),
+            |v| {
+                let (pend, i, e) = (v[0], v[1], v[2]);
+                vec![select(
+                    i - e + lit(0.5),
+                    select(pend - lit(0.5), e, lit(-1.0)),
+                    lit(-1e30),
+                )]
+            },
+        )
+        .unwrap();
+    // mask[i, j]: j in a picked pool (end − kp < j ≤ end), or in the tail
+    // (lend(i) < j ≤ i). A map: O(nsel) per (i, j), no reduction over T.
+    let mut margs = vec![a(i2, id(2)), a(e2, id(2)), a(lend, vec![u(2, 0)])];
+    for s in 0..nsel {
+        let slot = |o: i64| a(top, vec![u(2, 0), Form::constant(2, 2 * s as i64 + o)]);
+        margs.push(slot(0));
+        margs.push(slot(1));
+    }
+    let mask = b.map(&sp, margs, move |v| {
+        let (i, j, le) = (v[0], v[1], v[2]);
+        let mut m = select(
+            i - j + lit(0.5),
+            select(j - le - lit(0.5), lit(1.0), lit(0.0)),
+            lit(0.0),
+        );
+        for s in 0..nsel {
+            let (end, val) = (v[3 + 2 * s], v[4 + 2 * s]);
+            let inside = select(
+                end - j + lit(0.5),
+                select(j - end + lit(kpf) - lit(0.5), lit(1.0), lit(0.0)),
                 lit(0.0),
             );
-            v[0] + tail
-        },
-    );
+            m = m + select(val + lit(1e29), inside, lit(0.0));
+        }
+        m
+    });
     b.name(format!("{p}.indexer.mask"), mask);
     mask
 }
