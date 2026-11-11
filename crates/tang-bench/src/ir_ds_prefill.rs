@@ -130,6 +130,11 @@ pub struct DsDims {
     pub eps: f64,
     /// Cache capacity for the derived step.
     pub ctx: usize,
+    /// Rows of the bound expert tensors when they hold only some experts
+    /// (a CPU check at real size can't hold all 384 in f64): each MoE
+    /// layer then reads `ffn.expert_slot[n_experts]`, expert id → row.
+    /// 0: the tensors hold every expert, no slot map.
+    pub expert_rows: usize,
 }
 
 impl DsDims {
@@ -164,6 +169,7 @@ impl DsDims {
             hc_eps: 1e-6,
             eps: 1e-6,
             ctx: 16,
+            expert_rows: 0,
         }
     }
 
@@ -569,19 +575,15 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
     };
     let tokens = b.input("tokens".into(), &[T]);
     let emb = b.w("embed.weight".into(), &[dm.vocab, d]);
-    let esp = [T, fx(hc), fx(d), fx(dm.vocab)];
-    let vi = b.g.iota(&esp, 3);
+    // the embedding row by token id, copied to every stream
+    let e = b.g.gather(emb, 0, tokens, false).unwrap();
     let x3 =
         b.g.comp(
-            &esp[..3],
-            &esp[3..],
-            vec![
-                arg(emb, vec![unit(4, 3), unit(4, 2)]),
-                arg(tokens, vec![unit(4, 0)]),
-                arg(vi, ident(4)),
-            ],
-            Some(Monoid::sum()),
-            |v| vec![pick(v[2], v[1], v[0])],
+            &[T, fx(hc), fx(d)],
+            &[],
+            vec![arg(e, vec![unit(3, 0), unit(3, 2)])],
+            None,
+            |v| vec![v[0]],
         )
         .unwrap();
     let mut x = b.g.reshape(x3, &[T, fx(hc * d)]).unwrap();
@@ -924,9 +926,15 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
         let xn = b.rms(hx, fnw);
         let gate = b.w(format!("{p}.ffn.gate.weight"), &[ne, d]);
         let bias = b.w(format!("{p}.ffn.gate.bias"), &[ne]);
-        let w1 = b.w(format!("{p}.ffn.experts.w1"), &[ne, inter, d]);
-        let w3 = b.w(format!("{p}.ffn.experts.w3"), &[ne, inter, d]);
-        let w2 = b.w(format!("{p}.ffn.experts.w2"), &[ne, d, inter]);
+        let rows = if dm.expert_rows > 0 {
+            dm.expert_rows
+        } else {
+            ne
+        };
+        let w1 = b.w(format!("{p}.ffn.experts.w1"), &[rows, inter, d]);
+        let w3 = b.w(format!("{p}.ffn.experts.w3"), &[rows, inter, d]);
+        let w2 = b.w(format!("{p}.ffn.experts.w2"), &[rows, d, inter]);
+        let slot_map = (dm.expert_rows > 0).then(|| b.w(format!("{p}.ffn.expert_slot"), &[ne]));
         let s1 = b.w(format!("{p}.ffn.shared_experts.w1.weight"), &[inter, d]);
         let s3w = b.w(format!("{p}.ffn.shared_experts.w3.weight"), &[inter, d]);
         let s2 = b.w(format!("{p}.ffn.shared_experts.w2.weight"), &[d, inter]);
@@ -960,32 +968,62 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
             )
             .unwrap();
         b.name(format!("{p}.expert_topk"), etop);
-        let ei2 = b.g.iota(&[T, fx(ne)], 1);
-        let mut wa = vec![arg(sc, ident(2)), arg(ei2, ident(2))];
-        wa.extend((0..ka).map(|s| arg(etop, vec![unit(2, 0), konst(2, 2 * s as i64)])));
-        let wsel =
-            b.g.comp(&[T, fx(ne)], &[], wa, None, |v| {
-                let m = v[2..]
-                    .iter()
-                    .fold(lit(0.0), |a, &i| a + pick(i, v[1], lit(1.0)));
-                vec![m * v[0]]
-            })
+        // the picked expert ids `[T, ka]` (slot s at etop[t, 2s])
+        let ids =
+            |rank: usize, sd: usize| arg(etop, vec![unit(rank, 0), form(rank, &[(sd, 2)], 0)]);
+        // the row of the expert tensors slot s reads
+        let erow = slot_map.map(|m| {
+            b.g.comp(
+                &[T, fx(ka)],
+                &[],
+                vec![
+                    ids(2, 1),
+                    Arg {
+                        src: m,
+                        view: View::pick(2, &[None]).gather(0, 0, 1),
+                    },
+                ],
+                None,
+                |v| vec![v[1]],
+            )
+            .unwrap()
+        });
+        let row_ix = |rank: usize, sd: usize| match erow {
+            Some(e) => arg(e, vec![unit(rank, 0), unit(rank, sd)]),
+            None => ids(rank, sd),
+        };
+        // routing weights: the unbiased score of each pick (a one-hot sum
+        // over the experts: a gather of the `[T, ne]` scores would be a
+        // gather of a sequence-bearing tensor), renormalized, scaled
+        let ei3 = b.g.iota(&[T, fx(ka), fx(ne)], 2);
+        let wpick =
+            b.g.comp(
+                &[T, fx(ka)],
+                &[fx(ne)],
+                vec![
+                    ids(3, 1),
+                    arg(sc, vec![unit(3, 0), unit(3, 2)]),
+                    arg(ei3, ident(3)),
+                ],
+                Some(Monoid::sum()),
+                |v| vec![pick(v[0], v[2], v[1])],
+            )
             .unwrap();
         let (norm, rs) = (dm.norm_topk_prob && ka > 1, dm.route_scale);
         let wsum =
             b.g.comp(
                 &[T],
-                &[fx(ne)],
-                vec![arg(wsel, ident(2))],
+                &[fx(ka)],
+                vec![arg(wpick, ident(2))],
                 Some(Monoid::sum()),
                 |v| vec![v[0]],
             )
             .unwrap();
         let wt =
             b.g.comp(
-                &[T, fx(ne)],
+                &[T, fx(ka)],
                 &[],
-                vec![arg(wsel, ident(2)), arg(wsum, vec![unit(2, 0)])],
+                vec![arg(wpick, ident(2)), arg(wsum, vec![unit(2, 0)])],
                 None,
                 |v| {
                     vec![
@@ -1009,23 +1047,28 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
             };
             g * sigmoid(g) * u
         };
+        // each picked expert's gate/up rows, gathered by its row: space (t, slot, f, n)
         let up = |b: &mut B, w: TensorId| {
             b.g.comp(
-                &[T, fx(ne), fx(inter)],
+                &[T, fx(ka), fx(inter)],
                 &[fx(d)],
                 vec![
+                    row_ix(4, 1),
                     arg(xn, vec![unit(4, 0), unit(4, 3)]),
-                    arg(w, vec![unit(4, 1), unit(4, 2), unit(4, 3)]),
+                    Arg {
+                        src: w,
+                        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+                    },
                 ],
                 Some(Monoid::sum()),
-                |v| vec![v[0] * v[1]],
+                |v| vec![v[1] * v[2]],
             )
             .unwrap()
         };
         let (eg, eu) = (up(&mut b, w1), up(&mut b, w3));
         let eh =
             b.g.comp(
-                &[T, fx(ne), fx(inter)],
+                &[T, fx(ka), fx(inter)],
                 &[],
                 vec![
                     arg(eg, ident(3)),
@@ -1036,16 +1079,30 @@ pub fn prefill_graph(dm: &DsDims) -> PrefillGraph {
                 |v| vec![v[2] * swiglu(v[0], v[1])],
             )
             .unwrap();
+        // each pick's down projection: space (t, slot, n, f)
+        let dn =
+            b.g.comp(
+                &[T, fx(ka), fx(d)],
+                &[fx(inter)],
+                vec![
+                    row_ix(4, 1),
+                    arg(eh, vec![unit(4, 0), unit(4, 1), unit(4, 3)]),
+                    Arg {
+                        src: w2,
+                        view: View::pick(4, &[None, Some(2), Some(3)]).gather(0, 0, 1),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[1] * v[2]],
+            )
+            .unwrap();
         let routed =
             b.g.comp(
                 &[T, fx(d)],
-                &[fx(ne), fx(inter)],
-                vec![
-                    arg(eh, vec![unit(4, 0), unit(4, 2), unit(4, 3)]),
-                    arg(w2, vec![unit(4, 2), unit(4, 1), unit(4, 3)]),
-                ],
+                &[fx(ka)],
+                vec![arg(dn, vec![unit(3, 0), unit(3, 2), unit(3, 1)])],
                 Some(Monoid::sum()),
-                |v| vec![v[0] * v[1]],
+                |v| vec![v[0]],
             )
             .unwrap();
         let sg = b.linear(xn, s1);
@@ -1087,12 +1144,12 @@ pub fn derived_step(pg: &PrefillGraph, dm: &DsDims, k: usize) -> Result<StepGrap
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use tang_compile::tensor::step::{seed_cache, StepInput};
 
-    type Weights = HashMap<String, Vec<f64>>;
+    pub(crate) type Weights = HashMap<String, Vec<f64>>;
 
     fn weights(pg: &PrefillGraph, dm: &DsDims) -> Weights {
         let rd = dm.rope_head_dim;
@@ -1159,7 +1216,7 @@ mod tests {
             .collect()
     }
 
-    fn rel(a: &[f64], b: &[f64]) -> f64 {
+    pub(crate) fn rel(a: &[f64], b: &[f64]) -> f64 {
         assert_eq!(a.len(), b.len());
         let scale = b.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-300);
         a.iter()
@@ -1179,16 +1236,21 @@ mod tests {
 
     /// Knobs for negative controls.
     #[derive(Clone, Copy, Default)]
-    struct Bugs {
+    pub(crate) struct Bugs {
         window_plus_one: bool,
         drop_sink: bool,
         no_compressed: bool,
     }
 
-    struct Ref<'a> {
-        dm: &'a DsDims,
-        w: &'a Weights,
-        bugs: Bugs,
+    /// Routed expert `e` of layer `l` as `(w1, w3, w2)`, when the weights
+    /// don't hold the fused expert tensors (real size: loaded per pick).
+    pub(crate) type LoadExpert<'a> = &'a dyn Fn(usize, usize) -> (Vec<f64>, Vec<f64>, Vec<f64>);
+
+    pub(crate) struct Ref<'a> {
+        pub(crate) dm: &'a DsDims,
+        pub(crate) w: &'a Weights,
+        pub(crate) bugs: Bugs,
+        pub(crate) load: Option<LoadExpert<'a>>,
     }
 
     fn mm(x: &[f64], t: usize, w: &[f64], n: usize, k: usize) -> Vec<f64> {
@@ -1595,11 +1657,15 @@ mod tests {
                 .map(|s| (if s > 20.0 { s } else { s.exp().ln_1p() }).sqrt())
                 .collect();
             let bias = self.w(&format!("{p}.ffn.gate.bias"));
-            let (w1, w3, w2) = (
-                self.w(&format!("{p}.ffn.experts.w1")),
-                self.w(&format!("{p}.ffn.experts.w3")),
-                self.w(&format!("{p}.ffn.experts.w2")),
-            );
+            let fused = |k: &str| -> &[f64] {
+                if self.load.is_some() {
+                    &[]
+                } else {
+                    self.w(&format!("{p}.ffn.experts.{k}"))
+                }
+            };
+            let (w1, w3, w2) = (fused("w1"), fused("w3"), fused("w2"));
+            let slot = self.w.get(&format!("{p}.ffn.expert_slot"));
             let mut y = vec![0.0; t * d];
             for ti in 0..t {
                 let row = &sc[ti * ne..(ti + 1) * ne];
@@ -1612,15 +1678,22 @@ mod tests {
                 }
                 let xr = &x[ti * d..(ti + 1) * d];
                 for (e, wv) in sel.into_iter().zip(wv) {
-                    let (a, b) = (e * inter * d, (e + 1) * inter * d);
-                    let o = self.expert(
-                        xr,
-                        1,
-                        &w1[a..b],
-                        &w3[a..b],
-                        &w2[e * d * inter..(e + 1) * d * inter],
-                        Some(&[wv * dm.route_scale]),
-                    );
+                    let ws = [wv * dm.route_scale];
+                    let o = if let Some(load) = self.load {
+                        let (a, b, c) = load(l, e);
+                        self.expert(xr, 1, &a, &b, &c, Some(&ws))
+                    } else {
+                        let e = slot.map_or(e, |m| m[e] as usize);
+                        let (a, b) = (e * inter * d, (e + 1) * inter * d);
+                        self.expert(
+                            xr,
+                            1,
+                            &w1[a..b],
+                            &w3[a..b],
+                            &w2[e * d * inter..(e + 1) * d * inter],
+                            Some(&ws),
+                        )
+                    };
                     for i in 0..d {
                         y[ti * d + i] += o[i];
                     }
@@ -1637,7 +1710,7 @@ mod tests {
             y.iter().zip(&sh).map(|(a, b)| a + b).collect()
         }
 
-        fn forward(&self, toks: &[f64]) -> Vec<f64> {
+        pub(crate) fn forward(&self, toks: &[f64]) -> Vec<f64> {
             let dm = self.dm;
             let (hc, d, t) = (dm.hc, dm.dim, toks.len());
             let e = self.w("embed.weight");
@@ -1690,6 +1763,7 @@ mod tests {
                 dm: &dm,
                 w: &w,
                 bugs: Bugs::default(),
+                load: None,
             }
             .forward(&all[..t]);
             let e = rel(&got[0], &want);
@@ -1736,6 +1810,7 @@ mod tests {
                 dm: &dm,
                 w: &w,
                 bugs,
+                load: None,
             }
             .forward(&all);
             let e = rel(&got[0], &want);
