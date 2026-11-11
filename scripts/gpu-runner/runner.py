@@ -95,25 +95,72 @@ def log_line(log, msg):
         f.write(msg + "\n")
 
 
+def copy_ranges(src, dst, parts=16, chunk=64 << 20):
+    """Copy one file in `parts` parallel byte ranges (the object-backed volume serves
+    ~45 MB/s a stream; ranges in parallel go several times faster)."""
+    import concurrent.futures
+    n = os.path.getsize(src)
+    with open(dst, "wb") as f:
+        f.truncate(n)
+    step = -(-n // parts) if n else 0
+
+    def one(i):
+        lo, hi = i * step, min(n, (i + 1) * step)
+        with open(src, "rb", buffering=0) as a, open(dst, "r+b", buffering=0) as b:
+            a.seek(lo)
+            b.seek(lo)
+            while lo < hi:
+                buf = a.read(min(chunk, hi - lo))
+                if not buf:
+                    raise IOError(f"short read in {src} at {lo}")
+                b.write(buf)
+                lo += len(buf)
+
+    with concurrent.futures.ThreadPoolExecutor(parts) as ex:
+        list(ex.map(one, range(parts)))
+
+
 def model_dir(name, log):
+    """The model's local copy (~/runner/models/<name>): copied from the volume once, in
+    parallel byte ranges, marked .runner-complete and reused by every later job. Read from
+    the volume in place only when the local disk can't hold it (or the copy fails)."""
     if not name:
         return None
     vol = VOLUME.get(name, name)
     if name in NO_COPY or not os.path.isdir(vol):
         return vol
     local = os.path.join(MODELS, name)
-    if os.path.exists(os.path.join(local, ".runner-complete")):
-        return local  # a finished local copy: container disk, faster than the volume
-    # a complete volume copy (its .complete marker) is used in place: copying a 50 GB GGUF
-    # first held a job up for 1h43m
-    if os.path.exists(os.path.join(vol, ".complete")):
-        log_line(log, f"[runner] model {name}: {vol} (volume, no copy)")
-        return vol
-    # otherwise copy once (rsync is a no-op when it's already there); write then mark
+    done = os.path.join(local, ".runner-complete")
+    if os.path.exists(done):
+        return local
+    files = [(r, f) for r, _, fs in os.walk(vol) for f in fs]
+    need = sum(os.path.getsize(os.path.join(r, f)) for r, f in files)
     os.makedirs(local, exist_ok=True)
-    rc, _ = sh(f"rsync -a {vol}/ {local}/ && touch {local}/.runner-complete", log)
-    if rc:
+    have = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local) for f in fs)
+    free = shutil.disk_usage(local).free
+    headroom = float(os.environ.get("RUNNER_DISK_HEADROOM_GB", "20")) * 1e9
+    if need - have + headroom > free:
+        log_line(log, f"[runner] model {name}: {need / 1e9:.1f} GB won't fit "
+                      f"({free / 1e9:.1f} GB free); reading {vol} in place")
         return vol
+    t = time.time()
+    try:
+        for r, f in files:
+            src = os.path.join(r, f)
+            dst = os.path.join(local, os.path.relpath(src, vol))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src) \
+                    and f != ".complete":
+                continue  # a file a previous (interrupted) copy finished
+            copy_ranges(src, dst + ".part")
+            os.replace(dst + ".part", dst)
+    except Exception as e:
+        log_line(log, f"[runner] model {name}: copy failed ({e!r}); reading {vol} in place")
+        return vol
+    open(done, "w").write(now() + "\n")
+    dt = time.time() - t
+    log_line(log, f"[runner] model {name}: copied {need / 1e9:.1f} GB to {local} in {dt:.0f} s "
+                  f"({need / 1e6 / max(dt, 1e-3):.0f} MB/s)")
     return local
 
 
