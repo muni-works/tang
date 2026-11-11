@@ -745,7 +745,7 @@ impl RealRun {
         use tang_compile::tensor::step::StepInput;
         let mut experts: HashMap<String, Vec<u8>> = HashMap::new();
         for (l, u) in used.iter().enumerate() {
-            if ns.storage.iter().any(|s| *s == Some(Format::Mxfp4)) {
+            if ns.storage.contains(&Some(Format::Mxfp4)) {
                 experts.extend(self.native_expert_tables(l, u, rows)?);
             }
         }
