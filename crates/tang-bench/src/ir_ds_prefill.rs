@@ -2522,6 +2522,50 @@ pub(crate) mod tests {
         (w, all)
     }
 
+    /// One derived step of `k` rows after a prefill of `p0` on the
+    /// interpreter: the step graph, its inputs, the ids it is read at
+    /// (outputs then updated caches), the interpreter's values there, and
+    /// the step inputs that are Engram tables (the host-resident ones).
+    pub(crate) fn step_case(
+        dm: &DsDims,
+        p0: usize,
+        k: usize,
+    ) -> (StepGraph, Vec<Vec<f64>>, Vec<TensorId>, Vec<Vec<f64>>, Vec<usize>) {
+        let pg = prefill_graph(dm);
+        let (w, all) = setup(dm, &pg, p0 + k);
+        let st = derived_step(&pg, dm, k).unwrap();
+        let fg = pg.g.bind(&[(SEQ, p0)]).unwrap();
+        let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
+        let vals = fg.eval(&inputs(&pg, &w, &all[..p0]), &nodes);
+        let caches: Vec<Vec<f64>> = nodes
+            .iter()
+            .zip(vals)
+            .zip(&st.caches)
+            .map(|((&n, v), c)| seed_cache(c, &shape_at(&pg, n, p0), &v, p0, dm.ctx))
+            .collect();
+        let ins: Vec<Vec<f64>> = st
+            .inputs
+            .iter()
+            .map(|&si| match si {
+                StepInput::Pos => vec![p0 as f64],
+                StepInput::New(i) => new_rows(&pg, &w, &all, i, p0, k),
+                StepInput::Same(i) => w[&pg.inputs[i].name].clone(),
+                StepInput::Cache(c) => caches[c].clone(),
+            })
+            .collect();
+        let engram: Vec<usize> = st
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, si)| matches!(si, StepInput::Same(i) if pg.inputs[*i].name.ends_with("engram.embed.weight")))
+            .map(|(j, _)| j)
+            .collect();
+        let mut ids = st.outputs.clone();
+        ids.extend(st.caches.iter().map(|c| c.updated));
+        let want = st.graph.eval(&ins, &ids);
+        (st, ins, ids, want, engram)
+    }
+
     /// Chains of derived steps from a prefill of `start` against prefills
     /// of the grown sequence.
     fn check_derived(dm: &DsDims, start: usize, chains: &[&[usize]]) {

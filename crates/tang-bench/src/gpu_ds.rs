@@ -118,3 +118,58 @@ fn engram_host_mapped_gather() {
     assert_eq!(dev.read(&rt, out), want, "device gather");
     eprintln!("engram {gb} GB in device memory: {:.3} ms/step", dev.time(&rt, 50));
 }
+
+/// The derived DS step (tiny_full: Engram layers 1 and 4, ratio-1 KV,
+/// candidate blocks; and a top-512 variant at 600 positions, where the
+/// indexer runs the block select) as one CUDA decode program with the
+/// Engram tables host-mapped, against the interpreter's step; ms per step
+/// host-mapped vs device-resident.
+#[test]
+#[ignore]
+fn ds_step_engram_host_mapped() {
+    use crate::ir_ds_prefill::tests::step_case;
+    use crate::ir_ds_prefill::DsDims;
+    let rt = Runtime::cuda().expect("cuda");
+    // ratio-1 layers 3..5 hold 600 compressed rows: the indexer drops some
+    let topk = DsDims {
+        index_topk: 512,
+        ctx: 608,
+        ..DsDims::tiny_full()
+    };
+    for (name, dm, p0) in [("tiny_full", DsDims::tiny_full(), 5usize), ("top-512", topk, 600)] {
+        let (st, ins, ids, want, engram) = step_case(&dm, p0, 1);
+        assert!(!engram.is_empty(), "{name}: no Engram input");
+        let words: Vec<Vec<f32>> = ins
+            .iter()
+            .map(|v| v.iter().map(|&x| if x.is_nan() { 0.0 } else { x as f32 }).collect())
+            .collect();
+        let refs: Vec<&[f32]> = words.iter().map(|v| v.as_slice()).collect();
+        let lower = || {
+            let dp = st.graph.to_cuda_decode(&ids, &DecodeOpts::default());
+            let src: String = dp.program.kernels.iter().map(|k| k.source.as_str()).collect();
+            (dp, src.contains("block select"))
+        };
+        let (dp, select) = lower();
+        let host = Program::with_host(&rt, dp.program, &refs, &engram);
+        host.run(&rt);
+        let mut worst = 0.0f64;
+        for (t, w) in ids.iter().zip(&want) {
+            let g = host.read(&rt, *t);
+            let (a, b): (Vec<f64>, Vec<f64>) =
+                g.iter().zip(w).filter(|(_, w)| !w.is_nan()).map(|(a, b)| (*a as f64, *b)).unzip();
+            worst = worst.max(crate::ir_ds_prefill::tests::rel(&a, &b));
+        }
+        let mh = host.time(&rt, 20);
+        let hb = host.host_bytes();
+        drop(host);
+        let dev = Program::new(&rt, lower().0.program, &refs);
+        let md = dev.time(&rt, 20);
+        eprintln!(
+            "ds step {name} (pos {p0}): rel err {worst:.2e} vs interpreter, {} Engram inputs host-mapped ({hb} B), \
+             block select {select}; {mh:.3} ms/step host-mapped, {md:.3} ms device-resident",
+            engram.len()
+        );
+        assert!(worst < 1e-4, "{name}: {worst:e}");
+        assert_eq!(select, dm.index_topk >= 32, "{name}: block select");
+    }
+}

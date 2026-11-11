@@ -495,4 +495,29 @@ mod tests {
             eprintln!("top-{k} over {n} x {rows} rows: kernel = interpreter");
         }
     }
+
+    /// The derived DS step (tiny_full: Engram, ratio-1 KV, candidate
+    /// blocks) as its CUDA decode program on the CPU, against the
+    /// interpreter.
+    #[test]
+    fn ds_step_kernels_run_on_the_cpu() {
+        use crate::ir_ds_prefill::tests::{rel, step_case};
+        let (st, ins, ids, want, engram) = step_case(&crate::ir_ds_prefill::DsDims::tiny_full(), 5, 1);
+        assert!(!engram.is_empty());
+        let dp = st.graph.to_cuda_decode(&ids, &DecodeOpts::default());
+        let words: Vec<Vec<f32>> = ins
+            .iter()
+            .map(|v| v.iter().map(|&x| if x.is_nan() { 0.0 } else { x as f32 }).collect())
+            .collect();
+        let got = super::run(&dp, &words, &ids);
+        let mut worst = 0.0f64;
+        for (g, w) in got.iter().zip(&want) {
+            let (a, b): (Vec<f64>, Vec<f64>) =
+                g.iter().zip(w).filter(|(_, w)| !w.is_nan()).map(|(a, b)| (*a as f64, *b)).unzip();
+            worst = worst.max(rel(&a, &b));
+        }
+        eprintln!("ds tiny_full step: {} CUDA kernels on the CPU vs interpreter: rel err {worst:.2e}", dp.program.kernels.len());
+        assert!(worst < 1e-4, "{worst}");
+    }
+
 }
