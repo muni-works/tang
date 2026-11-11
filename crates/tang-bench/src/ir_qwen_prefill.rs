@@ -572,7 +572,10 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
         .iter()
         .filter_map(|t| step.rows.get(t).copied())
         .collect();
-    if seq > 1 {
+    // (a short window, `seq ≤ window_gemv_max()`, is lowered like decode:
+    // the dequantization stays inlined into the GEMV that loads the packed
+    // words, each word read once for all the window's rows)
+    if seq > super::window_gemv_max() {
         // a window reads every weight `seq` times: its dequantization is
         // materialized (stored f16 by `compiled_decode`), as `step_graph`
         // writes it for seq > 1, and `merge_reduce_dims_scaled` reads it
@@ -1032,6 +1035,18 @@ mod tests {
             if k == 1 {
                 // decode: every kernel has the native decode lowering
                 assert_eq!(native, p.native.len(), "transpiled decode kernels");
+            } else if k <= super::super::window_gemv_max() {
+                // a short window is lowered like decode: no tiles, and no
+                // kernel writes a dequantized weight (the GEMVs read the
+                // packed words, the window's rows in registers)
+                assert_eq!(mma, 0, "mma tiles in a short window");
+                assert!(
+                    !p.program
+                        .kernels
+                        .iter()
+                        .any(|kn| kn.source.contains("map over packed")),
+                    "a short window materializes a dequantized weight"
+                );
             } else {
                 // a window: every projection a tensor-core tile, as the hand
                 // prefill's, plus the LM head (logits of all k rows, which a
@@ -1123,7 +1138,12 @@ mod tests {
         // those run for the last row only here (the hand step computes all
         // k rows and keeps the last); no LM-head tile either
         let ht = tiles(&hp, &hg);
-        assert_eq!(tiles(&p, &g), ht[..ht.len() - 3]);
+        if k <= super::super::window_gemv_max() {
+            // (lowered like decode: no tiles)
+            assert!(tiles(&p, &g).is_empty());
+        } else {
+            assert_eq!(tiles(&p, &g), ht[..ht.len() - 3]);
+        }
     }
 
     /// Derived kernels whose (canonical) source is one of the hand

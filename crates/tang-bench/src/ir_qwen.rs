@@ -143,7 +143,26 @@ pub struct DecodeGraph {
     pub q4: bool,
 }
 
+/// Longest derived window lowered like decode ([`DecodeGraph::gemv_window`]):
+/// `TANG_WINDOW_GEMV` (default 8, the register tile's limit; 0 disables).
+pub fn window_gemv_max() -> usize {
+    std::env::var("TANG_WINDOW_GEMV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 impl DecodeGraph {
+    /// A short derived window (`1 < seq ≤ window_gemv_max()`, a draft
+    /// verify): lowered like decode, the 4-bit weights dequantized where
+    /// the GEMV loads them and the window's rows a register tile (each
+    /// packed word read once for every row). Not as a prefill: that
+    /// writes every weight's f16 copy per run (Qwen3-8B: ~8 GB a window
+    /// of 4, 5.5× a step) for tensor-core tiles a few rows can't use.
+    pub fn gemv_window(&self) -> bool {
+        self.seq > 1 && self.seq <= window_gemv_max() && self.inputs.iter().any(|s| s.name == "pos")
+    }
+
     /// Index of the graph input called `name`.
     pub fn input(&self, name: &str) -> usize {
         self.inputs
@@ -1162,7 +1181,8 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     };
     // gate|up as one tuple-valued matmul: CUDA's tiles take it; Metal's
     // simdgroup tile takes one output, so a prefill there keeps them apart
-    let (g, outs) = if dg.seq > 1 && !half_tiles {
+    let gemv = dg.gemv_window();
+    let (g, outs) = if dg.seq > 1 && !half_tiles && !gemv {
         (g, outs)
     } else {
         g.merge_siblings(&outs)
@@ -1170,7 +1190,10 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     // (scaled: a derived window's projections read `x[t, 64·g + j]`; the
     // OpenCL 4-bit prefill evaluates the grouped weight where it loads it,
     // so its reduce dims stay apart)
-    let (mut g, mut outs) = if dg.seq > 1 && !dg.q4 {
+    let (mut g, mut outs) = if gemv {
+        // decode-shaped: the packed weight's [groups, 64] stay apart
+        (g, outs)
+    } else if dg.seq > 1 && !dg.q4 {
         g.merge_reduce_dims_scaled(&outs)
     } else if dg.seq > 1 {
         g.merge_reduce_dims(&outs)
@@ -1309,13 +1332,14 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
     let maps = match std::env::var("TANG_DECODE_MAPS").as_deref() {
         Ok("0") => false,
         Ok(_) => true,
-        Err(_) => !(half_tiles && dg.seq == 1),
+        Err(_) => !(half_tiles && (dg.seq == 1 || gemv)),
     };
     if maps {
         g.schedule_decode_maps(&outs, &u4, &caches);
     }
-    if dg.q4 {
-        // a prefill over packed weights: the dequantization maps are
+    if dg.q4 || gemv {
+        // a prefill over packed weights (or a short window): the
+        // dequantization maps are
         // evaluated where the matmul loads the packed words, and the
         // activations the matmuls read stay materialized (a norm would be
         // recomputed per register block and k step otherwise)
@@ -1512,7 +1536,7 @@ pub fn compiled_decode(dg: &DecodeGraph, half_tiles: bool) -> (TensorGraph, Vec<
             g.set_inline(TensorId::from_index(p), true);
         }
     }
-    if dg.seq > 1 && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
+    if dg.seq > 1 && !gemv && half_tiles && std::env::var_os("TANG_PREFILL_TF32").is_none() {
         // prefill: the dequantized weights stored f16, so the matmuls run
         // on f16 tensor cores (the f32 activations are converted while
         // staging)
@@ -1592,7 +1616,7 @@ pub fn decode_opts(dg: &DecodeGraph, outputs: &[TensorId]) -> DecodeOpts {
     DecodeOpts {
         packed,
         inplace,
-        mma: dg.seq > 1,
+        mma: dg.seq > 1 && !dg.gemv_window(),
         ..Default::default()
     }
 }

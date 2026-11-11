@@ -142,7 +142,7 @@ impl Step {
             // (10.0 -> 6.7 ms per Qwen3-8B step on the 3090 with the
             // materialized norms and split-K of `compiled_decode`;
             // BENCHMARKS.md)
-            if seq == 1 && rt.kind() == BackendKind::Cuda {
+            if (seq == 1 || dg.gemv_window()) && rt.kind() == BackendKind::Cuda {
                 if opts.rows == 0 {
                     opts.rows = 8;
                 }
