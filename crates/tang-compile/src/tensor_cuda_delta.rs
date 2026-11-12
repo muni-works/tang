@@ -435,6 +435,7 @@ impl TensorGraph {
                 },
             )
         };
+        let solve_on = u8::from(env_usize("TANG_DELTA_SKIP", 0) & 8 == 0);
         let delta = if d.delta {
             format!(
                 "{}{}{}",
@@ -483,7 +484,7 @@ impl TensorGraph {
         }}
         __syncthreads();
         // (I + A)U = R: a thread per column, U's column in registers
-        if (tid < {bp}) {{
+        if (tid < {bp} && {solve_on}) {{
             float u[{cc}];
             #pragma unroll
             for (int t = 0; t < {cc}; ++t) {{
