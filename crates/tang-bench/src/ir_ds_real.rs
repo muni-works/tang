@@ -681,45 +681,20 @@ pub fn lower_native_step(
     format_of: &dyn Fn(&str) -> Option<Format>,
 ) -> NativeStep {
     use tang_compile::tensor::step::StepInput;
-    use tang_compile::tensor::{Op, Precision, TensorGraph, TensorId};
-    let input_node = |g: &TensorGraph, k: usize| {
-        (0..g.nodes().len())
-            .find(|&i| matches!(g.nodes()[i].op, Op::Input(j) if j == k))
-            .map(TensorId::from_index)
-            .unwrap()
-    };
     let name_of = |k: usize| match st.inputs[k] {
         StepInput::Same(i) => Some(pg.inputs[i].name.as_str()),
         _ => None,
     };
-    let mut graph = st.graph.clone();
-    for k in 0..st.inputs.len() {
-        if let Some(f) = name_of(k).and_then(format_of) {
-            graph.set_precision(input_node(&graph, k), Precision::storage(f));
-        }
-    }
     let mut outs = st.outputs.clone();
     outs.extend(st.caches.iter().map(|c| c.updated));
-    let (graph, outs, sched) = graph.schedule_block_weights(&outs);
-    let n = outs.len();
-    let mut keep = outs.clone();
-    keep.extend(&sched.copies);
-    let (graph, keep) = graph.substitute_maps(&keep);
-    let (graph, keep) = graph.eliminate_common(&keep);
-    let outs = keep[..n].to_vec();
-    let storage: Vec<Option<Format>> = (0..st.inputs.len())
-        .map(|k| {
-            let s = graph.nodes()[input_node(&graph, k).index()]
-                .precision
-                .storage;
-            s.is_block().then_some(s)
-        })
+    let fmt: Vec<Option<Format>> = (0..st.inputs.len())
+        .map(|k| name_of(k).and_then(format_of))
         .collect();
+    let (graph, outs, program, sched, storage) = lower_native_graph(&st.graph, &outs, &fmt);
     let demoted = (0..st.inputs.len())
-        .filter(|&k| storage[k].is_none() && name_of(k).and_then(format_of).is_some())
+        .filter(|&k| storage[k].is_none() && fmt[k].is_some())
         .map(|k| name_of(k).unwrap().to_string())
         .collect();
-    let program = graph.to_cuda_decode(&outs, &Default::default());
     NativeStep {
         graph,
         outs,
@@ -728,6 +703,53 @@ pub fn lower_native_step(
         storage,
         demoted,
     }
+}
+
+/// [`lower_native_step`] on any graph (a rank's segment): input `k` stored
+/// as `formats[k]` where the int8 GEMV can read it. Returns the scheduled
+/// graph, its outputs, the program, the schedule and per input the format
+/// its buffer holds (`None`: f32 values).
+#[allow(clippy::type_complexity)]
+pub fn lower_native_graph(
+    g: &tang_compile::tensor::TensorGraph,
+    outs: &[tang_compile::tensor::TensorId],
+    formats: &[Option<Format>],
+) -> (
+    tang_compile::tensor::TensorGraph,
+    Vec<tang_compile::tensor::TensorId>,
+    tang_compile::tensor::cuda_gemv::DecodeProgram,
+    tang_compile::tensor::int8_sched::BlockSchedule,
+    Vec<Option<Format>>,
+) {
+    use tang_compile::tensor::{Op, Precision, TensorGraph, TensorId};
+    let input_node = |g: &TensorGraph, k: usize| {
+        (0..g.nodes().len())
+            .find(|&i| matches!(g.nodes()[i].op, Op::Input(j) if j == k))
+            .map(TensorId::from_index)
+    };
+    let mut graph = g.clone();
+    for (k, f) in formats.iter().enumerate() {
+        if let (Some(f), Some(n)) = (f, input_node(&graph, k)) {
+            graph.set_precision(n, Precision::storage(*f));
+        }
+    }
+    let (graph, outs, sched) = graph.schedule_block_weights(outs);
+    let n = outs.len();
+    let mut keep = outs.clone();
+    keep.extend(&sched.copies);
+    let (graph, keep) = graph.substitute_maps(&keep);
+    let (graph, keep) = graph.eliminate_common(&keep);
+    let outs = keep[..n].to_vec();
+    let storage: Vec<Option<Format>> = (0..formats.len())
+        .map(|k| {
+            input_node(&graph, k).and_then(|i| {
+                let s = graph.nodes()[i.index()].precision.storage;
+                s.is_block().then_some(s)
+            })
+        })
+        .collect();
+    let program = graph.to_cuda_decode(&outs, &Default::default());
+    (graph, outs, program, sched, storage)
 }
 
 impl RealRun {

@@ -606,7 +606,7 @@ mod tests {
                 &RealOpts {
                     batch: Some(nb),
                     group,
-                    block: BlockOpts::default(),
+                    block: Some(BlockOpts::default()),
                 },
             );
             crate::cuda_cpu::run(&low.program, &vals, &low.outs[..1]).remove(0)

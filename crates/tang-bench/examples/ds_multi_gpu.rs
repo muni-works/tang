@@ -29,7 +29,18 @@ use tang_compile::tensor::shard::{
 use tang_compile::tensor::TensorId;
 use tang_gpu::program::{Program, Runtime};
 
-fn real_case() -> (Case, HashMap<TensorId, String>) {
+/// What a native per-rank load needs besides the case.
+struct RealCtx {
+    run: tang_bench::ir_ds_real::RealRun,
+    used: Vec<Vec<usize>>,
+    rows: usize,
+    dm: tang_bench::ir_ds_prefill::DsDims,
+    pg_inputs: Vec<tang_bench::ir_ds_prefill::PrefillInput>,
+    /// Per step input: the graph input name of a weight.
+    knames: Vec<Option<String>>,
+}
+
+fn real_case() -> (Case, HashMap<TensorId, String>, Option<RealCtx>) {
     use tang_bench::ir_ds_prefill::{derived_step, prefill_graph, DsDims, SEQ};
     use tang_bench::ir_ds_real::*;
     use tang_compile::tensor::step::{seed_cache, StepInput};
@@ -83,6 +94,14 @@ fn real_case() -> (Case, HashMap<TensorId, String>) {
         })
         .collect();
     let mut wnames = HashMap::new();
+    let knames: Vec<Option<String>> = st
+        .inputs
+        .iter()
+        .map(|x| match x {
+            StepInput::Same(i) => Some(names[*i].clone()),
+            _ => None,
+        })
+        .collect();
     let ins: Vec<Vec<f64>> = st
         .inputs
         .iter()
@@ -105,6 +124,7 @@ fn real_case() -> (Case, HashMap<TensorId, String>) {
     let want = st.graph.eval(&ins, &outs);
     let weights: HashSet<TensorId> = wnames.keys().copied().collect();
     let caches = tang_bench::ir_shard::cache_pairs(&st);
+    let pg_inputs = pg.inputs.clone();
     (
         Case {
             st,
@@ -115,6 +135,14 @@ fn real_case() -> (Case, HashMap<TensorId, String>) {
             caches,
         },
         wnames,
+        Some(RealCtx {
+            run,
+            used,
+            rows,
+            dm,
+            pg_inputs,
+            knames,
+        }),
     )
 }
 
@@ -130,9 +158,9 @@ fn main() {
         .unwrap_or(2);
     let eager = std::env::var("MGPU_PLAN").as_deref() == Ok("eager");
     let t0 = Instant::now();
-    let (c, names) = match model.as_str() {
-        "ds-tiny" => (case(&ds_model(ds_wide()), 1, 5), HashMap::new()),
-        "coder-tiny" => (case(&coder_model(coder_wide()), 1, 5), HashMap::new()),
+    let (c, names, ctx) = match model.as_str() {
+        "ds-tiny" => (case(&ds_model(ds_wide()), 1, 5), HashMap::new(), None),
+        "coder-tiny" => (case(&coder_model(coder_wide()), 1, 5), HashMap::new(), None),
         "ds-real" => real_case(),
         m => panic!("MGPU_MODEL {m}?"),
     };
@@ -146,7 +174,7 @@ fn main() {
     } else {
         CostModel::h200()
     };
-    let plan = plan_auto(
+    let plan = tang_bench::ir_shard::plan_auto_cached(
         &c.st.graph,
         &c.outs,
         &c.weights,
@@ -179,17 +207,79 @@ fn main() {
     #[cfg(not(feature = "nccl"))]
     assert!(!use_nccl, "MGPU_COMM=nccl needs --features nccl");
     let shapes = input_shapes(&c.st.graph);
+    // DS_NATIVE=1 (ds-real): each rank loads its boxes of the checkpoint
+    // (`ds_shard_load`) and every segment is lowered with its weights stored
+    // in the checkpoint's formats (fp8 / fp4, Q8x32 activations)
+    let native = std::env::var("DS_NATIVE").as_deref() == Ok("1");
+    assert!(
+        !native || ctx.is_some(),
+        "DS_NATIVE=1 needs MGPU_MODEL=ds-real"
+    );
+    let computed = |n: &str| {
+        let cx = ctx.as_ref()?;
+        let i = cx.pg_inputs.iter().find(|i| i.name == n)?;
+        cx.run
+            .dense_inputs(std::slice::from_ref(i), &cx.dm)
+            .ok()?
+            .remove(n)
+    };
+    let loader = ctx
+        .as_ref()
+        .filter(|_| native)
+        .map(|cx| tang_bench::ds_shard_load::Loader {
+            st: &cx.run.st,
+            layer_ids: Some(&cx.run.layer_ids),
+            vocab_ids: Some(&cx.run.vocab_ids),
+            experts: cx
+                .used
+                .iter()
+                .enumerate()
+                .map(|(l, u)| {
+                    let mut m: Vec<Option<usize>> = u.iter().copied().map(Some).collect();
+                    m.resize(cx.rows, None);
+                    (format!("layers.{l}"), m)
+                })
+                .collect(),
+            computed: &computed,
+        });
+    let bare: Vec<Vec<f64>> = match &ctx {
+        Some(cx) if native => c
+            .ins
+            .iter()
+            .zip(&cx.knames)
+            .map(|(v, n)| if n.is_some() { Vec::new() } else { v.clone() })
+            .collect(),
+        _ => Vec::new(),
+    };
     let results: Vec<(Vec<Vec<f64>>, f64, f64)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..world)
             .filter(|r| only.is_none_or(|o| o == *r))
             .map(|r| {
                 let (c, an, comm, shapes) = (&c, &an, comm.clone(), &shapes);
+                let (loader, bare, ctx) = (loader.as_ref(), &bare, ctx.as_ref());
                 sc.spawn(move || {
                     let ord = device.unwrap_or(if only.is_some() { 0 } else { r });
-                    let rt =
-                        Runtime::cuda_on(ord).unwrap_or_else(|| panic!("no CUDA device {ord}"));
+                    let rt = Runtime::cuda_on(ord).unwrap_or_else(|| panic!("no CUDA device {ord}"));
                     let p = rank_program(&c.st.graph, &c.outs, an, &c.weights, r, comm.clone());
-                    let ins = p.local_inputs(&c.ins, shapes);
+                    let t_load = Instant::now();
+                    let load = loader.map(|ld| {
+                        tang_bench::ds_shard_load::load_rank(ld, &p, shapes, &ctx.unwrap().knames, bare, None)
+                            .unwrap_or_else(|e| panic!("rank {r}: {e}"))
+                    });
+                    let ins = match &load {
+                        Some(l) => l.ins.clone(),
+                        None => p.local_inputs(&c.ins, shapes),
+                    };
+                    if let Some(l) = &load {
+                        eprintln!(
+                            "rank {r}: loaded {} native tensors ({:.1} MB), {:.1} M values, demoted {:?} in {:.1?}",
+                            l.native,
+                            l.native_bytes as f64 / 1e6,
+                            l.value_elems as f64 / 1e6,
+                            l.demoted,
+                            t_load.elapsed()
+                        );
+                    }
                     let sg = segments(&p);
                     // one Program per segment, its fed values written each step
                     let progs: Vec<Option<(Program, Vec<TensorId>)>> = sg
@@ -199,44 +289,54 @@ fn main() {
                             if seg.outputs.is_empty() {
                                 return None;
                             }
-                            let (g, outs) = seg.graph.substitute_maps(&seg.outputs);
-                            let (g, outs) = g.eliminate_common(&outs);
-                            let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
+                            let shards = load.as_ref().map(|l| &l.shards);
+                            let formats: Vec<Option<tang_compile::tensor::Format>> = seg
+                                .feeds
+                                .iter()
+                                .map(|f| match (f, shards) {
+                                    (Feed::Input(i), Some(sh)) => sh[*i].as_ref().map(|s| s.0),
+                                    _ => None,
+                                })
+                                .collect();
+                            let (g, outs, dp, storage) = if shards.is_some() {
+                                let (g, outs, dp, _, storage) =
+                                    tang_bench::ir_ds_real::lower_native_graph(&seg.graph, &seg.outputs, &formats);
+                                (g, outs, dp, storage)
+                            } else {
+                                let (g, outs) = seg.graph.substitute_maps(&seg.outputs);
+                                let (g, outs) = g.eliminate_common(&outs);
+                                let dp = lower(&rt, &g, &outs, &DecodeOpts::default());
+                                (g, outs, dp, vec![None; seg.feeds.len()])
+                            };
                             let init: Vec<Vec<f32>> = seg
                                 .feeds
                                 .iter()
                                 .enumerate()
-                                .map(|(k, f)| match f {
-                                    Feed::Input(i) => ins[*i].iter().map(|&x| x as f32).collect(),
-                                    Feed::Value(_) => vec![
-                                        0.0;
-                                        seg.graph
-                                            .shape(tang_bench::ir_model::input_node(&seg.graph, k))
-                                            .iter()
-                                            .map(|d| d.n())
-                                            .product()
-                                    ],
+                                .map(|(k, f)| match (f, storage[k]) {
+                                    (Feed::Input(i), Some(fm)) => {
+                                        let (lf, b) = shards.unwrap()[*i].as_ref().unwrap();
+                                        assert_eq!(*lf, fm, "segment input {k}: loaded {lf:?}, scheduled {fm:?}");
+                                        tang_bench::ir_ds_real::words_of(b)
+                                    }
+                                    (Feed::Input(i), None) => {
+                                        ins[*i].iter().map(|&x| if x.is_nan() { 0.0 } else { x as f32 }).collect()
+                                    }
+                                    (Feed::Value(_), _) => vec![0.0; seg.graph.shape(tang_bench::ir_model::input_node(&seg.graph, k)).iter().map(|d| d.n()).product()],
                                 })
                                 .collect();
                             let refs: Vec<&[f32]> = init.iter().map(|v| v.as_slice()).collect();
                             let prog = Program::new(&rt, dp.program, &refs);
                             for o in &outs {
                                 if !prog.has_buffer(*o) {
-                                    eprintln!(
-                                        "no buffer for {o:?}: {}",
-                                        tang_compile::tensor::shard::describe(&g, *o)
-                                    );
+                                    eprintln!("no buffer for {o:?}: {}", tang_compile::tensor::shard::describe(&g, *o));
                                 }
                             }
                             Some((prog, outs))
                         })
                         .collect();
                     let step = || -> Vec<Vec<f64>> {
-                        let mut vals: HashMap<usize, Vec<f64>> = sg
-                            .input_nodes
-                            .iter()
-                            .map(|&(i, k)| (i, ins[k].clone()))
-                            .collect();
+                        let mut vals: HashMap<usize, Vec<f64>> =
+                            sg.input_nodes.iter().map(|&(i, k)| (i, ins[k].clone())).collect();
                         for (si, seg) in sg.segments.iter().enumerate() {
                             for b in &sg.before[si] {
                                 let x = &vals[&b.src];
@@ -246,9 +346,7 @@ fn main() {
                                 };
                                 vals.insert(b.dst, y);
                             }
-                            let Some((prog, outs)) = &progs[si] else {
-                                continue;
-                            };
+                            let Some((prog, outs)) = &progs[si] else { continue };
                             for (k, f) in seg.feeds.iter().enumerate() {
                                 if let Feed::Value(n) = f {
                                     if !prog.has_input(k) {
@@ -260,14 +358,8 @@ fn main() {
                             }
                             prog.run(&rt);
                             for (d, o) in seg.defines.iter().zip(outs) {
-                                assert!(
-                                    prog.has_buffer(*o),
-                                    "segment {si} output {o:?} (node {d}) has no buffer"
-                                );
-                                vals.insert(
-                                    *d,
-                                    prog.read(&rt, *o).iter().map(|&x| x as f64).collect(),
-                                );
+                                assert!(prog.has_buffer(*o), "segment {si} output {o:?} (node {d}) has no buffer");
+                                vals.insert(*d, prog.read(&rt, *o).iter().map(|&x| x as f64).collect());
                             }
                         }
                         sg.outputs.iter().map(|o| vals[o].clone()).collect()
@@ -285,11 +377,7 @@ fn main() {
                             dstep();
                         }
                         let n = iters as f64;
-                        return (
-                            out,
-                            t.elapsed().as_secs_f64() * 1e3 / n,
-                            dev.comm_ms.get() / n,
-                        );
+                        return (out, t.elapsed().as_secs_f64() * 1e3 / n, dev.comm_ms.get() / n);
                     }
                     let out = step();
                     let t = Instant::now();
@@ -297,16 +385,27 @@ fn main() {
                     for _ in 0..iters {
                         step();
                     }
-                    (
-                        out,
-                        t.elapsed().as_secs_f64() * 1e3 / iters as f64,
-                        f64::NAN,
-                    )
+                    (out, t.elapsed().as_secs_f64() * 1e3 / iters as f64, f64::NAN)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    // native: unwritten cache rows (NaN in the reference) are left out,
+    // the device holds them as 0
+    let relx = |a: &[f64], b: &[f64]| -> f64 {
+        if !native {
+            return rel(a, b);
+        }
+        let (x, y): (Vec<f64>, Vec<f64>) = a
+            .iter()
+            .zip(b)
+            .filter(|(_, w)| !w.is_nan())
+            .map(|(p, q)| (*p, *q))
+            .unzip();
+        rel(&x, &y)
+    };
+    let mut logits = (f64::NAN, true);
     let worst = match only {
         // this rank alone: replicated outputs whole, split ones against its slice
         Some(r) => c
@@ -314,7 +413,7 @@ fn main() {
             .iter()
             .enumerate()
             .map(|(o, t)| match an.out_local[o] {
-                None => rel(&results[0].0[o], &c.want[o]),
+                None => relx(&results[0].0[o], &c.want[o]),
                 Some(d) => {
                     let full: Vec<usize> = c.st.graph.shape(*t).iter().map(|x| x.n()).collect();
                     let outer: usize = full[..d].iter().product();
@@ -324,27 +423,47 @@ fn main() {
                             c.want[o][(i * world + r) * row..(i * world + r + 1) * row].to_vec()
                         })
                         .collect();
-                    rel(&results[0].0[o], &mine)
+                    relx(&results[0].0[o], &mine)
                 }
             })
             .fold(0.0, f64::max),
         None => {
             let ranks: Vec<Vec<Vec<f64>>> = results.iter().map(|r| r.0.clone()).collect();
             let got = assemble(&c.st.graph, &c.outs, &an, &ranks);
+            let argmax = |r: &[f64]| (0..r.len()).max_by(|&a, &b| r[a].total_cmp(&r[b])).unwrap();
+            logits = (
+                relx(&got[0], &c.want[0]),
+                argmax(&got[0]) == argmax(&c.want[0]),
+            );
             got.iter()
                 .zip(&c.want)
-                .map(|(a, b)| rel(a, b))
+                .map(|(a, b)| relx(a, b))
                 .fold(0.0, f64::max)
         }
     };
-    let ok = worst < 1e-3;
+    // native: Q8x32 activations against the pure f64 step (ds_real_gpu's
+    // native gate is 2e-2 against the emulated rounding): logits within
+    // 3e-2 and the same top-1
+    let ok = if native {
+        logits.0 < 3e-2 && logits.1
+    } else {
+        worst < 1e-3
+    };
+    if native {
+        eprintln!(
+            "native: logits rel err {:.2e}, top-1 {}",
+            logits.0,
+            if logits.1 { "equal" } else { "DIFFERS" }
+        );
+    }
     println!(
         "{model} on {world} GPUs{}: vs unsharded interpreter rel err {worst:.2e}, {:.2} ms a step, {:.2} ms of it \
-         in collectives ({} collectives, f32 weights): {}",
+         in collectives ({} collectives, {} weights): {}",
         only.map_or(String::new(), |r| format!(" (rank {r} of this process)")),
         results[0].1,
         results[0].2,
         if use_nccl { "NCCL device" } else { "host" },
+        if native { "native fp8/fp4" } else { "f32" },
         if ok { "PASS" } else { "FAIL" }
     );
     if !ok {

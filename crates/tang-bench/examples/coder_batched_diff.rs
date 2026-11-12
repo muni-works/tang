@@ -52,16 +52,16 @@ fn main() {
     let plain = RealOpts {
         batch: Some(nb),
         group: 0,
-        block: BlockOpts::default(),
+        block: Some(BlockOpts::default()),
     };
     let test = RealOpts {
         batch: Some(nb),
         group: env("TANG_BATCH_GROUP", 0),
-        block: BlockOpts {
+        block: Some(BlockOpts {
             pos_tile: env("TANG_BATCH_PT", 1),
             mma_min: env("TANG_BATCH_MMA_MIN", 0),
             ksplit: env("TANG_BATCH_KSPLIT", 2) as u32,
-        },
+        }),
     };
     let pos: Vec<f32> = vec![0.0; nb];
     let toks: Vec<f32> = (0..nb).map(|b| (151 + 7 * b) as f32).collect();

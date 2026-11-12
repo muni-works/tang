@@ -75,7 +75,7 @@ fn main() {
     let ro = RealOpts {
         batch: Some(nb),
         group,
-        block: BlockOpts::batched(),
+        block: Some(BlockOpts::batched()),
     };
     let low = lower_real_step_with(&pg, &st, &tys, &ro);
     let native = low.program.native.iter().filter(|n| **n).count();

@@ -279,11 +279,16 @@ pub mod qwen_session;
 
 /// Batched decode: B streams through one derived step (CPU checks, int8 cases).
 pub mod batch_decode;
+/// Qwen3-Coder-Next served from its derived step (`TANG_CODER_ENGINE=derived`).
+#[cfg(feature = "coder-serve")]
+pub mod coder_serve;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
 /// without a GPU.
 pub mod cuda_cpu;
 /// The four tiny prefill graphs through one `derive_step` (tests).
 pub mod derive_all;
+/// Per-rank native weight loading for the sharded DeepSeek step.
+pub mod ds_shard_load;
 /// DS pieces on a CUDA device: the top-k block select, the Engram table
 /// in host-mapped memory.
 #[cfg(all(test, feature = "cuda"))]

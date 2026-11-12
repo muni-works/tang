@@ -140,6 +140,9 @@ pub fn batch_graph(
                         bands: Some(bands),
                         ..
                     } => ng.semiring_scan_banded(ins[0], ins[1], bands, dim, reverse, *ring)?,
+                    ScanKind::Delta(_) => {
+                        return err(format!("batch_graph: scan {i} is a fused delta step"))
+                    }
                 }
             }
             Op::Operator(_) => return err("batch_graph: operator nodes are not batched"),

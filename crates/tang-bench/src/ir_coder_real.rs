@@ -142,7 +142,9 @@ pub struct RealOpts {
     /// positions (`schedule_expert_groups`; 0: never).
     pub group: usize,
     /// Stages of the int8 contractions by their positions.
-    pub block: tang_compile::tensor::int8_sched::BlockOpts,
+    /// `None`: `schedule_block_weights` (the decode GEMV, the MMA tile for
+    /// many-row steps).
+    pub block: Option<tang_compile::tensor::int8_sched::BlockOpts>,
 }
 
 /// [`lower_real_step`] with [`RealOpts`].
@@ -187,7 +189,10 @@ pub fn lower_real_step_with(
     } else {
         (graph, outs)
     };
-    let (graph, outs, sched) = graph.schedule_block_weights_with(&outs, &ro.block);
+    let (graph, outs, sched) = match &ro.block {
+        Some(bo) => graph.schedule_block_weights_with(&outs, bo),
+        None => graph.schedule_block_weights(&outs),
+    };
     let n = outs.len();
     let mut keep = outs.clone();
     keep.extend(&sched.copies);
@@ -266,7 +271,7 @@ pub fn lower_real_step_with(
 
 /// The residual adds of shape `[k, d_model]` (`a + b` of two plain reads)
 /// read by more than one comp: the residual stream of the step.
-pub(crate) fn residual_stream(
+pub fn residual_stream(
     g: &tang_compile::tensor::TensorGraph,
     pg: &CoderPrefill,
 ) -> Vec<tang_compile::tensor::TensorId> {

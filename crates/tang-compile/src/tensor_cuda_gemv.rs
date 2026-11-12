@@ -51,7 +51,9 @@ use tang_expr::{ExprGraph, ExprId, Node};
 use super::msl_mma::Addr;
 use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
-use super::{fixed, numel, Arg, Form, IntMma, Monoid, Op, Stage, TensorGraph, TensorId};
+use super::{
+    fixed, numel, Arg, Form, IntMma, Monoid, Op, Scan, ScanKind, Stage, TensorGraph, TensorId,
+};
 
 /// How a graph input is stored on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +279,55 @@ impl TensorGraph {
         target: DecodeTarget,
         tiles: &[usize],
     ) -> DecodeProgram {
+        // a k-row delta step's scan, readout and last state as fused
+        // kernels (no per-step states; see `tensor_cuda_delta.rs`)
+        if target == DecodeTarget::Cuda {
+            if let Some(g) = self.fuse_delta_steps(outputs) {
+                return g.to_decode_with(outputs, opts, target, tiles);
+            }
+            // many-row contractions as tensor-core matmuls (attention's
+            // p·v in a k-row step; see `tensor_cuda_split.rs`)
+            // (not over packed inputs: the tile reads plain f32/f16 only)
+            let packed_in: Vec<usize> = opts
+                .packed
+                .iter()
+                .filter_map(|&(k, _)| {
+                    (0..self.nodes.len())
+                        .find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
+                })
+                .collect();
+            if std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
+                if let Some(g) = self.split_bilinear_avoiding(outputs, &packed_in) {
+                    // factors were appended after their readers: lower the
+                    // graph renumbered in dependency order, then give the
+                    // program this graph's ids back (new factors keep ids
+                    // past this graph's nodes)
+                    let (r, old) = g.renumber(outputs);
+                    let mut new_of = vec![usize::MAX; g.nodes.len()];
+                    for (n, &o) in old.iter().enumerate() {
+                        new_of[o] = n;
+                    }
+                    let nid = |t: TensorId| TensorId(new_of[t.n()] as u32);
+                    let oid = |t: TensorId| TensorId(old[t.n()] as u32);
+                    let routs: Vec<TensorId> = outputs.iter().map(|&t| nid(t)).collect();
+                    let mut ropts = opts.clone();
+                    ropts.inplace = opts.inplace.iter().map(|&(t, k)| (nid(t), k)).collect();
+                    let mut dp = r.to_decode_with(&routs, &ropts, target, tiles);
+                    for k in &mut dp.program.kernels {
+                        k.node = oid(k.node);
+                        k.reads.iter_mut().for_each(|t| *t = oid(*t));
+                    }
+                    for b in &mut dp.program.buffers {
+                        b.node = oid(b.node);
+                    }
+                    for (a, b) in &mut dp.program.aliases {
+                        *a = oid(*a);
+                        *b = oid(*b);
+                    }
+                    return dp;
+                }
+            }
+        }
         // Block formats (GGUF weights, Q8x32 activations) on CUDA: laid out
         // as f32, then the buffers get their formats back; the int8 GEMV
         // (`IntMma`) reads them and Q8x32 writers store them (see
@@ -329,6 +380,34 @@ impl TensorGraph {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             super::tune::set_kernel(ki, Some(self.kernel_sig(root, &reads)));
+            if let Op::Scan(Scan {
+                kind: ScanKind::Delta(_),
+                ..
+            }) = &self.nodes[root].op
+            {
+                let (src, threads, blocks) = self.cuda_delta_kernel(root, &reads);
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = (threads * blocks) as u32;
+                native.push(true);
+                continue;
+            }
+            if target == DecodeTarget::Cuda
+                && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0")
+                && self.nodes[root].int_mma.is_none()
+                && self.mma_candidate(root)
+                && !reads.iter().any(|&r| blocky(r) || packed.contains_key(&r))
+            {
+                if let Some(src) = self.cuda_mma_kernel(root, &reads) {
+                    let threads = super::cuda::src_define(&src, "TANG_THREADS");
+                    let tiles = super::cuda::src_define(&src, "TANG_TILES");
+                    k.source = src;
+                    k.workgroup_size = threads as u32;
+                    k.count = (threads * tiles) as u32;
+                    native.push(true);
+                    continue;
+                }
+            }
             if any_block {
                 if let Some(s) = self.nodes[root].int_mma {
                     // a batched schedule (tensor cores, tiled positions) this

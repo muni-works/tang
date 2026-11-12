@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use tang_bench::ir_coder_prefill::{derived_step, prefill_graph};
+use tang_bench::ir_coder_prefill::{derived_step, derived_step_rows, prefill_graph};
 use tang_bench::ir_coder_real::*;
 use tang_bench::qwen_session::{runtime, slot_plan};
 use tang_compile::tensor::step::StepInput;
@@ -41,6 +41,60 @@ fn words_of_bytes(b: &[u8]) -> Vec<f32> {
     w
 }
 
+macro_rules! profile {
+    ($prog:expr, $rt:expr, $kinfo:expr) => {{
+        let prog = &$prog;
+        let rt = &$rt;
+        let kinfo = &$kinfo;
+        // every kernel timed alone at the last position, then grouped
+        let mut t: Vec<(f64, usize)> = prog
+            .order()
+            .iter()
+            .map(|&i| (prog.time_kernel(rt, i, 5), i))
+            .collect();
+        let total: f64 = t.iter().map(|x| x.0).sum();
+        t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        println!("profile: {} kernels, sum {total:.3} ms", t.len());
+        for (ms, i) in t.iter().take(25) {
+            let (what, nat, head) = &kinfo[*i];
+            println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
+        }
+        // by shape: the same op in every layer, summed
+        let mut sh: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+        for (ms, i) in &t {
+            let e = sh.entry(kinfo[*i].0.as_str()).or_default();
+            e.0 += 1;
+            e.1 += ms;
+        }
+        let mut sh: Vec<_> = sh.into_iter().collect();
+        sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        for (k, (n, ms)) in sh.iter().take(30) {
+            println!(
+                "  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}",
+                1e3 * ms / *n as f64
+            );
+        }
+        // by kind: (native, int8, first line)
+        let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+        for (ms, i) in &t {
+            let (what, nat, head) = &kinfo[*i];
+            let key = format!(
+                "native={nat} int8={} gather={} {head}",
+                what.contains("int8 true"),
+                !what.contains("gathers 0")
+            );
+            let e = by.entry(key).or_default();
+            e.0 += 1;
+            e.1 += ms;
+        }
+        let mut by: Vec<_> = by.into_iter().collect();
+        by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        for (k, (n, ms)) in by.iter().take(12) {
+            println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
+        }
+    }};
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |k: &str| {
@@ -57,13 +111,21 @@ fn main() {
     let gen: usize = opt("-n").map_or(64, |v| v.parse().unwrap());
     let ctx: usize = opt("--ctx").map_or(4096, |v| v.parse().unwrap());
     let top: usize = opt("--top").map_or(5, |v| v.parse().unwrap());
+    // --chunk K: the derived step appends K tokens; the prompt runs in
+    // K-token chunks (chunked prefill), timed, and the run stops there
+    let chunk: usize = opt("--chunk").map_or(1, |v| v.parse().unwrap());
 
     let t0 = Instant::now();
     let g = Gguf::open(Path::new(&path)).unwrap();
     let dims = dims_from_gguf(&g).unwrap();
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
-    let st = derived_step(&pg, 1, ctx).unwrap();
+    // a prefill chunk needs only its last row's logits (all rows for --check)
+    let st = if chunk > 1 && opt("--check").is_none() {
+        derived_step_rows(&pg, chunk, ctx, tang_compile::tensor::step::Rows::Last).unwrap()
+    } else {
+        derived_step(&pg, chunk, ctx).unwrap()
+    };
     // the device first: its tuning cache (tune/<gpu>.tsv) steers the lowering
     let rt = runtime();
     let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
@@ -78,8 +140,18 @@ fn main() {
         low.f32_inputs,
         t0.elapsed().as_secs_f64()
     );
-    let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
+    // (dumped residual buffers stay live to the end, out of slot reuse)
+    let mut plan_outs = low.outs.clone();
+    if opt("--dump-resid").is_some() {
+        plan_outs.extend(residual_stream(&low.graph, &pg));
+    }
+    let plan = slot_plan(&low.program.program, &plan_outs, &low.inplace);
     let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
+    // --dump-resid FILE: every residual-stream buffer after the prompt
+    // (chunk mode) or after each prompt step (decode mode), f32 LE
+    let resid = residual_stream(&low.graph, &pg);
+    let dump = opt("--dump-resid");
+    let mut dumped: Vec<f32> = Vec::new();
     let RealStep {
         program,
         outs,
@@ -93,7 +165,11 @@ fn main() {
         .iter()
         .zip(&program.native)
         .map(|(k, &nat)| {
-            let nd = &graph.nodes()[k.node.index()];
+            let head = k.source.lines().next().unwrap_or("").to_string();
+            // nodes the lowering added (a split factor) have no entry here
+            let Some(nd) = graph.nodes().get(k.node.index()) else {
+                return ("(lowering node) gathers 0".to_string(), nat, head);
+            };
             let what = match graph.comp_at(k.node.index()) {
                 Some(c) => format!(
                     "{:?} red {:?} gathers {} int8 {}",
@@ -104,7 +180,7 @@ fn main() {
                 ),
                 None => format!("{:?} (not a comp) gathers 0", nd.shape),
             };
-            (what, nat, k.source.lines().next().unwrap_or("").to_string())
+            (what, nat, head)
         })
         .collect();
     let mut prog = Program::with_plan(&rt, program.program, &empty, &plan);
@@ -171,10 +247,75 @@ fn main() {
             .map(|i| (i, l[i] as f64 - m - z.ln()))
             .collect()
     };
+    if chunk > 1 {
+        let n = ids.len() / chunk * chunk;
+        let toks: Vec<f32> = ids[..n].iter().map(|&t| t as f32).collect();
+        // no warm-up chunk: a run updates caches in place, and the timed
+        // run must start from the empty session
+        let check_from: Option<usize> = opt("--check").map(|v| v.parse().unwrap());
+        let (mut agree, mut total) = (0usize, 0usize);
+        let t = Instant::now();
+        for c in 0..n / chunk {
+            prog.write(&rt, prog.input(pos_in), &[(c * chunk) as f32]);
+            prog.write(&rt, prog.input(tok_in), &toks[c * chunk..(c + 1) * chunk]);
+            prog.run(&rt);
+            for &(k, upd) in &swaps {
+                prog.copy(&rt, prog.input(k), &prog, upd);
+            }
+            // --check: each row's argmax against the next prompt token
+            // (teacher-forced; the prompt a greedy k = 1 continuation)
+            if check_from.is_some() {
+                let l = prog.read(&rt, outs[0]);
+                for r in 0..chunk {
+                    let p = c * chunk + r;
+                    if p + 1 < n && p + 1 >= check_from.unwrap() {
+                        let row = &l[r * vocab..(r + 1) * vocab];
+                        let am = (0..vocab).fold(0, |b, i| if row[i] > row[b] { i } else { b });
+                        agree += usize::from(am == ids[p + 1]);
+                        total += 1;
+                    }
+                }
+            }
+        }
+        if total > 0 {
+            println!("teacher-forced argmax = next token: {agree}/{total}");
+        }
+        let l = prog.read(&rt, outs[0]);
+        let s = t.elapsed().as_secs_f64();
+        if let Some(p) = &dump {
+            for &r in &resid {
+                dumped.extend(prog.read(&rt, r));
+            }
+            let b: Vec<u8> = dumped.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(p, b).unwrap();
+            eprintln!("dumped {} residual buffers", resid.len());
+        }
+        println!("last row top: {:?}", logprobs(&l[l.len() - vocab..]));
+        println!(
+            "chunked prefill: {n} tokens in chunks of {chunk}: {:.1} ms = {:.1} tok/s ({:.2} ms a chunk)",
+            s * 1e3,
+            n as f64 / s,
+            s * 1e3 / (n / chunk) as f64
+        );
+        if args.iter().any(|a| a == "--profile") {
+            profile!(prog, rt, kinfo);
+        }
+        return;
+    }
     let mut lines = Vec::new();
     let t2 = Instant::now();
     for (p, &tok) in ids.iter().enumerate() {
         step(tok, p);
+        if dump.is_some() {
+            for &r in &resid {
+                dumped.extend(prog.read(&rt, r));
+            }
+        }
+    }
+    if let Some(p) = &dump {
+        let b: Vec<u8> = dumped.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(p, b).unwrap();
+        eprintln!("dumped {} residual buffers a step", resid.len());
     }
     let prompt_s = t2.elapsed().as_secs_f64();
     let mut out = Vec::new();
@@ -226,52 +367,7 @@ fn main() {
         std::fs::write(p, lines.join("\n") + "\n").unwrap();
     }
     if args.iter().any(|a| a == "--profile") {
-        // every kernel timed alone at the last position, then grouped
-        let mut t: Vec<(f64, usize)> = prog
-            .order()
-            .iter()
-            .map(|&i| (prog.time_kernel(&rt, i, 5), i))
-            .collect();
-        let total: f64 = t.iter().map(|x| x.0).sum();
-        t.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        println!("profile: {} kernels, sum {total:.3} ms", t.len());
-        for (ms, i) in t.iter().take(25) {
-            let (what, nat, head) = &kinfo[*i];
-            println!("  {ms:8.4} ms  k{i:<5} native {nat:<5} {what}  | {head}");
-        }
-        // by shape: the same op in every layer, summed
-        let mut sh: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
-        for (ms, i) in &t {
-            let e = sh.entry(kinfo[*i].0.as_str()).or_default();
-            e.0 += 1;
-            e.1 += ms;
-        }
-        let mut sh: Vec<_> = sh.into_iter().collect();
-        sh.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
-        for (k, (n, ms)) in sh.iter().take(30) {
-            println!(
-                "  shape {ms:8.3} ms over {n:5} kernels ({:6.1} µs each): {k}",
-                1e3 * ms / *n as f64
-            );
-        }
-        // by kind: (native, int8, first line)
-        let mut by: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
-        for (ms, i) in &t {
-            let (what, nat, head) = &kinfo[*i];
-            let key = format!(
-                "native={nat} int8={} gather={} {head}",
-                what.contains("int8 true"),
-                !what.contains("gathers 0")
-            );
-            let e = by.entry(key).or_default();
-            e.0 += 1;
-            e.1 += ms;
-        }
-        let mut by: Vec<_> = by.into_iter().collect();
-        by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
-        for (k, (n, ms)) in by.iter().take(12) {
-            println!("  group {ms:8.3} ms over {n:5} kernels: {k}");
-        }
+        profile!(prog, rt, kinfo);
     }
     // --tune: the autotuner over this step on the live buffers (after the
     // generation: variant steps write the shared caches), cache written to

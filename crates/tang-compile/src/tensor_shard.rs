@@ -362,6 +362,8 @@ fn scan_rule(
     let lead = match &sc.kind {
         ScanKind::Monoid(m) => out.len() - usize::from(m.width > 1),
         ScanKind::Affine { .. } => out.len() - 2,
+        // a fused delta step (CUDA decode only) is not split
+        ScanKind::Delta(_) => 0,
     };
     let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
     if let Some(Place::S(d)) = ps.first() {
@@ -1248,6 +1250,78 @@ pub fn expert_inputs(g: &TensorGraph, outputs: &[TensorId], world: usize) -> Has
         .collect()
 }
 
+/// The greedy split search over `cands` in order: each candidate's first
+/// cheapest split (of `dims`) is kept when it makes the step cheaper than
+/// `best` by more than 1e-9 of it; returns the candidates left unsplit.
+/// Speculatively parallel and exact: the next candidates' splits are costed
+/// at once against the current plan; replayed in order, the results stand up
+/// to the first accepted split, after which the plan changed and the batch
+/// restarts behind it.
+fn greedy_splits(
+    cost: &(dyn Fn(&ShardPlan) -> f64 + Sync),
+    dims: &(dyn Fn(TensorId) -> Vec<usize> + Sync),
+    plan: &mut ShardPlan,
+    best: &mut f64,
+    cands: &[TensorId],
+    threads: usize,
+) -> Vec<TensorId> {
+    let mut failed = Vec::new();
+    let mut i = 0;
+    while i < cands.len() {
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        let mut j = i;
+        while j < cands.len() && (jobs.is_empty() || jobs.len() < threads) {
+            jobs.extend(dims(cands[j]).into_iter().map(|d| (j, d)));
+            j += 1;
+        }
+        let base: &ShardPlan = plan;
+        let one = |&(c, d): &(usize, usize)| {
+            let mut p = base.clone();
+            p.inputs.insert(cands[c], WeightPlace::Split(d));
+            cost(&p)
+        };
+        let costs: Vec<f64> = if threads == 1 || jobs.len() <= 1 {
+            jobs.iter().map(one).collect()
+        } else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let out: Vec<std::sync::Mutex<f64>> =
+                jobs.iter().map(|_| std::sync::Mutex::new(0.0)).collect();
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| loop {
+                        let q = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if q >= jobs.len() {
+                            break;
+                        }
+                        *out[q].lock().unwrap() = one(&jobs[q]);
+                    });
+                }
+            });
+            out.into_iter().map(|m| m.into_inner().unwrap()).collect()
+        };
+        let mut resume = j;
+        for c in i..j {
+            let mut pick = None;
+            for (q, &(cj, d)) in jobs.iter().enumerate() {
+                if cj == c && costs[q] < *best * (1.0 - 1e-9) {
+                    *best = costs[q];
+                    pick = Some(d);
+                }
+            }
+            match pick {
+                Some(d) => {
+                    plan.inputs.insert(cands[c], WeightPlace::Split(d));
+                    resume = c + 1;
+                    break;
+                }
+                None => failed.push(cands[c]),
+            }
+        }
+        i = resume;
+    }
+    failed
+}
+
 /// The plan: experts by [`expert_inputs`], then a greedy pass over the
 /// other weights (largest first) keeping each `Split(d)` that lowers
 /// [`step_cost`].
@@ -1273,11 +1347,25 @@ pub fn plan_auto(
             plan.inputs.insert(t, WeightPlace::Experts);
         }
     }
+    // element sizes up front: the cost runs on worker threads
+    let elems: Vec<f64> = (0..g.nodes.len())
+        .map(|i| elem(TensorId(i as u32)))
+        .collect();
+    let elem_of = |t: TensorId| elems[t.n()];
     let cost = |plan: &ShardPlan| {
         let an = analyze(g, outputs, plan);
-        step_cost(g, outputs, &an, weights, elem, cm).seconds
+        step_cost(g, outputs, &an, weights, &elem_of, cm).seconds
     };
+    let threads = std::env::var("TANG_PLAN_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .max(1);
+    let t_cost = std::time::Instant::now();
     let mut best = cost(&plan);
+    if std::env::var("TANG_PLAN_TRACE").is_ok() {
+        eprintln!("plan_auto: one cost {:.1?}", t_cost.elapsed());
+    }
     let mut cands: Vec<TensorId> = weights
         .iter()
         .copied()
@@ -1286,35 +1374,27 @@ pub fn plan_auto(
         .filter(|t| numel(&g.nodes[t.n()].shape) as f64 * elem(*t) / cm.hbm >= 0.05 * cm.latency)
         .collect();
     cands.sort_by_key(|t| (std::cmp::Reverse(numel(&g.nodes[t.n()].shape)), t.n()));
-    let mut failed = Vec::new();
-    for t in cands {
+    let dims = |t: TensorId| -> Vec<usize> {
         let shape = fixed(&g.nodes[t.n()].shape);
-        let mut pick = None;
-        for d in 0..shape.len() {
-            if !shape[d].is_multiple_of(world) || shape[d] < world {
-                continue;
-            }
-            plan.inputs.insert(t, WeightPlace::Split(d));
-            let c = cost(&plan);
-            if c < best * (1.0 - 1e-9) {
-                best = c;
-                pick = Some(d);
-            }
-        }
-        match pick {
-            Some(d) => plan.inputs.insert(t, WeightPlace::Split(d)),
-            None => plan.inputs.remove(&t),
-        };
-        if pick.is_none() {
-            failed.push(t);
-        }
-    }
+        (0..shape.len())
+            .filter(|&d| shape[d].is_multiple_of(world) && shape[d] >= world)
+            .collect()
+    };
+    let failed = greedy_splits(&cost, &dims, &mut plan, &mut best, &cands, threads);
     // Joint moves: a block split by head (GDN: in-projections, conv, decay
     // and output projection) only pays once every weight in it is split; one
     // alone just adds gathers. For each split that lost on its own, keep it
     // tentatively and greedily co-split the weights built next to it (input
     // order follows the builder, so neighbours are the same layer, 1-D ones
     // included); adopt the group if the step got cheaper.
+    let trace = std::env::var("TANG_PLAN_TRACE").is_ok();
+    let t_joint = std::time::Instant::now();
+    if trace {
+        eprintln!(
+            "plan_auto: greedy pass done, {} failed singles; joint moves next",
+            failed.len()
+        );
+    }
     let mut near: Vec<TensorId> = weights
         .iter()
         .copied()
@@ -1366,28 +1446,10 @@ pub fn plan_auto(
             trial.inputs.insert(t, WeightPlace::Split(d));
             let mut group = vec![(t, d)];
             let mut cur = cost(&trial);
+            greedy_splits(&cost, &dims, &mut trial, &mut cur, &hood, threads);
             for &u in &hood {
-                let us = fixed(&g.nodes[u.n()].shape);
-                let mut upick = None;
-                for e in 0..us.len() {
-                    if !us[e].is_multiple_of(world) || us[e] < world {
-                        continue;
-                    }
-                    trial.inputs.insert(u, WeightPlace::Split(e));
-                    let c = cost(&trial);
-                    if c < cur * (1.0 - 1e-9) {
-                        cur = c;
-                        upick = Some(e);
-                    }
-                }
-                match upick {
-                    Some(e) => {
-                        trial.inputs.insert(u, WeightPlace::Split(e));
-                        group.push((u, e));
-                    }
-                    None => {
-                        trial.inputs.remove(&u);
-                    }
+                if let Some(WeightPlace::Split(e)) = trial.inputs.get(&u) {
+                    group.push((u, *e));
                 }
             }
             let bar = adopt.as_ref().map_or(best, |a| a.0);
@@ -1417,6 +1479,13 @@ pub fn plan_auto(
                 plan.inputs.insert(u, WeightPlace::Split(e));
             }
         }
+    }
+    if trace {
+        eprintln!(
+            "plan_auto: joint moves {:.1?} ({} shape patterns)",
+            t_joint.elapsed(),
+            memo.len()
+        );
     }
     plan
 }
