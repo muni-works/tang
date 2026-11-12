@@ -1094,7 +1094,7 @@ mod tests {
             let mut ids = st.outputs.clone();
             ids.extend(st.caches.iter().map(|c| c.updated));
             let (g, ids) = if group > 0 {
-                let (g, ids, _) = st.graph.schedule_expert_groups(&ids, group);
+                let (g, ids, _) = st.graph.schedule_expert_groups(&ids, group, false);
                 (g, ids)
             } else {
                 (st.graph.clone(), ids)
