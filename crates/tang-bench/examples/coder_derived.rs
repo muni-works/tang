@@ -130,20 +130,7 @@ fn main() {
     let rt = runtime();
     let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
     eprintln!("runtime: {}; tuning cache: {tuned} entries", rt.name());
-    // TANG_CODER_GROUP=N: routed experts sorted by expert from N positions (chunked prefill)
-    let group = std::env::var("TANG_CODER_GROUP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let low = tang_bench::ir_coder_real::lower_real_step_with(
-        &pg,
-        &st,
-        &tys,
-        &tang_bench::ir_coder_real::RealOpts {
-            group,
-            ..Default::default()
-        },
-    );
+    let low = lower_real_step(&pg, &st, &tys);
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
         "derived step: {} kernels ({native} native, {} int8 GEMVs), {} caches; f32 uploads {:?}; built in {:.1}s",
