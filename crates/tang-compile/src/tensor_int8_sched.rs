@@ -176,7 +176,7 @@ impl TensorGraph {
         // a gathered activation picks whole rows: never along k
         let x_gather_ok = xa.gather.as_ref().is_none_or(|g| {
             g.coefs.last() == Some(&0)
-                && !matches!(&c.args[g.arg].view.gather, Some(_))
+                && c.args[g.arg].view.gather.is_none()
                 && c.args[g.arg]
                     .view
                     .forms
