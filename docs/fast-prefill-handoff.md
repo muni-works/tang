@@ -135,29 +135,63 @@ Two consequences for this PR:
 Panic: `coder_derived.rs:253`, `partial_cmp(..).unwrap()` returning `None`
 because a logit is NaN.
 
-### The PR's explanation is the wrong quantity
+### The PR's arithmetic is right in kind, and the cap IS exceeded
 
 The PR body blames `TANG_SPLIT_MAX` at rows·16·ctx = 4096·16·33024 ≈ 2.16e9.
 
-That number is **the wrong quantity**. The cap is checked **per comp**
-(`tensor_cuda_split.rs:241`, inside the `for r in …` loop), and each head is
-its own comp. At 32k with chunk 4096:
+**That is the right quantity.** The cap is checked per comp
+(`tensor_cuda_split.rs:241`), and `rows` is the product of *all* the comp's
+point dims (`tensor_cuda_split.rs:237-238`):
+
+```rust
+let keep: Vec<usize> = (0..np).filter(|&d| !cols[d]).collect();
+let rows: usize = keep.iter().map(|&d| c.points()[d].n()).product();
+```
+
+Heads are a point dim, so they fold into `rows`. The code's own comment
+("an 8k-token prefill step's attention weights at 8k context are 4.4 GB")
+only reconciles with heads folded:
 
 ```
-per-head factor = 4096 × 33024 = 1.353e8 elements = 0.54 GB
-cap default 2³¹ = 2.147e9  ->  per-head fits by 16×
-cap 2²⁹ (the old MAX_FACTOR) = 5.369e8  ->  per-head still fits
+8k rows × 8k ctx × 16 kv heads = 1.074e9 elems = 4.29 GB   <- matches the comment
+  under 2³¹ (2.147e9): yes      over the old 2²⁹ (5.369e8): yes
 ```
 
-The 4.4 GB figure in the code's own comment is **all 16 heads summed**, which
-is not what the cap compares. So at 32k **the split is not refused** — p·v is
-already a tensor-core matmul, and `TANG_SPLIT_MAX` never enters the decision.
-Raising or lowering it changes nothing at this geometry.
+So the old `MAX_FACTOR = 2²⁹` refused the split at 8k, and raising it to 2³¹
+admitted it — exactly what `e53de284` says it does. At 32k with chunk 4096:
 
-The manager's read is right, and it's stronger than "slow, not NaN": past the
-cap p·v falls back to a warp reduction (slow, and correct — the tiny-model
-`split_bilinear_keeps_the_step` test runs both paths at rel err 0.00e0), and at
-this geometry the cap isn't even hit.
+```
+4096 rows × 33024 ctx × 16 kv heads = 2.164e9 elems = 8.66 GB
+  2³¹ = 2.147e9  ->  OVER by ~1%  ->  the split is refused
+```
+
+(If `per = 2` MQA keys fold in as well, rows is 16× larger and the overrun is
+~258×.) Either way: **at 32k the cap is exceeded and p·v falls back to the warp
+reduction.** The PR's account of *which branch runs* is correct.
+
+### But exceeding the cap doesn't explain a NaN
+
+What the cap selects is a fallback path, not a correctness change. The tiny
+model runs both paths and they agree exactly:
+
+```
+split_bilinear_keeps_the_step ... split_bilinear on the tiny coder k = 8 step: rel err 0.00e0
+```
+
+The `max_factor()` docstring says the same: "past the cap p·v stays a warp
+reduction, ~50× slower" — slower, with no claim of wrong. So the cap is the
+right *trigger* to investigate and the wrong *mechanism* for a NaN: it puts a
+different, less-tested kernel on the critical path at 32k. The NaN is either in
+that warp-reduction path (newly reachable only because 8k→32k changed which
+path runs) or somewhere else entirely.
+
+This still makes the manager's read right on the bottom line — **the cap is
+not the bug** — but for the right reason: not because it isn't hit, but because
+hitting it only picks a slow path. Note the corollary the manager didn't
+state: because the cap *is* hit at 32k, `TANG_SPLIT_MAX=536870912` in the PR's
+suggested bisect **changes nothing** (2²⁹ and 2³¹ both refuse at 2.16e9), so
+that arm is a no-op. To actually flip the branch, set it above 2.16e9 —
+e.g. `TANG_SPLIT_MAX=4294967296` (2³², 16 GB of f32; check headroom first).
 
 ### The counting sort is int-safe at this size
 
@@ -168,20 +202,23 @@ overflow, no shared-memory overflow. **Not the NaN.**
 
 ### Ranked suspects, in order
 
-1. **Attention, at long context.** Unchanged in this PR, which is the point:
+1. **The warp-reduction p·v path at 32k** — the path the cap now selects. New
+   in this PR only in the sense that `e53de284` is what lets it be reached at
+   this size; the kernel itself is old. Test by raising the cap above 2³² and
+   seeing whether the NaN clears.
+2. **Attention, at long context.** Unchanged in this PR, which is the point:
    if it reproduces on unmodified `origin/main`, the PR did not cause it.
    This is the branch the manager flagged — if it traces here, flash-attn #275
    comes back as a correctness fix, not a speed one.
-2. **`substitute_maps` at 32k rows.** It is exact at k=16 on the tiny model
+3. **`substitute_maps` at 32k rows.** It is exact at k=16 on the tiny model
    (§2) but the 32k step is a different size regime. Cheap to isolate by code
    revert.
-3. **The grouped path at 32k rows.** `--group 0` isolates it with no rebuild.
-4. **The split cap.** Least likely, and arithmetic says it can't be reached at
-   this geometry.
+4. **The grouped path at 32k rows.** `--group 0` isolates it with no rebuild.
 
 The discriminating control is **`origin/main` at 32k** — no grouping, no sort,
-no Q8_0, cap at the old 2²⁹. If main NaNs too, suspects 2 and 3 are out
-immediately and this is a pre-existing long-context bug.
+no Q8_0, and the cap back at 2²⁹, so p·v takes the *same* warp-reduction path.
+If main NaNs too, the cap path is the prime suspect and the PR did not cause
+it. If main is clean, the PR is implicated and suspect 3/4 come up.
 
 ---
 
@@ -238,35 +275,42 @@ LANE=long scripts/gpu-run.sh h200-1 origin/main \
    target/release/examples/coder_derived \$MODEL_DIR/Qwen3-Coder-Next-UD-Q4_K_XL.gguf \
      --ids-file /tmp/ids32k --ctx 33024 --chunk 4096 --check 33 --group 0 --top 5"
 
-# 2. PR head, grouping off (isolates the sort + substitute_maps + split cap)
+# 2. PR head, grouping off (isolates the sort + substitute_maps)
 LANE=long scripts/gpu-run.sh h200-1 claude/moe-align \
   "cmd:cargo build --release -p tang-bench --features cuda,gguf --example coder_derived && \
    target/release/examples/coder_derived \$MODEL_DIR/Qwen3-Coder-Next-UD-Q4_K_XL.gguf \
      --ids-file /tmp/ids32k --ctx 33024 --chunk 4096 --check 33 --group 0 --top 5" \
   TANG_Q6K_Q8=0
 
-# 3. PR head, grouping on, cap lowered as the PR suggests
+# 3. PR head, grouping on (does grouping produce the NaN?)
 LANE=long scripts/gpu-run.sh h200-1 claude/moe-align \
   "cmd:cargo build --release -p tang-bench --features cuda,gguf --example coder_derived && \
    target/release/examples/coder_derived \$MODEL_DIR/Qwen3-Coder-Next-UD-Q4_K_XL.gguf \
      --ids-file /tmp/ids32k --ctx 33024 --chunk 4096 --check 33 --group 16 --top 5" \
-  TANG_Q6K_Q8=1 TANG_SPLIT_MAX=536870912
+  TANG_Q6K_Q8=1
 
-# 4. grouping on, Q8_0 off (does the requant produce the NaN?)
+# 4. the decisive one — put p·v BACK on the tensor-core split at 32k.
+#    Over the cap (2.164e9) it is refused; 2^32 admits it. Clears => the
+#    warp-reduction path is the NaN. Still NaNs => it isn't p·v at all.
+#    (16 GB of f32: confirm the card has the headroom before running.)
 LANE=long scripts/gpu-run.sh h200-1 claude/moe-align \
   "cmd:cargo build --release -p tang-bench --features cuda,gguf --example coder_derived && \
    target/release/examples/coder_derived \$MODEL_DIR/Qwen3-Coder-Next-UD-Q4_K_XL.gguf \
-     --ids-file /tmp/ids32k --ctx 33024 --chunk 4096 --check 33 --group 16 --top 5" \
-  TANG_Q6K_Q8=0
+     --ids-file /tmp/ids32k --ctx 33024 --chunk 4096 --check 33 --group 0 --top 5" \
+  TANG_Q6K_Q8=0 TANG_SPLIT_MAX=4294967296
 ```
 
-Read: 1 NaN ⇒ pre-existing long-context bug, PR did not cause it (go to
-attention, revive #275). 1 clean but 2 NaN ⇒ sort/`substitute_maps`/cap.
-2 clean but 3 NaN ⇒ grouping. 3 clean but 4 NaN ⇒ the Q8_0 requant.
+Read: 1 NaN ⇒ the warp-reduction path or long-context attention, pre-existing;
+the PR did not cause it (revive #275 as a correctness fix). 1 clean but 2 NaN
+⇒ sort/`substitute_maps`. 2 clean but 3 NaN ⇒ grouping. **4 clean ⇒ the
+warp-reduction p·v is the NaN; 4 still NaN ⇒ p·v is exonerated and this is
+attention at long context.**
 
-`TANG_SPLIT_MAX=536870912` in command 3 is included only because the PR asks
-for it; per §4 it cannot change the outcome at this geometry, so treat a
-difference there as evidence the model of the cap is wrong, not as a fix.
+`TANG_SPLIT_MAX=536870912` (the value the PR suggests) is deliberately **not**
+in any command: at 2.164e9 required, both 2²⁹ and the 2³¹ default refuse the
+split, so that arm is a no-op and would only cost a GPU run. Command 4 is the
+arm that actually flips the branch — that is where the cap hypothesis gets
+tested.
 
 ---
 
@@ -284,7 +328,15 @@ difference there as evidence the model of the cap is wrong, not as a fix.
   the three-arm GPU score above to confirm.
 - Do not revert `a3bc106f` to buy accuracy; it is a correctness fix that
   reaches CUDA (§3).
-- The 32k NaN should not gate the merge if command 1 shows main NaN-ing too.
+- **The 32k NaN is not a reason to hold this PR** unless the control
+  (command 1 of §5) shows main clean at 32k. The cap *is* exceeded at 32k, but
+  exceeding it only selects a slow fallback path, and that path is old code
+  reachable on main too. The PR's own account of the trigger is right; its
+  leap from "cap exceeded" to "cap causes NaN" is the part that isn't
+  supported (§4).
+- If the NaN does turn out to live in the warp-reduction p·v, the fix is in
+  attention, not in this PR — and it lands as a correctness fix, which is the
+  same shape as reviving #275.
 
 `~1.3×` over main without Q8_0 is the floor worth landing.
 
@@ -316,6 +368,16 @@ cargo +1.94.1 clippy --workspace --lib --tests --bins \
 - The three-arm score (§5) is unrun. Everything in §6 past "sort and
   substitute_maps are clean" is inference from the code, not measurement.
 - Arm D (gather refusal) needs a revert branch.
-- The 32k NaN verdict needs command 1 of §5 — the control is the whole answer.
+- The 32k NaN verdict needs commands 1 and 4 of §5 — the control decides
+  whether the PR is implicated, and command 4 decides whether p·v is.
 - `--ctx 33024` assumes a 32k prompt plus one chunk of headroom; confirm the
   ids file's length matches what the PR used.
+- The `rows` arithmetic in §4 assumes `per = 2` MQA keys fold in, which makes
+  the overrun ~258× rather than ~1%. Either way the cap is exceeded, but if a
+  GPU run shows the split *did* run at 32k, the point-dim fold is the thing to
+  re-check first.
+- **Correction made during this session:** an earlier draft of §4 claimed the
+  cap could not be reached because it is applied per head. That was wrong —
+  `rows` folds heads (`tensor_cuda_split.rs:237-238`), which the code's own
+  4.4 GB comment confirms. The manager's "cap is not the bug" conclusion holds,
+  but on the "wrong mechanism" argument, not the "never reached" one.
