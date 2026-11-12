@@ -27,8 +27,15 @@ prints `result.json`. The branch has to be pushed to muni-works/tang.
   files that changed, so cargo's fingerprints and `src/target` stay valid. A
   branch with no changes builds in seconds. The toolchain and sccache come
   from `/models/bootstrap/tang-up.sh`.
-- **Weights:** `~/runner/models/<name>` holds weights copied once from the
-  `/models` network volume to local disk. After the first job they are also
+- **Weights:** `~/runner/models/<name>` holds weights pulled once to local
+  disk: from the private R2 bucket `frog-models` (pinned revisions under
+  `<org>/<name>/<sha>/`) when the pod has `R2_KEY` / `R2_SECRET`, else copied from
+  the `/models` network volume. On a 4090 pod the 49.6 GB coder-next GGUF takes
+  150–270 s from R2 (rclone, 16 streams: 0.18–0.33 GB/s) against 36 min from the volume
+  (0.023 GB/s). Create runner pods with
+  `R2_KEY={{ RUNPOD_SECRET_r2_access_key_id }}` and
+  `R2_SECRET={{ RUNPOD_SECRET_r2_secret_access_key }}`; without them, or on any R2
+  error, the runner uses the volume as before. After the first job they are also
   in the page cache (2 TB RAM). DS weights are read straight from the volume,
   since they are too big for the 200 GB disk.
 - **Not yet: weights resident in VRAM across jobs.** Each job is a new

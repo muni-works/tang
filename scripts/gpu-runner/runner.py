@@ -49,6 +49,15 @@ VOLUME = {"qwen3-8b": "/models/qwen3-8b-4bit", "coder-next": "/models/coder-next
           "ds": "/models/ds41-flash"}
 # models too big to copy to the 200 GB container disk are read from the volume
 NO_COPY = {"ds"}
+# the same pinned revisions mirrored in the private R2 bucket `frog-models`
+# (<org>/<name>/<revision>/<file>); pulled to local disk before falling back to the volume
+R2_BUCKET = "frog-models"
+R2_ENDPOINT = "https://45c5b88a0c035f973b32e7e36f3d9f4a.r2.cloudflarestorage.com"
+R2_PREFIX = {
+    "coder-next": "unsloth/Qwen3-Coder-Next-GGUF/ce09c67b53bc8739eef83fe67b2f5d293c270632",
+    "coder-next-hf": "Qwen/Qwen3-Coder-Next/a7fbcb5c0e12d62a448eaa0e260346bf5dcc0feb",
+    "ds": "deepseek-ai/DeepSeek-V4.1-Flash/314113f8a7dadb388215396ba5fbee2c610a04d6",
+}
 ENV = os.path.expanduser("~/.tang-up/env")
 
 
@@ -133,9 +142,58 @@ def copy_ranges(src, dst, parts=16, chunk=8 << 20):
         list(ex.map(one, range(parts)))
 
 
+def pod_env(key):
+    """A pod env var: ours if set, else PID 1's (ssh sessions don't always inherit
+    RunPod's env, e.g. R2_KEY={{ RUNPOD_SECRET_r2_access_key_id }})."""
+    if os.environ.get(key):
+        return os.environ[key]
+    try:
+        for kv in open("/proc/1/environ", "rb").read().split(b"\0"):
+            k, _, v = kv.decode(errors="replace").partition("=")
+            if k == key and v:
+                return v
+    except OSError:
+        pass
+    return None
+
+
+def r2_pull(name, local, log):
+    """Pull the model's R2 mirror into `local` with rclone (16 streams a file, 4 files at
+    once): 0.18–0.33 GB/s on a 4090 pod vs 0.023 GB/s whole-file from the /models volume.
+    False (and the caller uses the volume) when there's no mirror, no credentials, or the
+    pull fails."""
+    prefix, key, secret = R2_PREFIX.get(name), pod_env("R2_KEY"), pod_env("R2_SECRET")
+    if not (prefix and key and secret):
+        return False
+    rclone = shutil.which("rclone")
+    if not rclone:
+        rc, _ = sh("curl -fsSL https://rclone.org/install.sh | bash >/dev/null", log)
+        rclone = shutil.which("rclone")
+        if rc or not rclone:
+            log_line(log, f"[runner] model {name}: no rclone; using the volume")
+            return False
+    env = dict(os.environ, RCLONE_CONFIG_R2_TYPE="s3", RCLONE_CONFIG_R2_PROVIDER="Cloudflare",
+               RCLONE_CONFIG_R2_ACCESS_KEY_ID=key, RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=secret,
+               RCLONE_CONFIG_R2_ENDPOINT=pod_env("R2_ENDPOINT") or R2_ENDPOINT)
+    t = time.time()
+    with open(log, "a") as f:
+        rc = subprocess.run([rclone, "copy", f"r2:{R2_BUCKET}/{prefix}", local,
+                             "--multi-thread-streams", "16", "--multi-thread-cutoff", "64M",
+                             "--transfers", "4", "--retries", "5", "--stats", "60s",
+                             "--stats-one-line"], stdout=f, stderr=f, env=env).returncode
+    if rc:
+        log_line(log, f"[runner] model {name}: R2 pull failed (rc {rc}); using the volume")
+        return False
+    n = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local) for f in fs)
+    dt = time.time() - t
+    log_line(log, f"[runner] model {name}: pulled {n / 1e9:.1f} GB from r2:{R2_BUCKET}/{prefix} "
+                  f"in {dt:.0f} s ({n / 1e6 / max(dt, 1e-3):.0f} MB/s)")
+    return True
+
+
 def model_dir(name, log):
-    """The model's local copy (~/runner/models/<name>): copied from the volume once, in
-    parallel byte ranges, marked .runner-complete and reused by every later job. Read from
+    """The model's local copy (~/runner/models/<name>): pulled once from its R2 mirror
+    when the pod has R2_KEY/R2_SECRET, else copied from the volume in parallel byte ranges, marked .runner-complete and reused by every later job. Read from
     the volume in place only when the local disk can't hold it (or the copy fails)."""
     if not name:
         return None
@@ -156,6 +214,9 @@ def model_dir(name, log):
         log_line(log, f"[runner] model {name}: {need / 1e9:.1f} GB won't fit "
                       f"({free / 1e9:.1f} GB free); reading {vol} in place")
         return vol
+    if r2_pull(name, local, log):
+        open(done, "w").write(now() + "\n")
+        return local
     t = time.time()
     try:
         for r, f in files:
