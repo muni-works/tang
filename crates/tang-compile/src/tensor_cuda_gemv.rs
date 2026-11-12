@@ -50,7 +50,7 @@ use tang_expr::{ExprGraph, ExprId, Node};
 
 use super::msl_mma::Addr;
 use super::tile::emit_scalar;
-use super::wgsl::{Target, WgslProgram};
+use super::wgsl::{Target, WgslKernel, WgslProgram};
 use super::{
     fixed, numel, Arg, Form, IntMma, Monoid, Op, Scan, ScanKind, Stage, TensorGraph, TensorId,
 };
@@ -4779,5 +4779,240 @@ impl TensorGraph {
             }
         }
         (inlined, jobs)
+    }
+}
+
+/// A native kernel's source split for [`DecodeProgram::merge_launches`]:
+/// everything before the entry point, its parameters, its body.
+struct EntryParts<'a> {
+    prelude: &'a str,
+    params: Vec<&'a str>,
+    body: &'a str,
+}
+
+fn entry_parts(src: &str) -> Option<EntryParts<'_>> {
+    let at = src.rfind("extern \"C\" __global__ void")?;
+    let open = at + src[at..].find("main0(")? + "main0(".len();
+    let close = open + src[open..].find(')')?;
+    let brace = close + src[close..].find('{')?;
+    let params: Vec<&str> = src[open..close].split(',').map(str::trim).collect();
+    if params.last() != Some(&"unsigned count") || src.contains("extern __shared__") {
+        return None;
+    }
+    Some(EntryParts {
+        prelude: &src[..at],
+        params,
+        body: &src[brace + 1..],
+    })
+}
+
+/// `src` (a native kernel) as `namespace {ns} {{ … tang_main(…, unsigned
+/// tang_bid) }}`: its entry point a device function that sees block
+/// `tang_bid` of `blocks` (`blockIdx` / `gridDim` shadowed), its
+/// `#include`s returned apart, its macros undefined after it.
+fn as_device_fn(src: &str, ns: &str, blocks: u32) -> Option<(String, Vec<String>)> {
+    let e = entry_parts(src)?;
+    let mut includes = Vec::new();
+    let mut s = format!("namespace {ns} {{\n");
+    let mut macros = Vec::new();
+    for line in e.prelude.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#include") {
+            includes.push(t.to_string());
+            continue;
+        }
+        if t.starts_with("#pragma once") {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("#define ") {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            macros.push(name);
+        }
+        s.push_str(line);
+        s.push('\n');
+    }
+    writeln!(
+        s,
+        "__device__ __forceinline__ void tang_main({}, unsigned tang_bid) {{",
+        e.params.join(", ")
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "    const struct {{ unsigned x, y, z; }} blockIdx = {{tang_bid, 0u, 0u}};"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "    const struct {{ unsigned x, y, z; }} gridDim = {{{blocks}u, 1u, 1u}};"
+    )
+    .unwrap();
+    s.push_str(e.body);
+    s.push_str("\n} // namespace\n");
+    for m in macros {
+        writeln!(s, "#undef {m}").unwrap();
+    }
+    Some((s, includes))
+}
+
+/// A parameter declaration's name (its last identifier).
+fn param_name(p: &str) -> &str {
+    let p = p.trim_end();
+    let start = p
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |i| i + 1);
+    &p[start..]
+}
+
+impl DecodeProgram {
+    /// Launch merging (decode, CUDA): two kernels next to each other in
+    /// launch order, both native, with the same block size and nothing
+    /// one writes read or written by the other, become one launch whose
+    /// blocks dispatch on `blockIdx` (the first kernel's, then the
+    /// second's). Their outputs and the second's become the merged
+    /// kernel's writes. A step is latency-bound: a launch saved is a few
+    /// µs. At most `TANG_MERGE_MAX` blocks a merged launch (default 2048).
+    /// Returns how many launches it removed.
+    pub fn merge_launches(&mut self) -> usize {
+        let max_blocks: u32 = super::tune::knob_parse("TANG_MERGE_MAX").unwrap_or(2048);
+        let p = &self.program;
+        let storage = |t: TensorId| p.storage(t);
+        let mut ks: Vec<WgslKernel> = Vec::with_capacity(p.kernels.len());
+        let mut nat: Vec<bool> = Vec::with_capacity(p.kernels.len());
+        let mut merged = 0;
+        let mut i = 0;
+        while i < p.kernels.len() {
+            let a = &p.kernels[i];
+            if i + 1 < p.kernels.len() && self.native[i] && self.native[i + 1] {
+                let b = &p.kernels[i + 1];
+                if let Some(k) = Self::merge_pair(a, b, &storage, max_blocks) {
+                    ks.push(k);
+                    nat.push(true);
+                    merged += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+            ks.push(a.clone());
+            nat.push(self.native[i]);
+            i += 1;
+        }
+        self.program.kernels = ks;
+        self.native = nat;
+        merged
+    }
+
+    fn merge_pair(
+        a: &WgslKernel,
+        b: &WgslKernel,
+        storage: &dyn Fn(TensorId) -> TensorId,
+        max_blocks: u32,
+    ) -> Option<WgslKernel> {
+        let wg = a.workgroup_size;
+        if wg == 0 || b.workgroup_size != wg || a.count % wg != 0 || b.count % wg != 0 {
+            return None;
+        }
+        let (na, nb) = (a.count / wg, b.count / wg);
+        if na + nb > max_blocks || na == 0 || nb == 0 {
+            return None;
+        }
+        let outs = |k: &WgslKernel| k.outputs().map(storage).collect::<Vec<_>>();
+        let ins = |k: &WgslKernel| k.reads.iter().map(|&t| storage(t)).collect::<Vec<_>>();
+        let (oa, ob, ia, ib) = (outs(a), outs(b), ins(a), ins(b));
+        if oa.iter().any(|t| ib.contains(t) || ob.contains(t)) || ob.iter().any(|t| ia.contains(t))
+        {
+            return None;
+        }
+        let ea = entry_parts(&a.source)?;
+        let eb = entry_parts(&b.source)?;
+        // reads, out, writes, count
+        let split = |e: &EntryParts, k: &WgslKernel| -> Option<(Vec<String>, Vec<String>)> {
+            let nr = k.reads.len();
+            if e.params.len() != nr + 2 + k.writes.len() {
+                return None;
+            }
+            let r = e.params[..nr].iter().map(|s| s.to_string()).collect();
+            let w = e.params[nr..e.params.len() - 1]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            Some((r, w))
+        };
+        let (ra, wa) = split(&ea, a)?;
+        let (rb, wb) = split(&eb, b)?;
+        let (sa, inc_a) = as_device_fn(&a.source, "tang_ka", na)?;
+        let (sb, inc_b) = as_device_fn(&b.source, "tang_kb", nb)?;
+        let mut src = String::new();
+        let mut incs = inc_a;
+        incs.extend(inc_b);
+        incs.dedup();
+        for l in &incs {
+            writeln!(src, "{l}").unwrap();
+        }
+        src.push_str(&sa);
+        src.push_str(&sb);
+        // merged parameters, renamed: reads (a, b), outs + writes (a, b)
+        let rename = |decl: &str, new: &str| {
+            let name = param_name(decl);
+            format!("{}{new}", &decl[..decl.len() - name.len()])
+        };
+        let mut params = Vec::new();
+        let mut args_a = Vec::new();
+        let mut args_b = Vec::new();
+        for (j, d) in ra.iter().enumerate() {
+            params.push(rename(d, &format!("ra{j}")));
+            args_a.push(format!("ra{j}"));
+        }
+        for (j, d) in rb.iter().enumerate() {
+            params.push(rename(d, &format!("rb{j}")));
+            args_b.push(format!("rb{j}"));
+        }
+        for (j, d) in wa.iter().enumerate() {
+            params.push(rename(d, &format!("wa{j}")));
+            args_a.push(format!("wa{j}"));
+        }
+        for (j, d) in wb.iter().enumerate() {
+            // the second kernel's out was `float* out` (read-write)
+            params.push(rename(&d.replace("const ", ""), &format!("wb{j}")));
+            args_b.push(format!("wb{j}"));
+        }
+        params.push("unsigned count".into());
+        writeln!(
+            src,
+            "extern \"C\" __global__ void __launch_bounds__({wg}) main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
+        writeln!(
+            src,
+            "    if (blockIdx.x < {na}u) tang_ka::tang_main({}, {}u, blockIdx.x);",
+            args_a.join(", "),
+            a.points
+        )
+        .unwrap();
+        writeln!(
+            src,
+            "    else tang_kb::tang_main({}, {}u, blockIdx.x - {na}u);",
+            args_b.join(", "),
+            b.points
+        )
+        .unwrap();
+        writeln!(src, "}}").unwrap();
+        let mut reads = a.reads.clone();
+        reads.extend(&b.reads);
+        let mut writes = a.writes.clone();
+        writes.extend(b.outputs());
+        Some(WgslKernel {
+            source: src,
+            node: a.node,
+            reads,
+            points: a.points,
+            count: a.count + b.count,
+            workgroup_size: wg,
+            writes,
+        })
     }
 }

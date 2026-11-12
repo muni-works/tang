@@ -399,6 +399,16 @@ mod tests {
         staged: bool,
         cokernels: bool,
     ) -> (f64, usize) {
+        coder_step_on_cpu_with(opts, keep_residual, staged, cokernels, false)
+    }
+
+    pub(crate) fn coder_step_on_cpu_with(
+        opts: &DecodeOpts,
+        keep_residual: bool,
+        staged: bool,
+        cokernels: bool,
+        merge: bool,
+    ) -> (f64, usize) {
         let m = coder();
         let w = weights(&m);
         let p0 = 5;
@@ -471,7 +481,12 @@ mod tests {
                 }
             }
         }
-        let dp = g.to_cuda_decode(&outs, opts);
+        let mut dp = g.to_cuda_decode(&outs, opts);
+        if merge {
+            let m = dp.merge_launches();
+            eprintln!("merged launches: {m} fewer");
+            assert!(m > 0, "nothing merged");
+        }
         let nk = dp.program.kernels.len();
         if std::env::var("LIST").is_ok() {
             for k in &dp.program.kernels {
@@ -531,6 +546,20 @@ mod tests {
         eprintln!(
             "tiny coder step: {n0} kernels (rel err {e0:.2e}) -> {n1} with multi-output \
              kernels (rel err {e1:.2e} vs interpreter)"
+        );
+        assert!(e1 < 1e-4, "{e1}");
+        assert!(n1 < n0, "{n1} >= {n0}");
+    }
+
+    /// The tiny coder step (staged statistics, multi-output kernels) with
+    /// neighbouring independent launches merged (`merge_launches`)
+    /// against the interpreter.
+    #[test]
+    fn coder_step_merged_launches_run_on_the_cpu() {
+        let (e0, n0) = coder_step_on_cpu_with(&DecodeOpts::default(), true, true, true, false);
+        let (e1, n1) = coder_step_on_cpu_with(&DecodeOpts::default(), true, true, true, true);
+        eprintln!(
+            "tiny coder step: {n0} kernels (rel err {e0:.2e}) -> {n1} merged (rel err {e1:.2e})"
         );
         assert!(e1 < 1e-4, "{e1}");
         assert!(n1 < n0, "{n1} >= {n0}");
