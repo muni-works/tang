@@ -453,7 +453,8 @@ impl BatchedCoder {
     /// Zero slot `s`'s running blocks and the K/V rows it wrote (the timing runs above
     /// wrote rows below 1 as well).
     fn clear_slot(&mut self, s: usize) {
-        let n = self.slots[s].tokens.len().max(1);
+        // (+ 1: the row an idle stream writes at its next position)
+        let n = self.slots[s].tokens.len() + 1;
         let p = &self.sampled.prog;
         for (c, &(kind, w)) in self.caches.iter().enumerate() {
             let t = self.sampled.cache(c);
@@ -465,6 +466,21 @@ impl BatchedCoder {
             }
         }
         self.slots[s].tokens.clear();
+    }
+
+    /// Zero rows `from..to` (clamped to the context) of slot `s`'s K/V blocks.
+    fn zero_rows(&self, s: usize, from: usize, to: usize) {
+        let to = to.min(self.ctx);
+        if to <= from {
+            return;
+        }
+        let p = &self.sampled.prog;
+        for (c, &(kind, w)) in self.caches.iter().enumerate() {
+            if let Kind::Rows { row } = kind {
+                let z = vec![0.0f32; (to - from) * row];
+                p.write_words(&self.rt, self.sampled.cache(c), s * w + from * row, &z);
+            }
+        }
     }
 
     /// One batched step: `rows` (slot, token) advance; every other stream computes at its own
@@ -789,6 +805,10 @@ impl ServeEngine for BatchedCoder {
                 .prog
                 .write_words(&self.rt, self.sampled.cache(c), slot * w, part);
         }
+        // the rows past the prefix (and the one an idle stream writes at its next
+        // position) are stale: zero them, as the per-slot engine does
+        let old = self.slots[slot].tokens.len();
+        self.zero_rows(slot, prefix.len(), old + 1);
         self.slots[slot].tokens = prefix.to_vec();
         Ok(())
     }
