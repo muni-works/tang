@@ -505,8 +505,46 @@ struct Snap {
     pos: Vec<Arc<Positional>>,
     pinned: bool,
     used: u64,
+    /// Requests this state served (eviction keeps reused states: see [`FlashServe::evict_key`]).
+    hits: u32,
+    /// The tenant it belongs to; `None`: any request may restore it (see [`Share`]).
+    owner: Option<u64>,
     /// Last used, by the wall clock (see [`crate::retention`]).
     at: std::time::SystemTime,
+}
+
+/// Which prefix states one tenant's request may restore from another's (`TANG_SERVE_SHARE`).
+///
+/// A K/V row or GDN state holds no text, and a state is only reused for a token-identical
+/// prefix, so sharing never hands one tenant another's content. What it does leak is timing:
+/// a prompt whose prefix someone else sent recently comes back faster (cached tokens, TTFT), so
+/// a tenant can probe whether a guessed prefix (a document, a secret in a template) was seen.
+/// The system part of a prompt (tools, system prompt: the operator's text, the same for every
+/// user of a client) is low-value to probe and most of the reuse, so that is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Share {
+    /// Every state is shared (the policy before tenants: max hit rate, timing visible).
+    All,
+    /// States up to the end of a leading system message are shared; later ones stay within
+    /// the tenant (the default).
+    System,
+    /// Nothing crosses tenants.
+    None,
+}
+
+impl Share {
+    fn from_env() -> Self {
+        match std::env::var("TANG_SERVE_SHARE").as_deref() {
+            Ok("all") => Share::All,
+            Ok("none") => Share::None,
+            _ => Share::System,
+        }
+    }
+}
+
+/// May a request of `tenant` restore a state owned by `owner`?
+pub(super) fn visible(owner: Option<u64>, tenant: Option<u64>) -> bool {
+    owner.is_none() || owner == tenant
 }
 
 /// A completion this server generated, to splice back into later prompts.
@@ -656,6 +694,9 @@ pub struct FlashServe {
     snaps: Vec<Snap>,
     max_snaps: usize,
     max_snap_bytes: usize,
+    /// Content-addressed prefix states on disk (`kvstore`), under `disk`.
+    store: Option<super::kvstore::KvStore>,
+    share: Share,
     memo: VecDeque<Memo>,
     policy: Policy,
     clock: u64,
@@ -688,9 +729,12 @@ pub(super) enum Hit {
     /// prefix boundary inside the shared part: its KV rows below the boundary are kept, only
     /// the recurrent state is copied up.
     Rewound,
-    /// A saved state in host RAM (or read from disk) restored into a fresh slot: recurrent
-    /// state and K/V rows copied up.
+    /// A saved state in host RAM restored into a fresh slot: recurrent state and K/V rows
+    /// copied up.
     Host,
+    /// A saved state read from the content-addressed store on disk (`kvstore`), restored into
+    /// a fresh slot.
+    Disk,
 }
 
 impl Hit {
@@ -700,6 +744,7 @@ impl Hit {
             Hit::Parked => "parked",
             Hit::Rewound => "rewound",
             Hit::Host => "host",
+            Hit::Disk => "disk",
         }
     }
 }
@@ -707,8 +752,8 @@ impl Hit {
 /// Cumulative prefix-cache counters (requests and reused tokens by [`Hit`]).
 #[derive(Default)]
 pub(super) struct CacheStats {
-    pub requests: [u64; 4],
-    pub reused: [u64; 4],
+    pub requests: [u64; 5],
+    pub reused: [u64; 5],
     pub prompt: u64,
     /// Parked slots spilled to host RAM when evicted, and their tokens.
     pub spills: u64,
@@ -727,7 +772,7 @@ impl CacheStats {
     pub(super) fn line(&self) -> String {
         let reused: u64 = self.reused.iter().sum();
         let rate = 100.0 * reused as f64 / self.prompt.max(1) as f64;
-        let by = [Hit::Parked, Hit::Rewound, Hit::Host, Hit::Miss]
+        let by = [Hit::Parked, Hit::Rewound, Hit::Host, Hit::Disk, Hit::Miss]
             .iter()
             .map(|&h| {
                 format!(
@@ -767,20 +812,8 @@ fn args_as_objects(msgs: &mut Value) {
 
 const MARK: &str = "\u{F8FF}tang-splice\u{F8FF}";
 
-fn lcp(a: &[u32], b: &[u32]) -> usize {
+pub(super) fn lcp(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
-}
-
-fn hash(ids: &[u32]) -> u64 {
-    // FNV-1a: stable across runs (the disk cache is keyed by it).
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &i in ids {
-        for b in i.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-    }
-    h
 }
 
 impl FlashServe {
@@ -954,6 +987,11 @@ impl FlashServe {
             snaps: Vec::new(),
             max_snaps: s.snapshots,
             max_snap_bytes: s.snapshot_bytes,
+            store: s
+                .disk
+                .as_deref()
+                .and_then(super::kvstore::KvStore::from_env),
+            share: Share::from_env(),
             memo: VecDeque::new(),
             policy: Policy::new(),
             clock: 0,
@@ -1239,11 +1277,17 @@ impl FlashServe {
 
     /// Keep a copy of the running state after `tokens` (the engine's sequence now).
     fn snapshot(&mut self, pinned: bool) -> Result<()> {
-        self.snapshot_at(0, pinned)
+        self.snapshot_at(0, pinned, None)
     }
 
-    /// Save sequence slot `slot`'s state (after its tokens) as a reusable prefix state.
-    pub(super) fn snapshot_at(&mut self, slot: usize, pinned: bool) -> Result<()> {
+    /// Save sequence slot `slot`'s state (after its tokens) as a reusable prefix state, owned
+    /// by `owner` (`None`: any tenant may restore it).
+    pub(super) fn snapshot_at(
+        &mut self,
+        slot: usize,
+        pinned: bool,
+        owner: Option<u64>,
+    ) -> Result<()> {
         let toks: Vec<u32> = if slot == 0 {
             self.e.tokens().clone()
         } else {
@@ -1251,7 +1295,11 @@ impl FlashServe {
         };
         self.clock += 1;
         let clock = self.clock;
-        if let Some(s) = self.snaps.iter_mut().find(|s| s.tokens == toks) {
+        if let Some(s) = self
+            .snaps
+            .iter_mut()
+            .find(|s| s.tokens == toks && s.owner == owner)
+        {
             s.used = clock;
             s.at = crate::retention::now();
             s.pinned |= pinned;
@@ -1261,7 +1309,8 @@ impl FlashServe {
         let state = Arc::new(self.e.save_running_at(slot)?);
         let t_run = t.elapsed().as_secs_f64() * 1e3;
         let n = toks.len();
-        // Only the positions past the longest saved state this one extends are copied.
+        // Only the positions past the longest saved state this one extends are copied (the
+        // segments are shared: copy-on-write, by `Arc`, and on disk by content address).
         let base = (0..self.snaps.len())
             .filter(|&i| toks.starts_with(&self.snaps[i].tokens))
             .max_by_key(|&i| self.snaps[i].tokens.len());
@@ -1274,9 +1323,13 @@ impl FlashServe {
         }
         let t_pos = t.elapsed().as_secs_f64() * 1e3;
         let tokens = toks;
-        if pinned && self.disk_path(&tokens).is_some_and(|p| !p.exists()) {
-            // From the host copies just made (the segments cover 0..n), on the writer thread.
-            self.save_disk(&tokens, state.clone(), pos.clone());
+        // Pinned states (and every state with `TANG_KV_WRITETHROUGH=1`) go to disk now, the
+        // rest when host RAM lets them go (`write_back`).
+        if pinned || std::env::var("TANG_KV_WRITETHROUGH").is_ok_and(|v| v == "1") {
+            // From the host copies just made, on the store's writer thread.
+            if let Some(st) = self.store.as_mut() {
+                st.save(owner.unwrap_or(0), &tokens, state.clone(), pos.clone());
+            }
         }
         let t_disk = t.elapsed().as_secs_f64() * 1e3;
         self.line.snap_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -1286,6 +1339,8 @@ impl FlashServe {
             pos,
             pinned,
             used: clock,
+            hits: 0,
+            owner,
             at: crate::retention::now(),
         });
         let size = |snaps: &[Snap]| {
@@ -1304,11 +1359,12 @@ impl FlashServe {
         };
         while self.snaps.len() > 1 && size(&self.snaps) > self.max_snap_bytes {
             let lru = (0..self.snaps.len())
-                .min_by_key(|&i| (self.snaps[i].pinned, self.snaps[i].used))
+                .min_by_key(|&i| (self.snaps[i].pinned, self.evict_key(i)))
                 .unwrap();
-            self.snaps.swap_remove(lru);
+            let gone = self.snaps.swap_remove(lru);
+            self.write_back(gone);
         }
-        // Least recently used first; pinned ones have their own (small) quota.
+        // Least valuable first; pinned ones have their own (small) quota.
         for (want_pinned, cap) in [(false, self.max_snaps), (true, 4)] {
             while self
                 .snaps
@@ -1319,9 +1375,10 @@ impl FlashServe {
             {
                 let lru = (0..self.snaps.len())
                     .filter(|&i| self.snaps[i].pinned == want_pinned)
-                    .min_by_key(|&i| self.snaps[i].used)
+                    .min_by_key(|&i| self.evict_key(i))
                     .unwrap();
-                self.snaps.swap_remove(lru);
+                let gone = self.snaps.swap_remove(lru);
+                self.write_back(gone);
             }
         }
         if std::env::var("TANG_SNAP_TIMES").is_ok_and(|v| v == "1") {
@@ -1333,6 +1390,29 @@ impl FlashServe {
             );
         }
         Ok(())
+    }
+
+    /// Eviction order for host-RAM prefix states, lowest first: recency (the clock at last use)
+    /// plus `TANG_SERVE_REUSE_W` (default 16) clock ticks per request the state served, so a
+    /// tools block forty sessions restored outlives one session's last turn boundary.
+    fn evict_key(&self, i: usize) -> u64 {
+        let w = std::env::var("TANG_SERVE_REUSE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16u64);
+        self.snaps[i].used + w * self.snaps[i].hits as u64
+    }
+
+    /// A state leaving host RAM goes to the disk store (written on its thread from the host
+    /// copies), so a session whose state was pushed out, or a restarted pod, restores it
+    /// instead of prefilling. `TANG_KV_WRITEBACK=0`: only pinned states reach disk.
+    fn write_back(&mut self, s: Snap) {
+        if std::env::var("TANG_KV_WRITEBACK").is_ok_and(|v| v == "0") || s.tokens.len() < 64 {
+            return;
+        }
+        if let Some(st) = self.store.as_mut() {
+            st.save(s.owner.unwrap_or(0), &s.tokens, s.state, s.pos);
+        }
     }
 
     /// Drop saved states, remembered replies and the live sequence unused for the TTL.
@@ -1353,22 +1433,9 @@ impl FlashServe {
             return;
         }
         self.expire_memory();
-        let Some(dir) = &self.disk else { return };
-        for ent in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = ent.path();
-            if p.extension().is_some_and(|x| x == "state") && crate::retention::stale_file(&p, ttl)
-            {
-                let _ = std::fs::remove_file(&p);
-            }
+        if let Some(st) = self.store.as_mut() {
+            st.expire(ttl);
         }
-    }
-
-    fn disk_path(&self, ids: &[u32]) -> Option<PathBuf> {
-        Some(
-            self.disk
-                .as_ref()?
-                .join(format!("{}-{:016x}.state", ids.len(), hash(ids))),
-        )
     }
 
     /// Write the routing counts to `disk` (seeds the next load's expert cache). Halves them
@@ -1390,169 +1457,36 @@ impl FlashServe {
         }
     }
 
-    /// Write a pinned state to disk: positions `0..ids.len()` are `pos`'s segments in order.
-    /// Serialized and written on a thread (the file appears complete or not at all), so the
-    /// serve loop only pays the device copies.
-    fn save_disk(&self, ids: &[u32], s: Arc<RunningState>, pos: Vec<Arc<Positional>>) {
-        let Some(path) = self.disk_path(ids) else {
-            return;
-        };
-        if path.exists() {
-            crate::retention::touch(&path);
-            return;
-        }
-        let ids = ids.to_vec();
-        let budget = std::env::var("TANG_FLASH_DISK_GB")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(8e9, |g| g * 1e9) as u64;
-        std::thread::spawn(move || {
-            let mut bytes: Vec<u8> = Vec::with_capacity(s.bytes() + 4 * ids.len() + 64);
-            bytes.extend_from_slice(b"TANGRS02");
-            bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
-            for &i in &ids {
-                bytes.extend_from_slice(&i.to_le_bytes());
-            }
-            let parts = s.parts();
-            bytes.extend_from_slice(&(parts.len() as u64).to_le_bytes());
-            for p in parts {
-                bytes.extend_from_slice(&(p.len() as u64).to_le_bytes());
-                // One copy of the f32s' little-endian bytes (a per-value loop here cost ~100 ms a
-                // save on the serve thread, in every pinned prompt's TTFT).
-                if cfg!(target_endian = "little") {
-                    // SAFETY: `p` is a valid `[f32]`; any byte view of it is valid `u8`s.
-                    bytes.extend_from_slice(unsafe {
-                        std::slice::from_raw_parts(
-                            p.as_ptr().cast::<u8>(),
-                            std::mem::size_of_val(p),
-                        )
-                    });
-                } else {
-                    for &x in p {
-                        bytes.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
-            }
-            // Each buffer's rows over 0..n: its part of every segment, in order.
-            let nbuf = pos.first().map_or(0, |p| p.parts().len());
-            bytes.extend_from_slice(&(nbuf as u64).to_le_bytes());
-            for b in 0..nbuf {
-                let len: usize = pos.iter().map(|p| p.parts()[b].len()).sum();
-                bytes.extend_from_slice(&(len as u64).to_le_bytes());
-                for p in &pos {
-                    bytes.extend_from_slice(&p.parts()[b]);
-                }
-            }
-            let tmp = path.with_extension("tmp");
-            let r = std::fs::File::create(&tmp)
-                .and_then(|mut f| f.write_all(&bytes))
-                .and_then(|_| std::fs::rename(&tmp, &path));
-            if let Err(e) = r {
-                eprintln!("tang-llm: saving {}: {e}", path.display());
-            }
-            // Keep the directory under its budget, oldest first.
-            let Some(dir) = path.parent() else { return };
-            let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "state"))
-                .filter_map(|e| {
-                    let m = e.metadata().ok()?;
-                    Some((m.modified().ok()?, m.len(), e.path()))
-                })
-                .collect();
-            files.sort();
-            let mut total: u64 = files.iter().map(|f| f.1).sum();
-            for (_, len, p) in files {
-                if total <= budget {
-                    break;
-                }
-                let _ = std::fs::remove_file(&p);
-                total -= len;
-            }
-        });
-    }
-
-    /// The longest state on disk that `ids[..=limit]` extends.
-    fn load_disk(&self, ids: &[u32], limit: usize) -> Option<Snap> {
-        let dir = self.disk.as_ref()?;
-        let mut best: Option<(usize, PathBuf)> = None;
-        for ent in std::fs::read_dir(dir).ok()?.flatten() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".state") else {
-                continue;
-            };
-            let Some((n, h)) = stem.split_once('-') else {
-                continue;
-            };
-            let (Ok(n), Ok(h)) = (n.parse::<usize>(), u64::from_str_radix(h, 16)) else {
-                continue;
-            };
-            if crate::retention::stale_file(&ent.path(), crate::retention::ttl()) {
-                let _ = std::fs::remove_file(ent.path());
-                continue;
-            }
-            if n <= limit && n > best.as_ref().map_or(0, |b| b.0) && hash(&ids[..n]) == h {
-                best = Some((n, ent.path()));
-            }
-        }
-        let (n, path) = best?;
-        crate::retention::touch(&path);
-        let read = || -> Result<Snap> {
-            let mut b = Vec::new();
-            std::fs::File::open(&path)?.read_to_end(&mut b)?;
-            let mut at = 8usize;
-            fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
-                let s = b.get(*at..*at + n).context("state file is short")?;
-                *at += n;
-                Ok(s)
-            }
-            let word = |b: &[u8], at: &mut usize| -> Result<usize> {
-                Ok(u64::from_le_bytes(take(b, at, 8)?.try_into()?) as usize)
-            };
-            ensure!(b.get(..8) == Some(&b"TANGRS02"[..]), "not a state file");
-            let len = word(&b, &mut at)?;
-            ensure!(len == n, "length");
-            let tokens: Vec<u32> = take(&b, &mut at, 4 * len)?
-                .chunks(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            ensure!(tokens == ids[..n], "tokens differ");
-            ensure!(word(&b, &mut at)? == self.shape.len(), "parts");
-            let mut parts = Vec::with_capacity(self.shape.len());
-            for &want in &self.shape {
-                let k = word(&b, &mut at)?;
-                ensure!(k == want, "part size");
-                parts.push(
-                    take(&b, &mut at, 4 * k)?
-                        .chunks(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                        .collect(),
-                );
-            }
-            let np = word(&b, &mut at)?;
-            let mut pos = Vec::with_capacity(np);
-            for _ in 0..np {
-                let k = word(&b, &mut at)?;
-                pos.push(take(&b, &mut at, k)?.to_vec());
-            }
-            Ok(Snap {
-                tokens,
-                state: Arc::new(RunningState::from_parts(n, self.gdn_layers, parts)?),
-                pos: vec![Arc::new(Positional::from_parts(0, n, pos))],
-                pinned: true,
-                used: 0,
-                at: crate::retention::now(),
-            })
-        };
-        match read() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("tang-llm: reading {}: {e:#}", path.display());
-                None
-            }
-        }
+    /// The longest state in the disk store that `ids[..=limit]` extends, longer than `beat`,
+    /// that a request of `tenant` may restore (shared states, and the tenant's own).
+    pub(super) fn load_store(
+        &mut self,
+        ids: &[u32],
+        limit: usize,
+        beat: usize,
+        tenant: Option<u64>,
+    ) -> Option<Snap> {
+        let seeds: Vec<u64> = std::iter::once(0).chain(tenant).collect();
+        let st = self.store.as_mut()?;
+        let (n, seed) = st.find(ids, limit, &seeds).filter(|f| f.0 > beat)?;
+        let l = st.load(ids, n, seed, &self.shape, self.gdn_layers)?;
+        eprintln!(
+            "tang-llm: read the prefix state at {n} from {} disk: {:.0} MB in {:.0} ms ({:.2} GB/s)",
+            if l.cold { "cold" } else { "hot" },
+            l.bytes as f64 / 1e6,
+            l.secs * 1e3,
+            l.bytes as f64 / l.secs.max(1e-9) / 1e9
+        );
+        Some(Snap {
+            tokens: l.tokens,
+            state: Arc::new(l.state),
+            pos: l.pos.into_iter().map(Arc::new).collect(),
+            pinned: false,
+            used: self.clock,
+            hits: 0,
+            owner: (seed != 0).then_some(seed),
+            at: crate::retention::now(),
+        })
     }
 
     /// Bring the engine to a prefix of `ids` (live sequence, a saved state, or empty), prefill
@@ -1574,12 +1508,8 @@ impl FlashServe {
             let i = best.unwrap();
             self.clock += 1;
             self.snaps[i].used = self.clock;
+            self.snaps[i].hits += 1;
             self.snaps[i].at = crate::retention::now();
-            if self.snaps[i].pinned {
-                if let Some(p) = self.disk_path(&self.snaps[i].tokens) {
-                    crate::retention::touch(&p);
-                }
-            }
             let valid = lcp(self.e.tokens(), &self.snaps[i].tokens);
             for p in &self.snaps[i].pos {
                 self.e.restore_positional(p, valid)?;
@@ -1588,7 +1518,7 @@ impl FlashServe {
             self.e.restore_running(state, tokens)?;
             start = snap_len;
         } else if !live_ok {
-            match self.load_disk(ids, limit).filter(|s| s.tokens.len() > 0) {
+            match self.load_store(ids, limit, 0, None) {
                 Some(s) => {
                     let valid = lcp(self.e.tokens(), &s.tokens);
                     for p in &s.pos {

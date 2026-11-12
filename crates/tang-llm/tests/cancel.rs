@@ -45,6 +45,7 @@ fn req(user: &str, max: usize) -> Request {
         max_tokens: Some(max),
         stop: vec![],
         cache_key: Some("cancel".into()),
+        tenant: None,
         prefill_only: false,
     }
 }
