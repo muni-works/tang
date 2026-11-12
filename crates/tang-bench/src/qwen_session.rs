@@ -530,7 +530,7 @@ pub fn hadamard_matrix(n: usize) -> Vec<f32> {
     let s = 1.0 / (n as f32).sqrt();
     (0..n * n)
         .map(|e| {
-            if (e / n & e % n).count_ones() % 2 == 0 {
+            if ((e / n) & (e % n)).count_ones().is_multiple_of(2) {
                 s
             } else {
                 -s

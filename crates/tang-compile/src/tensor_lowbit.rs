@@ -103,7 +103,7 @@ pub fn kmeans(v: &[f64], dim: usize, k: usize, iters: usize) -> Vec<f64> {
 }
 
 fn vq(w: &mut [f64], cols: usize, dim: usize, k: usize, group: usize) {
-    assert!(cols % group == 0 && group % dim == 0);
+    assert!(cols.is_multiple_of(group) && group.is_multiple_of(dim));
     let scales: Vec<f64> = w
         .chunks(group)
         .map(|g| {
@@ -128,7 +128,7 @@ fn vq(w: &mut [f64], cols: usize, dim: usize, k: usize, group: usize) {
 /// of two): `x ← H_b · (x ⊙ signs)`, orthonormal, so `inverse` undoes it.
 /// At inference the activations get the same rotation, so `W'x' = Wx`.
 pub fn rotate(w: &mut [f64], cols: usize, b: usize, signs: &[f64], inverse: bool) {
-    assert!(b.is_power_of_two() && cols % b == 0 && signs.len() == cols);
+    assert!(b.is_power_of_two() && cols.is_multiple_of(b) && signs.len() == cols);
     let norm = 1.0 / (b as f64).sqrt();
     for row in w.chunks_mut(cols) {
         if !inverse {
@@ -192,11 +192,11 @@ pub struct VqMatrix {
 }
 
 fn h16(x: f64) -> u16 {
-    super::precision::f16_bits(x) as u16
+    super::precision::f16_bits(x)
 }
 
 fn f16v(b: u16) -> f64 {
-    super::precision::f16_from_bits(b.into())
+    super::precision::f16_from_bits(b)
 }
 
 /// The rotation's signs for a matrix: deterministic in `seed`.
@@ -239,7 +239,9 @@ impl VqMatrix {
         book: Option<&[f64]>,
         iters: usize,
     ) -> Self {
-        assert!(w.len() == rows * cols && cols % VQ_GROUP == 0 && cols % VQ_HB == 0);
+        assert!(
+            w.len() == rows * cols && cols.is_multiple_of(VQ_GROUP) && cols.is_multiple_of(VQ_HB)
+        );
         let signs = vq_signs(cols, seed);
         let s64: Vec<f64> = signs.iter().map(|&x| x as f64).collect();
         let mut v = w.to_vec();
@@ -462,7 +464,9 @@ impl AffineMatrix {
         signs: Vec<f32>,
     ) -> Self {
         assert!(bits == 3 || bits == 4);
-        assert!(q.len() == rows * cols && cols % AFF_SPAN == 0 && cols % VQ_HB == 0);
+        assert!(
+            q.len() == rows * cols && cols.is_multiple_of(AFF_SPAN) && cols.is_multiple_of(VQ_HB)
+        );
         assert!(scales.len() == rows * cols / AFF_GROUP && biases.len() == scales.len());
         assert!(signs.is_empty() || signs.len() == cols);
         let mut codes = vec![0u32; q.len() / AFF_CHUNK * bits];
@@ -704,7 +708,7 @@ mod tests {
         (0..rows * cols)
             .map(|i| {
                 let g: f64 = (0..4).map(|_| u() - 0.5).sum();
-                if i % cols % 61 == 0 {
+                if (i % cols).is_multiple_of(61) {
                     12.0 * g
                 } else {
                     g
