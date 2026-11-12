@@ -368,12 +368,23 @@ fn scan_rule(
     let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
     if let Some(Place::S(d)) = ps.first() {
         let d = *d;
+        // a derived step's delta form starts from the cached state
+        // (`[P…\dim, n, m]`: its split dim sits one lower past the scan
+        // dim); it is replicated until the cache follows the split update
+        let init = match &sc.kind {
+            ScanKind::Affine { form: Some(f), .. } => f.init,
+            _ => None,
+        };
+        let d_init = d - usize::from(sc.dim < d);
         let ok = d < lead
             && d != sc.dim
-            && ps
-                .iter()
-                .zip(&sc.inputs)
-                .all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
+            && ps.iter().zip(&sc.inputs).enumerate().all(|(k, (p, t))| {
+                if Some(k) == init {
+                    *p == Place::R || *p == Place::S(d_init)
+                } else {
+                    *p == Place::S(d) && g.nodes[t.n()].shape.len() > d
+                }
+            });
         if ok {
             return Place::S(d);
         }
