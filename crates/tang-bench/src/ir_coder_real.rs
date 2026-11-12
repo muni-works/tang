@@ -227,6 +227,7 @@ pub fn lower_real_step_with(
         _ => unreachable!(),
     };
     let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
+        no_step_mma: ro.batch.unwrap_or(1) > 1,
         inplace: st
             .caches
             .iter()
