@@ -231,67 +231,83 @@ impl TensorGraph {
                 |v| vec![v[0]],
             )
             .expect("expert index");
-        // flat(p), row-major over the positions
-        let fargs: Vec<Arg> = iotas.iter().map(|&t| a(t, ident.clone())).collect();
-        let st = strides.clone();
-        let flat = ng
-            .comp(pos, &[] as &[usize], fargs, None, move |v| {
-                let mut e = ExprId::ZERO;
-                for (d, &s) in st.iter().enumerate() {
-                    e += v[d] * ExprId::from_f64(s as f64);
-                }
-                vec![e]
-            })
-            .expect("flat position");
-        // rank[p] = #{p' : (idx[p'], p') < (idx[p], p)}, space [p | p'],
-        // compared lexicographically (a key idx·P + p passes 2²⁴ and stops
-        // being exact in f32 once P·n_expert does: 4096 tokens × top-10 ×
-        // 512 experts)
-        let here = View::pick(2 * m, &(0..m).map(Some).collect::<Vec<_>>());
-        let there = View::pick(2 * m, &(m..2 * m).map(Some).collect::<Vec<_>>());
+        // experts: the gathered leading dims of W
+        let wsrc = c.args[cd.wi].src.n();
+        let wshape: Vec<usize> = self.nodes[wsrc]
+            .shape
+            .iter()
+            .map(|d| d.fixed().unwrap())
+            .collect();
+        let experts: usize = c.args[cd.wi]
+            .view
+            .gather
+            .as_ref()
+            .unwrap()
+            .coefs
+            .iter()
+            .zip(&wshape)
+            .filter(|(&q, _)| q != 0)
+            .map(|(_, &n)| n)
+            .product();
+        // a counting sort of the flat positions by expert ([`ScanKind::Sort`]):
+        // row 0 rank[p], row 1 order[q] (O(P), not the O(P²) rank of compares)
+        let idx_flat = ng.reshape(idx, &[Dim::Fixed(npos)]).expect("flat index");
+        let sorted_pos = ng.expert_sort(idx_flat, experts).expect("expert sort");
+        let flat_form = Form {
+            coefs: strides.clone(),
+            offset: 0,
+        };
         let rank = ng
             .comp(
                 pos,
-                pos,
-                vec![
-                    a(idx, here.clone()),
-                    a(idx, there.clone()),
-                    a(flat, here),
-                    a(flat, there),
-                ],
-                Some(Monoid::sum()),
-                |v| {
-                    let (di, dj) = (v[0] - v[1], v[1] - v[0]);
-                    let dp = v[2] - v[3];
-                    vec![tang_expr::with_graph(|eg| {
-                        let later = eg.select(dp, ExprId::ONE, ExprId::ZERO);
-                        let tie = eg.select(dj, ExprId::ZERO, later);
-                        eg.select(di, ExprId::ONE, tie)
-                    })]
-                },
+                &[] as &[usize],
+                vec![a(
+                    sorted_pos,
+                    View {
+                        forms: vec![Form::zero(m), flat_form],
+                        guard: false,
+                        gather: None,
+                    },
+                )],
+                None,
+                |v| vec![v[0]],
             )
             .expect("sort rank");
-        let iq = ng.iota(&[npos], 0);
-        // the value at rank q: Σ_p [rank[p] = q]·val[p], space [q | p]
+        // the value at rank q: val[order[q]]
         let at_rank = |ng: &mut TensorGraph, val: TensorId| {
-            let rp: Vec<Option<usize>> = (1..=m).map(Some).collect();
+            let vf = ng.reshape(val, &[Dim::Fixed(npos)]).expect("flat value");
             ng.comp(
                 &[npos],
-                pos,
+                &[] as &[usize],
                 vec![
-                    a(rank, View::pick(1 + m, &rp)),
-                    a(iq, View::pick(1 + m, &[Some(0)])),
-                    a(val, View::pick(1 + m, &rp)),
+                    a(
+                        vf,
+                        View {
+                            forms: vec![Form::zero(1)],
+                            guard: false,
+                            gather: Some(Gather {
+                                arg: 1,
+                                coefs: vec![1],
+                            }),
+                        },
+                    ),
+                    a(
+                        sorted_pos,
+                        View {
+                            forms: vec![
+                                Form {
+                                    coefs: vec![0],
+                                    offset: 1,
+                                },
+                                Form::unit(1, 0),
+                            ],
+                            guard: false,
+                            gather: None,
+                        },
+                    ),
                 ],
-                Some(Monoid::sum()),
-                |v| {
-                    let (up, down) = (v[0] - v[1], v[1] - v[0]);
-                    let eq = tang_expr::with_graph(|eg| {
-                        let inner = eg.select(down, ExprId::ZERO, ExprId::ONE);
-                        eg.select(up, ExprId::ZERO, inner)
-                    });
-                    vec![eq * v[2]]
-                },
+                None,
+                |v| vec![v[0]],
             )
             .expect("sorted pick")
         };

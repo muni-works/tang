@@ -1831,6 +1831,16 @@ impl TensorGraph {
                     }
                 }
             }
+            // a gathered read of a reshape cannot be pushed through it
+            for i in 0..n {
+                if let Some(c) = self.comp_at(i) {
+                    for a in c.args.iter().filter(|a| a.view.is_gather()) {
+                        if let Op::Reshape(src) = self.nodes[a.src.n()].op {
+                            r[src.n()] = true;
+                        }
+                    }
+                }
+            }
             r
         };
         // recompute factor per producer: max over consumers of
@@ -1877,6 +1887,14 @@ impl TensorGraph {
             if let Op::Scan(sc) = &self.nodes[i].op {
                 for t in &sc.inputs {
                     op_read[t.n()] = true;
+                }
+            }
+        }
+        // ... and through reshapes (a reshape of a spliced map dissolves)
+        for i in (0..n).rev() {
+            if op_read[i] {
+                if let Op::Reshape(src) = self.nodes[i].op {
+                    op_read[src.n()] = true;
                 }
             }
         }

@@ -411,6 +411,18 @@ impl TensorGraph {
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             super::tune::set_kernel(ki, Some(self.kernel_sig(root, &reads)));
             if let Op::Scan(Scan {
+                kind: ScanKind::Sort { experts },
+                ..
+            }) = &self.nodes[root].op
+            {
+                let (src, threads) = self.cuda_sort_kernel(root, *experts, &reads);
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = threads as u32;
+                native.push(true);
+                continue;
+            }
+            if let Op::Scan(Scan {
                 kind: ScanKind::Delta(_),
                 ..
             }) = &self.nodes[root].op

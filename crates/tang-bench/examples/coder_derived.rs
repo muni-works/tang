@@ -127,7 +127,9 @@ fn main() {
     // --group N: routed experts sorted by expert over the chunk's
     // (token, slot) positions once there are N of them (one weight read
     // per expert run: the grouped expert GEMM of layer-wise prefill)
-    let group: usize = opt("--group").map_or(0, |v| v.parse().unwrap());
+    // default 16 (a counting sort per routed contraction, `ScanKind::Sort`:
+    // cheap at any chunk size); `--group 0` turns it off
+    let group: usize = opt("--group").map_or(16, |v| v.parse().unwrap());
     let low = lower_real_step_with(
         &pg,
         &st,
@@ -135,6 +137,10 @@ fn main() {
         &RealOpts {
             group,
             batch: (batch > 1).then_some(batch),
+            // the Q6_K routed down-projection on the int8 kernels: grouped,
+            // an f32 copy is a gathered contraction no MMA tile reads.
+            // `TANG_Q6K_Q8=0` keeps it f32 (the ungrouped arm's upload)
+            q6k_as_q8_0: std::env::var("TANG_Q6K_Q8").as_deref() != Ok("0"),
             ..Default::default()
         },
     );
