@@ -299,9 +299,16 @@ pub fn with_griddep(src: &str) -> String {
     };
     let mut out = String::with_capacity(src.len() + 200);
     out.push_str(&src[..=open]);
-    out.push_str(
-        "\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.launch_dependents;\");\n    asm volatile(\"griddepcontrol.wait;\" ::: \"memory\");\n#endif\n",
-    );
+    // TANG_PDL_TRIGGER=1: also trigger the dependents up front (measured
+    // 2x slower on an H200 chain: waiting blocks pile up)
+    let trigger = if std::env::var("TANG_PDL_TRIGGER").is_ok_and(|v| v == "1") {
+        "    asm volatile(\"griddepcontrol.launch_dependents;\");\n"
+    } else {
+        ""
+    };
+    out.push_str(&format!(
+        "\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n{trigger}    asm volatile(\"griddepcontrol.wait;\" ::: \"memory\");\n#endif\n"
+    ));
     out.push_str(&src[open + 1..]);
     out
 }
