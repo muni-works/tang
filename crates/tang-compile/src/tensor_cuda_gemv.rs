@@ -322,7 +322,10 @@ impl TensorGraph {
                         .find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
                 })
                 .collect();
-            if std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
+            if !matches!(
+                std::env::var("TANG_STEP_MMA").as_deref(),
+                Ok("0") | Ok("nosplit")
+            ) {
                 if let Some(g) = self.split_bilinear_avoiding(outputs, &packed_in) {
                     // factors were appended after their readers: lower the
                     // graph renumbered in dependency order, then give the
@@ -419,12 +422,24 @@ impl TensorGraph {
                 continue;
             }
             if target == DecodeTarget::Cuda
-                && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0")
+                && !matches!(
+                    std::env::var("TANG_STEP_MMA").as_deref(),
+                    Ok("0") | Ok("nokernel")
+                )
                 && self.nodes[root].int_mma.is_none()
                 && self.mma_candidate(root)
                 && !reads.iter().any(|&r| blocky(r) || packed.contains_key(&r))
             {
                 if let Some(src) = self.cuda_mma_kernel(root, &reads) {
+                    if std::env::var("TANG_STEP_MMA_LOG").is_ok() {
+                        let cc = self.comp_at(root).unwrap();
+                        eprintln!(
+                            "step mma: node {root} points {:?} red {:?} args {}",
+                            cc.points(),
+                            cc.red,
+                            cc.args.len()
+                        );
+                    }
                     let threads = super::cuda::src_define(&src, "TANG_THREADS");
                     let tiles = super::cuda::src_define(&src, "TANG_TILES");
                     k.source = src;
