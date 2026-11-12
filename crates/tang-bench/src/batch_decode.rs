@@ -481,7 +481,7 @@ mod tests {
     fn coder_packed_prefill_runs_on_the_cpu() {
         let m = coder();
         for group in [0, 2] {
-            let e = batched_k_on_cpu(&m, &[0, 3, 5, 8], 8, &DecodeOpts::default(), group);
+            let e = batched_k_on_cpu(&m, &[1, 3, 5, 8], 8, &DecodeOpts::default(), group);
             assert!(e < 1e-4, "group {group}: {e}");
         }
     }
