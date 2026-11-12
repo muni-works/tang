@@ -484,7 +484,8 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
             for (int i = 0; i < 2; ++i) {{
                 const int t = 2 * tid + i;
                 const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
-                l[i] = t < nt ? logf({al}) : 0.f;
+                // α may underflow to 0: log α ≥ −80 (e^{{−80}} is 0 in f32 already)
+                l[i] = t < nt ? fmaxf(logf({al}), -80.f) : 0.f;
                 bs[t] = t < nt ? {be} : 0.f;
             }}
             float x = l[0] + l[1];
