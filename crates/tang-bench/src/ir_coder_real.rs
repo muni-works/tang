@@ -238,10 +238,10 @@ pub fn lower_real_step_with(
     };
     // norms' and gates' statistics recomputed inside their maps (one
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
-    // evaluated in their readers; opt-in with TANG_STAGED_MAP=1 (measured
-    // slower on coder-next: 6.18 vs 5.885 ms)
+    // evaluated in their readers. On by default: with cokernels (side jobs on
+    // their own blocks) H200 5.12 -> 4.83 ms, 1649 -> 1385 kernels; TANG_STAGED_MAP=0 off
     if tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
-        == Some("1")
+        != Some("0")
     {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
