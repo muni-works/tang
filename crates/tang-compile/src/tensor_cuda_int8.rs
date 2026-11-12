@@ -418,6 +418,24 @@ impl TensorGraph {
                 wvalid: wvalid.as_deref(),
             }));
         }
+        // many positions on an ungathered weight: a vendor GEMM
+        // (`TANG_VENDOR_GEMM`, see `vendor_gemm_min`) when the shape is plain
+        if wa.view.gather.is_none() && xa.view.gather.is_none() && fused.is_none() {
+            if let Some(min) = vendor_gemm_min() {
+                if npos >= min {
+                    let geo = VendorGeo { pts: &pts, rd, kd };
+                    if let Some(src) = vendor_gemm_source(
+                        wfmt,
+                        &geo,
+                        (&wa.view, &ws),
+                        (&xa.view, &xs),
+                        (param(wi)?, param(xi)?),
+                    ) {
+                        return Ok((src, 32, 1));
+                    }
+                }
+            }
+        }
         let ksplit = s.ksplit as usize;
         if b.per == 32 {
             let nb = k / 32;
@@ -1530,4 +1548,104 @@ fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
     )
     .unwrap();
     (src, warps * 32, g.npos * row_blocks)
+}
+
+/// The fewest positions an int8 contraction needs to run as a vendor GEMM
+/// (`TANG_VENDOR_GEMM=<min>`, `1` meaning 128); `None` (unset or `0`): never.
+pub fn vendor_gemm_min() -> Option<usize> {
+    let v: usize = std::env::var("TANG_VENDOR_GEMM").ok()?.parse().ok()?;
+    match v {
+        0 => None,
+        1 => Some(128),
+        n => Some(n),
+    }
+}
+
+/// The first line of a vendor GEMM's kernel source. The runtime runs such a
+/// kernel as a host call (`tang_gpu::vendor`), not as the stub it compiles.
+pub const VENDOR_TAG: &str = "// tang-vendor gemm ";
+
+/// The geometry of a contraction: its point extents, row coordinate and
+/// reduce coordinate.
+struct VendorGeo<'a> {
+    pts: &'a [usize],
+    rd: usize,
+    kd: usize,
+}
+
+/// Element offset of `view` over `shape` at iteration `coords`.
+fn view_offset(view: &View, shape: &[usize], coords: &[i64]) -> i64 {
+    let mut stride = 1i64;
+    let mut off = 0i64;
+    for d in (0..shape.len()).rev() {
+        let f = &view.forms[d];
+        let v = f.offset + f.coefs.iter().zip(coords).map(|(c, x)| c * x).sum::<i64>();
+        off += stride * v;
+        stride *= shape[d] as i64;
+    }
+    off
+}
+
+/// A vendor GEMM's source (see [`VENDOR_TAG`]) when `W` is one fixed
+/// `[rows, k]` matrix and position `P`'s row of `X` starts at `x0 + P·ld`:
+/// `out[P, r] = Σ_k W[r, k] · X[P, k]`, `out` row-major `[npos, rows]`.
+/// `params` are the bindings (`q{i}`) of W and X.
+fn vendor_gemm_source(
+    wfmt: Format,
+    geo: &VendorGeo,
+    (wv, ws): (&View, &[usize]),
+    (xv, xs): (&View, &[usize]),
+    (wp, xp): (String, String),
+) -> Option<String> {
+    let (rd, kd) = (geo.rd, geo.kd);
+    if !matches!(wfmt, Format::Q4K | Format::Q5K | Format::Q8_0) {
+        return None;
+    }
+    let rows = geo.pts[rd];
+    let k = ws[ws.len() - 1];
+    let wl = ws.len();
+    // W's leading dims fixed: one matrix for every position
+    if wv.forms[..wl - 2]
+        .iter()
+        .any(|f| f.coefs.iter().any(|&c| c != 0))
+        || wv.forms[wl - 2]
+            .coefs
+            .iter()
+            .enumerate()
+            .any(|(j, &c)| j != rd && c != 0)
+    {
+        return None;
+    }
+    let mut coords = vec![0i64; kd + 1];
+    let wb = view_offset(wv, ws, &coords);
+    let per = if wfmt == Format::Q8_0 { 32 } else { 256 };
+    if wb < 0 || wb % per != 0 {
+        return None;
+    }
+    // X rows: an arithmetic sequence over the flattened positions
+    let npos: usize = geo.pts[..rd].iter().product();
+    let xoff = |coords: &mut Vec<i64>, p: usize| {
+        let mut q = p;
+        for d in (0..rd).rev() {
+            coords[d] = (q % geo.pts[d]) as i64;
+            q /= geo.pts[d];
+        }
+        view_offset(xv, xs, coords)
+    };
+    let x0 = xoff(&mut coords, 0);
+    let ld = if npos > 1 {
+        xoff(&mut coords, 1) - x0
+    } else {
+        k as i64
+    };
+    if x0 < 0 || ld < k as i64 || (0..npos).any(|p| xoff(&mut coords, p) != x0 + p as i64 * ld) {
+        return None;
+    }
+    let xn: usize = xs.iter().product();
+    let wq = wp.strip_prefix('q')?;
+    let xq = xp.strip_prefix('q')?;
+    Some(format!(
+        "{VENDOR_TAG}w={wfmt:?} rows={rows} k={k} npos={npos} wb={wb} xb={x0} xld={ld} xn={xn} wq={wq} xq={xq}\nextern \"C\" __global__ void {}() {{}}\n",
+        super::cuda::CUDA_ENTRY
+    ))
 }

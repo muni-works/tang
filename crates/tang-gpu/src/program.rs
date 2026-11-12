@@ -375,6 +375,13 @@ enum Storage {
         /// Slots kept in host-pinned, device-mapped memory
         /// ([`Program::with_host`]): kernels read them zero-copy.
         host: Vec<Option<HostMapped>>,
+        /// Vendor GEMMs ([`crate::vendor`]) by kernel index, with scratch.
+        vendor: Vec<
+            Option<(
+                crate::vendor::Spec,
+                std::cell::RefCell<crate::vendor::Scratch>,
+            )>,
+        >,
     },
     #[cfg(feature = "opencl")]
     OpenCl {
@@ -627,12 +634,23 @@ impl Program {
                     .map(|k| d.function(&k.source))
                     .collect();
                 let host = (0..plan.slot_len.len()).map(|_| None).collect();
+                let vendor = program
+                    .kernels
+                    .iter()
+                    .map(|k| {
+                        crate::vendor::parse(&k.source).map(|s| {
+                            let sc = crate::vendor::Scratch::new(&d.stream, &s);
+                            (s, std::cell::RefCell::new(sc))
+                        })
+                    })
+                    .collect();
                 let storage = Storage::Cuda {
                     slots,
                     functions,
                     graph: None,
                     fused: None,
                     host,
+                    vendor,
                 };
                 Self::assemble(program, storage, plan)
             }
@@ -1038,6 +1056,7 @@ impl Program {
                 && threads.is_multiple_of(k.workgroup_size)
                 && threads / k.workgroup_size <= 15
                 && crate::cuda::dynamic_smem(&k.source) == 0
+                && !crate::vendor::is_vendor(&k.source)
                 // the megakernel's stages write one buffer (the last arg)
                 && k.writes.is_empty()
         };
@@ -1266,7 +1285,7 @@ impl Program {
 
     #[cfg(feature = "cuda")]
     fn run_cuda(&self, d: &CudaDevice, i: usize) {
-        self.run_cuda_on(&d.stream, i)
+        self.run_cuda_on(d, &d.stream, i)
     }
 
     /// Kernel dependencies in launch order, from slot hazards: the last
@@ -1360,7 +1379,7 @@ impl Program {
                 st.wait(ev[j].as_ref().expect("event before its waiter"))
                     .expect("wait");
             }
-            self.run_cuda_on(st, self.order[k]);
+            self.run_cuda_on(d, st, self.order[k]);
             if evented[k] {
                 ev[k] = Some(st.record_event(None).expect("event"));
             }
@@ -1371,7 +1390,12 @@ impl Program {
     }
 
     #[cfg(feature = "cuda")]
-    fn run_cuda_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>, i: usize) {
+    fn run_cuda_on(
+        &self,
+        d: &CudaDevice,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        i: usize,
+    ) {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let Storage::Cuda {
             slots, functions, ..
@@ -1379,6 +1403,25 @@ impl Program {
         else {
             panic!("program and runtime are on different backends")
         };
+        if let Storage::Cuda { vendor, host, .. } = &self.storage {
+            if let Some((spec, sc)) = &vendor[i] {
+                let a = &self.args[i];
+                let slot = |s: usize| {
+                    assert!(host[s].is_none(), "a vendor GEMM reads device buffers");
+                    &*slots[s]
+                };
+                crate::vendor::run(
+                    d,
+                    stream,
+                    spec,
+                    &mut sc.borrow_mut(),
+                    slot(a[spec.wq]),
+                    slot(a[spec.xq]),
+                    slot(a[a.len() - 1]),
+                );
+                return;
+            }
+        }
         let k = &self.program.kernels[i];
         let cfg = LaunchConfig {
             grid_dim: (k.count.div_ceil(k.workgroup_size), 1, 1),

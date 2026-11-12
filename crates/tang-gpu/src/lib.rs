@@ -70,6 +70,8 @@ pub mod buffer;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod vendor;
 /// The driver bindings tang-gpu's CUDA backend is built on, for code that
 /// needs the driver directly (CUDA graph capture in tang-bench's planned
 /// whole-model runner).
