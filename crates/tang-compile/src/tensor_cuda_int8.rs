@@ -253,10 +253,16 @@ impl TensorGraph {
                 .any(|f| !free_of(f, kd) || !free_of(f, rd))
             || ws[wl - 1] != k
             || ws[wl - 2] < rows
-            || wa.view.guard
+            // a guarded weight only as a DS-format GEMV gathering its
+            // leading dims (an expert-parallel rank's local expert table:
+            // another rank's expert reads 0), the guard checked on the key
+            || (wa.view.guard && !(ds_format(wfmt) && s.stage == Stage::Gemv && wa.view.gather.is_some()))
             || xa.view.guard
         {
-            return Err("W must be read [.., r, k]".into());
+            return Err(format!(
+                "W must be read [.., r, k] (W {ws:?} view {:?} guard {}, X guard {}, rows {rows} k {k})",
+                wa.view.forms, wa.view.guard, xa.view.guard
+            ));
         }
         if let Some(g) = &wa.view.gather {
             if g.coefs[wl - 1] != 0 || g.coefs[wl - 2] != 0 {
@@ -337,6 +343,29 @@ impl TensorGraph {
             Some(g) => Some(index_at(g.arg)?),
             None => None,
         };
+        // a guarded weight: the row is 0 unless every leading coordinate is in range
+        let wvalid: Option<String> = wa.view.guard.then(|| {
+            (0..wl - 2)
+                .map(|d| {
+                    let f = &wa.view.forms[d];
+                    let mut t = vec![format!("{}ll", f.offset)];
+                    for (j, &c) in f.coefs.iter().enumerate() {
+                        if c != 0 && !names[j].is_empty() {
+                            t.push(format!("{c} * (long long)({})", names[j]));
+                        }
+                    }
+                    if let Some(g) = &wa.view.gather {
+                        if g.coefs[d] != 0 {
+                            t.push(format!("{} * KEY", g.coefs[d]));
+                        }
+                    }
+                    let e = t.join(" + ");
+                    format!("(({e}) >= 0 && ({e}) < {}ll)", ws[d])
+                })
+                .collect::<Vec<_>>()
+                .join(" && ")
+        });
+        let wvalid = wvalid.filter(|v| !v.is_empty());
         // W slice base in elements (r = k = 0) and X row base in elements (k = 0)
         let w_off = offset_expr(&wa.view, &ws, &names, Some("KEY"));
         let x_off = offset_expr(&xa.view, &xs, &names, xkey.as_ref().map(|_| "XKEY"));
@@ -386,6 +415,7 @@ impl TensorGraph {
                 ptile: (s.pos_tile.max(1) as usize).min(npos),
                 fmt: wfmt,
                 w_total: ws.iter().product(),
+                wvalid: wvalid.as_deref(),
             }));
         }
         let ksplit = s.ksplit as usize;
@@ -909,6 +939,9 @@ struct GemvShape<'a> {
     fmt: Format,
     /// elements of the whole weight tensor (where a DS format's scales start)
     w_total: usize,
+    /// a guarded weight's in-range test (DS formats only): the row reads 0
+    /// when false
+    wvalid: Option<&'a str>,
 }
 
 /// [`Stage::Gemv`]: one dot a `(position, row)` on `dp4a`. A lane takes a
@@ -954,8 +987,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     }
     let units = g.k / 128;
     // half-super-blocks a lane (more loads in flight a lane), then lanes a row
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL")
-        .unwrap_or(2);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL").unwrap_or(2);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1078,8 +1110,7 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
 fn gemv_kernel_q8_0(g: &GemvShape) -> (String, usize, usize) {
     let units = g.k / 128;
     // units a lane (`TANG_GEMV_Q8_UPL`, default 1): more independent loads in flight a thread
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_Q8_UPL")
-        .unwrap_or(1);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_Q8_UPL").unwrap_or(1);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1358,8 +1389,7 @@ __device__ __forceinline__ float tang_e8m0(unsigned s) {
 fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
     let fp4 = g.fmt == Format::Mxfp4;
     let units = g.k / 128;
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_DS_UPL")
-        .unwrap_or(1);
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_DS_UPL").unwrap_or(1);
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;
@@ -1471,12 +1501,15 @@ fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
     const bool live = r < {rows};
     const int rr = live ? r : 0;
     long long KEY, xr, woff;
+    bool wok = true;
     {{ const long long P = pos;
 {decode}      KEY = {wkey};
 {xkey_decl}      xr = ({x_off});
-      woff = ({w_off}); }}
+      woff = ({w_off});
+      wok = ({wvalid}); }}
+    (void)wok;
 {wdecl}{xsrc}    float acc = 0.f;
-    if (live) {{
+    if (live && wok) {{
 {uloop}{body}        }}
     }}
     #pragma unroll
@@ -1489,6 +1522,7 @@ fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
         uloop = uloop(units, lanes, unroll),
         npos = g.npos,
         rows = g.rows,
+        wvalid = g.wvalid.unwrap_or("true"),
         decode = g.decode,
         wkey = g.wkey,
         x_off = g.x_off,

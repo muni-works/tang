@@ -63,6 +63,9 @@ otel = ["dep:tang-otel", "tang-gpu/otel"]
 # GGUF checkpoints through tang-llm's reader: ir_coder_real (Qwen3-Coder-Next
 # at real size from its derived graph) and the coder_derived runner.
 gguf = ["dep:tang-llm"]
+# Qwen3-Coder-Next served from its derived step (`coder_serve`, TANG_CODER_ENGINE=derived):
+# tang-llm's server and flash engines need its CUDA build.
+coder-serve = ["cuda", "gguf", "tang-llm/cuda", "dep:anyhow"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -81,11 +84,19 @@ name = "coder_derived"
 required-features = ["cuda", "gguf"]
 
 [[example]]
+name = "coder_serve"
+required-features = ["coder-serve"]
+
+[[example]]
 name = "glm_real_gpu"
 required-features = ["cuda", "gguf"]
 
 [[example]]
 name = "ds_real_gpu"
+required-features = ["cuda"]
+
+[[example]]
+name = "ds_vision_gpu"
 required-features = ["cuda"]
 
 [[example]]
@@ -106,9 +117,13 @@ metal       = { version = "0.33", optional = true }
 # qwen_session: the MLX checkpoint (mapped), config.json and the tokenizer
 memmap2 = "0.9"
 serde_json = "1"
+# ir_ds_vision: image decode and the embedding-cache key
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+sha2 = "0.10"
 tokenizers = { workspace = true }
 tang-otel = { workspace = true, optional = true }
 tang-llm = { workspace = true, optional = true }
+anyhow = { version = "1", optional = true }
 tang-moe = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -117,6 +132,7 @@ nalgebra  = "0.33"
 glam      = "0.29"
 rand      = "0.8"
 rayon     = "1"
+libm      = "0.2"
 tang-derive-wasm = { path = "../tang-derive-wasm" }
 # ir_glm_prefill tests (flash::glm5) and ir_coder_prefill (flash::reference):
 # tang-llm's CPU references as oracles

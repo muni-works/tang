@@ -214,11 +214,7 @@ impl TensorGraph {
                             t
                         });
                         c.args[xi].src = xq;
-                        node.int_mma = Some(IntMma {
-                            stage: Stage::Gemv,
-                            ksplit: 1,
-                            pos_tile: 1,
-                        });
+                        node.int_mma = Some(many_positions(self, i));
                         out.gemvs += 1;
                     }
                     Op::Comp(c)
@@ -248,5 +244,36 @@ impl TensorGraph {
         }
         out.demoted = out.demoted.iter().map(|t| map[t.n()]).collect();
         (ng, outputs.iter().map(|o| map[o.n()]).collect(), out)
+    }
+}
+
+/// The schedule of int8 contraction `i`: the decode GEMV for few
+/// positions; for a many-row step (`TANG_INT8_ROWS`, default 16, positions
+/// or more) the MMA tile (`TANG_INT8_STAGE` `gemv` / `mma` / `fragment`,
+/// `TANG_INT8_KSPLIT`, `TANG_INT8_POS_TILE` override).
+fn many_positions(g: &TensorGraph, i: usize) -> IntMma {
+    let env = |k: &str| std::env::var(k).ok();
+    let num = |k: &str, d: u32| env(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let pts = super::fixed(g.comp_at(i).unwrap().points());
+    let positions: usize = pts[..pts.len() - 1].iter().product();
+    let decode = IntMma {
+        stage: Stage::Gemv,
+        ksplit: 1,
+        pos_tile: 1,
+    };
+    if positions < num("TANG_INT8_ROWS", 16) as usize {
+        return decode;
+    }
+    // the tensor-core tile: 1.78k vs 0.84k tok/s for gemv on coder-next
+    // chunked prefill (k = 256, H200)
+    let stage = match env("TANG_INT8_STAGE").as_deref() {
+        Some("gemv") => Stage::Gemv,
+        Some("fragment") => Stage::Fragment,
+        _ => Stage::Mma,
+    };
+    IntMma {
+        stage,
+        ksplit: num("TANG_INT8_KSPLIT", 1),
+        pos_tile: num("TANG_INT8_POS_TILE", 1),
     }
 }

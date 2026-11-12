@@ -114,6 +114,7 @@ pub enum Target {
     MslMma,
 }
 
+#[derive(Clone)]
 pub struct WgslKernel {
     /// WGSL, or MSL when it starts with `#include` (entry point `main0`).
     pub source: String,
@@ -141,6 +142,7 @@ impl WgslKernel {
 }
 
 /// A buffer the program needs.
+#[derive(Clone)]
 pub struct BufferSpec {
     pub node: TensorId,
     /// Length in elements.
@@ -153,6 +155,7 @@ pub struct BufferSpec {
     pub input: Option<usize>,
 }
 
+#[derive(Clone)]
 pub struct WgslProgram {
     /// Kernels in dependency order.
     pub kernels: Vec<WgslKernel>,

@@ -51,7 +51,7 @@ use tang_expr::{ExprGraph, ExprId, Node};
 use super::msl_mma::Addr;
 use super::tile::emit_scalar;
 use super::wgsl::{Target, WgslProgram};
-use super::{fixed, numel, Arg, Form, Monoid, Op, TensorGraph, TensorId};
+use super::{fixed, numel, Arg, Form, Monoid, Op, Scan, ScanKind, TensorGraph, TensorId};
 
 /// How a graph input is stored on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +59,11 @@ pub enum Packing {
     /// Unsigned 4-bit integers, eight per 32-bit word, element `i` in
     /// bits `4·(i % 8)` of word `i / 8` (MLX's layout). Values `0..=15`.
     U4,
+    /// Unsigned 3-bit integers as one little-endian bit stream: element
+    /// `i` in bits `3i .. 3i+3` of the words (it straddles two when
+    /// `3i % 32 > 29`; 32 elements are exactly 3 words). Values `0..=7`
+    /// (the GPTQ 3-bit weights of bench/lowbit).
+    U3,
     /// bfloat16, two per word, element `i` in the `i % 2` half (the raw
     /// little-endian bytes of a bf16 array).
     Bf16,
@@ -73,6 +78,7 @@ impl Packing {
     pub fn words(self, len: usize) -> usize {
         match self {
             Packing::U4 => len.div_ceil(8),
+            Packing::U3 => (3 * len).div_ceil(32),
             Packing::Bf16 | Packing::F16 => len.div_ceil(2),
         }
     }
@@ -82,8 +88,22 @@ impl Packing {
         match self {
             Packing::Bf16 => format!("__uint_as_float(({bits}) << 16)"),
             Packing::F16 => format!("tang_h2f({bits})"),
-            Packing::U4 => unreachable!(),
+            Packing::U4 | Packing::U3 => unreachable!(),
         }
+    }
+
+    /// Bytes per element in memory.
+    fn bytes(self) -> f64 {
+        match self {
+            Packing::U4 => 0.5,
+            Packing::U3 => 0.375,
+            Packing::Bf16 | Packing::F16 => 2.0,
+        }
+    }
+
+    /// A sub-byte integer weight (its GEMVs stream 32-element chunks).
+    fn low_bit(self) -> bool {
+        matches!(self, Packing::U4 | Packing::U3)
     }
 }
 
@@ -184,6 +204,12 @@ __device__ __forceinline__ float tang_u4(const float* b, int a) {
     unsigned q = (__ldg((const unsigned*)b + (a >> 3)) >> ((a & 7) * 4)) & 15u;
     return __uint_as_float(0x4b000000u | q) - 8388608.0f;
 }
+__device__ __forceinline__ float tang_u3(const float* b, int a) {
+    const unsigned* w = (const unsigned*)b;
+    unsigned bit = 3u * (unsigned)a, o = bit & 31u, lo = __ldg(w + (bit >> 5)) >> o;
+    unsigned q = (o > 29u ? lo | (__ldg(w + (bit >> 5) + 1) << (32u - o)) : lo) & 7u;
+    return __uint_as_float(0x4b000000u | q) - 8388608.0f;
+}
 __device__ __forceinline__ float tang_bf16(const float* b, int a) {
     unsigned w = __ldg((const unsigned*)b + (a >> 1));
     return __uint_as_float((a & 1) ? (w & 0xffff0000u) : (w << 16));
@@ -224,7 +250,12 @@ impl TensorGraph {
             .unwrap_or_default();
         let rd: Vec<String> = reads
             .iter()
-            .map(|&r| format!("{:?}/{:?}", self.nodes[r].shape, self.nodes[r].precision.storage))
+            .map(|&r| {
+                format!(
+                    "{:?}/{:?}",
+                    self.nodes[r].shape, self.nodes[r].precision.storage
+                )
+            })
             .collect();
         super::tune::hash_hex(&format!(
             "{:?}|{:?}|{red}|{:?}|{}",
@@ -272,6 +303,55 @@ impl TensorGraph {
         target: DecodeTarget,
         tiles: &[usize],
     ) -> DecodeProgram {
+        // a k-row delta step's scan, readout and last state as fused
+        // kernels (no per-step states; see `tensor_cuda_delta.rs`)
+        if target == DecodeTarget::Cuda {
+            if let Some(g) = self.fuse_delta_steps(outputs) {
+                return g.to_decode_with(outputs, opts, target, tiles);
+            }
+            // many-row contractions as tensor-core matmuls (attention's
+            // p·v in a k-row step; see `tensor_cuda_split.rs`)
+            // (not over packed inputs: the tile reads plain f32/f16 only)
+            let packed_in: Vec<usize> = opts
+                .packed
+                .iter()
+                .filter_map(|&(k, _)| {
+                    (0..self.nodes.len())
+                        .find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
+                })
+                .collect();
+            if std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
+                if let Some(g) = self.split_bilinear_avoiding(outputs, &packed_in) {
+                    // factors were appended after their readers: lower the
+                    // graph renumbered in dependency order, then give the
+                    // program this graph's ids back (new factors keep ids
+                    // past this graph's nodes)
+                    let (r, old) = g.renumber(outputs);
+                    let mut new_of = vec![usize::MAX; g.nodes.len()];
+                    for (n, &o) in old.iter().enumerate() {
+                        new_of[o] = n;
+                    }
+                    let nid = |t: TensorId| TensorId(new_of[t.n()] as u32);
+                    let oid = |t: TensorId| TensorId(old[t.n()] as u32);
+                    let routs: Vec<TensorId> = outputs.iter().map(|&t| nid(t)).collect();
+                    let mut ropts = opts.clone();
+                    ropts.inplace = opts.inplace.iter().map(|&(t, k)| (nid(t), k)).collect();
+                    let mut dp = r.to_decode_with(&routs, &ropts, target, tiles);
+                    for k in &mut dp.program.kernels {
+                        k.node = oid(k.node);
+                        k.reads.iter_mut().for_each(|t| *t = oid(*t));
+                    }
+                    for b in &mut dp.program.buffers {
+                        b.node = oid(b.node);
+                    }
+                    for (a, b) in &mut dp.program.aliases {
+                        *a = oid(*a);
+                        *b = oid(*b);
+                    }
+                    return dp;
+                }
+            }
+        }
         // Block formats (GGUF weights, Q8x32 activations) on CUDA: laid out
         // as f32, then the buffers get their formats back; the int8 GEMV
         // (`IntMma`) reads them and Q8x32 writers store them (see
@@ -324,6 +404,34 @@ impl TensorGraph {
             let root = k.node.index();
             let reads: Vec<usize> = k.reads.iter().map(|t| t.index()).collect();
             super::tune::set_kernel(ki, Some(self.kernel_sig(root, &reads)));
+            if let Op::Scan(Scan {
+                kind: ScanKind::Delta(_),
+                ..
+            }) = &self.nodes[root].op
+            {
+                let (src, threads, blocks) = self.cuda_delta_kernel(root, &reads);
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = (threads * blocks) as u32;
+                native.push(true);
+                continue;
+            }
+            if target == DecodeTarget::Cuda
+                && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0")
+                && self.nodes[root].int_mma.is_none()
+                && self.mma_candidate(root)
+                && !reads.iter().any(|&r| blocky(r) || packed.contains_key(&r))
+            {
+                if let Some(src) = self.cuda_mma_kernel(root, &reads) {
+                    let threads = super::cuda::src_define(&src, "TANG_THREADS");
+                    let tiles = super::cuda::src_define(&src, "TANG_TILES");
+                    k.source = src;
+                    k.workgroup_size = threads as u32;
+                    k.count = (threads * tiles) as u32;
+                    native.push(true);
+                    continue;
+                }
+            }
             if any_block {
                 if let Some(s) = self.nodes[root].int_mma {
                     let (src, threads, blocks) = self
@@ -438,7 +546,7 @@ impl TensorGraph {
                 None => (target == DecodeTarget::Cuda)
                     .then(|| lw.topk_select(root).or_else(|| lw.topk_warp(root)))
                     .flatten()
-                    .or_else(|| mma())
+                    .or_else(mma)
                     .or_else(|| lw.shared_reduction(root))
                     .or_else(|| lw.split_fused(root))
                     .or_else(|| lw.warp_reduction(root))
@@ -884,6 +992,7 @@ fn load(buf: usize, pack: Option<Packing>, a: &str) -> String {
     match pack {
         None => format!("__ldg(b{buf} + ({a}))"),
         Some(Packing::U4) => format!("tang_u4(b{buf}, {a})"),
+        Some(Packing::U3) => format!("tang_u3(b{buf}, {a})"),
         Some(Packing::Bf16) => format!("tang_bf16(b{buf}, {a})"),
         Some(Packing::F16) => format!("tang_f16(b{buf}, {a})"),
     }
@@ -2019,7 +2128,7 @@ impl Lowering<'_> {
         let unit = |l: &Leaf| l.addr.coefs[kin] == 1;
         let vec = if leaves
             .iter()
-            .any(|l| unit(l) && l.pack == Some(Packing::U4) && aligned(l, 32))
+            .any(|l| unit(l) && l.pack.is_some_and(Packing::low_bit) && aligned(l, 32))
             && ri.is_multiple_of(32)
         {
             32
@@ -2035,7 +2144,7 @@ impl Lowering<'_> {
                 && ri.is_multiple_of(wide)
                 && leaves
                     .iter()
-                    .filter(|l| unit(l) && l.pack != Some(Packing::U4))
+                    .filter(|l| unit(l) && !l.pack.is_some_and(Packing::low_bit))
                     .all(|l| aligned(l, 4))
             {
                 wide
@@ -2055,7 +2164,7 @@ impl Lowering<'_> {
                     && unit(l)
                     && match l.pack {
                         None => aligned(l, 4),
-                        Some(Packing::U4) => vec == 32 && aligned(l, 32),
+                        Some(Packing::U4 | Packing::U3) => vec == 32 && aligned(l, 32),
                         Some(Packing::Bf16 | Packing::F16) => aligned(l, 4),
                     }
                 {
@@ -2109,11 +2218,7 @@ impl Lowering<'_> {
         // but re-reads the f32 probabilities per `d`; tiling `d` shares
         // them), take it. `TANG_REG_MODEL=0` keeps the rule.
         if std::env::var("TANG_REG_MODEL").as_deref() != Ok("0") {
-            let bytes = |l: &Leaf| match l.pack {
-                Some(Packing::U4) => 0.5,
-                Some(Packing::Bf16 | Packing::F16) => 2.0,
-                None => 4.0,
-            };
+            let bytes = |l: &Leaf| l.pack.map_or(4.0, Packing::bytes);
             let streamed: Vec<&Leaf> = leaves
                 .iter()
                 .filter(|l| (pk..rank).any(|r| l.addr.coefs[r] != 0))
@@ -2158,13 +2263,9 @@ impl Lowering<'_> {
         let mut reg2: Option<(usize, usize)> = None;
         if let Some((d1, t1)) = reg {
             if super::tune::knob("TANG_REG2").as_deref() != Some("0")
-                && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
+                && !leaves.iter().any(|l| l.pack.is_some_and(Packing::low_bit))
             {
-                let bytes = |l: &Leaf| match l.pack {
-                    Some(Packing::U4) => 0.5,
-                    Some(Packing::Bf16 | Packing::F16) => 2.0,
-                    None => 4.0,
-                };
+                let bytes = |l: &Leaf| l.pack.map_or(4.0, Packing::bytes);
                 let cost = |d2: Option<(usize, usize)>| -> f64 {
                     leaves
                         .iter()
@@ -2198,11 +2299,10 @@ impl Lowering<'_> {
                 // lane loads k·32 f32 activations per 16 bytes of weight
                 // and a window is bound by those loads, not by DRAM. Up
                 // to `TANG_WIN_TILE` (32) points a lane
-                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE")
-                    .unwrap_or(32);
+                let cap: usize = super::tune::knob_parse("TANG_WIN_TILE").unwrap_or(32);
                 let w4: Vec<&Leaf> = leaves
                     .iter()
-                    .filter(|l| l.pack == Some(Packing::U4))
+                    .filter(|l| l.pack.is_some_and(Packing::low_bit))
                     .collect();
                 if t1 > 1 && w4.iter().all(|l| l.addr.coefs[d1] == 0) {
                     reg2 = (0..pk)
@@ -2214,6 +2314,56 @@ impl Lowering<'_> {
                         })
                         .flat_map(|d| [8usize, 4, 2].into_iter().map(move |t| (d, t)))
                         .find(|&(d, t)| pts[d].is_multiple_of(t) && t1 * t <= cap);
+                    // then the token and row tiles together, by the bytes
+                    // all groups load per reduce element (L2 traffic):
+                    // each group loads every leaf once per register point
+                    // it depends on; a 4-bit row re-read by k/t1 groups
+                    // vs k f32 activations re-read by rows/t2 groups.
+                    // 8×4 at k=8 is 8.5 B per weight element, 2×16 is 4
+                    // (H200: window time tracks it). TANG_WIN_JOINT=0 off
+                    // (only past 4 tokens: on the H200 2×16 took window-8
+                    // from 17.9 to 13.4 ms but window-4 from 6.9 to 9.0)
+                    if let Some((d2, _)) = reg2.filter(|_| pts[d1] > 4) {
+                        if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
+                            let bytes = |l: &Leaf| match l.pack {
+                                Some(Packing::U4) => 0.5,
+                                Some(Packing::Bf16 | Packing::F16) => 2.0,
+                                None => 4.0,
+                            };
+                            let traffic = |a: usize, b: usize| -> f64 {
+                                let groups = (pts[d1] / a * (pts[d2] / b)) as f64;
+                                groups
+                                    * leaves
+                                        .iter()
+                                        // (per-group scales, constant along
+                                        // the innermost reduce dim, amortize)
+                                        .filter(|l| l.addr.coefs[rank - 1] != 0)
+                                        .map(|l| {
+                                            let mut n = bytes(l);
+                                            if l.addr.coefs[d1] != 0 {
+                                                n *= a as f64;
+                                            }
+                                            if l.addr.coefs[d2] != 0 {
+                                                n *= b as f64;
+                                            }
+                                            n
+                                        })
+                                        .sum::<f64>()
+                            };
+                            let best = [8usize, 4, 2]
+                                .into_iter()
+                                .filter(|&a| pts[d1].is_multiple_of(a))
+                                .flat_map(|a| {
+                                    [32usize, 16, 8, 4, 2].into_iter().map(move |b| (a, b))
+                                })
+                                .filter(|&(a, b)| pts[d2].is_multiple_of(b) && a * b <= cap)
+                                .min_by(|x, y| traffic(x.0, x.1).total_cmp(&traffic(y.0, y.1)));
+                            if let Some((a, b)) = best {
+                                reg = Some((d1, a));
+                                reg2 = Some((d2, b));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2269,7 +2419,7 @@ impl Lowering<'_> {
         // (a 4-bit weight's 32-wide chunks keep a warp per group: its
         // lanes stream the weight rows)
         let lpg = if ks == 1
-            && !leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            && !leaves.iter().any(|l| l.pack.is_some_and(Packing::low_bit))
             && super::tune::knob("TANG_SUBWARP").as_deref() != Some("0")
         {
             n_chunks.div_ceil(4).next_power_of_two().clamp(1, 32)
@@ -2553,7 +2703,7 @@ impl Lowering<'_> {
         // the chunk instead of all `vec` up front: k·vec registers spill
         let stream = vec % 4 == 0
             && super::tune::knob("TANG_WIN_STREAM").as_deref() != Some("0")
-            && leaves.iter().any(|l| l.pack == Some(Packing::U4))
+            && leaves.iter().any(|l| l.pack.is_some_and(Packing::low_bit))
             && leaves
                 .iter()
                 .enumerate()
@@ -2584,6 +2734,17 @@ impl Lowering<'_> {
                             writeln!(
                                 s,
                                 "        for (int r = 0; r < {nr}; r++) u{i}[r] = __ldg((const uint4*)b{} + (({a}) >> 5));",
+                                l.buf
+                            )
+                            .unwrap();
+                        }
+                        Some(Packing::U3) => {
+                            // 32 codes = 3 words, chunk-aligned (no straddle)
+                            writeln!(s, "        uint3 u{i}[{nr}];").unwrap();
+                            writeln!(s, "        #pragma unroll").unwrap();
+                            writeln!(
+                                s,
+                                "        for (int r = 0; r < {nr}; r++) {{ const unsigned* p = (const unsigned*)b{} + (({a}) >> 5) * 3; u{i}[r] = make_uint3(__ldg(p), __ldg(p + 1), __ldg(p + 2)); }}",
                                 l.buf
                             )
                             .unwrap();
@@ -2667,6 +2828,12 @@ impl Lowering<'_> {
                     Some(Packing::U4) => format!(
                         "(__uint_as_float(0x4b000000u | (((&u{i}[{}].x)[e >> 3] >> ((e & 7) * 4)) & 15u)) - 8388608.0)",
                         ri_(l)
+                    ),
+                    // bit 3e of the chunk's 3 words; `e` is unrolled, so
+                    // the word, shift and straddle fold to constants
+                    Some(Packing::U3) => format!(
+                        "(__uint_as_float(0x4b000000u | ((((&u{i}[{r}].x)[(3 * e) >> 5] >> ((3 * e) & 31)) | (((3 * e) & 31) > 29 ? (&u{i}[{r}].x)[((3 * e) >> 5) + 1] << (32 - ((3 * e) & 31)) : 0u)) & 7u)) - 8388608.0)",
+                        r = ri_(l)
                     ),
                     Some(p @ (Packing::Bf16 | Packing::F16)) => p.half(&format!(
                         "(((&w{i}[{}][e >> 2].x)[(e >> 1) & 1] >> (16 * (e & 1))) & 0xffffu)",
@@ -2924,7 +3091,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -2954,7 +3123,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    __shared__ float si[{p}];").unwrap();
         writeln!(s, "    __shared__ float sv[{p}];").unwrap();
         writeln!(s, "    const int tid = threadIdx.x;").unwrap();
@@ -2968,7 +3142,11 @@ impl Lowering<'_> {
         writeln!(s, "    for (int i = tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "    if (tid == 0) cnt = 0;").unwrap();
         writeln!(s, "    __syncthreads();").unwrap();
-        writeln!(s, "    for (int base = 0; base < {n_red}; base += {threads}) {{").unwrap();
+        writeln!(
+            s,
+            "    for (int base = 0; base < {n_red}; base += {threads}) {{"
+        )
+        .unwrap();
         writeln!(s, "      {{").unwrap();
         writeln!(s, "        const int r = base + tid;").unwrap();
         writeln!(s, "        float ej = 0.0f, ew = -3.40282347e38f;").unwrap();
@@ -2988,14 +3166,29 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         // only what beats the current k-th survives to the next sort
-        writeln!(s, "        const float tv = sv[{}], tj = si[{}];", k - 1, k - 1).unwrap();
-        writeln!(s, "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{").unwrap();
+        writeln!(
+            s,
+            "        const float tv = sv[{}], tj = si[{}];",
+            k - 1,
+            k - 1
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "        if (r < {n_red} && (ew > tv || (ew == tv && ej < tj))) {{"
+        )
+        .unwrap();
         writeln!(s, "          const int q = atomicAdd(&cnt, 1);").unwrap();
         writeln!(s, "          si[{k} + q] = ej; sv[{k} + q] = ew;").unwrap();
         writeln!(s, "        }}").unwrap();
@@ -3003,19 +3196,40 @@ impl Lowering<'_> {
         writeln!(s, "      __syncthreads();").unwrap();
         writeln!(s, "      const int c = cnt;").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
-        writeln!(s, "      if (c > {} || base + {threads} >= {n_red}) {{", chunk - threads).unwrap();
+        writeln!(
+            s,
+            "      if (c > {} || base + {threads} >= {n_red}) {{",
+            chunk - threads
+        )
+        .unwrap();
         writeln!(s, "      for (int i = {k} + c + tid; i < {p}; i += {threads}) {{ si[i] = 0.0f; sv[i] = -3.40282347e38f; }}").unwrap();
         writeln!(s, "      __syncthreads();").unwrap();
         // bitonic sort of all P, best first
         writeln!(s, "      for (int size = 2; size <= {p}; size <<= 1) {{").unwrap();
-        writeln!(s, "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{").unwrap();
+        writeln!(
+            s,
+            "        for (int stride = size >> 1; stride > 0; stride >>= 1) {{"
+        )
+        .unwrap();
         writeln!(s, "          for (int i = tid; i < {p}; i += {threads}) {{").unwrap();
         writeln!(s, "            const int j = i ^ stride;").unwrap();
         writeln!(s, "            if (j > i) {{").unwrap();
-        writeln!(s, "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);").unwrap();
-        writeln!(s, "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);").unwrap();
+        writeln!(
+            s,
+            "              const bool jb = sv[j] > sv[i] || (sv[j] == sv[i] && si[j] < si[i]);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "              const bool ib = sv[i] > sv[j] || (sv[i] == sv[j] && si[i] < si[j]);"
+        )
+        .unwrap();
         writeln!(s, "              if ((i & size) == 0 ? jb : ib) {{").unwrap();
-        writeln!(s, "                float a = si[i]; si[i] = si[j]; si[j] = a;").unwrap();
+        writeln!(
+            s,
+            "                float a = si[i]; si[i] = si[j]; si[j] = a;"
+        )
+        .unwrap();
         writeln!(s, "                a = sv[i]; sv[i] = sv[j]; sv[j] = a;").unwrap();
         writeln!(s, "              }}").unwrap();
         writeln!(s, "            }}").unwrap();
@@ -3579,7 +3793,7 @@ impl Lowering<'_> {
         // along the innermost dim, or (when that is the bounded dim, whose
         // points are all this thread's) one half by read-modify-write
         let pack = self.packed.get(&root).copied();
-        if pack == Some(Packing::U4) {
+        if pack.is_some_and(Packing::low_bit) {
             return None;
         }
         let last = pk - 1;
@@ -3782,7 +3996,9 @@ impl Lowering<'_> {
                 .map(|i| ((i * 5 + probe * 11) % 13) as f64 * 0.7 - 2.1)
                 .collect();
             let o = c.body.eval_many::<f64>(&c.body_outs[2..], &v);
-            if o.chunks(2).any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64)) {
+            if o.chunks(2)
+                .any(|p| p[0] != 0.0 || p[1] != -(f32::MAX as f64))
+            {
                 return None;
             }
         }
@@ -3813,7 +4029,12 @@ impl Lowering<'_> {
             .collect();
         params.push("float* __restrict__ out".into());
         params.push("unsigned count".into());
-        writeln!(s, "extern \"C\" __global__ void main0({}) {{", params.join(", ")).unwrap();
+        writeln!(
+            s,
+            "extern \"C\" __global__ void main0({}) {{",
+            params.join(", ")
+        )
+        .unwrap();
         writeln!(s, "    const int lane = threadIdx.x;").unwrap();
         writeln!(s, "    const int pt = blockIdx.x;").unwrap();
         let mut rem = "pt".to_string();
@@ -3842,9 +4063,14 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.emit_val(&mut s, a, &coords, "          ", &mut ctr, &el))
             .collect();
-        let y = emit(&mut s, &c.body, &c.body_outs[..2], "x_", "          ", &|v| {
-            vals[v as usize].clone()
-        });
+        let y = emit(
+            &mut s,
+            &c.body,
+            &c.body_outs[..2],
+            "x_",
+            "          ",
+            &|v| vals[v as usize].clone(),
+        );
         writeln!(s, "          ej = {}; ew = {};", y[0], y[1]).unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        vj[e] = ej; vw[e] = ew;").unwrap();
@@ -3859,9 +4085,21 @@ impl Lowering<'_> {
         writeln!(s, "        int bl = lane;").unwrap();
         writeln!(s, "        #pragma unroll").unwrap();
         writeln!(s, "        for (int o = 16; o > 0; o >>= 1) {{").unwrap();
-        writeln!(s, "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);").unwrap();
-        writeln!(s, "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);").unwrap();
-        writeln!(s, "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);").unwrap();
+        writeln!(
+            s,
+            "            const float oj = __shfl_xor_sync(0xffffffffu, bj, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const float ow = __shfl_xor_sync(0xffffffffu, bw, o);"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "            const int ol = __shfl_xor_sync(0xffffffffu, bl, o);"
+        )
+        .unwrap();
         writeln!(s, "            if (ow > bw || (ow == bw && (oj < bj || (oj == bj && ol < bl)))) {{ bj = oj; bw = ow; bl = ol; }}").unwrap();
         writeln!(s, "        }}").unwrap();
         writeln!(s, "        if (lane == bl) {{").unwrap();
@@ -3904,8 +4142,16 @@ fn topk_merge(s: &mut String, k: usize, indent: &str, accs: &[String], el: &[Str
         "{indent}    float ai = ta[2 * ia], av = ta[2 * ia + 1], bi = tb[2 * ib], bv = tb[2 * ib + 1];"
     )
     .unwrap();
-    writeln!(s, "{indent}    bool fa = av > bv || (av == bv && ai <= bi);").unwrap();
-    writeln!(s, "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;").unwrap();
+    writeln!(
+        s,
+        "{indent}    bool fa = av > bv || (av == bv && ai <= bi);"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{indent}    to[2 * q] = fa ? ai : bi; to[2 * q + 1] = fa ? av : bv;"
+    )
+    .unwrap();
     writeln!(s, "{indent}    if (fa) ia++; else ib++;").unwrap();
     writeln!(s, "{indent}  }}").unwrap();
     for i in 0..w {
@@ -3923,8 +4169,8 @@ impl TensorGraph {
 }
 
 impl Lowering<'_> {
-    /// A small reduction (at most 64 elements a point, Sum or Max, width
-    /// 1) as one thread per point looping over its reduce space: for a
+    /// A small reduction (at most 64 elements a point, Sum or Max, of
+    /// width 1) as one thread per point looping over its reduce space: for a
     /// kernel that hosts inlined nodes or side jobs (`TNode::host`) and
     /// has no warp lowering (a depthwise conv over a short window).
     fn thread_reduction(&self, root: usize) -> Option<Kernel> {
@@ -4047,7 +4293,7 @@ impl Lowering<'_> {
             || c.tuple != 0
             || g.nodes[u].precision.storage != super::Format::F32
             || self.packed.contains_key(&u)
-            || threads % 32 != 0
+            || !threads.is_multiple_of(32)
         {
             return None;
         }

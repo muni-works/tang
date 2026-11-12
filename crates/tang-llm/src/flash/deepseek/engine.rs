@@ -51,6 +51,38 @@ const B256: (u32, u32, u32) = (256, 1, 1);
 /// it (the kernels read it from `P[0]`): any host use gives wrong answers the tests catch.
 const DYN: usize = 1 << 40;
 
+/// `DS_ROWS_CHUNK`: the most rows one [`GpuModel::forward_rows`] step takes (default 8,
+/// the row-exact kernels; 0 = no limit).
+fn rows_chunk() -> usize {
+    std::env::var("DS_ROWS_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
+/// `DS_ROWS_FUSED=0`: a rows step's attention runs each row's whole attention (its own
+/// weight reads) instead of [`GpuModel::attention_rows_fused`]'s batched projections (A/B).
+fn rows_fused() -> bool {
+    std::env::var("DS_ROWS_FUSED").map_or(true, |v| v != "0")
+}
+
+/// `DS_ROWS_GRAPH=0`: rows steps run directly instead of as captured graphs.
+fn rows_graph() -> bool {
+    std::env::var("DS_ROWS_GRAPH").map_or(true, |v| v != "0")
+}
+
+/// `DS_ROWS_TAB=0`: a rows step's per-row kernels run row by row instead of once over all
+/// rows through the step's [`RowP`] table (A/B).
+fn rows_tab() -> bool {
+    std::env::var("DS_ROWS_TAB").map_or(true, |v| v != "0")
+}
+
+/// `DS_ROWS_ATTN=0`: a rows step's decode attention runs row by row instead of one
+/// `attn_fd_win_rows` launch pair for all rows (A/B).
+fn rows_attn() -> bool {
+    std::env::var("DS_ROWS_ATTN").map_or(true, |v| v != "0")
+}
+
 /// `DS_COMP_SEQ=1`: the per-position compressor loop instead of the batched `compress_rows`.
 fn comp_batched() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -278,10 +310,18 @@ pub struct GpuModel {
     pub graph: bool,
     pub graph_stats: GraphStats,
     tabs: Vec<DevBuf>,
-    win: Vec<DevBuf>,
-    ckv: HashMap<usize, DevBuf>,
-    idxk: HashMap<usize, DevBuf>,
-    cst: HashMap<usize, (DevBuf, DevBuf)>,
+    /// Per-sequence device state, one entry per serving slot ([`Self::add_slots`]); the
+    /// forward runs on `seqs[cur]` ([`Self::select_slot`]).
+    seqs: Vec<SeqState>,
+    cur: usize,
+    /// Set while [`Self::forward_rows`] runs: one decode row per sequence slot. The block
+    /// splits only its attention per row (that row's slot caches, position and selection).
+    segs: Option<Vec<Seg>>,
+    /// The rows step's `[layer][row]` [`RowP`] table and its row count (`DS_ROWS_TAB=0`:
+    /// none, the per-row kernels run row by row).
+    rowtab: Option<(Buf, usize)>,
+    /// The slot whose engram history the CPU model holds (always `cur` between calls).
+    hash_held: usize,
     qk: RefCell<HashMap<usize, Rc<DevBuf>>>,
     /// Set by [`GpuModel::block`]: `moe_finish` leaves the shared expert's output here,
     /// unsummed, for the post-mix to add (`ds_add_round` folded into `ds_hc_post`).
@@ -314,11 +354,11 @@ pub struct GpuModel {
     jrows: Vec<(usize, usize, Buf, Buf)>,
     arena: RefCell<Arena>,
     stage: RefCell<Staging>,
-    graphs: HashMap<(usize, bool), Captured>,
-    warm: HashMap<(usize, bool), (u64, u64)>,
+    graphs: HashMap<(usize, bool, Vec<usize>), Captured>,
+    warm: HashMap<(usize, bool, Vec<usize>), (u64, u64)>,
     /// Captured drafts by (main rows, sampler (temperature, top-p) bits), and their warm-ups.
-    spark_graphs: HashMap<(usize, Option<(u32, u32)>), SparkGraph>,
-    spark_warm: HashMap<(usize, Option<(u32, u32)>), (u64, u64)>,
+    spark_graphs: HashMap<(usize, Option<(u32, u32)>, usize), SparkGraph>,
+    spark_warm: HashMap<(usize, Option<(u32, u32)>, usize), (u64, u64)>,
     /// Debugging: each backbone layer's input stream and pre-mix (as [`Model::force`]).
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     /// Intermediates read back by name when `DS_TAP` is set (as [`Model::taps`]).
@@ -396,6 +436,85 @@ impl Drop for GpuModel {
     }
 }
 
+/// One sequence's device state: the sliding-window rings (every layer, MTP included), the
+/// compressed KV and indexer-key caches of the KV-source layers, and the compressors'
+/// partial groups. `cap` is the positions the caches hold.
+struct SeqState {
+    win: Vec<DevBuf>,
+    ckv: HashMap<usize, DevBuf>,
+    idxk: HashMap<usize, DevBuf>,
+    cst: HashMap<usize, (DevBuf, DevBuf)>,
+    cap: usize,
+    /// The engram token history ([`Model`]'s `hash_cache`) while the slot is inactive; the
+    /// active slot's lives in the CPU model.
+    hash: Vec<i64>,
+}
+
+impl SeqState {
+    fn alloc(c: &super::Config, cap: usize) -> Result<Self> {
+        let hd = c.head_dim;
+        let upf = |v: &[f32]| -> Result<DevBuf> { Ok(DevBuf::from_slice(v)?) };
+        let n_all = c.n_layers + c.n_mtp_layers;
+        let win = (0..n_all)
+            .map(|_| upf(&vec![0f32; c.window_size * hd]))
+            .collect::<Result<_>>()?;
+        let mut ckv = HashMap::new();
+        let mut idxk = HashMap::new();
+        let mut cst = HashMap::new();
+        for &l in &c.kv_source_layers {
+            let r = c.compress_ratios[l];
+            ckv.insert(l, upf(&vec![0f32; cap / r * hd])?);
+            idxk.insert(l, upf(&vec![0f32; cap / r * c.index_head_dim])?);
+            if r > 1 {
+                cst.insert(
+                    l,
+                    (
+                        upf(&vec![0f32; r * hd])?,
+                        upf(&vec![f32::NEG_INFINITY; r * hd])?,
+                    ),
+                );
+            }
+        }
+        Ok(Self {
+            win,
+            ckv,
+            idxk,
+            cst,
+            cap,
+            hash: vec![0; cap],
+        })
+    }
+}
+
+/// One row of a [`GpuModel::forward_rows`] step: its slot, its device position params
+/// (`P[0]` = the row's position) and the step's per-sequence selection state, swapped in
+/// around the row's attention.
+struct Seg {
+    slot: usize,
+    /// The row's index in the whole step (its row of the step's [`RowP`] tables).
+    row: usize,
+    p: Buf,
+    topk: Option<(Buf, usize)>,
+    cand: Option<(Buf, usize)>,
+    sh_ckv: usize,
+    sh_idxk: usize,
+}
+
+/// kernels.cu's `RowP`: one row of a rows step for one layer (its position, its slot's
+/// buffers), so a per-row kernel runs once over all rows. Staged per step as
+/// `[layer][row]` ([`GpuModel::forward_rows`]).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RowP {
+    ring: u64,
+    kst: u64,
+    sst: u64,
+    ckv: u64,
+    idxk: u64,
+    pos: i32,
+    pad: i32,
+}
+
 /// As [`super::forward::Snapshot`], on the device: views of the model's one snapshot store
 /// (a newer snapshot overwrites it).
 pub struct GpuSnapshot {
@@ -423,34 +542,14 @@ impl GpuModel {
         let s = Stream::blocking()?;
         let cpu = Model::open(dir)?;
         let c = cpu.cfg.clone();
-        let (hd, sl) = (c.head_dim, c.max_seq_len);
+        let sl = c.max_seq_len;
         let upf = |v: &[f32]| -> Result<DevBuf> { Ok(DevBuf::from_slice(v)?) };
         let tabs = cpu
             .freqs
             .iter()
             .map(|t| upf(&t.iter().flat_map(|&(a, b)| [a, b]).collect::<Vec<f32>>()))
             .collect::<Result<_>>()?;
-        let n_all = c.n_layers + c.n_mtp_layers;
-        let win = (0..n_all)
-            .map(|_| upf(&vec![0f32; c.window_size * hd]))
-            .collect::<Result<_>>()?;
-        let mut ckv = HashMap::new();
-        let mut idxk = HashMap::new();
-        let mut cst = HashMap::new();
-        for &l in &c.kv_source_layers {
-            let r = c.compress_ratios[l];
-            ckv.insert(l, upf(&vec![0f32; sl / r * hd])?);
-            idxk.insert(l, upf(&vec![0f32; sl / r * c.index_head_dim])?);
-            if r > 1 {
-                cst.insert(
-                    l,
-                    (
-                        upf(&vec![0f32; r * hd])?,
-                        upf(&vec![f32::NEG_INFINITY; r * hd])?,
-                    ),
-                );
-            }
-        }
+        let seq0 = SeqState::alloc(&c, sl)?;
         Ok(Self {
             cpu,
             k,
@@ -484,10 +583,11 @@ impl GpuModel {
             graph: std::env::var("DS_GRAPH").map_or(true, |v| v != "0"),
             graph_stats: GraphStats::default(),
             tabs,
-            win,
-            ckv,
-            idxk,
-            cst,
+            seqs: vec![seq0],
+            cur: 0,
+            segs: None,
+            rowtab: None,
+            hash_held: 0,
             qk: RefCell::new(HashMap::new()),
             defer_sh: Cell::new(false),
             sh: Cell::new(None),
@@ -536,7 +636,7 @@ impl GpuModel {
     /// compressors' partial groups do (in place: captured graphs hold their addresses).
     pub fn reset(&mut self) -> Result<()> {
         let hd = self.cpu.cfg.head_dim;
-        for (&l, (a, bb)) in self.cst.iter() {
+        for (&l, (a, bb)) in self.seqs[self.cur].cst.iter() {
             let n = self.cpu.cfg.compress_ratios[l] * hd;
             self.fill(a.ptr, 0, n)?;
             self.fill(bb.ptr, f32::NEG_INFINITY.to_bits() as i32, n)?;
@@ -546,6 +646,63 @@ impl GpuModel {
         self.topk = None;
         self.cand = None;
         Ok(())
+    }
+
+    /// Grow to `n` sequence slots (slot 0 is the one [`Self::open`] made, sized for the
+    /// model's `max_seq_len`); the new ones hold `cap` positions each. Each slot is its own
+    /// sequence: [`Self::select_slot`] picks the one the next forward / reset runs on.
+    pub fn add_slots(&mut self, n: usize, cap: usize) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let r = c.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        anyhow::ensure!(cap >= r && cap <= c.max_seq_len, "slot cap {cap}");
+        while self.seqs.len() < n {
+            self.seqs.push(SeqState::alloc(&c, cap)?);
+            let cur = self.cur;
+            self.cur = self.seqs.len() - 1;
+            self.reset()?;
+            self.cur = cur;
+        }
+        Ok(())
+    }
+
+    /// The sequence slots.
+    pub fn n_slots(&self) -> usize {
+        self.seqs.len()
+    }
+
+    /// The positions slot `s`'s caches hold.
+    pub fn slot_cap(&self, s: usize) -> usize {
+        self.seqs[s].cap
+    }
+
+    /// The slot the forward runs on.
+    pub fn slot(&self) -> usize {
+        self.cur
+    }
+
+    /// Run the next forwards on slot `s`'s sequence. A step's transient selection state is
+    /// dropped (it is recomputed each step); captured graphs are kept per slot (they bake
+    /// the slot's cache addresses). An open snapshot belongs to the slot it was taken on.
+    pub fn select_slot(&mut self, s: usize) -> Result<()> {
+        anyhow::ensure!(s < self.seqs.len(), "slot {s} >= {}", self.seqs.len());
+        if s == self.cur {
+            return Ok(());
+        }
+        anyhow::ensure!(!self.journal_on, "slot switch under an open snapshot");
+        self.s.sync()?;
+        self.swap_hash(s);
+        self.cur = s;
+        self.sh_ckv = 0;
+        self.sh_idxk = 0;
+        self.topk = None;
+        self.cand = None;
+        self.last = None;
+        Ok(())
+    }
+
+    /// The positions slot `cur`'s caches hold.
+    fn seq_cap(&self) -> usize {
+        self.seqs[self.cur].cap
     }
 
     // scratch
@@ -844,7 +1001,7 @@ impl GpuModel {
                         B256,
                         0,
                         &self.s,
-                        args![x.ptr, tab, r, pr, di, rdi, p, a, ps, fx, inv],
+                        args![x.ptr, tab, r, pr, di, rdi, p, a, ps, fx, inv, 0i32],
                     )
                 }
             }
@@ -859,6 +1016,862 @@ impl GpuModel {
         } else {
             self.attention_dyn(p, lid, x, t)
         }
+    }
+
+    /// Swap row `sg`'s per-sequence step state in (slot, position params, selection).
+    fn seg_in(&mut self, sg: &mut Seg) {
+        self.cur = sg.slot;
+        self.p = sg.p;
+        self.topk = sg.topk.take();
+        self.cand = sg.cand.take();
+        self.sh_ckv = sg.sh_ckv;
+        self.sh_idxk = sg.sh_idxk;
+    }
+
+    /// Swap the row's selection state back out into `sg`.
+    fn seg_out(&mut self, sg: &mut Seg) {
+        sg.topk = self.topk.take();
+        sg.cand = self.cand.take();
+        sg.sh_ckv = self.sh_ckv;
+        sg.sh_idxk = self.sh_idxk;
+    }
+
+    /// [`Self::attention`] over a [`Self::forward_rows`] step with every weight read ONCE
+    /// for the rows: wq_a|wkv, wq_b, the compressor and indexer projections and wo run over
+    /// all `t` rows; only the position- and cache-dependent kernels (the q/kv epilogue with
+    /// rope and the ring write, the compressor pool and cache rows, the indexer scores and
+    /// top-k, the attention itself) run per row, each on its row's slot and position. The
+    /// same kernels a lone t = 1 decode runs, so bit for bit (t <= 8). `None` when this
+    /// layer's shapes miss the fused q/kv path (the caller runs [`Self::attention_rows`]).
+    fn attention_rows_fused(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+    ) -> Result<Option<Buf>> {
+        let (h, hd) = (self.cpu.cfg.n_heads, self.cpu.cfg.head_dim);
+        let wqa = self.dw(&format!("{p}.attn.wq_a.weight"))?.v;
+        let wkv = self.dw(&format!("{p}.attn.wkv.weight"))?.v;
+        let wqb = self.dw(&format!("{p}.attn.wq_b.weight"))?.v;
+        let qn = self.dw(&format!("{p}.attn.q_norm.weight"))?.v;
+        let kn = self.dw(&format!("{p}.attn.kv_norm.weight"))?.v;
+        let ok = rows_fused()
+            && self.fast
+            && t >= 1
+            && comp_batched()
+            && [wqa, wkv, wqb].iter().all(|w| self.k.ks_ok(w))
+            && wqa.cols == wkv.cols
+            && wkv.rows as usize == hd
+            && wqb.cols == wqa.rows
+            && wqb.rows as usize == h * hd
+            && qn.cols == wqa.rows
+            && kn.cols as usize == hd
+            && wqa.rows % 32 == 0
+            && hd % 32 == 0;
+        if !ok {
+            return Ok(None);
+        }
+        let mut segs = self
+            .segs
+            .take()
+            .context("attention_rows_fused without rows")?;
+        // the q/kv codes buffers hold 8 rows: wider steps run the attention 8 rows at a time
+        // (the rest of the step, MoE included, still runs over every row at once)
+        let d = self.cpu.cfg.dim;
+        let ws = (wqa, wkv, wqb, qn, kn);
+        let r = (|| -> Result<Buf> {
+            if t <= 8 {
+                return self.attention_rows_fused_impl(p, lid, x, t, &mut segs, ws);
+            }
+            let y = self.fbuf(t * d)?;
+            for c0 in (0..t).step_by(8) {
+                let n = (t - c0).min(8);
+                let yc = self.attention_rows_fused_impl(
+                    p,
+                    lid,
+                    x.at(c0 * d * 4),
+                    n,
+                    &mut segs[c0..c0 + n],
+                    ws,
+                )?;
+                self.copy(y.ptr + (c0 * d * 4) as u64, yc.ptr, n * d)?;
+            }
+            Ok(y)
+        })();
+        self.segs = Some(segs);
+        r.map(Some)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn attention_rows_fused_impl(
+        &mut self,
+        p: &str,
+        lid: usize,
+        x: Buf,
+        t: usize,
+        segs: &mut [Seg],
+        (wqa, wkv, wqb, qn, kn): (DsW, DsW, DsW, DsW, DsW),
+    ) -> Result<Buf> {
+        let c = self.cpu.cfg.clone();
+        let (h, hd, win, rd, eps) = (
+            c.n_heads,
+            c.head_dim,
+            c.window_size,
+            c.rope_head_dim,
+            c.norm_eps,
+        );
+        anyhow::ensure!(segs.len() == t, "rows step: {} rows for t {t}", segs.len());
+        let r = c.compress_ratios[lid];
+        let (is_kv, is_idx) = (
+            r > 0 && c.is_kv_source(lid),
+            r > 0 && c.is_index_source(lid),
+        );
+        // ---- batched: wq_a | wkv over the rows (each bit for bit its own ks_gemv)
+        let (d, ql) = (wqa.cols as usize, wqa.rows as usize);
+        let sp = self.span("q");
+        let (xc, xs) = self.k.ks_x_ptrs();
+        self.k.ks_quant_to(&self.s, x.ptr, xc, xs, t * d)?;
+        let (qr, kv) = (self.fbuf(t * ql)?, self.fbuf(t * hd)?);
+        self.k
+            .ks_gemv2(&self.s, &wqa, &wkv, xc, xs, qr.ptr, kv.ptr, t, true)?;
+        // the compressor's projections over the rows (position-free)
+        let norm = format!("{p}.attn.compressor.norm.weight");
+        let comp = if is_kv {
+            Some(if r == 1 {
+                let kvc = self.lin(x, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+                self.rms(kvc, t, &norm)?;
+                (kvc, None)
+            } else {
+                let kvc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
+                let sc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
+                (kvc, Some(sc))
+            })
+        } else {
+            None
+        };
+        self.end(sp);
+        // ---- per row: the q/kv epilogue (rms, q codes, kv rope at the row's position, its
+        // slot's ring), the compressor pool into its slot's partial group
+        let (qc, qs) = self.k.wo_x_ptrs();
+        let tab = self.tabs[lid].ptr;
+        let (rdi, wi) = (rd as i32, win as i32);
+        let lat = if is_kv && r > 1 {
+            Some(self.fbuf(t * hd)?)
+        } else {
+            None
+        };
+        // this layer's rows of the step's RowP table: one launch per kernel for all rows
+        let rt = self.rowtab.map(|(tb, nrows)| {
+            tb.ptr + ((lid * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64
+        });
+        if let Some(rt) = rt {
+            let (pp, zero) = (self.p.ptr, 0u64);
+            unsafe {
+                self.k.go(
+                    "ds_qkv_post",
+                    (t as u32, 2, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, zero, wi, zero, eps, rt],
+                )?
+            };
+            if let (Some((kvc, Some(sc))), Some(lat)) = (comp, lat) {
+                let nw = self.dw(&norm)?.v;
+                let (ri, hdi, ti) = (r as i32, hd as i32, t as i32);
+                unsafe {
+                    self.k.go(
+                        "ds_comp_pool",
+                        (t as u32, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![zero, zero, kvc.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps, rt],
+                    )?;
+                    self.k.go(
+                        "ds_ring_last2",
+                        blocks(t * hd, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![zero, kvc.ptr, zero, sc.ptr, ti, hdi, ri, pp, rt],
+                    )?;
+                }
+                for i in 0..t {
+                    self.jrows
+                        .push((lid, 0, kvc.at(i * hd * 4), sc.at(i * hd * 4)));
+                }
+            }
+            if is_kv {
+                segs.iter_mut().for_each(|sg| sg.sh_ckv = lid);
+            }
+        }
+        for (i, sg) in segs.iter_mut().enumerate().filter(|_| rt.is_none()) {
+            self.seg_in(sg);
+            let ring = self.seqs[self.cur].win[lid].ptr;
+            let (pp, zero) = (self.p.ptr, 0u64);
+            let (qri, kvi) = (qr.at(i * ql * 4), kv.at(i * hd * 4));
+            let (qci, qsi) = (qc + (i * ql) as u64, qs + (i * (ql / 32) * 4) as u64);
+            unsafe {
+                self.k.go(
+                    "ds_qkv_post",
+                    (1, 2, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![
+                        qri.ptr, qn, qci, qsi, kvi.ptr, kn, tab, rdi, pp, ring, wi, zero, eps, zero
+                    ],
+                )?
+            };
+            if let (Some((kvc, Some(sc))), Some(lat)) = (comp, lat) {
+                self.sh_ckv = lid;
+                let (kst, sst) = {
+                    let (a, bb) = &self.seqs[self.cur].cst[&lid];
+                    (a.ptr, bb.ptr)
+                };
+                let nw = self.dw(&norm)?.v;
+                let (ri, hdi, one) = (r as i32, hd as i32, 1i32);
+                let (kvr, scr, lr) = (kvc.at(i * hd * 4), sc.at(i * hd * 4), lat.at(i * hd * 4));
+                unsafe {
+                    self.k.go(
+                        "ds_comp_pool",
+                        (1, 1, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![kst, sst, kvr.ptr, scr.ptr, lr.ptr, nw, pp, ri, hdi, eps, 0u64],
+                    )?;
+                    self.k.go(
+                        "ds_ring_last2",
+                        blocks(hd, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![kst, kvr.ptr, sst, scr.ptr, one, hdi, ri, pp, 0u64],
+                    )?;
+                }
+                self.jrows.push((lid, 0, kvr, scr));
+            } else if is_kv {
+                self.sh_ckv = lid;
+            }
+            self.seg_out(sg);
+        }
+        // ---- batched: wq_b over the rows' codes; the indexer's projections
+        let sp = self.span("q");
+        let q = self.fbuf(t * h * hd)?;
+        self.k
+            .ks_gemv(&self.s, &wqb, None, qc, qs, q.ptr, t, true, 0, 0.0)?;
+        self.end(sp);
+        let lat = match (comp, lat) {
+            (Some((kvc, None)), _) => Some(kvc),
+            (_, l) => l,
+        };
+        let key = match lat.filter(|_| is_idx) {
+            Some(l) => Some(self.lin(l, t, &format!("{p}.attn.indexer.wk.weight"))?),
+            None => None,
+        };
+        let iq = if is_idx {
+            let qi = self.lin(qr, t, &format!("{p}.attn.indexer.wq_b.weight"))?;
+            Some((qi, self.index_weights(p, x, t)?))
+        } else {
+            None
+        };
+        // ---- per row: compressed cache rows, indexer selection, the attention
+        let o = self.fbuf(t * h * hd)?;
+        let (nh, ihd) = (c.index_n_heads, c.index_head_dim);
+        let (wmax, kmax) = (if r > 0 { c.max_seq_len / r } else { 0 }, c.index_topk);
+        let src_l = c.candidate_source_layer;
+        let makes_cand = r > 0 && lid as i64 == src_l;
+        let eats_cand = is_idx && src_l >= 0 && (src_l as usize) < lid;
+        if let (Some(rt), Some(l)) = (rt, lat) {
+            let (kn2, ikp) = match key {
+                Some(k) => (
+                    self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
+                    k.ptr,
+                ),
+                None => (self.dw(&norm)?.v, 0),
+            };
+            if key.is_some() {
+                segs.iter_mut().for_each(|sg| sg.sh_idxk = lid);
+            }
+            let (hdi, ihdi, ri, ti) = (hd as i32, ihd as i32, r as i32, t as i32);
+            let (pp, tb, zero) = (self.p.ptr, self.tabs[lid].ptr, 0u64);
+            unsafe {
+                self.k.go(
+                    "ds_comp_post",
+                    (t as u32, 1 + key.is_some() as u32, 1),
+                    (1024, 1, 1),
+                    0,
+                    &self.s,
+                    args![l.ptr, hdi, zero, ikp, ihdi, kn2, zero, tb, rdi, pp, ri, ti, eps, rt],
+                )?
+            };
+        }
+        // the indexer over all rows at once: each row's position and its slot's keys from the
+        // table (the key layer's rows), its candidate mask row, its top-k row
+        let mut idx_done = false;
+        let cand_rows = |segs: &[Seg]| -> Option<(Buf, usize)> {
+            let (c0, st) = segs[0].cand?;
+            segs.iter()
+                .enumerate()
+                .all(|(i, sg)| {
+                    sg.cand
+                        .is_some_and(|(cb, s2)| s2 == st && cb.ptr == c0.ptr + (i * st) as u64)
+                })
+                .then_some((c0, st))
+        };
+        if let (Some(rt), Some((qi, wts))) = (rt, iq) {
+            let cin = if eats_cand { cand_rows(segs) } else { None };
+            if !eats_cand || cin.is_some() {
+                let (tb, nrows) = self.rowtab.unwrap();
+                let kl = segs[0].sh_idxk;
+                let rtk =
+                    tb.ptr + ((kl * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64;
+                let s = self.span("indexer");
+                let (ti, nhi, ihdi, rdi2, zero, one) = (
+                    t as i32,
+                    nh as i32,
+                    ihd as i32,
+                    c.rope_head_dim as i32,
+                    0i32,
+                    1i32,
+                );
+                let tabp = self.tabs[lid].ptr;
+                let half = c.rope_head_dim / 2;
+                unsafe {
+                    self.gk.go(
+                        "dg_rope",
+                        blocks(t * nh * half, 256),
+                        B256,
+                        0,
+                        &self.s,
+                        args![qi.ptr, tabp, ti, nhi, ihdi, rdi2, rt, zero, zero, zero, zero, one],
+                    )?
+                };
+                self.k.fp4_qdq(&self.s, qi.ptr, t * nh * ihd, 32, false)?;
+                let score = self.fbuf(t * wmax)?;
+                let (ri, wi2) = (r as i32, wmax as i32);
+                let sg_ = blocks(wmax * 32, 256);
+                unsafe {
+                    self.gk.go(
+                        "dg_index_score",
+                        (sg_.0, t as u32, 1),
+                        B256,
+                        0,
+                        &self.s,
+                        args![qi.ptr, 0u64, wts.ptr, score.ptr, rtk, zero, ri, nhi, ihdi, wi2, one],
+                    )?
+                };
+                let cout = if makes_cand {
+                    let cb = self.bytes(t * wmax)?;
+                    let (bs, kb) = (c.candidate_block_size, c.candidate_topk_blocks);
+                    let nb = wmax.div_ceil(bs);
+                    let (sc, sel) = (self.fbuf(t * nb)?, self.fbuf(t * nb)?);
+                    let (bsi, kbi, nbi) = (bs as i32, kb as i32, nb as i32);
+                    unsafe {
+                        self.gk.go(
+                            "dg_candidates",
+                            (t as u32, 1, 1),
+                            SEL,
+                            0,
+                            &self.s,
+                            args![
+                                score.ptr, sc.ptr, sel.ptr, cb.ptr, rt, zero, ri, bsi, kbi, wi2,
+                                nbi, wi2, one
+                            ],
+                        )?
+                    };
+                    Some(cb)
+                } else if let Some((cb, st)) = cin {
+                    let (mg, sti) = (blocks(wmax, 256), st as i32);
+                    unsafe {
+                        self.gk.go(
+                            "dg_mask_scores",
+                            (mg.0, t as u32, 1),
+                            B256,
+                            0,
+                            &self.s,
+                            args![score.ptr, cb.ptr, rt, zero, ri, wi2, sti, one],
+                        )?
+                    };
+                    None
+                } else {
+                    None
+                };
+                let (tk, sel) = (self.fbuf(t * kmax)?, self.fbuf(t * kmax)?);
+                let (ki, oi) = (kmax as i32, win as i32);
+                unsafe {
+                    self.gk.go(
+                        "dg_topk",
+                        (t as u32, 1, 1),
+                        SEL,
+                        0,
+                        &self.s,
+                        args![score.ptr, sel.ptr, tk.ptr, rt, zero, ri, ki, oi, wi2, one],
+                    )?
+                };
+                self.end(s);
+                for (i, sg) in segs.iter_mut().enumerate() {
+                    sg.topk = Some((tk.at(i * kmax * 4), kmax));
+                    if let Some(cb) = cout {
+                        sg.cand = Some((cb.at(i * wmax), wmax));
+                    }
+                }
+                idx_done = true;
+            }
+        }
+        let fdm_rows = rt.is_some()
+            && rows_attn()
+            && rd % 2 == 0
+            && rd <= hd
+            && self.k.attn_fdm
+            && self
+                .k
+                .attn_fd_win_ok(h, hd, win + if r > 0 { kmax } else { 0 });
+        for (i, sg) in segs.iter_mut().enumerate() {
+            self.seg_in(sg);
+            let pp = self.p.ptr;
+            if let (None, Some(l)) = (rt, lat) {
+                let li = l.at(i * hd * 4);
+                let (kn2, ikp, idxk) = match key {
+                    Some(k) => (
+                        self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
+                        k.at(i * ihd * 4).ptr,
+                        self.seqs[self.cur].idxk[&lid].ptr,
+                    ),
+                    None => (self.dw(&norm)?.v, 0, 0),
+                };
+                if key.is_some() {
+                    self.sh_idxk = lid;
+                }
+                let (hdi, ihdi, ri, one) = (hd as i32, ihd as i32, r as i32, 1i32);
+                let (ckv, tb) = (self.seqs[self.cur].ckv[&lid].ptr, self.tabs[lid].ptr);
+                unsafe {
+                    self.k.go(
+                        "ds_comp_post",
+                        (1, 1 + key.is_some() as u32, 1),
+                        (1024, 1, 1),
+                        0,
+                        &self.s,
+                        args![
+                            li.ptr, hdi, ckv, ikp, ihdi, kn2, idxk, tb, rdi, pp, ri, one, eps, 0u64
+                        ],
+                    )?
+                };
+            }
+            if let (Some((qi, wts)), false) = (iq, idx_done) {
+                let tk = self.fbuf(kmax)?;
+                let cand_out = if makes_cand {
+                    Some(self.bytes(wmax)?)
+                } else {
+                    None
+                };
+                let cand_in = if eats_cand {
+                    Some(self.cand.context("no candidate mask")?)
+                } else {
+                    None
+                };
+                let s = self.span("indexer");
+                let q1 = qi.at(i * nh * ihd * 4);
+                let w1 = wts.at(i * nh * 4);
+                self.indexer_row(lid, q1, w1, win, tk, cand_out, cand_in)?;
+                self.end(s);
+                self.topk = Some((tk, kmax));
+                if let Some(cb) = cand_out {
+                    self.cand = Some((cb, wmax));
+                }
+            } else if makes_cand && !idx_done {
+                anyhow::bail!("rows step: a candidate source that is not an index source");
+            }
+            if fdm_rows {
+                // the attention runs once for all rows below
+                self.seg_out(sg);
+                continue;
+            }
+            self.attn_row(
+                p,
+                lid,
+                q.at(i * h * hd * 4),
+                o.ptr + (i * h * hd * 4) as u64,
+            )?;
+            self.seg_out(sg);
+        }
+        if fdm_rows {
+            let kc = if r > 0 { kmax } else { 0 };
+            let tk = segs[0].topk.map(|x| x.0);
+            let contiguous = r == 0
+                || segs.iter().enumerate().all(|(i, sg)| {
+                    sg.topk.is_some_and(|(b2, k2)| {
+                        k2 == kmax && tk.is_some_and(|b0| b2.ptr == b0.ptr + (i * kmax * 4) as u64)
+                    })
+                });
+            if contiguous {
+                let (tb, nrows) = self.rowtab.unwrap();
+                let rtk = if r > 0 {
+                    let kl = segs[0].sh_ckv;
+                    tb.ptr + ((kl * nrows + segs[0].row) * std::mem::size_of::<RowP>()) as u64
+                } else {
+                    0
+                };
+                let sink = self.dw(&format!("{p}.attn.attn_sink"))?.v.w;
+                let scale = (hd as f32).powf(-0.5);
+                let s = self.span("sparse_attn");
+                self.k.attn_fd_win_rows(
+                    &self.s,
+                    q.ptr,
+                    rt.unwrap(),
+                    rtk,
+                    win,
+                    sink,
+                    o.ptr,
+                    t,
+                    h,
+                    hd,
+                    kc,
+                    scale,
+                    self.tabs[lid].ptr,
+                    rd as i32,
+                    tk.map_or(0, |b0| b0.ptr),
+                )?;
+                self.end(s);
+            } else {
+                for (i, sg) in segs.iter_mut().enumerate() {
+                    self.seg_in(sg);
+                    self.attn_row(
+                        p,
+                        lid,
+                        q.at(i * h * hd * 4),
+                        o.ptr + (i * h * hd * 4) as u64,
+                    )?;
+                    self.seg_out(sg);
+                }
+            }
+        }
+        // ---- batched: wo over the rows
+        self.attn_wo(p, o, t, false)
+    }
+
+    /// One row's attention in a rows step (its state swapped in by `seg_in`): the window and
+    /// selected compressed keys of its slot, the t = 1 kernels, o into `dst` [h][hd].
+    fn attn_row(&mut self, p: &str, lid: usize, qi: Buf, dst: u64) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let (h, hd, win, rd) = (c.n_heads, c.head_dim, c.window_size, c.rope_head_dim);
+        let r = c.compress_ratios[lid];
+        let at0 = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        let pp = self.p.ptr;
+        let (mut kc, mut kv1) = (0, 0);
+        if r > 0 {
+            kc = self.topk.as_ref().context("no top-k")?.1;
+            kv1 = self.seqs[self.cur].ckv[&self.sh_ckv].ptr;
+        }
+        let (src, ki) = match kc {
+            0 => (0, 0),
+            _ => (self.topk.as_ref().unwrap().0.ptr, kc as i32),
+        };
+        let ring = b(&self.seqs[self.cur].win[lid]);
+        let ix = if rd % 2 == 0 && rd <= hd && self.k.attn_fd_win_ok(h, hd, win + kc) {
+            Ix::Win(WinIdx {
+                mode: 1,
+                win: win as i32,
+                src,
+                kc: ki,
+            })
+        } else {
+            let idx = self.fbuf(win + kc)?;
+            let (st, ni, mi, wi2) = ((win + kc) as i32, win as i32, 1i32, win as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_win_idx",
+                    blocks(win + kc, 256),
+                    B256,
+                    0,
+                    &self.s,
+                    args![idx.ptr, 1i32, st, ni, mi, pp, wi2, src, ki, 0i32],
+                )?
+            };
+            Ix::Rows(idx)
+        };
+        let (oi, _) = self.attn_core(
+            p,
+            qi,
+            false,
+            (ring, win, kv1),
+            ix,
+            1,
+            win + kc,
+            lid,
+            at0,
+            false,
+        )?;
+        self.copy(dst, oi.ptr, h * hd)
+    }
+
+    /// One row's indexer selection (as [`Self::indexer_dyn`] at t = 1, from its projected
+    /// query `q` [nh][ihd] and weights `wts` [nh]) into `out` [index_topk].
+    #[allow(clippy::too_many_arguments)]
+    fn indexer_row(
+        &mut self,
+        lid: usize,
+        q: Buf,
+        wts: Buf,
+        offset: usize,
+        out: Buf,
+        cand_out: Option<Buf>,
+        cand_in: Option<(Buf, usize)>,
+    ) -> Result<()> {
+        let c = self.cpu.cfg.clone();
+        let (r, nh, ihd) = (c.compress_ratios[lid], c.index_n_heads, c.index_head_dim);
+        let (wmax, kmax) = (c.max_seq_len / r, c.index_topk);
+        // q is a slice of the rows' batch: rope / quantize a private copy
+        let qq = self.fbuf(nh * ihd)?;
+        self.copy(qq.ptr, q.ptr, nh * ihd)?;
+        let at = At::Dev {
+            add: 0,
+            stride: 1,
+            fixed_r: 0,
+        };
+        self.rope(qq, 1, nh, ihd, lid, at, false)?;
+        self.k.fp4_qdq(&self.s, qq.ptr, nh * ihd, 32, false)?;
+        let score = self.fbuf(wmax)?;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
+        let (pp, ri, nhi, ihdi, wi) = (self.p.ptr, r as i32, nh as i32, ihd as i32, wmax as i32);
+        let (sg, ty) = (blocks(wmax * 32, 256), 1u32);
+        unsafe {
+            self.gk.go(
+                "dg_index_score",
+                (sg.0, ty, 1),
+                B256,
+                0,
+                &self.s,
+                args![qq.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi, 0i32],
+            )?
+        };
+        if let Some(cb) = cand_out {
+            let (bs, kb) = (c.candidate_block_size, c.candidate_topk_blocks);
+            let nb = wmax.div_ceil(bs);
+            let (sc, sel) = (self.fbuf(nb)?, self.fbuf(nb)?);
+            let (bsi, kbi, nbi) = (bs as i32, kb as i32, nb as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_candidates",
+                    (ty, 1, 1),
+                    SEL,
+                    0,
+                    &self.s,
+                    args![
+                        score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi,
+                        0i32
+                    ],
+                )?
+            };
+        } else if let Some((cb, st)) = cand_in {
+            let (mg, sti) = (blocks(wmax, 256), st as i32);
+            unsafe {
+                self.gk.go(
+                    "dg_mask_scores",
+                    (mg.0, ty, 1),
+                    B256,
+                    0,
+                    &self.s,
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti, 0i32],
+                )?
+            };
+        }
+        let sel = self.fbuf(kmax)?;
+        let (ki, oi) = (kmax as i32, offset as i32);
+        unsafe {
+            self.gk.go(
+                "dg_topk",
+                (ty, 1, 1),
+                SEL,
+                0,
+                &self.s,
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi, 0i32],
+            )
+        }
+    }
+
+    /// [`Self::attention`] over a [`Self::forward_rows`] step: row `i` attends on its own
+    /// slot (caches, position, the step's selection so far), one row at a time.
+    fn attention_rows(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
+        if let Some(y) = self.attention_rows_fused(p, lid, x, t)? {
+            return Ok(y);
+        }
+        let d = self.cpu.cfg.dim;
+        let mut segs = self.segs.take().context("attention_rows without rows")?;
+        anyhow::ensure!(segs.len() == t, "rows step: {} rows for t {t}", segs.len());
+        let out = self.fbuf(t * d)?;
+        let r = (|| -> Result<()> {
+            for (i, sg) in segs.iter_mut().enumerate() {
+                self.cur = sg.slot;
+                self.p = sg.p;
+                self.topk = sg.topk.take();
+                self.cand = sg.cand.take();
+                self.sh_ckv = sg.sh_ckv;
+                self.sh_idxk = sg.sh_idxk;
+                let off = (i * d * 4) as u64;
+                let xi = Buf {
+                    ptr: x.ptr + off,
+                    len: d * 4,
+                };
+                let y = self.attention_dyn(p, lid, xi, 1)?;
+                self.copy(out.ptr + off, y.ptr, d)?;
+                sg.topk = self.topk.take();
+                sg.cand = self.cand.take();
+                sg.sh_ckv = self.sh_ckv;
+                sg.sh_idxk = self.sh_idxk;
+            }
+            Ok(())
+        })();
+        self.segs = Some(segs);
+        r.map(|_| out)
+    }
+
+    /// Batched decode over sequence slots: row `i` is token `rows[i].1` of slot `rows[i].0`
+    /// at position `rows[i].2` (> 0; distinct slots). Embedding, engram, mHC, the linears
+    /// and the MoE run ONCE over all rows (each weight read once for the batch); only the
+    /// attention splits per row ([`Self::attention_rows`]). Returns each row's greedy next
+    /// token. Direct launches (no graph), the unfused block (bit-equal to the fused one).
+    pub fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        self.forward_rows_impl(rows, false).map(|r| r.0)
+    }
+
+    /// [`Self::forward_rows`] that also reads back every row's logits `[rows][V]`.
+    pub fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        self.forward_rows_impl(rows, true)
+    }
+
+    fn forward_rows_impl(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+        logits: bool,
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        let t = rows.len();
+        anyhow::ensure!(t > 0, "empty rows step");
+        // the t <= 8 kernels give each row exactly its lone t = 1 result; the t > 8 tiles
+        // round differently in rare elements (an ulp, amplified into top-1 flips on the
+        // tiny fixture). DS_ROWS_CHUNK (default 8; 0 = one step for any t) bounds the rows
+        // per step: every weight is still read once per chunk instead of once per row.
+        let chunk = rows_chunk();
+        if chunk > 0 && t > chunk {
+            let (mut ids, mut lg) = (Vec::with_capacity(t), Vec::new());
+            for c in rows.chunks(chunk) {
+                let (a, b) = self.forward_rows_impl(c, logits)?;
+                ids.extend(a);
+                lg.extend(b);
+            }
+            return Ok((ids, lg));
+        }
+        for (i, &(sl, _, pos)) in rows.iter().enumerate() {
+            anyhow::ensure!(sl < self.seqs.len(), "slot {sl} >= {}", self.seqs.len());
+            anyhow::ensure!(!rows[..i].iter().any(|r| r.0 == sl), "slot {sl} twice");
+            anyhow::ensure!(pos > 0, "rows step: slot {sl} at position 0 (prefill it)");
+            anyhow::ensure!(
+                pos < self.seqs[sl].cap,
+                "slot {sl}: position {pos} past its cap"
+            );
+        }
+        anyhow::ensure!(!self.journal_on, "rows step under an open snapshot");
+        let c = self.cpu.cfg.clone();
+        let home = self.cur;
+        self.last = None;
+        self.begin_step()?;
+        // the engram hashes, each row from its own slot's token history
+        let hashes = if c.engram_layer_ids.is_empty() {
+            None
+        } else {
+            let mut hs = Vec::with_capacity(t);
+            for &(sl, tok, pos) in rows {
+                self.swap_hash(sl);
+                hs.push(self.cpu.engram_hash(&[tok], pos).remove(0));
+            }
+            self.swap_hash(home);
+            Some(hs)
+        };
+        let ids: Vec<usize> = rows.iter().map(|r| r.1).collect();
+        let mut inp = self.inputs(&ids, 1, hashes.as_deref())?;
+        let mut segs = Vec::with_capacity(t);
+        for (row, &(sl, _, pos)) in rows.iter().enumerate() {
+            let (pb, u) = self.stage(&[pos as i32, 0, 0, 0])?;
+            inp.copies.push(u);
+            segs.push(Seg {
+                slot: sl,
+                row,
+                p: pb,
+                topk: None,
+                cand: None,
+                sh_ckv: 0,
+                sh_idxk: 0,
+            });
+        }
+        self.segs = Some(segs);
+        self.rowtab = None;
+        if rows_tab() {
+            let nl = c.n_layers;
+            let mut tab = vec![RowP::default(); nl * t];
+            for l in 0..nl {
+                for (row, &(sl, _, pos)) in rows.iter().enumerate() {
+                    let q = &self.seqs[sl];
+                    let (kst, sst) = q.cst.get(&l).map_or((0, 0), |(a, b2)| (a.ptr, b2.ptr));
+                    tab[l * t + row] = RowP {
+                        ring: q.win[l].ptr,
+                        kst,
+                        sst,
+                        ckv: q.ckv.get(&l).map_or(0, |b2| b2.ptr),
+                        idxk: q.idxk.get(&l).map_or(0, |b2| b2.ptr),
+                        pos: pos as i32,
+                        pad: 0,
+                    };
+                }
+            }
+            let (tb, u) = self.stage(&tab)?;
+            inp.copies.push(u);
+            self.rowtab = Some((tb, t));
+        }
+        // graphs keyed by the rows' slots (each row's cache addresses are baked in)
+        let graphable = self.graphable(1, false) && rows_graph();
+        // (a leading usize::MAX: never a plain step's [slot] key)
+        let key: Vec<usize> = std::iter::once(usize::MAX)
+            .chain(rows.iter().map(|r| r.0))
+            .collect();
+        let out = self.run_step(&inp, t, DYN, true, graphable, key, None);
+        self.segs = None;
+        self.rowtab = None;
+        self.cur = home;
+        self.sh_ckv = 0;
+        self.sh_idxk = 0;
+        self.topk = None;
+        self.cand = None;
+        let out = out?;
+        self.sync()?;
+        let a = out.amax.dev().read::<i32>(0, out.rows)?;
+        let lg = if logits {
+            out.logits.dev().read::<f32>(0, out.rows * c.vocab_size)?
+        } else {
+            Vec::new()
+        };
+        Ok((a.into_iter().map(|i| i as usize).collect(), lg))
+    }
+
+    /// Make slot `s`'s engram history the CPU model's (the current one goes back to its
+    /// slot). Host only; `self.cur` is untouched.
+    fn swap_hash(&mut self, s: usize) {
+        let held = self.hash_held;
+        if held == s {
+            return;
+        }
+        std::mem::swap(&mut self.cpu.hash_cache, &mut self.seqs[held].hash);
+        std::mem::swap(&mut self.cpu.hash_cache, &mut self.seqs[s].hash);
+        self.hash_held = s;
     }
 
     fn attention_prefill(&mut self, p: &str, lid: usize, x: Buf, t: usize) -> Result<Buf> {
@@ -892,7 +1905,7 @@ impl GpuModel {
             let s = self.span("compress");
             let (src, k) = self.compress_kv_prefill(p, lid, x, qr, t)?;
             kc = k;
-            kv1 = self.ckv[&src].ptr;
+            kv1 = self.seqs[self.cur].ckv[&src].ptr;
             self.end(s);
         }
         let s = self.span("sparse_attn");
@@ -973,7 +1986,7 @@ impl GpuModel {
             .ks_gemv2(&self.s, &wqa, &wkv, xc, xs, qr.ptr, kv.ptr, t, true)?;
         self.end(sp);
         let sp = self.span("window_kv");
-        let ring = b(&self.win[lid]);
+        let ring = b(&self.seqs[self.cur].win[lid]);
         let (kv0, split, mode, allp) = if t > 1 {
             let all = self.fbuf((win + t) * hd)?;
             self.copy(all.ptr, ring.ptr, win * hd)?;
@@ -990,7 +2003,7 @@ impl GpuModel {
                 (1024, 1, 1),
                 0,
                 &self.s,
-                args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, ring.ptr, wi, allp, eps],
+                args![qr.ptr, qn, qc, qs, kv.ptr, kn, tab, rdi, pp, ring.ptr, wi, allp, eps, 0u64],
             )?
         };
         self.end(sp);
@@ -1025,7 +2038,7 @@ impl GpuModel {
                 self.rms(kv, t, &format!("{p}.attn.kv_norm.weight"))?;
                 self.rope(kv, t, 1, hd, lid, at, false)?;
                 self.k.fp8_qdq(&self.s, kv.ptr, t * hd)?;
-                let ring = b(&self.win[lid]);
+                let ring = b(&self.seqs[self.cur].win[lid]);
                 let (kv0, split, mode) = if t > 1 {
                     // a verify window (as forward.rs): the pre-chunk ring then the chunk's rows
                     let all = self.fbuf((win + t) * hd)?;
@@ -1046,7 +2059,7 @@ impl GpuModel {
             let s = self.span("compress");
             let src = self.compress_dyn(p, lid, x, qr, t, split)?;
             kc = self.topk.as_ref().context("no top-k")?.1;
-            kv1 = self.ckv[&src].ptr;
+            kv1 = self.seqs[self.cur].ckv[&src].ptr;
             self.end(s);
         }
         let (src, ki) = match kc {
@@ -1091,7 +2104,7 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![idx.ptr, ti, st, ni, mi, pp, wi, src, ki],
+                args![idx.ptr, ti, st, ni, mi, pp, wi, src, ki, 0i32],
             )?
         };
         self.end(s);
@@ -1207,6 +2220,26 @@ impl GpuModel {
         lid: usize,
         at: At,
     ) -> Result<Buf> {
+        let (o, wo_pre) = self.attn_core(p, q, q_roped, kv, di, t, k, lid, at, true)?;
+        self.attn_wo(p, o, t, wo_pre)
+    }
+
+    /// [`Self::attn_out`]'s attention: o `[t][h][hd]` (inverse rope applied) and whether the
+    /// fused merge already quantized it for wo_ks (only when `pre_ok`).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_core(
+        &self,
+        p: &str,
+        q: Buf,
+        q_roped: bool,
+        kv: (Buf, usize, u64),
+        di: Ix,
+        t: usize,
+        k: usize,
+        lid: usize,
+        at: At,
+        pre_ok: bool,
+    ) -> Result<(Buf, bool)> {
         let c = &self.cpu.cfg;
         let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
         let s = self.span("sparse_attn");
@@ -1244,7 +2277,7 @@ impl GpuModel {
             (Ix::Win(w), Some(mut r)) => {
                 // the merge also quantizes o for wo_ks (one launch fewer)
                 let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
-                r.wo_quant = self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
+                r.wo_quant = pre_ok && self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol);
                 wo_pre = r.wo_quant;
                 self.k.attn_fd_win(
                     &self.s, q.ptr, kv.0.ptr, kv.1, kv.2, sink.v.w, o.ptr, t, h, hd, k, scale, r, w,
@@ -1254,10 +2287,17 @@ impl GpuModel {
         }
         self.tap(&format!("{p}.sa"), o, t * h * hd)?;
         self.end(s);
-        let s = self.span("wo");
         if rope.is_none() {
             self.rope(o, t, h, hd, lid, at, true)?;
         }
+        Ok((o, wo_pre))
+    }
+
+    /// [`Self::attn_out`]'s output projection over `t` rows of o.
+    fn attn_wo(&self, p: &str, o: Buf, t: usize, wo_pre: bool) -> Result<Buf> {
+        let c = &self.cpu.cfg;
+        let (h, hd, g, ol) = (c.n_heads, c.head_dim, c.o_groups, c.o_lora_rank);
+        let s = self.span("wo");
         let wo_a = self.dw(&format!("{p}.attn.wo_a.weight"))?;
         let mid = self.fbuf(t * g * ol)?;
         if self.fast && self.k.wo_ks_ok(&wo_a.v, t, g, ol) {
@@ -1336,7 +2376,7 @@ impl GpuModel {
 
     fn ring_seed(&self, lid: usize, kv: Buf, t: usize) -> Result<()> {
         let (hd, win) = (self.cpu.cfg.head_dim, self.cpu.cfg.window_size);
-        let ring = self.win[lid].ptr;
+        let ring = self.seqs[self.cur].win[lid].ptr;
         if t <= win {
             return self.copy(ring, kv.ptr, t * hd);
         }
@@ -1393,7 +2433,7 @@ impl GpuModel {
         let kv = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
         let sc = self.raw(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
         let (kst, sst) = {
-            let (a, bb) = &self.cst[&lid];
+            let (a, bb) = &self.seqs[self.cur].cst[&lid];
             (a.ptr, bb.ptr)
         };
         let row = (hd * 4) as u64;
@@ -1449,7 +2489,7 @@ impl GpuModel {
             };
             self.rope(lat, n, 1, hd, lid, at, false)?;
             self.k.fp4_qdq(&self.s, lat.ptr, n * hd, 16, true)?;
-            self.copy(self.ckv[&lid].ptr, lat.ptr, n * hd)?;
+            self.copy(self.seqs[self.cur].ckv[&lid].ptr, lat.ptr, n * hd)?;
         }
         Ok((self.sh_ckv, kc))
     }
@@ -1476,7 +2516,7 @@ impl GpuModel {
             };
             self.rope(k, n, 1, ihd, lid, at, false)?;
             self.k.fp4_qdq(&self.s, k.ptr, n * ihd, 32, false)?;
-            self.copy(self.idxk[&lid].ptr, k.ptr, n * ihd)?;
+            self.copy(self.seqs[self.cur].idxk[&lid].ptr, k.ptr, n * ihd)?;
         }
         if owns {
             self.sh_idxk = lid;
@@ -1493,7 +2533,7 @@ impl GpuModel {
         let wts = self.index_weights(p, x, t)?;
         let score = self.fbuf(t * width)?;
         let (ti, wi, nhi, ihdi) = (t as i32, width as i32, nh as i32, ihd as i32);
-        let ik = self.idxk[&self.sh_idxk].ptr;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
         unsafe {
             self.k.go(
                 "ds_index_score",
@@ -1636,7 +2676,7 @@ impl GpuModel {
                 };
                 self.rope(lat, 1, 1, hd, lid, at, false)?;
                 self.k.fp4_qdq(&self.s, lat.ptr, hd, 16, true)?;
-                self.row_write(self.ckv[&lid].ptr, lat, hd, e, r)?;
+                self.row_write(self.seqs[self.cur].ckv[&lid].ptr, lat, hd, e, r)?;
             }
         }
         if let Some(tk) = tk {
@@ -1688,7 +2728,7 @@ impl GpuModel {
             let kv = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wkv.weight"))?;
             let sc = self.raw_bf(x.ptr, t, &format!("{p}.attn.compressor.wgate.weight"))?;
             let (kst, sst) = {
-                let (a, bb) = &self.cst[&lid];
+                let (a, bb) = &self.seqs[self.cur].cst[&lid];
                 (b(a), b(bb))
             };
             let lat = self.fbuf(t * hd)?;
@@ -1701,7 +2741,7 @@ impl GpuModel {
                     (1024, 1, 1),
                     0,
                     &self.s,
-                    args![kst.ptr, sst.ptr, kv.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps],
+                    args![kst.ptr, sst.ptr, kv.ptr, sc.ptr, lat.ptr, nw, pp, ri, hdi, eps, 0u64],
                 )?;
                 let ti = t as i32;
                 self.k.go(
@@ -1710,7 +2750,7 @@ impl GpuModel {
                     B256,
                     0,
                     &self.s,
-                    args![kst.ptr, kv.ptr, sst.ptr, sc.ptr, ti, hdi, ri, pp],
+                    args![kst.ptr, kv.ptr, sst.ptr, sc.ptr, ti, hdi, ri, pp, 0u64],
                 )?;
             }
             for e in 0..t {
@@ -1729,12 +2769,12 @@ impl GpuModel {
             Some(k) => (
                 self.dw(&format!("{p}.attn.indexer.k_norm.weight"))?.v,
                 k.ptr,
-                self.idxk[&lid].ptr,
+                self.seqs[self.cur].idxk[&lid].ptr,
             ),
             None => (self.dw(&norm)?.v, 0, 0),
         };
         let (hdi, ihdi, rdi, ri, ti) = (hd as i32, ihd as i32, rd as i32, r as i32, t as i32);
-        let (ckv, tab) = (self.ckv[&lid].ptr, self.tabs[lid].ptr);
+        let (ckv, tab) = (self.seqs[self.cur].ckv[&lid].ptr, self.tabs[lid].ptr);
         unsafe {
             self.k.go(
                 "ds_comp_post",
@@ -1742,7 +2782,7 @@ impl GpuModel {
                 (1024, 1, 1),
                 0,
                 &self.s,
-                args![lat.ptr, hdi, ckv, ikp, ihdi, kn, idxk, tab, rdi, pp, ri, ti, eps],
+                args![lat.ptr, hdi, ckv, ikp, ihdi, kn, idxk, tab, rdi, pp, ri, ti, eps, 0u64],
             )?
         };
         Ok(())
@@ -1761,7 +2801,7 @@ impl GpuModel {
         let kv = self.raw(xe.ptr, 1, &format!("{p}.attn.compressor.wkv.weight"))?;
         let sc = self.raw(xe.ptr, 1, &format!("{p}.attn.compressor.wgate.weight"))?;
         let (kst, sst) = {
-            let (a, bb) = &self.cst[&lid];
+            let (a, bb) = &self.seqs[self.cur].cst[&lid];
             (b(a), b(bb))
         };
         self.ring_write(kst, kv, 1, hd, r, e)?;
@@ -1790,7 +2830,7 @@ impl GpuModel {
         };
         self.rope(k, 1, 1, ihd, lid, at, false)?;
         self.k.fp4_qdq(&self.s, k.ptr, ihd, 32, false)?;
-        self.row_write(self.idxk[&lid].ptr, k, ihd, e, r)
+        self.row_write(self.seqs[self.cur].idxk[&lid].ptr, k, ihd, e, r)
     }
 
     /// The step's `t` indexer queries, scores and top-k rows into `out` [t][index_topk] (see
@@ -1821,7 +2861,7 @@ impl GpuModel {
         self.k.fp4_qdq(&self.s, q.ptr, t * nh * ihd, 32, false)?;
         let wts = self.index_weights(p, x, t)?;
         let score = self.fbuf(t * wmax)?;
-        let ik = self.idxk[&self.sh_idxk].ptr;
+        let ik = self.seqs[self.cur].idxk[&self.sh_idxk].ptr;
         let (pp, ri, nhi, ihdi, wi) = (self.p.ptr, r as i32, nh as i32, ihd as i32, wmax as i32);
         let (sg, ty) = (blocks(wmax * 32, 256), t as u32);
         unsafe {
@@ -1831,7 +2871,7 @@ impl GpuModel {
                 B256,
                 0,
                 &self.s,
-                args![q.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi],
+                args![q.ptr, ik, wts.ptr, score.ptr, pp, 0i32, ri, nhi, ihdi, wi, 0i32],
             )?
         };
         if let Some(cb) = cand_out {
@@ -1846,7 +2886,10 @@ impl GpuModel {
                     SEL,
                     0,
                     &self.s,
-                    args![score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi],
+                    args![
+                        score.ptr, sc.ptr, sel.ptr, cb.ptr, pp, 0i32, ri, bsi, kbi, wi, nbi, wi,
+                        0i32
+                    ],
                 )?
             };
         } else if let Some((cb, st)) = cand_in {
@@ -1858,7 +2901,7 @@ impl GpuModel {
                     B256,
                     0,
                     &self.s,
-                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti],
+                    args![score.ptr, cb.ptr, pp, 0i32, ri, wi, sti, 0i32],
                 )?
             };
         }
@@ -1871,7 +2914,7 @@ impl GpuModel {
                 SEL,
                 0,
                 &self.s,
-                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi],
+                args![score.ptr, sel.ptr, out.ptr, pp, 0i32, ri, ki, oi, wi, 0i32],
             )
         }
     }
@@ -2804,7 +3847,11 @@ impl GpuModel {
         attn: Attn,
     ) -> Result<(Buf, Buf)> {
         let d = self.cpu.cfg.dim;
-        if std::env::var_os("DS_TAP").is_none() && d % 32 == 0 && self.cpu.cfg.hc_mult <= 8 {
+        if std::env::var_os("DS_TAP").is_none()
+            && d % 32 == 0
+            && self.cpu.cfg.hc_mult <= 8
+            && self.segs.is_none()
+        {
             return self.block_fused(p, lid, x, t, sp, pre_mix, attn);
         }
         let s = self.span("hc");
@@ -2816,6 +3863,7 @@ impl GpuModel {
         self.end(s);
         let s = self.span("attn");
         let h = match attn {
+            Attn::Main if self.segs.is_some() => self.attention_rows(p, lid, h, t)?,
             Attn::Main => self.attention(p, lid, h, t, sp)?,
             Attn::Spark(main_x, mt) => self.dspark_attention(p, lid, h, t, sp, main_x, mt)?,
         };
@@ -3134,6 +4182,82 @@ impl GpuModel {
             && !self.obs.direct()
     }
 
+    /// A step from staged inputs: replay its captured graph (keyed by its row count, `all`
+    /// and the slots it runs on, whose cache addresses the graph bakes in), capture it once
+    /// it ran warm at this arena generation, or run it directly.
+    #[allow(clippy::too_many_arguments)]
+    fn run_step(
+        &mut self,
+        inp: &Inputs,
+        t: usize,
+        bsp: usize,
+        all: bool,
+        graphable: bool,
+        slots: Vec<usize>,
+        hook: Option<&mut dyn FnMut(&str, &[f32])>,
+    ) -> Result<StepOut> {
+        let key = (t, all, slots);
+        let gen = self.gen();
+        let out = if graphable {
+            if let Some(cg) = self.graphs.get(&key) {
+                self.obs.path(true, false);
+                super::obs::replay();
+                super::obs::h2d(inp.copies.iter().map(|u| u.n).sum());
+                cg.g.launch(&self.s)?;
+                self.graph_stats.replays += 1;
+                cg.out.clone()
+            } else if self.warm.get(&key) == Some(&gen) {
+                // warmed up at this generation: every weight is resident and the arena fits
+                // the step, so the capture allocates nothing
+                let s = ManuallyDrop::new(Stream(self.s.0));
+                // no timeline events inside the capture
+                self.obs.path(true, true);
+                super::obs::capture();
+                self.arena.borrow_mut().frozen = true;
+                let mut out = None;
+                let g = Graph::capture(&s, |s| {
+                    let r = (|| -> Result<StepOut> {
+                        for u in &inp.copies {
+                            u.enqueue(s)?;
+                        }
+                        self.body(inp, t, bsp, all, None)
+                    })();
+                    let ok = r.is_ok();
+                    out = Some(r);
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(tang_moe::gpu::Error("capture body failed".into()))
+                    }
+                });
+                self.arena.borrow_mut().frozen = false;
+                let out = out.context("capture")?.context("captured step")?;
+                let g = g?;
+                g.launch(&self.s)?;
+                self.graph_stats.captures += 1;
+                self.graphs.insert(
+                    key,
+                    Captured {
+                        g,
+                        out: out.clone(),
+                        gen,
+                    },
+                );
+                out
+            } else {
+                self.obs.path(false, false);
+                let out = self.direct(inp, t, bsp, all, None)?;
+                // a step that grew the arena moves it at the next start: warm up again
+                self.warm.insert(key, self.gen_after());
+                out
+            }
+        } else {
+            self.obs.path(false, false);
+            self.direct(inp, t, bsp, all, hook)?
+        };
+        Ok(out)
+    }
+
     fn forward_impl(
         &mut self,
         ids: &[usize],
@@ -3167,71 +4291,25 @@ impl GpuModel {
                     .collect::<Vec<_>>(),
             );
         }
+        anyhow::ensure!(
+            sp + t <= self.seq_cap(),
+            "slot {}: positions {sp}..{} past its cap {}",
+            self.cur,
+            sp + t,
+            self.seq_cap()
+        );
         let inp = self.inputs(ids, sp, hashes.as_deref())?;
         // host code of a decode step never sees the position (see `DYN`)
         let bsp = if sp == 0 { 0 } else { DYN };
-        let key = (t, all);
-        let gen = self.gen();
         if std::env::var_os("DS_GRAPH_DEBUG").is_some() {
-            eprintln!("step t={t} sp={sp} gen={gen:?} {:?}", self.graph_stats);
+            eprintln!(
+                "step t={t} sp={sp} gen={:?} {:?}",
+                self.gen(),
+                self.graph_stats
+            );
         }
-        let out = if self.graphable(sp, hook.is_some()) {
-            if let Some(cg) = self.graphs.get(&key) {
-                self.obs.path(true, false);
-                super::obs::replay();
-                super::obs::h2d(inp.copies.iter().map(|u| u.n).sum());
-                cg.g.launch(&self.s)?;
-                self.graph_stats.replays += 1;
-                cg.out.clone()
-            } else if self.warm.get(&key) == Some(&gen) {
-                // warmed up at this generation: every weight is resident and the arena fits
-                // the step, so the capture allocates nothing
-                let s = ManuallyDrop::new(Stream(self.s.0));
-                // no timeline events inside the capture
-                self.obs.path(true, true);
-                super::obs::capture();
-                self.arena.borrow_mut().frozen = true;
-                let mut out = None;
-                let g = Graph::capture(&s, |s| {
-                    let r = (|| -> Result<StepOut> {
-                        for u in &inp.copies {
-                            u.enqueue(s)?;
-                        }
-                        self.body(&inp, t, bsp, all, None)
-                    })();
-                    let ok = r.is_ok();
-                    out = Some(r);
-                    if ok {
-                        Ok(())
-                    } else {
-                        Err(tang_moe::gpu::Error("capture body failed".into()))
-                    }
-                });
-                self.arena.borrow_mut().frozen = false;
-                let out = out.context("capture")?.context("captured step")?;
-                let g = g?;
-                g.launch(&self.s)?;
-                self.graph_stats.captures += 1;
-                self.graphs.insert(
-                    key,
-                    Captured {
-                        g,
-                        out: out.clone(),
-                        gen,
-                    },
-                );
-                out
-            } else {
-                self.obs.path(false, false);
-                let out = self.direct(&inp, t, bsp, all, None)?;
-                // a step that grew the arena moves it at the next start: warm up again
-                self.warm.insert(key, self.gen_after());
-                out
-            }
-        } else {
-            self.obs.path(false, false);
-            self.direct(&inp, t, bsp, all, hook)?
-        };
+        let graphable = self.graphable(sp, hook.is_some());
+        let out = self.run_step(&inp, t, bsp, all, graphable, vec![self.cur], hook)?;
         self.obs.gpu_end(&self.s, self.arena.borrow().capacity());
         if self.journal_on && sp > 0 {
             self.journal_steps += 1;
@@ -3499,7 +4577,7 @@ impl GpuModel {
                 args![idx.ptr, bi, ni, pp, ai, wi],
             )?
         };
-        let ring = b(&self.win[lid]);
+        let ring = b(&self.seqs[self.cur].win[lid]);
         self.ring_write(ring, mkv, t, hd, win, 0)?;
         let all = self.fbuf((win + bl) * hd)?;
         self.copy(all.ptr, ring.ptr, win * hd)?;
@@ -3677,6 +4755,7 @@ impl GpuModel {
         let key = (
             t + if dev_main { 1 << 20 } else { 0 },
             samp.map(|(a, b)| (a.to_bits(), b.to_bits())),
+            self.cur,
         );
         if samp.is_some() && self.spec_dev.is_none() {
             self.spec_dev = Some(SpecDev::new(blk, v)?);
@@ -3871,7 +4950,7 @@ impl GpuModel {
                 .map(|_| z(c.window_size * hd))
                 .collect::<Result<_>>()?;
             let mut cst = HashMap::new();
-            for &l in self.cst.keys() {
+            for &l in self.seqs[self.cur].cst.keys() {
                 let n = c.compress_ratios[l] * hd;
                 cst.insert(l, (z(n)?, z(n)?));
             }
@@ -3884,12 +4963,12 @@ impl GpuModel {
         );
         let mut cl = Vec::new();
         for (l, dst) in sw.iter().enumerate() {
-            cl.push((dst.ptr, self.win[l].ptr, c.window_size * hd));
+            cl.push((dst.ptr, self.seqs[self.cur].win[l].ptr, c.window_size * hd));
         }
         for (l, (a, bb)) in &sc {
             let n = c.compress_ratios[*l] * hd;
-            cl.push((a.ptr, self.cst[l].0.ptr, n));
-            cl.push((bb.ptr, self.cst[l].1.ptr, n));
+            cl.push((a.ptr, self.seqs[self.cur].cst[l].0.ptr, n));
+            cl.push((bb.ptr, self.seqs[self.cur].cst[l].1.ptr, n));
         }
         self.copy_many(0, &[&cl])?;
         self.journal_on = true;
@@ -3912,12 +4991,15 @@ impl GpuModel {
         for (l, old) in snap.win.iter().enumerate() {
             for pos in from..end.min(from + win) {
                 let o = ((pos % win) * hd * 4) as u64;
-                first.push((self.win[l].ptr + o, old.ptr + o, hd));
+                first.push((self.seqs[self.cur].win[l].ptr + o, old.ptr + o, hd));
             }
         }
         for (l, (a, bb)) in &snap.cst {
             let n = c.compress_ratios[*l] * hd;
-            let (ka, kb) = (self.cst[l].0.ptr, self.cst[l].1.ptr);
+            let (ka, kb) = (
+                self.seqs[self.cur].cst[l].0.ptr,
+                self.seqs[self.cur].cst[l].1.ptr,
+            );
             first.push((ka, a.ptr, n));
             first.push((kb, bb.ptr, n));
         }
@@ -3927,7 +5009,10 @@ impl GpuModel {
         for (lid, pos, kv, sc) in &journal {
             if *pos < from {
                 let o = ((pos % c.compress_ratios[*lid]) * hd * 4) as u64;
-                let (ka, kb) = (self.cst[lid].0.ptr, self.cst[lid].1.ptr);
+                let (ka, kb) = (
+                    self.seqs[self.cur].cst[lid].0.ptr,
+                    self.seqs[self.cur].cst[lid].1.ptr,
+                );
                 let k = seen.entry(ka + o).or_insert(0);
                 if reps.len() <= *k {
                     reps.push(Vec::new());
@@ -4549,6 +5634,333 @@ mod tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect()
+    }
+
+    /// Per-slot sequence state: three sequences interleaved step by step on one model (slot
+    /// switches between every forward, graphs on) give each lone sequence's logits bit for
+    /// bit, including a slot whose caches are smaller than slot 0's.
+    #[test]
+    fn gpu_tiny_slots_interleaved_exact() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        let mut a = GpuModel::open(&dir).unwrap();
+        let v = a.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = vec![
+            ids.clone(),
+            (0..ids.len() + 3).map(|i| (37 * i + 11) % v).collect(),
+            ids[2..].to_vec(),
+        ];
+        let steps = 12;
+        // the lone runs: prefill then greedy decode
+        let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+        for p in &prompts {
+            a.reset().unwrap();
+            let (mut l, _) = a.forward(p, 0, None).unwrap();
+            let mut w = vec![l.clone()];
+            for i in 0..steps {
+                l = a.forward(&[argmax(&l)], p.len() + i, None).unwrap().0;
+                w.push(l.clone());
+            }
+            want.push(w);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(3, cap).unwrap();
+        assert_eq!(m.n_slots(), 3);
+        let mut last: Vec<Vec<f32>> = vec![Vec::new(); 3];
+        for (k, p) in prompts.iter().enumerate().rev() {
+            m.select_slot(k).unwrap();
+            last[k] = m.forward(p, 0, None).unwrap().0;
+            assert_eq!(last[k], want[k][0], "slot {k} prefill");
+        }
+        for i in 0..steps {
+            for k in [1, 0, 2] {
+                m.select_slot(k).unwrap();
+                let tok = argmax(&last[k]);
+                last[k] = m.forward(&[tok], prompts[k].len() + i, None).unwrap().0;
+                assert_eq!(last[k], want[k][i + 1], "slot {k} step {i}");
+            }
+        }
+        // a reset clears only the selected slot
+        m.select_slot(1).unwrap();
+        m.reset().unwrap();
+        let l = m.forward(&prompts[1], 0, None).unwrap().0;
+        assert_eq!(l, want[1][0], "slot 1 after reset");
+        m.select_slot(2).unwrap();
+        let tok = argmax(&last[2]);
+        let (l, _) = m.forward(&[tok], prompts[2].len() + steps, None).unwrap();
+        a = GpuModel::open(&dir).unwrap();
+        let (mut r, _) = a.forward(&prompts[2], 0, None).unwrap();
+        for i in 0..=steps {
+            r = a
+                .forward(&[argmax(&r)], prompts[2].len() + i, None)
+                .unwrap()
+                .0;
+        }
+        assert_eq!(l, r, "slot 2 untouched by slot 1's reset");
+        assert!(m.select_slot(3).is_err());
+    }
+
+    /// Batched decode over slots ([`GpuModel::forward_rows`]): 10 sequences with different
+    /// prompts (t = 10 rows: past the grouped MoE's 8-row cap), rows in a different slot
+    /// order each step, give each lone sequence's greedy ids; a lone forward on a slot
+    /// afterwards still continues it exactly.
+    #[test]
+    fn gpu_tiny_rows_match_lone() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        // the exact mHC mixes on both sides: the rows step runs the unfused block (exact
+        // mixes), and the tiny random fixture amplifies the relaxed K-split's ulp drift
+        // into top-1 flips (as `gpu_tiny_free_running`)
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let v = a.cpu.cfg.vocab_size;
+        let ns = 10;
+        let prompts: Vec<Vec<usize>> = (0..ns)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - (k % 3);
+                    p[j] = (p[j] + 7919 * k) % v;
+                    p.truncate(p.len() - k % 2);
+                }
+                p
+            })
+            .collect();
+        let steps = 10;
+        let mut want: Vec<Vec<usize>> = Vec::new();
+        for p in &prompts {
+            a.reset().unwrap();
+            let (mut l, _) = a.forward(p, 0, None).unwrap();
+            let mut w = vec![argmax(&l)];
+            for i in 0..=steps {
+                l = a
+                    .forward(&[*w.last().unwrap()], p.len() + i, None)
+                    .unwrap()
+                    .0;
+                w.push(argmax(&l));
+            }
+            want.push(w);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(ns, cap).unwrap();
+        let mut gen: Vec<Vec<usize>> = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            m.select_slot(k).unwrap();
+            let (l, _) = m.forward(p, 0, None).unwrap();
+            gen.push(vec![argmax(&l)]);
+        }
+        m.select_slot(0).unwrap();
+        let mut mism = 0;
+        for i in 0..steps {
+            let mut order: Vec<usize> = (0..ns).collect();
+            order.rotate_left(i % ns);
+            if i % 2 == 1 {
+                order.reverse();
+            }
+            let rows: Vec<(usize, usize, usize)> = order
+                .iter()
+                .map(|&k| (k, *gen[k].last().unwrap(), prompts[k].len() + i))
+                .collect();
+            let next = m.forward_rows(&rows).unwrap();
+            for (j, &k) in order.iter().enumerate() {
+                gen[k].push(next[j]);
+            }
+        }
+        for k in 0..ns {
+            let ok = gen[k][..] == want[k][..=steps];
+            mism += (!ok) as usize;
+            eprintln!("slot {k}: rows {:?} lone {:?}", gen[k], &want[k][..=steps]);
+        }
+        assert_eq!(mism, 0, "{mism} slots differ from their lone run");
+        // a lone forward continues a slot after the rows steps
+        for k in [3, 0] {
+            m.select_slot(k).unwrap();
+            let (l, _) = m
+                .forward(&[gen[k][steps]], prompts[k].len() + steps, None)
+                .unwrap();
+            assert_eq!(argmax(&l), want[k][steps + 1], "slot {k} after rows");
+        }
+    }
+
+    /// Teacher-forced: every row of a [`GpuModel::forward_rows`] step against the same token
+    /// through a lone model on that sequence, logits compared (max abs over the vocabulary,
+    /// relative to the logit scale). Separates a state bug (grows, flips with margin) from
+    /// batched-GEMM rounding (stays at ulp level).
+    #[test]
+    fn gpu_tiny_rows_logits_match_lone() {
+        let Some((_, meta)) = open() else { return };
+        let ids = prompt(&meta);
+        let dir = Path::new(&tiny()).join("hf");
+        let ns = 10;
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let v = m.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = (0..ns)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - (k % 3);
+                    p[j] = (p[j] + 7919 * k) % v;
+                    p.truncate(p.len() - k % 2);
+                }
+                p
+            })
+            .collect();
+        let cap = m.cpu.cfg.max_seq_len.min(512);
+        m.add_slots(ns, cap).unwrap();
+        let mut lone: Vec<GpuModel> = Vec::new();
+        let mut cur = Vec::new();
+        for (k, p) in prompts.iter().enumerate() {
+            m.select_slot(k).unwrap();
+            let (l, _) = m.forward(p, 0, None).unwrap();
+            let mut a = GpuModel::open(&dir).unwrap();
+            a.hc_exact = true;
+            let (la, _) = a.forward(p, 0, None).unwrap();
+            assert_eq!(l, la, "slot {k} prefill");
+            cur.push(argmax(&l));
+            lone.push(a);
+        }
+        m.select_slot(0).unwrap();
+        let mut worst = 0f32;
+        let mut flips = 0;
+        for i in 0..10 {
+            // DS_ROWS_SLOTS=a,b,..: only those slots step (bisecting a failure)
+            let act: Vec<usize> = std::env::var("DS_ROWS_SLOTS")
+                .ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| (0..ns).collect());
+            let rows: Vec<(usize, usize, usize)> = act
+                .iter()
+                .map(|&k| (k, cur[k], prompts[k].len() + i))
+                .collect();
+            m.taps.borrow_mut().clear();
+            let (got, lg) = m.forward_rows_logits(&rows).unwrap();
+            for (ri, &k) in act.iter().enumerate() {
+                lone[k].taps.borrow_mut().clear();
+                let (la, _) = lone[k]
+                    .forward(&[cur[k]], prompts[k].len() + i, None)
+                    .unwrap();
+                let row = &lg[ri * v..(ri + 1) * v];
+                let scale = la.iter().fold(1f32, |a, x| a.max(x.abs()));
+                let d = la
+                    .iter()
+                    .zip(row)
+                    .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                let mut srt = la.clone();
+                srt.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let margin = srt[0] - srt[1];
+                eprintln!("step {i} slot {k}: diff {d:.3e}");
+                // DS_TAP=1 DS_ROWS_TAP=step,slot: the first tap where this row departs
+                let want_tap = std::env::var("DS_ROWS_TAP").ok().map(|v| {
+                    let w: Vec<usize> = v.split(',').map(|x| x.parse().unwrap()).collect();
+                    (w[0], w[1])
+                });
+                if want_tap == Some((i, k)) {
+                    let (mt, lt) = (m.taps.borrow(), lone[k].taps.borrow());
+                    let nr = act.len();
+                    let mut shown = 0;
+                    for (j, (name, lv)) in lt.iter().enumerate() {
+                        let Some((_, mv)) = mt
+                            .iter()
+                            .filter(|x| &x.0 == name)
+                            .nth(lt[..j].iter().filter(|x| &x.0 == name).count())
+                        else {
+                            eprintln!("tap {name}: missing in rows");
+                            continue;
+                        };
+                        if mv.len() != lv.len() * nr {
+                            eprintln!("tap {name}: len {} vs {}x{nr}", mv.len(), lv.len());
+                            continue;
+                        }
+                        let n1 = lv.len();
+                        let r = &mv[ri * n1..(ri + 1) * n1];
+                        let dd = lv
+                            .iter()
+                            .zip(r)
+                            .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                        if dd > 0.0 && shown < 12 {
+                            eprintln!("tap {name}: max abs {dd:.3e}");
+                            shown += 1;
+                        }
+                    }
+                }
+                if argmax(&la) != got[ri] {
+                    flips += 1;
+                    eprintln!("flip: step {i} slot {k}: margin {margin:.3e} diff {d:.3e}");
+                }
+                worst = worst.max(d / scale);
+                cur[k] = argmax(&la);
+            }
+        }
+        eprintln!("rows vs lone, teacher-forced: worst rel {worst:.3e}, {flips} flips");
+        assert!(worst < 1e-3, "rows logits off: rel {worst}");
+    }
+
+    /// A K-split linear over t > 8 rows (`ds_ksr`) gives every row exactly its t = 1 and
+    /// t = 8 result, for each K-split weight of layer 0's attention and a shared expert's
+    /// gate/up pair; `DS_KSR=0` (ds_kst) is reported for contrast.
+    #[test]
+    fn gpu_tiny_linear_rows_invariant() {
+        let Some((m, _)) = open() else { return };
+        let names = [
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wq_b.weight",
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wo_b.weight",
+        ];
+        let mut checked = 0;
+        for name in names {
+            let w = m.dw(name).unwrap().v;
+            if !m.k.ks_ok(&w) {
+                eprintln!("{name}: not on the K-split path, skipped");
+                continue;
+            }
+            let k = w.cols as usize;
+            let n = w.rows as usize;
+            for t in [9usize, 17, 24] {
+                m.arena.borrow_mut().reset().unwrap();
+                let xs: Vec<f32> = (0..t * k)
+                    .map(|i| (((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0) * 0.7)
+                    .collect();
+                let x = m.up(&xs).unwrap();
+                let y = m.lin(x, t, name).unwrap();
+                let got = m.read(y, t * n).unwrap();
+                for r in 0..t {
+                    let xr = Buf {
+                        ptr: x.ptr + (r * k * 4) as u64,
+                        len: k * 4,
+                    };
+                    let y1 = m.lin(xr, 1, name).unwrap();
+                    let one = m.read(y1, n).unwrap();
+                    assert_eq!(
+                        &got[r * n..(r + 1) * n],
+                        &one[..],
+                        "{name} t {t} row {r} vs t=1"
+                    );
+                }
+                let c0 = (t - 1) / 8 * 8;
+                let xc = Buf {
+                    ptr: x.ptr + (c0 * k * 4) as u64,
+                    len: (t - c0) * k * 4,
+                };
+                let y8 = m.lin(xc, t - c0, name).unwrap();
+                let eight = m.read(y8, (t - c0) * n).unwrap();
+                assert_eq!(
+                    &got[c0 * n..],
+                    &eight[..],
+                    "{name} t {t} last chunk vs its t<=8 run"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no K-split weight in the fixture");
     }
 
     /// As forward.rs `tiny_chunk_and_rewind_exact`, on the device.

@@ -8,9 +8,14 @@ scripts/gpu-run.sh h200-1 install                 # copy to the pod, start (idem
 scripts/gpu-run.sh h200-1 my-branch check         # tiny parity + short Qwen3-8B timing
 scripts/gpu-run.sh h200-1 my-branch race:qwen3-8b LENS=128,4096
 scripts/gpu-run.sh h200-2 my-branch race:coder-next
-scripts/gpu-run.sh h200-1 my-branch 'cmd:cargo test --release -p tang-gpu --features cuda'
+scripts/gpu-run.sh h200-1 my-branch 'cmd:cargo test --release -p tang-gpu --features cuda -- --test-threads=1'
 scripts/gpu-run.sh h200-1 status
 ```
+
+Run `tang-gpu` and `tang-bench` test suites on a runner pod with `--test-threads=1`:
+with parallel test threads `tang-bench --lib` segfaults intermittently on the pods
+(not root-caused; never seen single-threaded). The pods have no Vulkan driver, so
+the wgpu tests in `tang-gpu` skip (they print `skipped: no wgpu adapter`).
 
 The client blocks, with one server-side wait that checks every 60 s, then
 prints `result.json`. The branch has to be pushed to muni-works/tang.

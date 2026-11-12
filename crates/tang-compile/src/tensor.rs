@@ -43,6 +43,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
+#[path = "tensor_cuda_delta.rs"]
+mod cuda_delta;
 #[path = "tensor_cuda_gemv.rs"]
 pub mod cuda_gemv;
 /// The int8 tensor-core lowering of [`IntMma`] and the Q8x32 store.
@@ -50,12 +52,11 @@ pub mod cuda_gemv;
 mod cuda_int8;
 #[path = "tensor_cuda_mega.rs"]
 pub mod cuda_mega;
-/// Measured schedule choices (the tuning cache) behind the lowering knobs.
-#[path = "tensor_tune.rs"]
-pub mod tune;
 /// A whole program as one persistent CUDA kernel (no kernel boundaries).
 #[path = "tensor_cuda_scan.rs"]
 pub mod cuda_scan;
+#[path = "tensor_cuda_split.rs"]
+mod cuda_split;
 /// Algorithm discovery: online, scan and chunked lifts.
 #[path = "tensor_discover.rs"]
 pub mod discover;
@@ -77,6 +78,9 @@ mod grad;
 pub mod int8_sched;
 #[path = "tensor_io.rs"]
 pub mod io;
+/// Measured schedule choices (the tuning cache) behind the lowering knobs.
+#[path = "tensor_tune.rs"]
+pub mod tune;
 pub use io::{IoReport, KernelIo};
 #[path = "tensor_io_lp.rs"]
 pub mod io_lp;
@@ -100,21 +104,24 @@ pub mod opencl_gemv;
 #[path = "tensor_place.rs"]
 pub mod place;
 pub use place::{Boundary, MemorySchedule, Place, Placed};
+/// Sub-4-bit weight formats (affine, codebook VQ, Hadamard), emulated.
+#[path = "tensor_lowbit.rs"]
+pub mod lowbit;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
-pub use scan::{DeltaForm, Scan, ScanKind, Semiring};
+pub use scan::{DeltaForm, DeltaStep, Scan, ScanKind, Semiring};
+/// Multi-GPU decode: placements, collectives and per-rank programs.
+#[path = "tensor_shard.rs"]
+pub mod shard;
 #[path = "tensor_space.rs"]
 pub mod space;
 /// Sparse SpMV/PCG as tensor-IR programs and the `LinearSolve` /
 /// `IndexedGather` operator nodes.
 #[path = "tensor_sparse.rs"]
 pub mod sparse;
-/// Multi-GPU decode: placements, collectives and per-rank programs.
-#[path = "tensor_shard.rs"]
-pub mod shard;
 /// Decode as the finite difference of prefill: the `T → T + k` step and
 /// its KV cache, derived from the full-sequence graph.
 #[path = "tensor_step.rs"]
@@ -528,13 +535,12 @@ impl Monoid {
     /// `Some(k)` when this is [`Monoid::topk`]`(k)` (same identity, same
     /// combine at probe points).
     pub fn topk_k(&self) -> Option<usize> {
-        if self.width < 2 || self.width % 2 != 0 {
+        if self.width < 2 || !self.width.is_multiple_of(2) {
             return None;
         }
         let k = self.width / 2;
-        let id_ok = (0..k).all(|r| {
-            self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64)
-        });
+        let id_ok = (0..k)
+            .all(|r| self.identity[2 * r] == 0.0 && self.identity[2 * r + 1] == -(f32::MAX as f64));
         (id_ok && self.matches(&Monoid::topk(k))).then_some(k)
     }
 

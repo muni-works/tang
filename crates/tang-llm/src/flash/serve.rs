@@ -103,6 +103,25 @@ fn request_sampling(mode: SamplingMode, temp0: f32, req: &Request) -> (f32, usiz
     (temp, top_k, top_p, req.presence_penalty.unwrap_or(card.3))
 }
 
+/// Loads a derived-step Qwen3-Coder-Next engine: `(gguf, ctx, sequence slots)`.
+pub type DerivedCoderLoad = fn(&Path, usize, usize) -> Result<Box<dyn ServeEngine>>;
+
+static DERIVED_CODER: std::sync::OnceLock<DerivedCoderLoad> = std::sync::OnceLock::new();
+
+/// Register the engine `TANG_CODER_ENGINE=derived` serves qwen3next GGUFs with. tang-llm can't
+/// build the derived step itself (the graphs and the program runner live in tang-bench /
+/// tang-gpu), so a binary that links them registers it before [`serve_cli`]
+/// (`tang-bench`'s `coder_serve`).
+pub fn register_derived_coder(load: DerivedCoderLoad) {
+    let _ = DERIVED_CODER.set(load);
+}
+
+/// `TANG_CODER_ENGINE=derived`: serve Qwen3-Coder-Next decode from the derived step instead of
+/// the hand engine (`hand`, the default).
+pub fn coder_engine_derived() -> bool {
+    std::env::var("TANG_CODER_ENGINE").as_deref() == Ok("derived")
+}
+
 /// What the server needs from an engine: the Flash-Next [`Engine`] or the qwen3next
 /// [`Coder`](super::coder::Coder).
 pub trait ServeEngine {
@@ -654,6 +673,77 @@ pub struct FlashServe {
     requests: usize,
     line: Line,
     drafts_mode: &'static str,
+    /// Prefix-cache hits under batching, by where the reused tokens came from.
+    cache: CacheStats,
+}
+
+/// Where a batched request's reused prompt tokens came from (`take_slot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hit {
+    /// Nothing reused: the whole prompt prefilled.
+    Miss,
+    /// A parked slot whose tokens the prompt extends (KV and GDN state already on the GPU).
+    Parked,
+    /// A parked slot that diverges from the prompt, rewound to a saved GDN/conv state at a
+    /// prefix boundary inside the shared part: its KV rows below the boundary are kept, only
+    /// the recurrent state is copied up.
+    Rewound,
+    /// A saved state in host RAM (or read from disk) restored into a fresh slot: recurrent
+    /// state and K/V rows copied up.
+    Host,
+}
+
+impl Hit {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Hit::Miss => "miss",
+            Hit::Parked => "parked",
+            Hit::Rewound => "rewound",
+            Hit::Host => "host",
+        }
+    }
+}
+
+/// Cumulative prefix-cache counters (requests and reused tokens by [`Hit`]).
+#[derive(Default)]
+pub(super) struct CacheStats {
+    pub requests: [u64; 4],
+    pub reused: [u64; 4],
+    pub prompt: u64,
+    /// Parked slots spilled to host RAM when evicted, and their tokens.
+    pub spills: u64,
+    pub spilled_tokens: u64,
+}
+
+impl CacheStats {
+    pub(super) fn note(&mut self, hit: Hit, prompt: usize, reused: usize) {
+        self.requests[hit as usize] += 1;
+        self.reused[hit as usize] += reused as u64;
+        self.prompt += prompt as u64;
+    }
+
+    /// `hit rate 87.1% (parked 40/31.2k, rewound ..., host ..., miss ...)`: tokens reused over
+    /// prompt tokens since start.
+    pub(super) fn line(&self) -> String {
+        let reused: u64 = self.reused.iter().sum();
+        let rate = 100.0 * reused as f64 / self.prompt.max(1) as f64;
+        let by = [Hit::Parked, Hit::Rewound, Hit::Host, Hit::Miss]
+            .iter()
+            .map(|&h| {
+                format!(
+                    "{} {}/{}",
+                    h.name(),
+                    self.requests[h as usize],
+                    self.reused[h as usize]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "cache: {reused}/{} prompt tokens reused = {rate:.1}% ({by}; spills {} = {} tokens)",
+            self.prompt, self.spills, self.spilled_tokens
+        )
+    }
 }
 
 /// Tool-call arguments as objects (the template wants mappings; OpenAI clients send strings).
@@ -728,7 +818,19 @@ impl FlashServe {
             profile: profile.clone(),
             ..Opts::default()
         };
-        let mut e: Box<dyn ServeEngine> = if super::coder::is_qwen3next(&s.gguf)? {
+        let qwen3next = super::coder::is_qwen3next(&s.gguf)?;
+        let mut e: Box<dyn ServeEngine> = if qwen3next && coder_engine_derived() {
+            let load = DERIVED_CODER.get().context(
+                "TANG_CODER_ENGINE=derived: this binary has no derived coder engine \
+                 (tang-bench's coder_serve registers one)",
+            )?;
+            let slots = s.batch.max(1);
+            eprintln!(
+                "tang-llm: TANG_CODER_ENGINE=derived: decode from the derived step, {slots} slot(s), ctx {}",
+                s.ctx
+            );
+            load(&s.gguf, s.ctx, slots)?
+        } else if qwen3next {
             let mut c = super::coder::Coder::load(
                 &s.gguf,
                 super::coder::CoderOpts {
@@ -867,6 +969,7 @@ impl FlashServe {
             shape,
             gdn_layers,
             requests: 0,
+            cache: CacheStats::default(),
             line: Line::default(),
         };
         // Capture the wide prefill graphs (64, 32, 16) now, not in the first request.
@@ -2245,6 +2348,114 @@ pub fn resume_test(args: &[String]) -> Result<()> {
 
 /// The routing-count profile in the state directory.
 const ROUTING: &str = "routing.bin";
+
+/// Bytes of host RAM available (`MemAvailable`), 0 when unknown.
+fn mem_available() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .find(|l| l.starts_with("MemAvailable:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<f64>()
+                .ok()
+        })
+        .map_or(0.0, |kb| kb * 1024.0)
+}
+
+/// `tang-llm serve <first shard.gguf> [--mtp M] [--host H] [--port P] [--ctx N] [--api-key-file F]
+/// [--temp T] [--snapshots N] [--dump-ids DIR] [--no-suffix] [--warm-dir DIR] [--batch N]`: the Flash engine (`flash::serve`):
+/// Flash-Next, or qwen3next (Qwen3-Coder-Next) by the GGUF's architecture. Without MTP, suffix
+/// drafts are on unless `--no-suffix`.
+pub fn serve_cli(args: &[String], hardware: crate::node::Probe) -> Result<()> {
+    let gguf = PathBuf::from(args.first().context("serve <first shard.gguf>")?);
+    let mut s = Settings {
+        sampling: crate::flash::serve::SamplingMode::Greedy,
+        disk: default_disk(&gguf),
+        gguf,
+        mtp: None,
+        ctx: 32_768,
+        temp: 0.0,
+        snapshots: 6,
+        warm: Vec::new(),
+        profile: None,
+        suffix: true,
+        warm_dir: None,
+        batch: 0,
+        // Host RAM for saved prefix states: TANG_FLASH_SNAP_GB, else a third of what's
+        // available, 12..64 GB (under batching evicted slots spill here).
+        snapshot_bytes: std::env::var("TANG_FLASH_SNAP_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or_else(|| (mem_available() / 3.0).clamp(12e9, 64e9), |g| g * 1e9)
+            as usize,
+        dump: None,
+    };
+    let (mut host, mut port) = ("127.0.0.1".to_string(), 8911u16);
+    let mut key = std::env::var("TANG_API_KEY").ok();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => host = val()?.clone(),
+            // live OTLP/HTTP export (otel builds); the default is the local file only
+            "--otel-live" => std::env::set_var("TANG_OTEL_LIVE", "1"),
+            "--port" => port = val()?.parse()?,
+            "--ctx" => s.ctx = val()?.parse()?,
+            "--mtp" => s.mtp = Some(PathBuf::from(val()?)),
+            "--temp" => s.temp = val()?.parse()?,
+            "--sampling" => {
+                s.sampling = match val()?.as_str() {
+                    "greedy" => crate::flash::serve::SamplingMode::Greedy,
+                    "model-card" => crate::flash::serve::SamplingMode::ModelCard,
+                    m => bail!("--sampling greedy|model-card, not {m}"),
+                }
+            }
+            "--snapshots" => s.snapshots = val()?.parse()?,
+            "--warm-request" => s.warm.push(PathBuf::from(val()?)),
+            "--profile" => s.profile = Some(PathBuf::from(val()?)),
+            "--dump-ids" => s.dump = Some(PathBuf::from(val()?)),
+            "--no-suffix" => s.suffix = false,
+            "--warm-dir" => s.warm_dir = Some(PathBuf::from(val()?)),
+            "--batch" => s.batch = val()?.parse()?,
+            "--api-key-file" => {
+                let path = val()?;
+                key =
+                    Some(std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?);
+            }
+            other => bail!("unknown option {other}"),
+        }
+    }
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if key.is_none() && !host.starts_with("127.") && host != "localhost" {
+        eprintln!("tang-llm: listening on {host} without a static key: only paired clients get in (`tang-llm pair`)");
+    }
+    let name = s
+        .gguf
+        .file_name()
+        .map(|n| {
+            n.to_string_lossy()
+                .split("-0000")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let opts = crate::server::Options {
+        addr: format!("{host}:{port}"),
+        model: Some(name),
+        key,
+        dtype: crate::Dtype::Q4,
+        hardware,
+    };
+    // Under batching every session's last turn boundary (and each evicted slot) is a saved
+    // state: keep a few per slot unless `--snapshots` says otherwise.
+    if s.batch > 1 && !args.iter().any(|a| a == "--snapshots") {
+        s.snapshots = s.snapshots.max(4 * s.batch);
+    }
+    crate::server::serve(opts, move |_name: &str| FlashServe::load(&s))
+}
 
 /// `TANG_FLASH_STATE_DIR` or `~/.cache/tang/flash-serve/<model>`.
 pub fn default_disk(gguf: &Path) -> Option<PathBuf> {

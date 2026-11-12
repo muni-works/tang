@@ -255,7 +255,7 @@ pub struct Model {
     /// these, so a layer's error is its own (teacher forcing against the reference).
     pub force: Option<Vec<(Vec<f32>, Vec<f32>)>>,
     engram: Option<EngramMeta>,
-    hash_cache: Vec<i64>,
+    pub(crate) hash_cache: Vec<i64>,
     /// While a [`Snapshot`] is open: every compressor partial-group write (lid, pos, kv, score),
     /// so a rewind can replay the kept positions' writes over the snapshot.
     journal: Option<Vec<(usize, usize, Vec<f32>, Vec<f32>)>>,
