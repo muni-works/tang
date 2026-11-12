@@ -66,6 +66,11 @@ fn main() {
     let toks = run.rows_of(&prompt(t_pre + k));
     let all = std::env::var("DS_ALL_EXPERTS").as_deref() == Ok("1");
     let n_exp = run.cfg["n_routed_experts"].as_u64().unwrap_or(384) as usize;
+    // DS_N_EXPERTS=n: only the first n experts in the tables (bisects table size)
+    let n_exp: usize = std::env::var("DS_N_EXPERTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(n_exp);
     let used = if all {
         Ok(vec![(0..n_exp).collect::<Vec<_>>(); run.layer_ids.len()])
     } else {
