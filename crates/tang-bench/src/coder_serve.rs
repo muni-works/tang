@@ -82,6 +82,8 @@ struct ChunkVar {
     pos_in: usize,
     tok_in: usize,
     swaps: Vec<(usize, TensorId)>,
+    /// The last row's logits.
+    logits: TensorId,
 }
 
 /// The greedy step's own inputs and outputs (`[logits, updated caches…]`).
@@ -376,6 +378,7 @@ impl DerivedCoder {
                     .position(|s| matches!(s, StepInput::New(_)))
                     .context("chunk token input")?,
                 swaps: swapsc,
+                logits: lowc.outs[0],
             });
             eprintln!(
                 "coder derived: prefill chunk {k}: {} kernels, built in {:.1} s",
@@ -637,7 +640,20 @@ impl DerivedCoder {
     fn prefill_chunked(&mut self, s: usize, ids: &[u32]) -> Result<u32> {
         let t0 = Instant::now();
         let mut done = 0;
-        let body = ids.len().saturating_sub(1);
+        // a greedy slot whose ids the ladder covers exactly chunks them all and takes the
+        // token as the host argmax of the last chunk's logits (the server prefills in
+        // windows, so most windows end on a chunk boundary)
+        let smallest = self.chunk_vars.last().map_or(0, |c| c.k);
+        let whole = smallest > 0
+            && ids.len() % smallest == 0
+            && self.slots[s].params[TEMPERATURE] <= 0.0
+            && std::env::var("TANG_CODER_DERIVED_CHUNK_WHOLE").as_deref() != Ok("0");
+        let body = if whole {
+            ids.len()
+        } else {
+            ids.len().saturating_sub(1)
+        };
+        let mut last_chunk = None;
         for (v, cv) in self.chunk_vars.iter().enumerate() {
             while body - done >= cv.k {
                 let pos = self.slots[s].tokens.len();
@@ -658,10 +674,25 @@ impl DerivedCoder {
                     .tokens
                     .extend_from_slice(&ids[done..done + cv.k]);
                 done += cv.k;
+                last_chunk = Some(v);
             }
         }
         let chunked = done;
-        let next = self.feed(s, &ids[done..])?;
+        let next = match last_chunk {
+            Some(v) if done == ids.len() => {
+                let cv = &self.chunk_vars[v];
+                let l = self.slots[s].chunks[v].read(&self.rt, cv.logits);
+                let l = &l[l.len() - self.vocab..];
+                let mut a = 0;
+                for (i, &x) in l.iter().enumerate() {
+                    if x > l[a] {
+                        a = i;
+                    }
+                }
+                a as u32
+            }
+            _ => self.feed(s, &ids[done..])?,
+        };
         self.last = WinStats {
             t: ids.len(),
             wall_ms: t0.elapsed().as_secs_f64() * 1e3,
