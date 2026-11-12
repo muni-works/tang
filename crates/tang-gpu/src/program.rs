@@ -620,12 +620,22 @@ impl Program {
                     }
                 }
                 // nvrtc the missing kernels on all cores, then load
-                crate::cuda::precompile(program.kernels.iter().map(|k| k.source.as_str()), d.arch);
-                let functions = program
+                // programmatic dependent launch: every kernel lets its
+                // dependents launch, then waits for its producers
+                let pdl = crate::cuda::pdl_on(d.arch);
+                let srcs: Vec<String> = program
                     .kernels
                     .iter()
-                    .map(|k| d.function(&k.source))
+                    .map(|k| {
+                        if pdl {
+                            crate::cuda::with_griddep(&k.source)
+                        } else {
+                            k.source.clone()
+                        }
+                    })
                     .collect();
+                crate::cuda::precompile(srcs.iter().map(String::as_str), d.arch);
+                let functions = srcs.iter().map(|s| d.function(s)).collect();
                 let host = (0..plan.slot_len.len()).map(|_| None).collect();
                 let storage = Storage::Cuda {
                     slots,
@@ -1388,6 +1398,54 @@ impl Program {
         let Storage::Cuda { host, .. } = &self.storage else {
             unreachable!()
         };
+        if crate::cuda::pdl_active() {
+            use cudarc::driver::{sys, DevicePtr};
+            let mut guards = Vec::new();
+            let mut ptrs: Vec<u64> = Vec::with_capacity(self.args[i].len());
+            for &s in &self.args[i] {
+                match &host[s] {
+                    Some(h) => ptrs.push(h.dev),
+                    None => {
+                        let (p, g) = slots[s].device_ptr(stream);
+                        ptrs.push(p);
+                        guards.push(g);
+                    }
+                }
+            }
+            let mut points = k.points;
+            let mut args: Vec<*mut std::ffi::c_void> = ptrs
+                .iter_mut()
+                .map(|p| p as *mut u64 as *mut std::ffi::c_void)
+                .collect();
+            args.push(&mut points as *mut u32 as *mut std::ffi::c_void);
+            unsafe {
+                let mut attr: sys::CUlaunchAttribute = std::mem::zeroed();
+                attr.id =
+                    sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+                attr.value.programmaticStreamSerializationAllowed = 1;
+                let lc = sys::CUlaunchConfig {
+                    gridDimX: cfg.grid_dim.0,
+                    gridDimY: 1,
+                    gridDimZ: 1,
+                    blockDimX: cfg.block_dim.0,
+                    blockDimY: 1,
+                    blockDimZ: 1,
+                    sharedMemBytes: cfg.shared_mem_bytes,
+                    hStream: stream.cu_stream(),
+                    attrs: &mut attr,
+                    numAttrs: 1,
+                };
+                let r = sys::cuLaunchKernelEx(
+                    &lc,
+                    functions[i].cu_function(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "cuLaunchKernelEx");
+            }
+            drop(guards);
+            return;
+        }
         let mut launch = stream.launch_builder(&functions[i]);
         for &s in &self.args[i] {
             match &host[s] {

@@ -263,3 +263,45 @@ impl CudaDevice {
         self.stream.synchronize().expect("cuda sync");
     }
 }
+
+static PDL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Programmatic dependent launch for derived programs on `arch`: sm_90+
+/// unless `TANG_PDL=0`. Remembered for [`pdl_active`] (the launches of
+/// the kernels compiled with [`with_griddep`]).
+pub fn pdl_on(arch: &str) -> bool {
+    let cc: u32 = arch
+        .trim_start_matches("sm_")
+        .trim_end_matches(|c: char| c.is_alphabetic())
+        .parse()
+        .unwrap_or(0);
+    let on = cc >= 90 && !std::env::var("TANG_PDL").is_ok_and(|v| v == "0");
+    PDL.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// Whether derived kernels launch with programmatic stream serialization.
+pub fn pdl_active() -> bool {
+    PDL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `src` (a kernel with entry point `main0`) that first lets its
+/// dependents launch (`griddepcontrol.launch_dependents`), then waits for
+/// every grid it depends on to complete and flush
+/// (`griddepcontrol.wait`): its launch and block scheduling overlap the
+/// producer's tail, its reads still see all of the producer's writes.
+pub fn with_griddep(src: &str) -> String {
+    let Some(at) = src.rfind("main0(") else {
+        return src.to_string();
+    };
+    let Some(open) = src[at..].find('{').map(|i| at + i) else {
+        return src.to_string();
+    };
+    let mut out = String::with_capacity(src.len() + 200);
+    out.push_str(&src[..=open]);
+    out.push_str(
+        "\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n    asm volatile(\"griddepcontrol.launch_dependents;\");\n    asm volatile(\"griddepcontrol.wait;\" ::: \"memory\");\n#endif\n",
+    );
+    out.push_str(&src[open + 1..]);
+    out
+}
