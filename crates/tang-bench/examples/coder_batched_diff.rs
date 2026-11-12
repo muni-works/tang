@@ -53,12 +53,14 @@ fn main() {
         batch: Some(nb),
         group: 0,
         q6k_as_q8_0: false,
+        kv_f16: false,
         block: Some(BlockOpts::default()),
     };
     let test = RealOpts {
         batch: Some(nb),
         group: env("TANG_BATCH_GROUP", 0),
         q6k_as_q8_0: false,
+        kv_f16: false,
         block: Some(BlockOpts {
             pos_tile: env("TANG_BATCH_PT", 1),
             mma_min: env("TANG_BATCH_MMA_MIN", 0),

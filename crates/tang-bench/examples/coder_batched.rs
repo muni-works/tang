@@ -78,6 +78,8 @@ fn main() {
         block: Some(BlockOpts::batched()),
         // `TANG_Q6K_Q8=0`: keep Q6_K tensors as f32
         q6k_as_q8_0: std::env::var("TANG_Q6K_Q8").as_deref() != Ok("0"),
+        // `TANG_KV_F16=1`: K/V caches stored f16
+        kv_f16: std::env::var("TANG_KV_F16").as_deref() == Ok("1"),
     };
     let low = lower_real_step_with(&pg, &st, &tys, &ro);
     let native = low.program.native.iter().filter(|n| **n).count();

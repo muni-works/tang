@@ -610,6 +610,7 @@ mod tests {
                     batch: Some(nb),
                     group,
                     q6k_as_q8_0: false,
+                    kv_f16: false,
                     block: Some(BlockOpts::default()),
                 },
             );

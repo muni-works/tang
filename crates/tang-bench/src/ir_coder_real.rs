@@ -145,6 +145,9 @@ pub struct RealOpts {
     /// [`q8_0_bytes`]) so the int8 GEMV reads them instead of an f32
     /// gather: coder-next's blk.46 routed down, 2.7 ms at B = 64 as f32.
     pub q6k_as_q8_0: bool,
+    /// Full-capacity K/V caches stored f16 (`Packing::F16`, decoded at
+    /// load, the in-place update stores halves): half the attention bytes.
+    pub kv_f16: bool,
     /// Stages of the int8 contractions by their positions.
     /// `None`: `schedule_block_weights` (the decode GEMV, the MMA tile for
     /// many-row steps).
@@ -237,6 +240,20 @@ pub fn lower_real_step_with(
     };
     let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
         no_step_mma: ro.batch.unwrap_or(1) > 1,
+        packed: if ro.kv_f16 {
+            st.caches
+                .iter()
+                .filter(|s| !s.state && s.ring.is_none())
+                .map(|s| {
+                    (
+                        input_of(s.input),
+                        tang_compile::tensor::cuda_gemv::Packing::F16,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         inplace: st
             .caches
             .iter()
