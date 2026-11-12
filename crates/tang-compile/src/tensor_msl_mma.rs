@@ -234,6 +234,15 @@ impl TensorGraph {
         for pairs in out_pairs {
             let mut terms = Vec::with_capacity(pairs.len());
             for (va, vb) in pairs {
+                // the tile addresses operands affinely (`flat_addr`): a
+                // gathered read (DS sparse attention over top-k picked
+                // keys) or a guarded one would read the wrong elements
+                if [va, vb]
+                    .iter()
+                    .any(|&v| rc.args[v].view.gather.is_some() || rc.args[v].view.guard)
+                {
+                    return None;
+                }
                 let addr_a = self.flat_addr(&rc.args[va], rank);
                 let addr_b = self.flat_addr(&rc.args[vb], rank);
                 // A varies along rows (dy) and k, B along cols (dx) and k
