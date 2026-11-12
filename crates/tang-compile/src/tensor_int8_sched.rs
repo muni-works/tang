@@ -29,6 +29,73 @@ pub struct BlockSchedule {
     pub demoted: Vec<TensorId>,
 }
 
+/// How [`TensorGraph::schedule_block_weights_with`] stages a contraction
+/// over `P` positions (the point dims before the weight row: streams ×
+/// rows × routed slots). The default is the decode schedule everywhere
+/// (the dp4a GEMV, one position a weight read).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockOpts {
+    /// An ungathered weight over `2 ≤ P < mma_min` positions: the GEMV
+    /// with up to this many positions on one weight read (0 or 1: off).
+    pub pos_tile: usize,
+    /// From this many positions (0: never) an ungathered weight, or a
+    /// gathered one whose positions are grouped by weight slice (the
+    /// activation gathered too, `schedule_expert_groups`), runs on the
+    /// int8 tensor cores: one weight read per run of 8 positions.
+    pub mma_min: usize,
+    /// Warps splitting a tile's `k` on the tensor cores (0: 2).
+    pub ksplit: u32,
+}
+
+impl BlockOpts {
+    /// The batched-decode schedule: `TANG_BATCH_PT` (8),
+    /// `TANG_BATCH_MMA_MIN` (16), `TANG_BATCH_KSPLIT` (2).
+    pub fn batched() -> Self {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        Self {
+            pos_tile: env("TANG_BATCH_PT", 8),
+            mma_min: env("TANG_BATCH_MMA_MIN", 16),
+            ksplit: env("TANG_BATCH_KSPLIT", 2) as u32,
+        }
+    }
+
+    fn stage(&self, g: &TensorGraph, i: usize, (wi, xi): (usize, usize)) -> IntMma {
+        let gemv = IntMma {
+            stage: Stage::Gemv,
+            ksplit: 1,
+            pos_tile: 1,
+        };
+        let c = g.comp_at(i).unwrap();
+        let pts: Vec<usize> = c.points().iter().map(|d| d.fixed().unwrap()).collect();
+        let npos: usize = pts[..pts.len() - 1].iter().product();
+        let wf = g.nodes[c.args[wi].src.n()].precision.storage;
+        if npos <= 1 || matches!(wf, Format::Fp8B32 | Format::Mxfp4) {
+            return gemv;
+        }
+        let mma = IntMma {
+            stage: Stage::Mma,
+            ksplit: if self.ksplit == 0 { 2 } else { self.ksplit },
+            pos_tile: 8,
+        };
+        let big = self.mma_min > 0 && npos >= self.mma_min;
+        match (c.args[wi].view.is_gather(), c.args[xi].view.is_gather()) {
+            (true, true) if big => IntMma { pos_tile: 1, ..mma },
+            (true, _) => gemv,
+            (false, _) if big => mma,
+            (false, _) if self.pos_tile > 1 => IntMma {
+                pos_tile: npos.min(self.pos_tile) as u32,
+                ..gemv
+            },
+            _ => gemv,
+        }
+    }
+}
+
 fn int8_format(f: Format) -> bool {
     matches!(
         f,
@@ -76,9 +143,12 @@ impl TensorGraph {
             (false, true) => (b, a),
             _ => return None,
         };
-        // every other arg is the weight's gather index
+        // every other arg is the weight's gather index or the
+        // activation's (rows picked by position: expert-grouped positions,
+        // `schedule_expert_groups`)
         let index = c.args[wi].view.gather.as_ref().map(|g| g.arg);
-        if (0..c.args.len()).any(|j| j != wi && j != xi && Some(j) != index) {
+        let xindex = c.args[xi].view.gather.as_ref().map(|g| g.arg);
+        if (0..c.args.len()).any(|j| j != wi && j != xi && Some(j) != index && Some(j) != xindex) {
             return None;
         }
         let (w, xa) = (&c.args[wi].view, &c.args[xi].view);
@@ -103,7 +173,17 @@ impl TensorGraph {
         let xs = self.nodes[c.args[xi].src.n()].shape.clone();
         let xl = xs.last()?.fixed()?;
         let xf = xa.forms.last()?;
-        if xa.is_gather()
+        // a gathered activation picks whole rows: never along k
+        let x_gather_ok = xa.gather.as_ref().is_none_or(|g| {
+            g.coefs.last() == Some(&0)
+                && c.args[g.arg].view.gather.is_none()
+                && c.args[g.arg]
+                    .view
+                    .forms
+                    .iter()
+                    .all(|f| f.coefs[kd] == 0 && f.coefs[np - 1] == 0)
+        });
+        if !x_gather_ok
             || !on(xf, kd)
             || xf.offset % 32 != 0
             || xf
@@ -129,6 +209,24 @@ impl TensorGraph {
     pub fn schedule_block_weights(
         &self,
         outputs: &[TensorId],
+    ) -> (TensorGraph, Vec<TensorId>, BlockSchedule) {
+        self.schedule_block_weights_opt(outputs, None)
+    }
+
+    /// [`schedule_block_weights`](Self::schedule_block_weights) with a
+    /// stage per contraction by its number of positions ([`BlockOpts`]).
+    pub fn schedule_block_weights_with(
+        &self,
+        outputs: &[TensorId],
+        bo: &BlockOpts,
+    ) -> (TensorGraph, Vec<TensorId>, BlockSchedule) {
+        self.schedule_block_weights_opt(outputs, Some(bo))
+    }
+
+    fn schedule_block_weights_opt(
+        &self,
+        outputs: &[TensorId],
+        bo: Option<&BlockOpts>,
     ) -> (TensorGraph, Vec<TensorId>, BlockSchedule) {
         let mut g = self.clone();
         let live = self.live(outputs);
@@ -214,7 +312,10 @@ impl TensorGraph {
                             t
                         });
                         c.args[xi].src = xq;
-                        node.int_mma = Some(many_positions(self, i));
+                        node.int_mma = Some(match bo {
+                            Some(bo) => bo.stage(self, i, sched.unwrap()),
+                            None => many_positions(self, i),
+                        });
                         out.gemvs += 1;
                     }
                     Op::Comp(c)
