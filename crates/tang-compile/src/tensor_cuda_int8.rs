@@ -864,10 +864,20 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
             if a.view.is_gather() || a.view.guard {
                 return Err("the inlined producer's reads must be affine".into());
             }
+            // (an alias, e.g. a reshape, reads its storage's buffer)
+            let sn = self.storage(super::TensorId(n as u32)).n();
             let qi = reads
                 .iter()
-                .position(|&r| r == n)
-                .ok_or("an inlined producer read is not a buffer")?;
+                .position(|&r| r == n || r == sn)
+                .ok_or_else(|| {
+                    format!(
+                        "an inlined producer read is not a buffer (n{n} {:?} inline {} host {:?}, storage n{}, reads {reads:?})",
+                        self.nodes[n].shape,
+                        self.nodes[n].inline,
+                        self.nodes[n].host.map(|h| h.n()),
+                        self.storage(super::TensorId(n as u32)).n()
+                    )
+                })?;
             if self.nodes[n].precision.storage != Format::F32 {
                 return Err("the inlined producer must read f32".into());
             }

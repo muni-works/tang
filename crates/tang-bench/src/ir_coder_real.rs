@@ -247,14 +247,6 @@ pub fn lower_real_step_with(
         graph.schedule_staged_stats(&outs, &inplace);
         graph.schedule_small_maps(&outs, &inplace);
     }
-    // Q8x32 maps read only by int8 GEMVs (SwiGLU outputs, the GDN output)
-    // computed in the GEMVs' prologues; TANG_GEMV_PROLOGUE=0 off
-    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_GEMV_PROLOGUE").as_deref()
-        != Some("0")
-    {
-        let k = graph.schedule_gemv_prologues(&outs);
-        eprintln!("gemv prologues: {k} Q8x32 maps inlined");
-    }
     // multi-output kernels: residual adds folded into their norms (and
     // norms into their Q8x32 copies), conv windows into the convs, ring
     // and state updates as side jobs on blocks of their own. On by default (H200: 5.30 -> 5.13 ms,
@@ -281,6 +273,14 @@ pub fn lower_real_step_with(
     {
         let (a, b) = graph.schedule_cokernels(&outs, &opts);
         eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
+    }
+    // Q8x32 maps read only by int8 GEMVs (SwiGLU outputs, the GDN output)
+    // computed in the GEMVs' prologues; TANG_GEMV_PROLOGUE=0 off
+    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_GEMV_PROLOGUE").as_deref()
+        != Some("0")
+    {
+        let k = graph.schedule_gemv_prologues(&outs);
+        eprintln!("gemv prologues: {k} Q8x32 maps inlined");
     }
     let program = graph.to_cuda_decode(&outs, &opts);
     if let Ok(dir) = std::env::var("TANG_DUMP_STEP") {
