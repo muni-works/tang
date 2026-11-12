@@ -719,25 +719,33 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
 
     let logits = b.linear(x, router);
     let e = Dim::Fixed(ne);
-    let mx =
-        b.g.comp(
-            &[T],
-            &[e],
-            vec![arg(logits, ident(2))],
-            Some(Monoid::max()),
-            |v| vec![v[0]],
-        )
-        .unwrap();
-    let den =
-        b.g.comp(
-            &[T],
-            &[e],
-            vec![arg(logits, ident(2)), arg(mx, vec![unit(2, 0)])],
-            Some(Monoid::sum()),
-            |v| vec![(v[0] - v[1]).exp()],
-        )
-        .unwrap();
-    let prob =
+    // top-k over the logits (TANG_ROUTER_LOGITS=0: over the softmax): the
+    // order is the same and the renormalized weights need no softmax
+    // statistics, p_i / Σ_topk p_j = exp(l_i - l_1) / Σ_topk exp(l_j - l_1).
+    // Exact up to rounding: a top-k holds at least k/ne of the mass
+    // (10/512 here), far over the 2⁻¹⁴ clamp, which never applies
+    let by_logit = std::env::var("TANG_ROUTER_LOGITS").map_or(true, |v| v != "0");
+    let score = if by_logit {
+        logits
+    } else {
+        let mx =
+            b.g.comp(
+                &[T],
+                &[e],
+                vec![arg(logits, ident(2))],
+                Some(Monoid::max()),
+                |v| vec![v[0]],
+            )
+            .unwrap();
+        let den =
+            b.g.comp(
+                &[T],
+                &[e],
+                vec![arg(logits, ident(2)), arg(mx, vec![unit(2, 0)])],
+                Some(Monoid::sum()),
+                |v| vec![(v[0] - v[1]).exp()],
+            )
+            .unwrap();
         b.g.comp(
             &[T, e],
             &[],
@@ -749,14 +757,15 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
             None,
             |v| vec![(v[0] - v[1]).exp() / v[2]],
         )
-        .unwrap();
+        .unwrap()
+    };
     // top-k as (expert, p) pairs, best first, ties to the lower expert
     let ei = b.g.iota(&[T, e], 1);
     let topk =
         b.g.comp_tuple(
             &[T, Dim::Fixed(2 * k)],
             &[e],
-            vec![arg(ei, ident(2)), arg(prob, ident(2))],
+            vec![arg(ei, ident(2)), arg(score, ident(2))],
             Some(Monoid::topk(k)),
             |v| {
                 let mut o = vec![v[0], v[1]];
@@ -772,9 +781,12 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
         b.g.comp(
             &[T],
             &[Dim::Fixed(k)],
-            vec![arg(topk, vec![unit(2, 0), form(2, &[(1, 2)], 1)])],
+            vec![
+                arg(topk, vec![unit(2, 0), form(2, &[(1, 2)], 1)]),
+                arg(topk, vec![unit(2, 0), form(2, &[], 1)]),
+            ],
             Some(Monoid::sum()),
-            |v| vec![v[0]],
+            move |v| vec![if by_logit { (v[0] - v[1]).exp() } else { v[0] }],
         )
         .unwrap();
     // each picked expert's gate/up row block, gathered by its id:
@@ -826,9 +838,14 @@ fn moe(b: &mut B, dims: &CoderDims, l: usize, x: TensorId) -> TensorId {
                 arg(topk, vec![unit(3, 0), form(3, &[(2, 2)], 1)]),
                 arg(wsum, vec![unit(3, 0)]),
                 arg(dn, vec![unit(3, 0), unit(3, 2), unit(3, 1)]),
+                arg(topk, vec![unit(3, 0), form(3, &[], 1)]),
             ],
             Some(Monoid::sum()),
-            |v| {
+            move |v| {
+                if by_logit {
+                    // Σ ≥ 1 (the top logit's own term)
+                    return vec![(v[0] - v[3]).exp() / v[1] * v[2]];
+                }
                 let clamp = lit(6.103515625e-5);
                 let ws = select(v[1] - clamp, v[1], clamp);
                 vec![v[0] / ws * v[2]]
