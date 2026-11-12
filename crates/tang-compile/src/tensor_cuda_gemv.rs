@@ -3611,7 +3611,11 @@ impl Lowering<'_> {
             .iter()
             .map(|a| self.tree_staged(a, pk, &mut leaves, &mut staged))
             .collect::<Option<Vec<_>>>()?;
-        if staged.is_empty() {
+        // a plain map stored as Q8x32 (a SwiGLU or GDN output before its
+        // int8 GEMV) lowers here too, with nothing staged
+        // (TANG_Q8_MAP=0: the WGSL kernel with a Q8x32 writer)
+        let plain_q8 = q8 && super::tune::knob("TANG_Q8_MAP").as_deref() != Some("0");
+        if staged.is_empty() && !plain_q8 {
             return None;
         }
         self.staged_ok(&staged)?;
