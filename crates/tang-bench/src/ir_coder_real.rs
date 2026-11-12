@@ -350,7 +350,6 @@ pub fn residual_stream(
         .collect()
 }
 
-
 /// f32 → IEEE half bits, round to nearest even (finite, non-negative scales;
 /// subnormals flush to zero, overflow saturates).
 fn f32_to_f16_bits(x: f32) -> u16 {
@@ -398,7 +397,11 @@ pub fn q8_0_bytes(vals: &[f32]) -> Vec<u8> {
         let dq = f16_bits_to_f32(dh);
         out.extend_from_slice(&dh.to_le_bytes());
         for &x in blk {
-            let q = if dq == 0.0 { 0.0 } else { (x / dq).round().clamp(-127.0, 127.0) };
+            let q = if dq == 0.0 {
+                0.0
+            } else {
+                (x / dq).round().clamp(-127.0, 127.0)
+            };
             out.push(q as i8 as u8);
         }
     }
