@@ -368,23 +368,18 @@ fn scan_rule(
     let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
     if let Some(Place::S(d)) = ps.first() {
         let d = *d;
-        // a derived step's delta form starts from the cached state
-        // (`[P…\dim, n, m]`: its split dim sits one lower past the scan
-        // dim); it is replicated until the cache follows the split update
-        let init = match &sc.kind {
-            ScanKind::Affine { form: Some(f), .. } => f.init,
-            _ => None,
+        // a delta form's inputs (after `A`, `U`) only feed the fused CUDA
+        // lowering; a split scan drops the form (see `rank_program`)
+        let n = match &sc.kind {
+            ScanKind::Affine { form: Some(_), .. } => 2,
+            _ => ps.len(),
         };
-        let d_init = d - usize::from(sc.dim < d);
         let ok = d < lead
             && d != sc.dim
-            && ps.iter().zip(&sc.inputs).enumerate().all(|(k, (p, t))| {
-                if Some(k) == init {
-                    *p == Place::R || *p == Place::S(d_init)
-                } else {
-                    *p == Place::S(d) && g.nodes[t.n()].shape.len() > d
-                }
-            });
+            && ps[..n]
+                .iter()
+                .zip(&sc.inputs)
+                .all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
         if ok {
             return Place::S(d);
         }
@@ -887,6 +882,13 @@ pub fn rank_program(
                 }
             }
             Op::Scan(sc) => {
+                // split: the delta form describes the full-size scan, so
+                // the rank scans its slice of `A`, `U` without it
+                if let (Place::S(_), ScanKind::Affine { form, .. }) = (p, &mut sc.kind) {
+                    if form.take().is_some() {
+                        sc.inputs.truncate(2);
+                    }
+                }
                 for (k, t) in sc.inputs.iter_mut().enumerate() {
                     let s = t.n();
                     *t = match an.conv[i][k] {
