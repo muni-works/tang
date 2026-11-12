@@ -487,10 +487,18 @@ impl TensorGraph {
             float u[{cc}];
             #pragma unroll
             for (int t = 0; t < {cc}; ++t) {{
-                float a = Rs[t * {lb} + tid];
+                // four independent partial sums: a short dependency chain
+                float a0 = Rs[t * {lb} + tid], a1 = 0.f, a2 = 0.f, a3 = 0.f;
                 #pragma unroll
-                for (int s_ = 0; s_ < t; ++s_) a -= Ms[t * {lm} + s_] * u[s_];
-                u[t] = a;
+                for (int s_ = 0; s_ + 3 < t; s_ += 4) {{
+                    a0 -= Ms[t * {lm} + s_] * u[s_];
+                    a1 -= Ms[t * {lm} + s_ + 1] * u[s_ + 1];
+                    a2 -= Ms[t * {lm} + s_ + 2] * u[s_ + 2];
+                    a3 -= Ms[t * {lm} + s_ + 3] * u[s_ + 3];
+                }}
+                #pragma unroll
+                for (int s_ = t & ~3; s_ < t; ++s_) a0 -= Ms[t * {lm} + s_] * u[s_];
+                u[t] = (a0 + a1) + (a2 + a3);
             }}
             #pragma unroll
             for (int t = 0; t < {cc}; ++t) Us[t * {lb} + tid] = u[t];
