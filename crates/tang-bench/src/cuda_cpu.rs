@@ -46,6 +46,7 @@ struct int4 { int x, y, z, w; };
 #define __forceinline__ inline
 #define __global__
 #define __shared__ static
+#define __align__(n) __attribute__((aligned(n)))
 #define __launch_bounds__(...)
 #define __restrict__ __restrict
 #define __noinline__
@@ -734,6 +735,100 @@ mod tests {
             assert!(two.iter().any(|&x| x != 0.0));
             assert_eq!(bits(&two), bits(&one), "{f:?}");
         }
+    }
+
+    /// A SwiGLU `silu(a)·b` stored Q8x32 for a Q8_0 int8 GEMV: computed in
+    /// the GEMV's prologue (`schedule_gemv_prologues`, one kernel) against
+    /// the copy kernel and the GEMV (two), and against an f64 reference.
+    #[test]
+    fn gemv_prologue_matches_copy_kernel() {
+        use tang::Scalar;
+        use tang_compile::tensor::{Arg, Dim, Format, Monoid, Precision, TensorGraph, View};
+        let (k, rows) = (512usize, 64usize);
+        let mut g = TensorGraph::new();
+        let a = g.input(&[Dim::Fixed(1), Dim::Fixed(k)]);
+        let b = g.input(&[Dim::Fixed(1), Dim::Fixed(k)]);
+        let w = g.input(&[Dim::Fixed(rows), Dim::Fixed(k)]);
+        g.set_precision(w, Precision::storage(Format::Q8_0));
+        let h = g
+            .map(&[a, b], |v| {
+                let one = tang_expr::ExprId::ONE;
+                v[0] / (one + (-v[0]).exp()) * v[1]
+            })
+            .unwrap();
+        let y = g
+            .comp(
+                &[Dim::Fixed(1), Dim::Fixed(rows)],
+                &[Dim::Fixed(k)],
+                vec![
+                    Arg {
+                        src: h,
+                        view: View::pick(3, &[Some(0), Some(2)]),
+                    },
+                    Arg {
+                        src: w,
+                        view: View::pick(3, &[Some(1), Some(2)]),
+                    },
+                ],
+                Some(Monoid::sum()),
+                |v| vec![v[0] * v[1]],
+            )
+            .unwrap();
+        let (g, outs, sched) = g.schedule_block_weights(&[y]);
+        assert_eq!(sched.gemvs, 1, "not on the int8 GEMV");
+        let mut keep = outs.clone();
+        keep.extend(&sched.copies);
+        let (g, keep) = g.substitute_maps(&keep);
+        let outs = keep[..1].to_vec();
+        // Q8_0: 32 codes and an f16 scale (1/64) a block, 34 bytes
+        let mut bytes = Vec::new();
+        let mut wq = vec![0.0f64; rows * k];
+        for r in 0..rows {
+            for blk in 0..k / 32 {
+                bytes.extend_from_slice(&0x2400u16.to_le_bytes());
+                for c in 0..32 {
+                    let q = ((r * 7 + (blk * 32 + c) * 3) % 41) as i32 - 20;
+                    bytes.push(q as i8 as u8);
+                    wq[r * k + blk * 32 + c] = q as f64 / 64.0;
+                }
+            }
+        }
+        let av: Vec<f32> = (0..k)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect();
+        let bv: Vec<f32> = (0..k)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 9.0)
+            .collect();
+        let ins = vec![av.clone(), bv.clone(), crate::ir_ds_real::words_of(&bytes)];
+        let run = |g: &TensorGraph| {
+            let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+            let nk = dp.program.kernels.len();
+            (super::run(&dp, &ins, &outs).remove(0), nk)
+        };
+        let (two, n2) = run(&g);
+        let mut fg = g.clone();
+        assert_eq!(fg.schedule_gemv_prologues(&outs), 1, "no prologue");
+        let (one, n1) = run(&fg);
+        let want: Vec<f64> = (0..rows)
+            .map(|r| {
+                (0..k)
+                    .map(|c| {
+                        let x = av[c] as f64;
+                        x / (1.0 + (-x).exp()) * bv[c] as f64 * wq[r * k + c]
+                    })
+                    .sum()
+            })
+            .collect();
+        let f = |v: &[f32]| v[..rows].iter().map(|&x| x as f64).collect::<Vec<_>>();
+        let (e2, e1, d) = (
+            rel(&f(&two), &want),
+            rel(&f(&one), &want),
+            rel(&f(&one), &f(&two)),
+        );
+        eprintln!("gemv prologue: {n2} -> {n1} kernels; vs f64 {e2:.2e} / {e1:.2e}; fused vs copy {d:.2e}");
+        assert_eq!((n2, n1), (2, 1));
+        assert!(d < 1e-5, "{d}");
+        assert!(e1 < 2e-2, "{e1}");
     }
 
     /// Top-k reductions (k = 512 over rows longer than a chunk, with
