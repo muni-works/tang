@@ -230,6 +230,15 @@ fn main() {
                 let last = g.len() - dm.vocab;
                 top1 = argmax(&g[last..]) == argmax(&p[last..]);
             }
+            if std::env::var("DS_PER_OUTPUT").as_deref() == Ok("1") {
+                let name = if j < st.outputs.len() {
+                    "output".to_string()
+                } else {
+                    let c = &st.caches[j - st.outputs.len()];
+                    pg.name_of(c.node).unwrap_or("?").to_string()
+                };
+                eprintln!("  out {j} {name}: rel {:.3e}", rel(&g, &e));
+            }
             worst = worst.max(rel(&g, &e));
             worst_pure = worst_pure.max(rel(&g, &p));
         }
