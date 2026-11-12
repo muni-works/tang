@@ -1652,6 +1652,12 @@ fn tile_kernel(t: &TileShape) -> (String, usize, usize) {
     };
     let xst = ks + 16;
     let smem = 128 * rb + 64 * xst + (128 + 64) * nsub * 8;
+    // prefetch registers a thread: weight uint2s, code uint4s, scale float2s
+    let (nw, nx, ns) = (
+        (128 * rb / 8).div_ceil(256),
+        64 * ks / 16 / 256,
+        (64 * nsub).div_ceil(256),
+    );
     let mut src = format!("#define TANG_SMEM {smem}\n");
     src.push_str(HELPERS);
     write!(
@@ -1687,22 +1693,49 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     for (int i = 0; i < 2; i++)
         #pragma unroll
         for (int j = 0; j < 4; j++) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+    // register prefetch: step st + 1's bytes load while step st computes
+    __syncthreads();
+    uint2 pw[{nw}]; uint4 px[{nx}]; float2 ps[{ns}];
+    auto fetch = [&](int st) {{
+        #pragma unroll
+        for (int i = 0; i < {nw}; i++) {{
+            const int u = tid + 256 * i;
+            if (u < 128 * {rb} / 8) {{
+                const int r = u / ({rb} / 8), w = u % ({rb} / 8);
+                pw[i] = __ldg((const uint2*)(wbase + (size_t)min(row0 + r, {rows} - 1) * {row_bytes} + (size_t)st * {rb}) + w);
+            }}
+        }}
+        #pragma unroll
+        for (int i = 0; i < {nx}; i++) {{
+            const int u = tid + 256 * i, p = u / ({ks} / 16), w = u % ({ks} / 16);
+            px[i] = __ldg((const uint4*)(xcodes + xoff[p] + (size_t)st * {ks}) + w);
+        }}
+        #pragma unroll
+        for (int i = 0; i < {ns}; i++) {{
+            const int u = tid + 256 * i;
+            if (u < 64 * {nsub}) ps[i] = __ldg(xsc + xoff[u / {nsub}] / 32 + st * {nsub} + u % {nsub});
+        }}
+    }};
+    fetch(0);
     for (int st = 0; st < {steps}; st++) {{
         __syncthreads();
-        for (int u = tid; u < 128 * {rb} / 8; u += 256) {{
-            const int r = u / ({rb} / 8), w = u % ({rb} / 8);
-            const unsigned char* g = wbase + (size_t)min(row0 + r, {rows} - 1) * {row_bytes} + (size_t)st * {rb};
-            ((uint2*)(Ws + r * {rb}))[w] = __ldg((const uint2*)g + w);
+        #pragma unroll
+        for (int i = 0; i < {nw}; i++) {{
+            const int u = tid + 256 * i;
+            if (u < 128 * {rb} / 8) ((uint2*)(Ws + (u / ({rb} / 8)) * {rb}))[u % ({rb} / 8)] = pw[i];
         }}
-        for (int u = tid; u < 64 * {ks} / 16; u += 256) {{
-            const int p = u / ({ks} / 16), w = u % ({ks} / 16);
-            ((uint4*)(Xs + p * {xst}))[w] = __ldg((const uint4*)(xcodes + xoff[p] + (size_t)st * {ks}) + w);
+        #pragma unroll
+        for (int i = 0; i < {nx}; i++) {{
+            const int u = tid + 256 * i;
+            ((uint4*)(Xs + (u / ({ks} / 16)) * {xst}))[u % ({ks} / 16)] = px[i];
         }}
-        for (int u = tid; u < 64 * {nsub}; u += 256) {{
-            const int p = u / {nsub}, j = u % {nsub};
-            XSs[u] = __ldg(xsc + xoff[p] / 32 + st * {nsub} + j);
+        #pragma unroll
+        for (int i = 0; i < {ns}; i++) {{
+            const int u = tid + 256 * i;
+            if (u < 64 * {nsub}) XSs[u] = ps[i];
         }}
         __syncthreads();
+        if (st + 1 < {steps}) fetch(st + 1);
         for (int u = tid; u < 128 * {nsub}; u += 256) {{
             float fs_, fm_;
             sc(Ws + (u / {nsub}) * {rb}, u % {nsub}, fs_, fm_);
