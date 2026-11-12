@@ -239,7 +239,16 @@ pub fn lower_real_step_with(
         _ => unreachable!(),
     };
     let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
-        no_step_mma: ro.batch.unwrap_or(1) > 1,
+        // step tiles (and split_bilinear's softmax factor) off for a few
+        // streams (B=4: 0.4 ms slower), on from `TANG_STEP_MMA_MIN_B`
+        no_step_mma: {
+            let b = ro.batch.unwrap_or(1);
+            let min_b: usize = std::env::var("TANG_STEP_MMA_MIN_B")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16);
+            b > 1 && b < min_b
+        },
         packed: if ro.kv_f16 {
             st.caches
                 .iter()
