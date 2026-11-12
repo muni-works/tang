@@ -126,7 +126,18 @@ fn main() {
         .kernels
         .iter()
         .map(|k| {
-            let nd = &graph.nodes()[k.node.index()];
+            // (the lowering may add nodes past the returned graph)
+            let Some(nd) = graph.nodes().get(k.node.index()) else {
+                let head: String = k
+                    .source
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                return (format!("n{} (lowering-added)", k.node.index()), head);
+            };
             let what = match graph.comp_at(k.node.index()) {
                 Some(c) => format!(
                     "{:?} red {:?} gathers {} int8 {:?}",
