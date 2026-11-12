@@ -11,7 +11,7 @@
 #
 # Run from the repo root (gpu-run.sh race:coder-next:scripts/coder-serve-check.sh).
 # Env: MODEL_DIR [/root/models/coder-next], OUT [/root/coder-serve-check], CTX [8192],
-# MAX_TOKENS [128], ENGINES ["hand derived"].
+# MAX_TOKENS [128], LONG_WORDS [1500: long-prompt TTFT], ENGINES ["hand derived"].
 set -euo pipefail
 REPO=${REPO:-$PWD}
 MODEL_DIR=${MODEL_DIR:-/root/models/coder-next}
@@ -51,7 +51,7 @@ def req(prompt, temperature=0.0, seed=None):
         body["top_p"] = 0.95; body["top_k"] = 40
     r = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"content-type": "application/json"})
-    t0 = time.time(); first = None; text = ""; chunks = 0; usage = None
+    t0 = time.time(); first = None; text = ""; chunks = 0; usage = None; pieces = []
     with urllib.request.urlopen(r, timeout=3600) as f:
         for line in f:
             line = line.decode().strip()
@@ -66,12 +66,12 @@ def req(prompt, temperature=0.0, seed=None):
                 if piece:
                     if first is None:
                         first = time.time()
-                    text += piece; chunks += 1
+                    text += piece; chunks += 1; pieces.append(piece)
     t1 = time.time()
     n = (usage or {}).get("completion_tokens") or chunks
     first = first or t1
     dec = t1 - first
-    return {"text": text, "tokens": n, "ttft_ms": (first - t0) * 1e3, "total_ms": (t1 - t0) * 1e3,
+    return {"pieces": pieces, "text": text, "tokens": n, "ttft_ms": (first - t0) * 1e3, "total_ms": (t1 - t0) * 1e3,
             "decode_tok_s": (n - 1) / dec if dec > 0 and n > 1 else None}
 res = {"c1": [], "c4": []}
 req(PROMPTS[0])  # warm
@@ -85,6 +85,17 @@ th = [threading.Thread(target=run, args=(i,)) for i in range(len(PROMPTS))]
 res["c4"] = out4
 res["c4_wall_ms"] = (time.time() - t0) * 1e3
 res["c4_agg_tok_s"] = sum(x["tokens"] for x in out4) / (res["c4_wall_ms"] / 1e3)
+# long prompt TTFT (LONG_WORDS words of code-ish text, ~1.3 tokens a word; 0: skip)
+import os
+LW = int(os.environ.get("LONG_WORDS", "1500"))
+if LW:
+    words = ("fn step(x: &mut [f32], k: usize) -> f32 { let s = x.iter().sum::<f32>(); s / k as f32 } ").split()
+    long_p = "Summarize what this code does:\n" + " ".join(words[i % len(words)] for i in range(LW))
+    MAX0 = MAX; MAX = 8
+    # a distinct first line each time: no saved prefix state to reuse
+    req("Request warm. " + long_p)
+    res["long"] = [req(f"Request {i}. " + long_p) for i in range(2)]
+    MAX = MAX0
 if mode == "derived":
     a = req(PROMPTS[1], 0.8, 7); b = req(PROMPTS[1], 0.8, 7); c = req(PROMPTS[1], 0.8, 8)
     res["sampled"] = {"same_seed_equal": a["text"] == b["text"], "other_seed_differs": a["text"] != c["text"],
@@ -125,6 +136,7 @@ for e, x in r.items():
       "c4_ttft_ms_median": st.median(y["ttft_ms"] for y in x["c4"]),
       "c4_aggregate_tok_s": x["c4_agg_tok_s"],
     }
+    if "long" in x: s[e]["long_ttft_ms_median"] = st.median(y["ttft_ms"] for y in x["long"])
     if "sampled" in x: s[e]["sampled"] = {k: v for k, v in x["sampled"].items() if k.endswith(("equal", "differs"))}
 if len(r) == 2:
     h, d = r["hand"], r["derived"]
