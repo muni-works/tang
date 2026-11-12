@@ -276,6 +276,7 @@ def main():
     p.add_argument("--source", default="bench-all")
     p.add_argument("--config", help="non-default knobs, e.g. TANG_COKERNEL=1")
     p.add_argument("--prompt")
+    p.add_argument("--gpu", help="GPU name for rows whose output doesn't say")
     ad = sub.add_parser("add")
     for k in ("model", "gpu", "commit"):
         ad.add_argument(f"--{k}", required=True)
@@ -292,6 +293,8 @@ def main():
 
     if args.cmd == "parse":
         rows = parse(read(args.path), args.model)
+        for r in rows:
+            r["gpu"] = r.get("gpu") or args.gpu
         date = args.date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
         for r in stamp(rows, date, args.branch, args.source, args.config, args.prompt):
             print(json.dumps(r))
