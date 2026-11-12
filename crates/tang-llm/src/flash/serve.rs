@@ -1323,7 +1323,9 @@ impl FlashServe {
         }
         let t_pos = t.elapsed().as_secs_f64() * 1e3;
         let tokens = toks;
-        if pinned {
+        // Pinned states (and every state with `TANG_KV_WRITETHROUGH=1`) go to disk now, the
+        // rest when host RAM lets them go (`write_back`).
+        if pinned || std::env::var("TANG_KV_WRITETHROUGH").is_ok_and(|v| v == "1") {
             // From the host copies just made, on the store's writer thread.
             if let Some(st) = self.store.as_mut() {
                 st.save(owner.unwrap_or(0), &tokens, state.clone(), pos.clone());
