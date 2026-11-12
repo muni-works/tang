@@ -147,12 +147,15 @@ The run used real weights from `/models/ds41-flash`, layers 0 and 2, native fp8 
 
 | k (tokens/step) | device ms | tok/s (2 layers) | → 40 layers [A ×20] | check |
 |---|---|---|---|---|
-| 16 | 9.09 | 1,760 | ~88 | **FAIL**: rel err 4.1e-1 vs the emulated interpreter, so the k>1 native path is not yet correct |
-| 64, 256 | pending | | | runner job 1112-150923 (also runs a k=1 all-experts check to isolate the failure) |
+| 16 | 9.09 | 1,760 | ~88 | **FAIL**: rel err 4.1e-1 vs the emulated interpreter |
+| 64 | 31.95 | 2,003 | ~100 | time only |
+| 256 | 138.31 | 1,851 | ~93 | time only |
 
-Job 1112-142555 (commit cd29f7a9) printed 318 kernels, 249 of them native, and 23 int8 GEMVs with none demoted. The run spent 1,300 s loading f64 weights and 326 s on lowering and upload.
+Jobs 1112-142555 and 1112-150923 (commit cd29f7a9). Every run printed 318–320 kernels, 249 of them native, and 23 int8 GEMVs with none demoted. A k=1 check with all experts was still running when this was written. It separates whether the k=16 failure comes from the multi-token native path or from the full expert tables.
 
-What this says: today's DS device path is the decode GEMV run k times. At k=16 it reaches about 1.8k tok/s for 2 layers, roughly 88 tok/s for the whole model on one GPU (which it could not hold anyway). That is ~500× below the per-GPU GEMM SOL. It is the same starvation as coder-next before #263, plus the missing MMA tiling, and steps 1–2 of the plan target exactly that.
+Throughput is flat from k=16 to k=256, which is the GEMV signature: every token re-reads the weights. The ds-prefill session independently found ~92 tok/s for the whole model, 0.19% of SOL. It is extending the vendor cuBLASLt path to `Fp8B32`/`Mxfp4` on `claude/ds-prefill`.
+
+What this says: today's DS device path is the decode GEMV run k times. It reaches about 1.9k tok/s for 2 layers, roughly 93 tok/s for the whole model on one GPU (which it could not hold anyway). That is ~500× below the per-GPU GEMM SOL. It is the same starvation as coder-next before #263, plus the missing MMA tiling, and steps 1–2 of the plan target exactly that.
 
 ## Reproduce
 
