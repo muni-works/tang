@@ -856,6 +856,19 @@ mod tests {
     /// reads them. The logits of every step against the full prefill on
     /// the interpreter: `(worst rel err, kernels per step)`.
     pub(crate) fn chunked_then_decode(m: &Model, ks: &[usize]) -> (f64, Vec<usize>) {
+        let (e, nk, _) = chunked_then_decode_grouped(m, ks, 0);
+        (e, nk)
+    }
+
+    /// [`chunked_then_decode`] with routed experts sorted by expert
+    /// (`schedule_expert_groups`) in steps of at least `group` (token,
+    /// slot) positions (0: never); also returns the caches after the last
+    /// step.
+    pub(crate) fn chunked_then_decode_grouped(
+        m: &Model,
+        ks: &[usize],
+        group: usize,
+    ) -> (f64, Vec<usize>, Vec<Vec<f32>>) {
         let w = weights(m);
         let total: usize = ks.iter().sum();
         assert!(total <= m.cap);
@@ -901,7 +914,13 @@ mod tests {
                 .collect();
             let mut ids = st.outputs.clone();
             ids.extend(st.caches.iter().map(|c| c.updated));
-            let (g, outs) = st.graph.substitute_maps(&ids);
+            let (g, ids) = if group > 0 {
+                let (g, ids, _) = st.graph.schedule_expert_groups(&ids, group);
+                (g, ids)
+            } else {
+                (st.graph.clone(), ids)
+            };
+            let (g, outs) = g.substitute_maps(&ids);
             let (g, outs) = g.eliminate_common(&outs);
             let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
             nks.push(dp.program.kernels.len());
@@ -925,7 +944,7 @@ mod tests {
             *cs = got[1..].to_vec();
             pos = grown;
         }
-        (worst, nks)
+        (worst, nks, caches.unwrap_or_default())
     }
 
     /// The many-row contraction split (`split_bilinear`) on the tiny coder
@@ -982,6 +1001,31 @@ mod tests {
                 );
                 assert!(e < 1e-4, "{} {ks:?}: {e}", m.name);
             }
+        }
+    }
+
+    /// Layer-wise prefill: the whole prompt as one step (every layer over
+    /// all its tokens before the next), routed experts grouped by expert
+    /// over the (token, slot) positions, gives the logits of the full
+    /// prefill and the caches of 4-token chunked prefill.
+    #[test]
+    fn layerwise_prefill_matches_chunked_on_the_cpu() {
+        let m = coder();
+        let (ec, _, cc) = chunked_then_decode_grouped(&m, &[4, 4, 4, 4, 1], 0);
+        for group in [0, 2] {
+            let (el, nk, cl) = chunked_then_decode_grouped(&m, &[16, 1], group);
+            let mut worst = 0.0f64;
+            for (a, b) in cl.iter().zip(&cc) {
+                let a: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+                let b: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+                worst = worst.max(rel(&a, &b));
+            }
+            eprintln!(
+                "layer-wise k = 16 (group {group}): {nk:?} kernels, logits {el:.2e} \
+                 (chunked {ec:.2e}), caches vs chunked {worst:.2e}"
+            );
+            assert!(el < 1e-4 && ec < 1e-4, "{el} {ec}");
+            assert!(worst < 1e-4, "caches {worst}");
         }
     }
 }

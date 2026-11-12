@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! coder_derived <file.gguf> --ids-file F [-n 64] [--ctx 4096] [--top K] [--logprobs OUT.jsonl]
-//!               [--out IDS] [--bench L1,L2,…]
+//!               [--out IDS] [--bench L1,L2,…] [--chunk K [--group N]]
 //! ```
 //!
 //! The prompt runs through decode steps (one token a step), then `-n`
@@ -130,7 +130,19 @@ fn main() {
     let rt = runtime();
     let tuned = tang_compile::tensor::tune::load_for_gpu(rt.name());
     eprintln!("runtime: {}; tuning cache: {tuned} entries", rt.name());
-    let low = lower_real_step(&pg, &st, &tys);
+    // --group N: routed experts sorted by expert over the chunk's
+    // (token, slot) positions once there are N of them (one weight read
+    // per expert run: the grouped expert GEMM of layer-wise prefill)
+    let group: usize = opt("--group").map_or(0, |v| v.parse().unwrap());
+    let low = lower_real_step_with(
+        &pg,
+        &st,
+        &tys,
+        &RealOpts {
+            group,
+            ..Default::default()
+        },
+    );
     let native = low.program.native.iter().filter(|n| **n).count();
     eprintln!(
         "derived step: {} kernels ({native} native, {} int8 GEMVs), {} caches; f32 uploads {:?}; built in {:.1}s",
