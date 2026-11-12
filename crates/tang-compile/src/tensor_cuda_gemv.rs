@@ -311,6 +311,9 @@ impl TensorGraph {
             if let Some(g) = self.fuse_delta_steps(outputs) {
                 return g.to_decode_with(outputs, opts, target, tiles);
             }
+            if let Some(g) = self.fuse_attention_rows(outputs) {
+                return g.to_decode_with(outputs, opts, target, tiles);
+            }
             // many-row contractions as tensor-core matmuls (attention's
             // p·v in a k-row step; see `tensor_cuda_split.rs`)
             // (not over packed inputs: the tile reads plain f32/f16 only)
@@ -412,6 +415,18 @@ impl TensorGraph {
             }) = &self.nodes[root].op
             {
                 let (src, threads, blocks) = self.cuda_delta_kernel(root, &reads);
+                k.source = src;
+                k.workgroup_size = threads as u32;
+                k.count = (threads * blocks) as u32;
+                native.push(true);
+                continue;
+            }
+            if let Op::Scan(Scan {
+                kind: ScanKind::Attend(_),
+                ..
+            }) = &self.nodes[root].op
+            {
+                let (src, threads, blocks) = self.cuda_attend_kernel(root, &reads);
                 k.source = src;
                 k.workgroup_size = threads as u32;
                 k.count = (threads * blocks) as u32;

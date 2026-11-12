@@ -223,6 +223,7 @@ const MMA_S8_EMU: &str = r#"{
 /// `extern "C"` dropped (each kernel lives in its own namespace), dynamic
 /// shared memory as a static array of `TANG_SMEM` bytes.
 fn host_source(src: &str) -> String {
+    let src = &format!("#define TANG_HOST_EMU 1\n{src}");
     let mut s = src
         .replace(
             r#"asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(s));"#,
@@ -1112,6 +1113,15 @@ mod tests {
             if fused > 0 {
                 eprintln!("  k = {k}: {fused} fused delta-step kernels");
             }
+            let attend = dp
+                .program
+                .kernels
+                .iter()
+                .filter(|k| k.source.contains("fused attention rows"))
+                .count();
+            if attend > 0 {
+                eprintln!("  k = {k}: {attend} fused attention kernels");
+            }
             let got = super::run(&dp, &step_ins, &outs);
             let grown = pos + k;
             let want =
@@ -1194,7 +1204,16 @@ mod tests {
                     "{} chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}",
                     m.name
                 );
-                assert!(e < 1e-4, "{} {ks:?}: {e}", m.name);
+                // fused attention rows run on bf16 tensor cores
+                // (`TANG_FLASH=0`: the f32 path, ≤ 1e-4)
+                let tol = if m.name.starts_with("coder")
+                    && std::env::var("TANG_FLASH").as_deref() != Ok("0")
+                {
+                    2e-2
+                } else {
+                    1e-4
+                };
+                assert!(e < tol, "{} {ks:?}: {e}", m.name);
             }
         }
     }
