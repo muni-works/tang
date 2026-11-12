@@ -5,7 +5,7 @@
 # reports T / (chunks * mean step) as prefill tok/s for 2 layers and for 40.
 set -uo pipefail
 DS41_DIR=${DS41_DIR:-/root/ds41sol}
-CONFIGS=${CONFIGS:-"4096:256:0:0 4096:4096:0:0 4096:4096:64:0 32768:4096:0:0 32768:4096:64:0"}
+CONFIGS=${CONFIGS:-"4096:256:0:0 4096:4096:0:0 4096:4096:64:0 4096:4096:0:1 4096:4096:64:1 32768:4096:0:0 32768:4096:64:1"}
 OUT=${OUT:-/tmp/ds-prefill}; mkdir -p "$OUT"
 cargo build --release -p tang-bench --features cuda --example ds_real_gpu 2>&1 | tail -3
 bin=${CARGO_TARGET_DIR:-target}/release/examples/ds_real_gpu
