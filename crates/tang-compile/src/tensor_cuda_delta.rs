@@ -210,6 +210,13 @@ impl TensorGraph {
         let (kk, vv, s0) = (arg(ik), arg(iv), arg(ii));
         let al = ia.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
         let be = ib.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
+        // a column's `parts` row groups are adjacent lanes (a power of two
+        // ≤ 16, so a group never crosses a warp): both reductions are
+        // shuffles. Rows interleave (`part + parts·j`) so a group reads
+        // consecutive shared words. The inputs of `TC` steps are staged in
+        // shared memory at once: two barriers per `TC` steps.
+        let tc = (4096 / n).clamp(1, 32);
+        let iqs = iq.map(&arg);
         let mut src = String::new();
         writeln!(
             src,
@@ -219,78 +226,85 @@ impl TensorGraph {
         write!(
             src,
             r#"extern "C" __global__ void __launch_bounds__({threads}) main0({params}, float* __restrict__ out, unsigned count) {{
-    __shared__ float sk[{n}];
-    __shared__ float sq[{n}];
-    __shared__ float red[{parts}][{bv}];
+    __shared__ float sk[{tc}][{n}];
+    __shared__ float sq[{tcq}][{nq}];
+    __shared__ float sv[{tc}][{bv}];
+    __shared__ float sab[{tc}][2];
     const int h = blockIdx.x / {ncb}, cb = blockIdx.x % {ncb};
-    const int c = threadIdx.x % {bv}, part = threadIdx.x / {bv};
-    const int col = cb * {bv} + c, r0 = part * {rows};
+    const int c = threadIdx.x / {parts}, part = threadIdx.x % {parts};
+    const int col = cb * {bv} + c;
     const long long hi = h / {lo}, lo = h % {lo};
     float S[{rows}];
-    for (int r = 0; r < {rows}; ++r) S[r] = {s0}[(long long)h * {nm} + (long long)(r0 + r) * {m} + col];
-    for (int t = 0; t < {tn}; ++t) {{
-        const long long p = (hi * {tn} + t) * {lo} + lo;
-        for (int i = threadIdx.x; i < {n}; i += {threads}) {{
-            sk[i] = {kk}[p * {n} + i];
+    for (int j = 0; j < {rows}; ++j) S[j] = {s0}[(long long)h * {nm} + (long long)(part + {parts} * j) * {m} + col];
+    for (int t0 = 0; t0 < {tn}; t0 += {tc}) {{
+        const int nt = min({tc}, {tn} - t0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nt * {n}; i += {threads}) {{
+            const int tt = i / {n}, e = i % {n};
+            const long long p = (hi * {tn} + t0 + tt) * {lo} + lo;
+            sk[tt][e] = {kk}[p * {n} + e];
+{qload}        }}
+        for (int i = threadIdx.x; i < nt * {bv}; i += {threads}) {{
+            const int tt = i / {bv}, e = i % {bv};
+            const long long p = (hi * {tn} + t0 + tt) * {lo} + lo;
+            sv[tt][e] = {vv}[p * {m} + cb * {bv} + e];
+        }}
+        for (int tt = threadIdx.x; tt < nt; tt += {threads}) {{
+            const long long p = (hi * {tn} + t0 + tt) * {lo} + lo;
+            sab[tt][0] = {al}; sab[tt][1] = {be};
+        }}
+        __syncthreads();
+        for (int tt = 0; tt < nt; ++tt) {{
+            const float al = sab[tt][0], be = sab[tt][1], vc = sv[tt][c];
 "#,
             params = params.join(", "),
             nm = n * m,
+            tcq = if iq.is_some() { tc } else { 1 },
+            nq = if iq.is_some() { n } else { 1 },
+            qload = match &iqs {
+                Some(q) => format!("            sq[tt][e] = {q}[p * {n} + e];\n"),
+                None => String::new(),
+            },
         )
         .unwrap();
-        if let Some(iq) = iq {
-            writeln!(src, "            sq[i] = {}[p * {n} + i];", arg(iq)).unwrap();
-        }
-        write!(
-            src,
-            r#"        }}
-        __syncthreads();
-        const float al = {al}, be = {be};
-        const float vc = {vv}[p * {m} + col];
-"#
-        )
-        .unwrap();
+        // a sum over the column's row groups, in every lane of the group
+        let group_sum = |v: &str| {
+            let mut s = String::new();
+            let mut off = parts / 2;
+            while off > 0 {
+                write!(s, " {v} += __shfl_xor_sync(0xffffffffu, {v}, {off});").unwrap();
+                off /= 2;
+            }
+            s
+        };
         if d.delta {
-            write!(
+            writeln!(
                 src,
-                r#"        float part_ = 0.0f;
-        for (int r = 0; r < {rows}; ++r) part_ += sk[r0 + r] * S[r];
-        red[part][c] = part_;
-        __syncthreads();
-        float ks = 0.0f;
-        for (int x = 0; x < {parts}; ++x) ks += red[x][c];
-        __syncthreads();
-"#
+                "            float ks = 0.0f;\n            for (int j = 0; j < {rows}; ++j) ks += sk[tt][part + {parts} * j] * S[j];\n           {}",
+                group_sum("ks")
             )
             .unwrap();
         } else {
-            writeln!(src, "        const float ks = 0.0f;").unwrap();
+            writeln!(src, "            const float ks = 0.0f;").unwrap();
         }
         writeln!(
             src,
-            "        for (int r = 0; r < {rows}; ++r) {{ const float kr = sk[r0 + r]; S[r] = al * (S[r] - be * kr * ks) + be * kr * vc; }}"
+            "            for (int j = 0; j < {rows}; ++j) {{ const float kr = sk[tt][part + {parts} * j]; S[j] = al * (S[j] - be * kr * ks) + be * kr * vc; }}"
         )
         .unwrap();
         if let Some(scale) = d.readout {
-            write!(
+            writeln!(
                 src,
-                r#"        float o_ = 0.0f;
-        for (int r = 0; r < {rows}; ++r) o_ += sq[r0 + r] * S[r];
-        red[part][c] = o_;
-        __syncthreads();
-        if (part == 0) {{
-            float o = 0.0f;
-            for (int x = 0; x < {parts}; ++x) o += red[x][c];
-            out[p * {m} + col] = {scale:.9e}f * o;
-        }}
-"#
+                "            float o = 0.0f;\n            for (int j = 0; j < {rows}; ++j) o += sq[tt][part + {parts} * j] * S[j];\n           {}\n            if (part == 0) out[((hi * {tn} + t0 + tt) * {lo} + lo) * {m} + col] = {scale:.9e}f * o;",
+                group_sum("o")
             )
             .unwrap();
         }
-        writeln!(src, "        __syncthreads();\n    }}").unwrap();
+        writeln!(src, "        }}\n    }}").unwrap();
         if d.readout.is_none() {
             writeln!(
                 src,
-                "    for (int r = 0; r < {rows}; ++r) out[(long long)h * {} + (long long)(r0 + r) * {m} + col] = S[r];",
+                "    for (int j = 0; j < {rows}; ++j) out[(long long)h * {} + (long long)(part + {parts} * j) * {m} + col] = S[j];",
                 n * m
             )
             .unwrap();

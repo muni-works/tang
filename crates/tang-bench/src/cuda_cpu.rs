@@ -7,7 +7,7 @@
 //! ones included) against the interpreter without a GPU. Block-format
 //! buffers (GGUF / DeepSeek weights, Q8x32 activations) hold their raw
 //! words as on the device; `dp4a`, `__byte_perm` and the f16 conversion are
-//! emulated (not the int8 MMA: the int8 GEMV's `Gemv` stage only). One OS
+//! emulated, the int8 MMA by warp shuffles. One OS
 //! thread per CUDA thread, blocks one after the other.
 
 use std::fmt::Write as _;
@@ -46,6 +46,7 @@ struct int4 { int x, y, z, w; };
 #define __forceinline__ inline
 #define __global__
 #define __shared__ static
+#define __align__(n) __attribute__((aligned(n)))
 #define __launch_bounds__(...)
 #define __restrict__ __restrict
 #define __noinline__
@@ -149,6 +150,27 @@ template <class F> static void tang_launch(unsigned blocks, unsigned threads, F 
 }
 "#;
 
+/// [`host_source`]'s stand-in for the `mma.sync` m16n8k32 s8 asm in
+/// `tang_mma_s8(d, a, b0, b1)` (fragment layout as the PTX ISA's).
+const MMA_S8_EMU: &str = r#"{
+        const int tang_l = (int)(threadIdx.x & 31), tang_gq = tang_l >> 2, tang_tg = tang_l & 3;
+        int tang_acc[4] = {0, 0, 0, 0};
+        for (int t = 0; t < 4; t++)
+            for (int h = 0; h < 2; h++) {
+                const unsigned r0 = __shfl_sync(0xffffffffu, a[2 * h], tang_gq * 4 + t);
+                const unsigned r1 = __shfl_sync(0xffffffffu, a[2 * h + 1], tang_gq * 4 + t);
+                const unsigned bv = h ? b1 : b0;
+                const unsigned c0 = __shfl_sync(0xffffffffu, bv, (2 * tang_tg) * 4 + t);
+                const unsigned c1 = __shfl_sync(0xffffffffu, bv, (2 * tang_tg + 1) * 4 + t);
+                tang_acc[0] = __dp4a((int)r0, (int)c0, tang_acc[0]);
+                tang_acc[1] = __dp4a((int)r0, (int)c1, tang_acc[1]);
+                tang_acc[2] = __dp4a((int)r1, (int)c0, tang_acc[2]);
+                tang_acc[3] = __dp4a((int)r1, (int)c1, tang_acc[3]);
+            }
+        d[0] = tang_acc[0]; d[1] = tang_acc[1]; d[2] = tang_acc[2]; d[3] = tang_acc[3];
+    }
+"#;
+
 /// A kernel source made host C++: the PTX `asm` conversions replaced,
 /// `extern "C"` dropped (each kernel lives in its own namespace), dynamic
 /// shared memory as a static array of `TANG_SMEM` bytes.
@@ -167,10 +189,11 @@ fn host_source(src: &str) -> String {
             "f = tang_sw_h2f(h);",
         )
         .replace("extern \"C\" ", "");
-    // the int8 MMA (not emulated: only the Gemv stage runs here)
-    if let Some(i) = s.find("asm volatile(\"mma.sync") {
+    // the int8 MMA (m16n8k32 s8): each lane gathers its A rows (gq, gq + 8)
+    // and B columns (2 tig, + 1) from the lanes holding them, by shuffles
+    if let Some(i) = s.find("asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32") {
         let end = i + s[i..].find(");\n").unwrap() + 2;
-        s.replace_range(i..end, "std::abort();");
+        s.replace_range(i..end, MMA_S8_EMU);
     }
     let smem = src
         .lines()
@@ -733,6 +756,113 @@ mod tests {
             assert_eq!((n2, n1), (2, 1));
             assert!(two.iter().any(|&x| x != 0.0));
             assert_eq!(bits(&two), bits(&one), "{f:?}");
+        }
+    }
+
+    /// The prefill GEMM tile ([`Stage::Tile`]) on Q4_K / Q5_K / Q8_0
+    /// weights, 80 positions × 144 rows (both tile edges partial), against
+    /// the decode GEMV and the 8-position MMA tile: same products and
+    /// scales, only the summation order differs.
+    #[test]
+    fn int8_tile_matches_gemv_and_mma() {
+        use tang_compile::tensor::{
+            Arg, Dim, Format, IntMma, Monoid, Precision, Stage, TensorGraph, View,
+        };
+        let (p, r, k) = (80usize, 144usize, 512usize);
+        // a 2 × 2 grid: below the GPU's small-grid cutoff
+        std::env::set_var("TANG_INT8_TILE_MIN", "0");
+        for f in [Format::Q4K, Format::Q5K, Format::Q8_0] {
+            let (per, bytes) = match f {
+                Format::Q4K => (256, 144),
+                Format::Q5K => (256, 176),
+                _ => (32, 34),
+            };
+            // raw weight bytes: pseudo-random codes, small f16 scales
+            let row_bytes = k / per * bytes;
+            let mut wb = vec![0u8; r * row_bytes];
+            let mut st = 0x9e3779b9u32;
+            for v in wb.iter_mut() {
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                *v = st as u8;
+            }
+            for blk in 0..r * k / per {
+                let o = blk * bytes;
+                // d ≈ 0.004–0.008 (f16 0x1C00 + low bits), dmin likewise
+                wb[o] = wb[o] & 0x3F;
+                wb[o + 1] = 0x1C;
+                if per == 256 {
+                    wb[o + 2] = wb[o + 2] & 0x3F;
+                    wb[o + 3] = 0x1C;
+                }
+            }
+            let words: Vec<f32> = wb
+                .chunks(4)
+                .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect();
+            let xs: Vec<f32> = (0..p * k)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let mut g = TensorGraph::new();
+            let x = g.input(&[Dim::Fixed(p), Dim::Fixed(k)]);
+            let w = g.input(&[Dim::Fixed(r), Dim::Fixed(k)]);
+            g.set_precision(w, Precision::storage(f));
+            let c = g
+                .comp(
+                    &[Dim::Fixed(p), Dim::Fixed(r)],
+                    &[Dim::Fixed(k)],
+                    vec![
+                        Arg {
+                            src: w,
+                            view: View::pick(3, &[Some(1), Some(2)]),
+                        },
+                        Arg {
+                            src: x,
+                            view: View::pick(3, &[Some(0), Some(2)]),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let (g, outs, sched) = g.schedule_block_weights(&[c]);
+            let mut keep = outs.clone();
+            keep.extend(&sched.copies);
+            let ci = (0..g.nodes().len())
+                .find(|&i| g.nodes()[i].int_mma.is_some())
+                .expect("an int8 contraction");
+            let run = |stage: Stage| {
+                let mut g = g.clone();
+                g.set_int_mma(
+                    tang_compile::tensor::TensorId::from_index(ci),
+                    Some(IntMma {
+                        stage,
+                        ksplit: 1,
+                        pos_tile: 1,
+                    }),
+                );
+                let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+                let src = dp
+                    .program
+                    .kernels
+                    .iter()
+                    .any(|k| k.source.contains("float2* XSs = Ss + 128"));
+                assert_eq!(src, stage == Stage::Tile, "{f:?} {stage:?}: tile kernel");
+                super::run(&dp, &[xs.clone(), words.clone()], &outs).remove(0)
+            };
+            let gemv = run(Stage::Gemv);
+            let mma = run(Stage::Mma);
+            let tile = run(Stage::Tile);
+            let scale = gemv.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = |a: &[f32], b: &[f32]| {
+                a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+            };
+            let (dm, dt) = (diff(&gemv, &mma), diff(&gemv, &tile));
+            eprintln!("{f:?}: max |out| {scale:.3}, mma vs gemv {dm:.2e}, tile vs gemv {dt:.2e}");
+            assert!(scale > 0.0 && gemv.iter().all(|v| v.is_finite()));
+            assert!(dt < 1e-5 && dm < 1e-5, "{f:?}: mma {dm:.2e} tile {dt:.2e}");
+            let _ = keep;
         }
     }
 
