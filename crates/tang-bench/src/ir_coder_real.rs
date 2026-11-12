@@ -177,6 +177,18 @@ pub fn lower_real_step_with(
         StepInput::Same(i) => tys[i],
         _ => None,
     };
+    if ro.batch.unwrap_or(1) > 1
+        && !ro.q6k_as_q8_0
+        && (0..st.inputs.len()).any(|k| gguf_of(k) == Some(GgmlType::Q6K))
+    {
+        // the f32 gather such a tensor becomes is wrong at B > 1 on the GPU
+        // (coder-next blk.46 ffn_down_exps: B=4 vs B=1 top-1 0/4); right
+        // on the CPU harness. Store it Q8_0 instead.
+        eprintln!(
+            "warning: batched step with Q6_K weights kept f32; set RealOpts::q6k_as_q8_0 \
+             (and upload with weight_words)"
+        );
+    }
     for k in 0..st.inputs.len() {
         if let Some(f) = gguf_of(k).and_then(format_of) {
             let f = if ro.q6k_as_q8_0 && f == Format::Q6K {
@@ -374,6 +386,27 @@ pub fn residual_stream(
         })
         .map(tang_compile::tensor::TensorId::from_index)
         .collect()
+}
+
+/// The words to upload for GGUF tensor `t` into a step input stored as
+/// `storage` (`RealStep::storage`): raw block words where the int8 GEMV reads
+/// the file's format, a Q6_K tensor requantized to Q8_0 when it is stored
+/// Q8_0 ([`RealOpts::q6k_as_q8_0`]), else the dequantized f32 values.
+pub fn weight_words(g: &Gguf, t: &tang_llm::gguf::TensorInfo, storage: Option<Format>) -> Vec<f32> {
+    let words = |b: &[u8]| -> Vec<f32> {
+        b.chunks(4)
+            .map(|c| {
+                let mut a = [0u8; 4];
+                a[..c.len()].copy_from_slice(c);
+                f32::from_le_bytes(a)
+            })
+            .collect()
+    };
+    match (storage, t.ty) {
+        (Some(Format::Q8_0), GgmlType::Q6K) => words(&q8_0_bytes(&g.dequantize(t).unwrap())),
+        (Some(_), _) | (None, GgmlType::F32) => words(g.bytes(t)),
+        (None, _) => g.dequantize(t).unwrap(),
+    }
 }
 
 /// f32 → IEEE half bits, round to nearest even (finite, non-negative scales;
