@@ -76,6 +76,8 @@ fn main() {
         batch: Some(nb),
         group,
         block: Some(BlockOpts::batched()),
+        // `TANG_Q6K_Q8=0`: keep Q6_K tensors as f32
+        q6k_as_q8_0: std::env::var("TANG_Q6K_Q8").as_deref() != Ok("0"),
     };
     let low = lower_real_step_with(&pg, &st, &tys, &ro);
     let native = low.program.native.iter().filter(|n| **n).count();
@@ -172,6 +174,10 @@ fn main() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
         let words = match (storage[k], t.ty) {
+            // a Q6_K tensor stored Q8_0 (`RealOpts::q6k_as_q8_0`)
+            (Some(tang_compile::tensor::Format::Q8_0), GgmlType::Q6K) => {
+                words_of_bytes(&q8_0_bytes(&g.dequantize(t).unwrap()))
+            }
             (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
             (None, _) => g.dequantize(t).unwrap(),
         };

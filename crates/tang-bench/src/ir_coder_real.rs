@@ -141,6 +141,10 @@ pub struct RealOpts {
     /// Routed experts grouped by expert from this many (stream, slot)
     /// positions (`schedule_expert_groups`; 0: never).
     pub group: usize,
+    /// Q6_K tensors stored Q8_0 (the uploader requantizes them with
+    /// [`q8_0_bytes`]) so the int8 GEMV reads them instead of an f32
+    /// gather: coder-next's blk.46 routed down, 2.7 ms at B = 64 as f32.
+    pub q6k_as_q8_0: bool,
     /// Stages of the int8 contractions by their positions.
     /// `None`: `schedule_block_weights` (the decode GEMV, the MMA tile for
     /// many-row steps).
@@ -172,6 +176,11 @@ pub fn lower_real_step_with(
     };
     for k in 0..st.inputs.len() {
         if let Some(f) = gguf_of(k).and_then(format_of) {
+            let f = if ro.q6k_as_q8_0 && f == Format::Q6K {
+                Format::Q8_0
+            } else {
+                f
+            };
             if matches!(f, Format::Q4K | Format::Q5K | Format::Q8_0) {
                 graph.set_precision(input_node(&graph, k), Precision::storage(f));
             }
@@ -339,6 +348,61 @@ pub fn residual_stream(
         })
         .map(tang_compile::tensor::TensorId::from_index)
         .collect()
+}
+
+
+/// f32 → IEEE half bits, round to nearest even (finite, non-negative scales;
+/// subnormals flush to zero, overflow saturates).
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let m = b & 0x7f_ffff;
+    if e <= 0 {
+        return sign;
+    }
+    if e >= 31 {
+        return sign | 0x7bff;
+    }
+    let mut h = ((e as u32) << 10) | (m >> 13);
+    let rest = m & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && (h & 1) == 1) {
+        h += 1;
+    }
+    sign | h.min(0x7bff) as u16
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    let v = if e == 0 {
+        m * 2f32.powi(-24)
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    };
+    if h & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// `vals` (a multiple of 32) as GGUF Q8_0 blocks: per 32 values an f16
+/// scale `max|x| / 127` and 32 int8 codes `round(x / d)`.
+pub fn q8_0_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() / 32 * 34);
+    for blk in vals.chunks(32) {
+        let a = blk.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let d = a / 127.0;
+        let dh = f32_to_f16_bits(d);
+        let dq = f16_bits_to_f32(dh);
+        out.extend_from_slice(&dh.to_le_bytes());
+        for &x in blk {
+            let q = if dq == 0.0 { 0.0 } else { (x / dq).round().clamp(-127.0, 127.0) };
+            out.push(q as i8 as u8);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

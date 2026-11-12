@@ -112,6 +112,7 @@ pub fn lower(
     nb: usize,
     opts: &DecodeOpts,
     group: usize,
+    q6k_as_q8_0: false,
 ) -> (DecodeProgram, Vec<TensorId>, usize) {
     let mut ids = st.outputs.clone();
     ids.extend(st.caches.iter().map(|c| c.updated));
@@ -204,6 +205,7 @@ pub fn int8_case(
     d: &Int8Dims,
     bo: &tang_compile::tensor::int8_sched::BlockOpts,
     group: usize,
+    q6k_as_q8_0: false,
 ) -> Int8Case {
     use tang_compile::tensor::{gguf, Arg, Format, Monoid, Precision, View};
     let Int8Dims {
