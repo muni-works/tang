@@ -46,6 +46,7 @@ struct int4 { int x, y, z, w; };
 #define __forceinline__ inline
 #define __global__
 #define __shared__ static
+#define __align__(n) alignas(n)
 #define __launch_bounds__(...)
 #define __restrict__ __restrict
 #define __noinline__
