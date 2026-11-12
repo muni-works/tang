@@ -2,10 +2,10 @@
 # Shared by scripts/premerge.sh and scripts/main-guard.sh (sourced; runs on the Mac and
 # drives the pods over ssh, so no credentials ever sit on a pod).
 #   cpu_check <ref> <slot>   on the CPU build pod: fmt, CI's clippy, cuda build, tang-compile lib tests
-#   gpu_smoke <ref>          on H200 A's warm runner: scripts/guard/smoke-coder.sh (coder-next)
+#   gpu_smoke <ref>          on an H200 runner (auto pick, short lane): scripts/guard/smoke-coder.sh
 # Both print a tail on failure and return nonzero. Override hosts with BUILD_SSH / SMOKE_POD.
 BUILD_SSH=${BUILD_SSH:--p 38805 root@185.226.156.230}
-SMOKE_POD=${SMOKE_POD:-h200-1}
+SMOKE_POD=${SMOKE_POD:-auto}
 GUARD_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 cpu_check() {
@@ -39,7 +39,7 @@ gpu_smoke() {
   job=$(mktemp -t smoke).json
   printf '{"job":"cmd","model":"coder-next","cmd":"bash scripts/guard/smoke-coder.sh"}' >"$job"
   local res
-  res=$(BOARD_PUSH=0 "$GUARD_HERE/gpu-run.sh" "$SMOKE_POD" "$ref" "$job" 2>/dev/null)
+  res=$(BOARD_PUSH=0 LANE=short "$GUARD_HERE/gpu-run.sh" "$SMOKE_POD" "$ref" "$job" 2>/dev/null)
   rm -f "$job"
   printf '%s' "$res" | python3 -c '
 import json, sys

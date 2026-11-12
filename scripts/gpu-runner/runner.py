@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Warm GPU runner: one per pod, a FIFO spool of jobs, one GPU job at a time.
+"""Warm GPU runner: one per pod, a spool of jobs in two lanes, one GPU job at a time.
 
     python3 runner.py serve            # the daemon (start.sh runs it under nohup)
     python3 runner.py submit JOB.json  # copy a job into the spool, print its id
     python3 runner.py status           # queue, running job, last results
+    python3 runner.py status --json    # the same for gpu-run.sh's pod pick (auto)
 
 Layout (RUNNER_HOME, default ~/runner):
     src/            one tang clone, reused by every job: `git checkout` touches only
@@ -11,7 +12,8 @@ Layout (RUNNER_HOME, default ~/runner):
                     hot and an unchanged branch builds in seconds
     models/<name>/  weights copied once from /models (the network volume) to local
                     disk; after the first job they also sit in the page cache
-    jobs/<id>.json  pending jobs (FIFO by mtime)
+    jobs/<id>.json  pending jobs: short lane first, then long, FIFO by mtime within a lane
+                    (a running job is never interrupted: GPU timings stay clean)
     jobs/<id>/      job.json, log.txt, result.json, DONE (written last)
     bench/results/board.jsonl   board rows (scripts/bench_board.py format)
 
@@ -22,7 +24,8 @@ Job file (all but "job" optional):
      "script": "scripts/derived-race.sh",   race: script in the checkout
      "cmd": "cargo run ...",     cmd: shell line in the checkout
      "env": {"LENS": "128"},     extra env for the job
-     "timeout_s": 7200}
+     "timeout_s": 7200,
+     "lane": "short"}            short (smokes, checks: minutes) | long (default for race/cmd)
 check = build qwen_decode, then check.sh (tiny parity + short Qwen3-8B timing).
 race  = the race script with MODEL_DIR and OUT set; it builds what it needs.
 """
@@ -95,7 +98,7 @@ def log_line(log, msg):
         f.write(msg + "\n")
 
 
-def copy_ranges(src, dst, parts=16, chunk=64 << 20):
+def copy_ranges(src, dst, parts=16, chunk=8 << 20):
     """Copy one file in `parts` parallel byte ranges (the object-backed volume serves
     ~45 MB/s a stream; ranges in parallel go several times faster)."""
     import concurrent.futures
@@ -110,7 +113,17 @@ def copy_ranges(src, dst, parts=16, chunk=64 << 20):
             a.seek(lo)
             b.seek(lo)
             while lo < hi:
-                buf = a.read(min(chunk, hi - lo))
+                # the volume's FUSE mount can fail a read with ENOMEM under load:
+                # retry that chunk (a whole-file restart costs ~20 min on 50 GB)
+                for tries in range(6):
+                    try:
+                        a.seek(lo)
+                        buf = a.read(min(chunk, hi - lo))
+                        break
+                    except OSError:
+                        if tries == 5:
+                            raise
+                        time.sleep(2 << tries)
                 if not buf:
                     raise IOError(f"short read in {src} at {lo}")
                 b.write(buf)
@@ -252,12 +265,32 @@ def run(job_id, job, queued_at):
     return res
 
 
-def next_job():
+def lane(job):
+    """short | long: a check is short unless it says otherwise; anything else long."""
+    lane = job.get("lane") or ("short" if job.get("job", "check") == "check" else "long")
+    return "short" if lane == "short" else "long"
+
+
+def pending():
+    """Pending job names in run order: the short lane, then the long, FIFO in each."""
     try:
         names = [n for n in os.listdir(JOBS) if n.endswith(".json")]
     except FileNotFoundError:
-        return None
-    names.sort(key=lambda n: os.path.getmtime(os.path.join(JOBS, n)))
+        return []
+
+    def key(n):
+        p = os.path.join(JOBS, n)
+        try:
+            lane_n = lane(json.load(open(p)))
+        except Exception:
+            lane_n = "short"  # a bad file fails fast
+        return (lane_n != "short", os.path.getmtime(p))
+
+    return sorted(names, key=key)
+
+
+def next_job():
+    names = pending()
     return names[0] if names else None
 
 
@@ -323,12 +356,26 @@ def submit(path):
     print(job_id)
 
 
+def job_lane(path):
+    try:
+        return lane(json.load(open(path)))
+    except Exception:
+        return "short"
+
+
 def status():
-    running = open(os.path.join(HOME, "running")).read() if os.path.exists(
-        os.path.join(HOME, "running")) else None
-    pending = sorted((n for n in os.listdir(JOBS) if n.endswith(".json")),
-                     key=lambda n: os.path.getmtime(os.path.join(JOBS, n)))
-    print(f"running: {running}\npending: {[n[:-5] for n in pending]}")
+    rp = os.path.join(HOME, "running")
+    running = open(rp).read().strip() if os.path.exists(rp) else None
+    queue = pending()
+    if "--json" in sys.argv:
+        r = None
+        if running:
+            r = {"id": running, "lane": job_lane(os.path.join(JOBS, running, "job.json")),
+                 "for_s": round(time.time() - os.path.getmtime(rp))}
+        print(json.dumps({"running": r, "pending": [
+            {"id": n[:-5], "lane": job_lane(os.path.join(JOBS, n))} for n in queue]}))
+        return
+    print(f"running: {running}\npending: {[n[:-5] for n in queue]}")
     done = sorted((n for n in os.listdir(JOBS) if os.path.exists(os.path.join(JOBS, n, "DONE"))),
                   key=lambda n: os.path.getmtime(os.path.join(JOBS, n, "DONE")))[-5:]
     for n in done:
