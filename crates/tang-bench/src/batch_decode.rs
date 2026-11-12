@@ -14,13 +14,20 @@ use crate::derive_all::*;
 
 /// The batched step of `m` (`B` streams, `k = 1`, last row only).
 pub fn batched_step(m: &Model) -> (TensorGraph, StepGraph) {
+    batched_step_k(m, 1, Rows::Last)
+}
+
+/// The batched step of `m` appending `k` tokens to each of `B` streams:
+/// packed prefill (`B` prompts' chunks in one step, the routed experts
+/// grouped across all `B·k` tokens).
+pub fn batched_step_k(m: &Model, k: usize, rows: Rows) -> (TensorGraph, StepGraph) {
     let (bg, bouts) = batch_graph(&m.g, &[m.logits], "T", "B").unwrap();
     let st = derive_step_with(
         &bg,
         &bouts,
-        &spec(m, 1),
+        &spec(m, k),
         &StepOptions {
-            rows: Rows::Last,
+            rows,
             batch: Some("B"),
         },
     )
@@ -92,11 +99,29 @@ pub fn step_inputs(
     caches: &[Vec<Vec<f64>>],
     sess: &[usize],
 ) -> Vec<Vec<f64>> {
+    step_inputs_k(m, st, w, toks, pos, caches, sess, 1)
+}
+
+/// [`step_inputs`] for a step appending `k` tokens a stream.
+#[allow(clippy::too_many_arguments)]
+pub fn step_inputs_k(
+    m: &Model,
+    st: &StepGraph,
+    w: &HashMap<String, Vec<f64>>,
+    toks: &[Vec<f64>],
+    pos: &[usize],
+    caches: &[Vec<Vec<f64>>],
+    sess: &[usize],
+    k: usize,
+) -> Vec<Vec<f64>> {
     st.inputs
         .iter()
         .map(|&x| match x {
             StepInput::Pos => sess.iter().map(|&b| pos[b] as f64).collect(),
-            StepInput::New(_) => sess.iter().map(|&b| toks[b][pos[b]]).collect(),
+            StepInput::New(_) => sess
+                .iter()
+                .flat_map(|&b| toks[b][pos[b]..pos[b] + k].to_vec())
+                .collect(),
             StepInput::Same(i) => w[&m.inputs[i].0].clone(),
             StepInput::Cache(c) => sess.iter().flat_map(|&b| caches[b][c].clone()).collect(),
         })
@@ -349,7 +374,20 @@ mod tests {
     /// on the CPU against each stream's interpreter step alone (logits and
     /// every updated cache). Returns the worst rel err.
     pub(crate) fn batched_on_cpu(m: &Model, ps: &[usize], opts: &DecodeOpts, group: usize) -> f64 {
-        let (bg, st) = batched_step(m);
+        batched_k_on_cpu(m, ps, 1, opts, group)
+    }
+
+    /// [`batched_on_cpu`] with each stream appending `k` tokens (packed
+    /// prefill: every row's logits and the caches against each stream's
+    /// own interpreter step).
+    pub(crate) fn batched_k_on_cpu(
+        m: &Model,
+        ps: &[usize],
+        k: usize,
+        opts: &DecodeOpts,
+        group: usize,
+    ) -> f64 {
+        let (bg, st) = batched_step_k(m, k, if k == 1 { Rows::Last } else { Rows::All });
         let w = weights(m);
         let nb = ps.len();
         let vocab = vocab(m);
@@ -369,11 +407,16 @@ mod tests {
         ids.extend(st.caches.iter().map(|c| c.updated));
         let one = st.graph.bind(&[("B", 1)]).unwrap();
         let alone: Vec<Vec<Vec<f64>>> = (0..nb)
-            .map(|b| one.eval(&step_inputs(m, &st, &w, &toks, ps, &caches, &[b]), &ids))
+            .map(|b| {
+                one.eval(
+                    &step_inputs_k(m, &st, &w, &toks, ps, &caches, &[b], k),
+                    &ids,
+                )
+            })
             .collect();
         let (dp, outs, ngroup) = lower(&st, nb, opts, group);
         let all: Vec<usize> = (0..nb).collect();
-        let words: Vec<Vec<f32>> = step_inputs(m, &st, &w, &toks, ps, &caches, &all)
+        let words: Vec<Vec<f32>> = step_inputs_k(m, &st, &w, &toks, ps, &caches, &all, k)
             .iter()
             .map(|v| {
                 v.iter()
@@ -400,7 +443,7 @@ mod tests {
             }
         }
         eprintln!(
-            "{} batched B={nb} at lengths {ps:?} ({ngroup} expert-grouped contractions): {} \
+            "{} batched B={nb} k={k} at lengths {ps:?} ({ngroup} expert-grouped contractions): {} \
              CUDA kernels on the CPU vs {nb} single-stream interpreter steps: rel err {worst:.2e}",
             m.name,
             dp.program.kernels.len()
@@ -431,6 +474,18 @@ mod tests {
 
     /// Grouping on the interpreter: bit for bit the ungrouped step (the
     /// sort is a permutation; every sum keeps its terms and order).
+    /// Packed prefill: 4 prompts at different lengths each append 8
+    /// tokens in one step, routed experts grouped across all 32 tokens;
+    /// every row's logits and every cache equal each prompt's own step.
+    #[test]
+    fn coder_packed_prefill_runs_on_the_cpu() {
+        let m = coder();
+        for group in [0, 2] {
+            let e = batched_k_on_cpu(&m, &[1, 3, 5, 8], 8, &DecodeOpts::default(), group);
+            assert!(e < 1e-4, "group {group}: {e}");
+        }
+    }
+
     #[test]
     fn expert_groups_are_a_permutation() {
         let m = coder();

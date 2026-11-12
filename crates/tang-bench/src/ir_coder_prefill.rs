@@ -921,18 +921,29 @@ pub fn derived_step(pg: &CoderPrefill, k: usize, capacity: usize) -> Result<Step
 ///
 /// [`batch_graph`]: tang_compile::tensor::step::batch_graph
 pub fn derived_step_batched(pg: &CoderPrefill, capacity: usize) -> Result<StepGraph, String> {
-    use tang_compile::tensor::step::{batch_graph, derive_step_with, Rows, StepOptions};
+    derived_step_batched_k(pg, 1, capacity, tang_compile::tensor::step::Rows::All)
+}
+
+/// [`derived_step_batched`] appending `k` tokens to each stream: packed
+/// prefill, `B` prompts' chunks in one step.
+pub fn derived_step_batched_k(
+    pg: &CoderPrefill,
+    k: usize,
+    capacity: usize,
+    rows: tang_compile::tensor::step::Rows,
+) -> Result<StepGraph, String> {
+    use tang_compile::tensor::step::{batch_graph, derive_step_with, StepOptions};
     let (bg, outs) = batch_graph(&pg.g, &[pg.logits], SEQ, "B").map_err(|e| e.0)?;
     derive_step_with(
         &bg,
         &outs,
         &StepSpec {
             seq: SEQ,
-            new: 1,
+            new: k,
             capacity,
         },
         &StepOptions {
-            rows: Rows::All,
+            rows,
             batch: Some("B"),
         },
     )
