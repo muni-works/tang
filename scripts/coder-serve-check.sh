@@ -51,7 +51,7 @@ def req(prompt, temperature=0.0, seed=None):
         body["top_p"] = 0.95; body["top_k"] = 40
     r = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"content-type": "application/json"})
-    t0 = time.time(); first = None; text = ""; chunks = 0; usage = None
+    t0 = time.time(); first = None; text = ""; chunks = 0; usage = None; pieces = []
     with urllib.request.urlopen(r, timeout=3600) as f:
         for line in f:
             line = line.decode().strip()
@@ -66,12 +66,12 @@ def req(prompt, temperature=0.0, seed=None):
                 if piece:
                     if first is None:
                         first = time.time()
-                    text += piece; chunks += 1
+                    text += piece; chunks += 1; pieces.append(piece)
     t1 = time.time()
     n = (usage or {}).get("completion_tokens") or chunks
     first = first or t1
     dec = t1 - first
-    return {"text": text, "tokens": n, "ttft_ms": (first - t0) * 1e3, "total_ms": (t1 - t0) * 1e3,
+    return {"pieces": pieces, "text": text, "tokens": n, "ttft_ms": (first - t0) * 1e3, "total_ms": (t1 - t0) * 1e3,
             "decode_tok_s": (n - 1) / dec if dec > 0 and n > 1 else None}
 res = {"c1": [], "c4": []}
 req(PROMPTS[0])  # warm

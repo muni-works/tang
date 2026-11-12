@@ -61,6 +61,27 @@ fn words_of_bytes(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// `TANG_CODER_DERIVED_GAPS=1`: each greedy token's top-1/top-2 logit gap on stderr (the
+/// near-tie bar for greedy differences against the hand engine).
+fn gap_log(s: usize, pos: usize, l: &[f32]) {
+    if std::env::var("TANG_CODER_DERIVED_GAPS").as_deref() != Ok("1") {
+        return;
+    }
+    let (mut a, mut b) = (0usize, usize::MAX);
+    for (i, &x) in l.iter().enumerate().skip(1) {
+        if x > l[a] {
+            b = a;
+            a = i;
+        } else if b == usize::MAX || x > l[b] {
+            b = i;
+        }
+    }
+    eprintln!(
+        "gap slot {s} pos {pos} top1 {a} top2 {b} gap {:.5}",
+        l[a] - l[b]
+    );
+}
+
 struct Slot {
     prog: Program,
     tokens: Vec<u32>,
@@ -612,6 +633,7 @@ impl DerivedCoder {
                 a = i;
             }
         }
+        gap_log(s, sl.tokens.len(), l);
         a as u32
     }
 
@@ -689,6 +711,7 @@ impl DerivedCoder {
                         a = i;
                     }
                 }
+                gap_log(s, self.slots[s].tokens.len(), l);
                 a as u32
             }
             _ => self.feed(s, &ids[done..])?,
