@@ -39,7 +39,7 @@ struct Cand {
 }
 
 impl TensorGraph {
-    fn expert_candidate(&self, i: usize, min_positions: usize) -> Option<Cand> {
+    fn expert_candidate(&self, i: usize, min_positions: usize, blocks_only: bool) -> Option<Cand> {
         let c = self.comp_at(i)?;
         if c.tuple != 0
             || c.red.len() != 1
@@ -72,6 +72,9 @@ impl TensorGraph {
             _ => return None,
         };
         if !matches!(self.nodes[c.args[wi].src.n()].op, Op::Input(_)) {
+            return None;
+        }
+        if blocks_only && !self.nodes[c.args[wi].src.n()].precision.storage.is_block() {
             return None;
         }
         let ii = c.args[wi].view.gather.as_ref()?.arg;
@@ -124,12 +127,16 @@ impl TensorGraph {
 
     /// See the module docs: every contraction with a gathered weight over
     /// at least `min_positions` positions, rewritten over positions sorted
-    /// by its index. Returns the graph, `outputs`' ids in it, and what was
-    /// done.
+    /// by its index. `blocks_only`: only block-format weights (the int8
+    /// schedule's runs); an f32 weight grouped goes to the generic lowering,
+    /// slower than its ungrouped gather (coder-next blk.46's Q6_K down,
+    /// demoted to f32: 2.7 ms at B = 64). Returns the graph, `outputs`' ids
+    /// in it, and what was done.
     pub fn schedule_expert_groups(
         &self,
         outputs: &[TensorId],
         min_positions: usize,
+        blocks_only: bool,
     ) -> (TensorGraph, Vec<TensorId>, ExpertGroups) {
         let live = self.live(outputs);
         let n = self.nodes.len();
@@ -139,7 +146,7 @@ impl TensorGraph {
         let mut out = ExpertGroups::default();
         for i in 0..n {
             if live[i] {
-                if let Some(cd) = self.expert_candidate(i, min_positions) {
+                if let Some(cd) = self.expert_candidate(i, min_positions, blocks_only) {
                     let t = self.group_one(&mut ng, &map, i, &cd, &mut out);
                     map.push(t);
                     continue;

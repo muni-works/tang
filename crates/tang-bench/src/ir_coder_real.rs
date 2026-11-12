@@ -31,29 +31,34 @@ pub fn format_of(ty: GgmlType) -> Option<Format> {
     }
 }
 
-/// `vals` (a row-major weight, rows a multiple of 32 long) as GGUF Q8_0
-/// blocks: per 32 values an f16 `d = max|x| / 127` and `round(x / d)` as
-/// int8. How a Q6_K weight goes up once [`lower_real_step_with`] has given
-/// it Q8_0 storage.
-pub fn q8_0_of(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() / 32 * 34);
-    for b in vals.chunks(32) {
-        let amax = b.iter().fold(0f32, |m, &x| m.max(x.abs()));
-        let d = amax / 127.0;
-        let dh = tang_llm::gguf::f32_to_f16(d);
-        out.extend_from_slice(&dh.to_le_bytes());
-        // quantize against the scale as stored (f16)
-        let ds = tang_llm::gguf::f16_to_f32(dh);
-        for &x in b {
-            let q = if ds > 0.0 {
-                (x / ds).round().clamp(-127.0, 127.0)
-            } else {
-                0.0
-            };
-            out.push(q as i8 as u8);
-        }
+/// GGUF tensor `t` as the device words of a step input stored as `to` ([`RealStep::storage`]):
+/// its own bytes when the step keeps its encoding, dequantized f32 when the step stores f32,
+/// and an error for any other pairing, so a weight is never uploaded in an encoding its
+/// kernels don't read. A new conversion is a new arm here.
+pub fn encode(
+    g: &Gguf,
+    t: &tang_llm::gguf::TensorInfo,
+    to: Option<Format>,
+) -> Result<Vec<f32>, String> {
+    let words = |b: &[u8]| -> Vec<f32> {
+        b.chunks(4)
+            .map(|c| {
+                let mut a = [0u8; 4];
+                a[..c.len()].copy_from_slice(c);
+                f32::from_le_bytes(a)
+            })
+            .collect()
+    };
+    match (t.ty, to) {
+        (ty, Some(f)) if format_of(ty) == Some(f) => Ok(words(g.bytes(t))),
+        // RealOpts::q6k_as_q8_0: the generic f32 path is wrong at B > 1 on the GPU
+        (GgmlType::Q6K, Some(Format::Q8_0)) => Ok(words(&q8_0_bytes(
+            &g.dequantize(t).map_err(|e| format!("{}: {e}", t.name))?,
+        ))),
+        (GgmlType::F32, None) => Ok(words(g.bytes(t))),
+        (_, None) => g.dequantize(t).map_err(|e| format!("{}: {e}", t.name)),
+        (ty, Some(f)) => Err(format!("{}: stored {ty:?}, the step wants {f:?}", t.name)),
     }
-    out
 }
 
 /// [`CoderDims`] from the `qwen3next.*` header.
@@ -166,6 +171,13 @@ pub struct RealOpts {
     /// Routed experts grouped by expert from this many (stream, slot)
     /// positions (`schedule_expert_groups`; 0: never).
     pub group: usize,
+    /// Q6_K tensors stored Q8_0 (the uploader requantizes them with
+    /// [`q8_0_bytes`]) so the int8 GEMV reads them instead of an f32
+    /// gather: coder-next's blk.46 routed down, 2.7 ms at B = 64 as f32.
+    pub q6k_as_q8_0: bool,
+    /// Full-capacity K/V caches stored f16 (`Packing::F16`, decoded at
+    /// load, the in-place update stores halves): half the attention bytes.
+    pub kv_f16: bool,
     /// Stages of the int8 contractions by their positions.
     /// `None`: `schedule_block_weights` (the decode GEMV, the MMA tile for
     /// many-row steps).
@@ -195,22 +207,34 @@ pub fn lower_real_step_with(
         StepInput::Same(i) => tys[i],
         _ => None,
     };
+    if ro.batch.unwrap_or(1) > 1
+        && !ro.q6k_as_q8_0
+        && (0..st.inputs.len()).any(|k| gguf_of(k) == Some(GgmlType::Q6K))
+    {
+        // the f32 gather such a tensor becomes is wrong at B > 1 on the GPU
+        // (coder-next blk.46 ffn_down_exps: B=4 vs B=1 top-1 0/4); right
+        // on the CPU harness. Store it Q8_0 instead.
+        eprintln!(
+            "warning: batched step with Q6_K weights kept f32; set RealOpts::q6k_as_q8_0 \
+             (and upload with encode)"
+        );
+    }
     for k in 0..st.inputs.len() {
         if let Some(f) = gguf_of(k).and_then(format_of) {
+            let f = if ro.q6k_as_q8_0 && f == Format::Q6K {
+                Format::Q8_0
+            } else {
+                f
+            };
             if matches!(f, Format::Q4K | Format::Q5K | Format::Q8_0) {
                 graph.set_precision(input_node(&graph, k), Precision::storage(f));
-            }
-            // Q6_K (one routed down-projection): requantized to Q8_0 at
-            // upload ([`q8_0_of`]) so it rides the int8 kernels too
-            if f == Format::Q6K {
-                graph.set_precision(input_node(&graph, k), Precision::storage(Format::Q8_0));
             }
         }
     }
     let mut outs = st.outputs.clone();
     outs.extend(st.caches.iter().map(|c| c.updated));
     let (graph, outs) = if ro.group > 0 {
-        let (g, o, eg) = graph.schedule_expert_groups(&outs, ro.group);
+        let (g, o, eg) = graph.schedule_expert_groups(&outs, ro.group, true);
         eprintln!(
             "expert groups: {} routed contractions sorted by expert",
             eg.grouped.len()
@@ -257,6 +281,32 @@ pub fn lower_real_step_with(
         _ => unreachable!(),
     };
     let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
+        // step tiles (TF32, and split_bilinear's softmax factor) off for
+        // batched steps: B=4 0.4 ms slower, and at B=16 the race bar's max
+        // logprob gap grew to 1.25 (vs 0.2 without). On from
+        // `TANG_STEP_MMA_MIN_B` streams (B=64 ~6k: 38.7 vs 40.1 ms)
+        no_step_mma: {
+            let b = ro.batch.unwrap_or(1);
+            let min_b: usize = std::env::var("TANG_STEP_MMA_MIN_B")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
+            ro.batch.is_some() && b < min_b
+        },
+        packed: if ro.kv_f16 {
+            st.caches
+                .iter()
+                .filter(|s| !s.state && s.ring.is_none())
+                .map(|s| {
+                    (
+                        input_of(s.input),
+                        tang_compile::tensor::cuda_gemv::Packing::F16,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         inplace: st
             .caches
             .iter()
@@ -270,8 +320,12 @@ pub fn lower_real_step_with(
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
     // evaluated in their readers. On by default: with cokernels (side jobs on
     // their own blocks) H200 5.12 -> 4.83 ms, 1649 -> 1385 kernels; TANG_STAGED_MAP=0 off
-    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
-        != Some("0")
+    // (not for batched steps: at B > 1 the staged maps cost more than they
+    // save (B=4 H200: 9.1 vs 10.4 ms) and broke the predicated in-place
+    // cache update; a batched B = 1 step keeps the batched schedule)
+    if ro.batch.is_none()
+        && tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
+            != Some("0")
     {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
@@ -369,6 +423,64 @@ pub fn residual_stream(
         })
         .map(tang_compile::tensor::TensorId::from_index)
         .collect()
+}
+
+/// f32 → IEEE half bits, round to nearest even (finite, non-negative scales;
+/// subnormals flush to zero, overflow saturates).
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let m = b & 0x7f_ffff;
+    if e <= 0 {
+        return sign;
+    }
+    if e >= 31 {
+        return sign | 0x7bff;
+    }
+    let mut h = ((e as u32) << 10) | (m >> 13);
+    let rest = m & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && (h & 1) == 1) {
+        h += 1;
+    }
+    sign | h.min(0x7bff) as u16
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    let v = if e == 0 {
+        m * 2f32.powi(-24)
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    };
+    if h & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// `vals` (a multiple of 32) as GGUF Q8_0 blocks: per 32 values an f16
+/// scale `max|x| / 127` and 32 int8 codes `round(x / d)`.
+pub fn q8_0_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() / 32 * 34);
+    for blk in vals.chunks(32) {
+        let a = blk.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let d = a / 127.0;
+        let dh = f32_to_f16_bits(d);
+        let dq = f16_bits_to_f32(dh);
+        out.extend_from_slice(&dh.to_le_bytes());
+        for &x in blk {
+            let q = if dq == 0.0 {
+                0.0
+            } else {
+                (x / dq).round().clamp(-127.0, 127.0)
+            };
+            out.push(q as i8 as u8);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

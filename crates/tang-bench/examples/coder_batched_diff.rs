@@ -14,17 +14,7 @@ use tang_bench::qwen_session::runtime;
 use tang_compile::tensor::int8_sched::BlockOpts;
 use tang_compile::tensor::step::StepInput;
 use tang_gpu::program::Program;
-use tang_llm::gguf::{GgmlType, Gguf};
-
-fn words_of_bytes(b: &[u8]) -> Vec<f32> {
-    b.chunks(4)
-        .map(|c| {
-            let mut a = [0u8; 4];
-            a[..c.len()].copy_from_slice(c);
-            f32::from_le_bytes(a)
-        })
-        .collect()
-}
+use tang_llm::gguf::Gguf;
 
 fn env(k: &str, d: usize) -> usize {
     std::env::var(k)
@@ -52,11 +42,15 @@ fn main() {
     let plain = RealOpts {
         batch: Some(nb),
         group: 0,
+        q6k_as_q8_0: false,
+        kv_f16: false,
         block: Some(BlockOpts::default()),
     };
     let test = RealOpts {
         batch: Some(nb),
         group: env("TANG_BATCH_GROUP", 0),
+        q6k_as_q8_0: false,
+        kv_f16: false,
         block: Some(BlockOpts {
             pos_tile: env("TANG_BATCH_PT", 1),
             mma_min: env("TANG_BATCH_MMA_MIN", 0),
@@ -99,10 +93,7 @@ fn main() {
             match *si {
                 StepInput::Same(i) => {
                     let t = g.info(&pg.inputs[i].name).unwrap();
-                    let w = match (low.storage[k], t.ty) {
-                        (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
-                        (None, _) => g.dequantize(t).unwrap(),
-                    };
+                    let w = tang_bench::ir_coder_real::encode(&g, t, low.storage[k]).unwrap();
                     prog.write(&rt, prog.input(k), &w);
                 }
                 StepInput::Pos => prog.write(&rt, prog.input(k), &pos),

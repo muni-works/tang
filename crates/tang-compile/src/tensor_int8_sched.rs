@@ -64,6 +64,13 @@ impl BlockOpts {
         }
     }
 
+    fn mma_rows(&self) -> usize {
+        std::env::var("TANG_BATCH_MMA_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16384)
+    }
+
     fn stage(&self, g: &TensorGraph, i: usize, (wi, xi): (usize, usize)) -> IntMma {
         let gemv = IntMma {
             stage: Stage::Gemv,
@@ -77,16 +84,28 @@ impl BlockOpts {
         if npos <= 1 || matches!(wf, Format::Fp8B32 | Format::Mxfp4) {
             return gemv;
         }
+        // positions a block on the tensor cores (`TANG_BATCH_MMA_PT`, 16):
+        // each block reads its weight rows once for that many positions
+        // (coder-next B=64 at ~6k, H200: 8 → 38.7, 16 → 36.9, 32 → 37.5 ms)
+        let mma_pt: u32 = std::env::var("TANG_BATCH_MMA_PT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
         let mma = IntMma {
             stage: Stage::Mma,
             ksplit: if self.ksplit == 0 { 2 } else { self.ksplit },
-            pos_tile: 8,
+            pos_tile: mma_pt,
         };
         let big = self.mma_min > 0 && npos >= self.mma_min;
+        // a tall dense weight (the LM head) is weight-bound even at few
+        // positions: the tensor-core tile reads it once for all of them
+        // (B=4 H200: LM head 0.13 ms vs 0.38 pos-tiled; `TANG_BATCH_MMA_ROWS`)
+        let rows = pts[pts.len() - 1];
+        let tall = self.mma_min > 0 && rows >= self.mma_rows();
         match (c.args[wi].view.is_gather(), c.args[xi].view.is_gather()) {
             (true, true) if big => IntMma { pos_tile: 1, ..mma },
             (true, _) => gemv,
-            (false, _) if big => mma,
+            (false, _) if big || tall => mma,
             (false, _) if self.pos_tile > 1 => IntMma {
                 pos_tile: npos.min(self.pos_tile) as u32,
                 ..gemv

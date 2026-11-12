@@ -21,26 +21,14 @@
 use std::path::Path;
 use std::time::Instant;
 
-use tang_bench::ir_coder_prefill::{derived_step, derived_step_rows, prefill_graph};
+use tang_bench::ir_coder_prefill::{
+    derived_step, derived_step_batched_k, derived_step_rows, prefill_graph,
+};
 use tang_bench::ir_coder_real::*;
 use tang_bench::qwen_session::{runtime, slot_plan};
 use tang_compile::tensor::step::StepInput;
-use tang_compile::tensor::Format;
 use tang_gpu::program::Program;
-use tang_llm::gguf::{GgmlType, Gguf};
-
-fn words_of_bytes(b: &[u8]) -> Vec<f32> {
-    let mut w: Vec<f32> = b
-        .chunks(4)
-        .map(|c| {
-            let mut a = [0u8; 4];
-            a[..c.len()].copy_from_slice(c);
-            f32::from_le_bytes(a)
-        })
-        .collect();
-    w.shrink_to_fit();
-    w
-}
+use tang_llm::gguf::Gguf;
 
 macro_rules! profile {
     ($prog:expr, $rt:expr, $kinfo:expr) => {{
@@ -122,7 +110,12 @@ fn main() {
     let pg = prefill_graph(&dims);
     let tys = bind(&pg, &g).unwrap();
     // a prefill chunk needs only its last row's logits (all rows for --check)
-    let st = if chunk > 1 && opt("--check").is_none() {
+    // --batch B (with --chunk K): packed prefill, B prompts (the ids file
+    // rotated by b·997 tokens for prompt b) appending K tokens each per step
+    let batch: usize = opt("--batch").map_or(1, |v| v.parse().unwrap());
+    let st = if batch > 1 {
+        derived_step_batched_k(&pg, chunk, ctx, tang_compile::tensor::step::Rows::Last).unwrap()
+    } else if chunk > 1 && opt("--check").is_none() {
         derived_step_rows(&pg, chunk, ctx, tang_compile::tensor::step::Rows::Last).unwrap()
     } else {
         derived_step(&pg, chunk, ctx).unwrap()
@@ -134,8 +127,8 @@ fn main() {
     // --group N: routed experts sorted by expert over the chunk's
     // (token, slot) positions once there are N of them (one weight read
     // per expert run: the grouped expert GEMM of layer-wise prefill)
-    // default 16: a counting sort per routed contraction (`ScanKind::Sort`),
-    // cheap at any chunk size; `--group 0` turns it off
+    // default 16 (a counting sort per routed contraction, `ScanKind::Sort`:
+    // cheap at any chunk size); `--group 0` turns it off
     let group: usize = opt("--group").map_or(16, |v| v.parse().unwrap());
     let low = lower_real_step_with(
         &pg,
@@ -143,6 +136,10 @@ fn main() {
         &tys,
         &RealOpts {
             group,
+            batch: (batch > 1).then_some(batch),
+            // the Q6_K routed down-projection on the int8 kernels: grouped,
+            // an f32 copy is a gathered contraction no MMA tile reads
+            q6k_as_q8_0: true,
             ..Default::default()
         },
     );
@@ -206,13 +203,7 @@ fn main() {
     for (k, si) in st.inputs.iter().enumerate() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
-        let words = match (storage[k], t.ty) {
-            (Some(Format::Q8_0), GgmlType::Q6K) => {
-                words_of_bytes(&q8_0_of(&g.dequantize(t).unwrap()))
-            }
-            (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
-            (None, _) => g.dequantize(t).unwrap(),
-        };
+        let words = tang_bench::ir_coder_real::encode(&g, t, storage[k]).unwrap();
         bytes_up += words.len() * 4;
         prog.write(&rt, prog.input(k), &words);
     }
@@ -265,6 +256,44 @@ fn main() {
             .map(|i| (i, l[i] as f64 - m - z.ln()))
             .collect()
     };
+    if batch > 1 {
+        let n = ids.len() / chunk * chunk;
+        let prompts: Vec<Vec<f32>> = (0..batch)
+            .map(|b| {
+                (0..n)
+                    .map(|i| ids[(i + b * 997) % ids.len()] as f32)
+                    .collect()
+            })
+            .collect();
+        let t = Instant::now();
+        for c in 0..n / chunk {
+            prog.write(&rt, prog.input(pos_in), &vec![(c * chunk) as f32; batch]);
+            let toks: Vec<f32> = prompts
+                .iter()
+                .flat_map(|p| p[c * chunk..(c + 1) * chunk].to_vec())
+                .collect();
+            prog.write(&rt, prog.input(tok_in), &toks);
+            prog.run(&rt);
+            for &(k, upd) in &swaps {
+                prog.copy(&rt, prog.input(k), &prog, upd);
+            }
+        }
+        let l = prog.read(&rt, outs[0]);
+        let s = t.elapsed().as_secs_f64();
+        for b in 0..batch {
+            let row = &l[l.len() / batch * (b + 1) - vocab..l.len() / batch * (b + 1)];
+            println!("prompt {b} last row top: {:?}", logprobs(row));
+        }
+        println!(
+            "packed prefill: {batch} prompts x {n} tokens in chunks of {chunk}: {:.1} ms = {:.1} tok/s",
+            s * 1e3,
+            (batch * n) as f64 / s
+        );
+        if args.iter().any(|a| a == "--profile") {
+            profile!(prog, rt, kinfo);
+        }
+        return;
+    }
     if chunk > 1 {
         let n = ids.len() / chunk * chunk;
         let toks: Vec<f32> = ids[..n].iter().map(|&t| t as f32).collect();
