@@ -117,7 +117,7 @@ pub fn lower(
     ids.extend(st.caches.iter().map(|c| c.updated));
     let g = st.graph.bind(&[("B", nb)]).unwrap();
     let (g, ids, ng) = if group > 0 {
-        let (g, ids, eg) = g.schedule_expert_groups(&ids, group);
+        let (g, ids, eg) = g.schedule_expert_groups(&ids, group, false);
         (g, ids, eg.grouped.len())
     } else {
         (g, ids, 0)
@@ -296,7 +296,7 @@ pub fn int8_case(
     g.set_precision(w, Precision::storage(rf));
     g.set_precision(v, Precision::storage(Format::Q8_0));
     let (g, outs) = if group > 0 {
-        let (g, o, _) = g.schedule_expert_groups(&[y, z], group);
+        let (g, o, _) = g.schedule_expert_groups(&[y, z], group, true);
         (g, o)
     } else {
         (g, vec![y, z])
@@ -456,7 +456,7 @@ mod tests {
         let all: Vec<usize> = (0..nb).collect();
         let ins = step_inputs(&m, &st, &w, &toks, &ps, &caches, &all);
         let want = g.eval(&ins, &ids);
-        let (gg, gids, eg) = g.schedule_expert_groups(&ids, 2);
+        let (gg, gids, eg) = g.schedule_expert_groups(&ids, 2, false);
         assert!(!eg.grouped.is_empty(), "nothing grouped");
         let got = gg.eval(&ins, &gids);
         for (a, b) in got.iter().zip(&want) {
@@ -507,9 +507,6 @@ mod tests {
     }
 
     fn grouped_real(n_expert: usize, n_used: usize, nb: usize) {
-        // the CPU harness emulates no tensor cores: keep many-row f32
-        // contractions (attention at d = 256) on the warp lowering
-        std::env::set_var("TANG_STEP_MMA", "0");
         use crate::ir_coder_prefill::*;
         use crate::ir_coder_real::*;
         use tang_compile::tensor::int8_sched::BlockOpts;
@@ -609,6 +606,8 @@ mod tests {
                 &RealOpts {
                     batch: Some(nb),
                     group,
+                    q6k_as_q8_0: false,
+                    kv_f16: false,
                     block: Some(BlockOpts::default()),
                 },
             );
@@ -621,5 +620,144 @@ mod tests {
         let e = rel(&bd, &ad);
         eprintln!("real lowering B={nb}: grouped vs ungrouped logits rel err {e:.2e}");
         assert!(e < 1e-5, "{e}");
+    }
+
+    /// The real-size lowering at B = 4 against each stream stepped alone
+    /// (B = 1 programs), with the routed down table in f32 (as a Q6_K
+    /// `ffn_down_exps` is demoted) and the other experts Q4_K.
+    #[test]
+    fn real_lowering_b4_matches_b1_with_f32_down() {
+        use crate::ir_coder_prefill::*;
+        use crate::ir_coder_real::*;
+        use tang_compile::tensor::int8_sched::BlockOpts;
+        use tang_llm::gguf::GgmlType;
+        let dims = CoderDims {
+            d_model: 256,
+            vocab: 64,
+            recurrent: vec![true, false],
+            eps: 1e-6,
+            n_head: 4,
+            n_head_kv: 2,
+            head_dim: 64,
+            n_rot: 32,
+            rope_base: 1e4,
+            ssm_d_conv: 4,
+            ssm_d_state: 32,
+            ssm_k_heads: 2,
+            ssm_v_heads: 4,
+            n_expert: 16,
+            n_expert_used: 4,
+            n_ff_exp: 256,
+            n_ff_shexp: 256,
+        };
+        let pg = prefill_graph(&dims);
+        let tys: Vec<Option<GgmlType>> = pg
+            .inputs
+            .iter()
+            .map(|i| {
+                if i.name == "tokens" {
+                    None
+                } else if i.name.contains("ffn_down_exps") {
+                    Some(GgmlType::F32)
+                } else if i.name.contains("_exps") {
+                    Some(GgmlType::Q4K)
+                } else {
+                    Some(GgmlType::F32)
+                }
+            })
+            .collect();
+        let st = derived_step_batched(&pg, 8).unwrap();
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // weights once; per-B inputs built from them
+        let mut wv: std::collections::HashMap<usize, Vec<f32>> = Default::default();
+        for si in &st.inputs {
+            if let StepInput::Same(i) = *si {
+                let inp = &pg.inputs[i];
+                let n: usize = inp.shape.iter().map(|d| d.n()).product();
+                let v = if tys[i] == Some(GgmlType::Q4K) {
+                    let mut b = Vec::new();
+                    for _ in 0..n / 256 {
+                        let mut blk = vec![0u8; 144];
+                        blk[..2].copy_from_slice(&0x2000u16.to_le_bytes());
+                        blk[2..4].copy_from_slice(&0x1c00u16.to_le_bytes());
+                        for x in &mut blk[4..] {
+                            *x = rnd() as u8;
+                        }
+                        b.extend(blk);
+                    }
+                    crate::ir_ds_real::words_of(&b)
+                } else if inp.name.contains("norm") {
+                    (0..n)
+                        .map(|_| 1.0 + ((rnd() % 1000) as f32 - 500.0) * 1e-4)
+                        .collect()
+                } else {
+                    (0..n)
+                        .map(|_| ((rnd() % 2001) as f32 - 1000.0) * 1e-4)
+                        .collect()
+                };
+                wv.insert(i, v);
+            }
+        }
+        let toks = [5usize, 17, 29, 41];
+        let inputs = |nb: usize, sess: &[usize]| -> Vec<Vec<f32>> {
+            st.inputs
+                .iter()
+                .map(|si| match *si {
+                    StepInput::Pos => sess.iter().map(|_| 0.0).collect(),
+                    StepInput::New(_) => sess.iter().map(|&b| toks[b] as f32).collect(),
+                    StepInput::Cache(c) => {
+                        let n: usize = st
+                            .graph
+                            .shape(st.caches[c].input)
+                            .iter()
+                            .map(|d| match d {
+                                Dim::Sym(_) => nb,
+                                d => d.n(),
+                            })
+                            .product();
+                        vec![0.0; n]
+                    }
+                    StepInput::Same(i) => wv[&i].clone(),
+                })
+                .collect()
+        };
+        let lower = |nb: usize| {
+            lower_real_step_with(
+                &pg,
+                &st,
+                &tys,
+                &RealOpts {
+                    batch: Some(nb),
+                    group: 0,
+                    q6k_as_q8_0: false,
+                    kv_f16: false,
+                    block: Some(BlockOpts::batched()),
+                },
+            )
+        };
+        let l4 = lower(4);
+        let all =
+            crate::cuda_cpu::run(&l4.program, &inputs(4, &[0, 1, 2, 3]), &l4.outs[..1]).remove(0);
+        let l1 = lower(1);
+        let vocab = dims.vocab;
+        let mut worst = 0.0f64;
+        for b in 0..4 {
+            let one = crate::cuda_cpu::run(&l1.program, &inputs(1, &[b]), &l1.outs[..1]).remove(0);
+            let a: Vec<f64> = all[b * vocab..(b + 1) * vocab]
+                .iter()
+                .map(|&x| x as f64)
+                .collect();
+            let w: Vec<f64> = one.iter().map(|&x| x as f64).collect();
+            let e = rel(&a, &w);
+            eprintln!("stream {b}: B=4 vs B=1 rel err {e:.2e}");
+            worst = worst.max(e);
+        }
+        assert!(worst < 1e-4, "{worst}");
     }
 }
