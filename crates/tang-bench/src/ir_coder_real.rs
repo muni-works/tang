@@ -251,14 +251,16 @@ pub fn lower_real_step_with(
         _ => unreachable!(),
     };
     let opts = tang_compile::tensor::cuda_gemv::DecodeOpts {
-        // step tiles (and split_bilinear's softmax factor) off for a few
-        // streams (B=4: 0.4 ms slower), on from `TANG_STEP_MMA_MIN_B`
+        // step tiles (TF32, and split_bilinear's softmax factor) off for
+        // batched steps: B=4 0.4 ms slower, and at B=16 the race bar's max
+        // logprob gap grew to 1.25 (vs 0.2 without). On from
+        // `TANG_STEP_MMA_MIN_B` streams (B=64 ~6k: 38.7 vs 40.1 ms)
         no_step_mma: {
             let b = ro.batch.unwrap_or(1);
             let min_b: usize = std::env::var("TANG_STEP_MMA_MIN_B")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(16);
+                .unwrap_or(usize::MAX);
             b > 1 && b < min_b
         },
         packed: if ro.kv_f16 {
