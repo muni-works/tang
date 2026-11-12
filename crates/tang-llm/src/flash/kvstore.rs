@@ -479,9 +479,13 @@ fn enforce(hot: &Path, cold: Option<&Path>, hot_budget: u64, cold_budget: u64) {
                 (to, p.parent().and_then(|x| x.file_name()), p.file_name())
             {
                 let dst = to.join(sub).join(name);
-                if std::fs::rename(&p, &dst).is_err() {
-                    let tmp = dst.with_extension(tmp_ext());
-                    let _ = std::fs::copy(&p, &tmp).and_then(|_| std::fs::rename(&tmp, &dst));
+                // Across filesystems: a plain read and write (`fs::copy`'s copy_file_range
+                // leaves empty files on the network volume's FUSE mount), and the source goes
+                // only once the copy is whole.
+                let moved = std::fs::rename(&p, &dst).is_ok()
+                    || read_file(&p).and_then(|b| put(&dst, &b)).is_ok();
+                if !moved {
+                    eprintln!("tang-llm: moving {} to the cold tier failed", p.display());
                 }
             }
             let _ = std::fs::remove_file(&p);
