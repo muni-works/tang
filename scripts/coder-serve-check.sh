@@ -92,8 +92,9 @@ if LW:
     words = ("fn step(x: &mut [f32], k: usize) -> f32 { let s = x.iter().sum::<f32>(); s / k as f32 } ").split()
     long_p = "Summarize what this code does:\n" + " ".join(words[i % len(words)] for i in range(LW))
     MAX0 = MAX; MAX = 8
-    req(long_p + " warm")
-    res["long"] = [req(long_p) for _ in range(2)]
+    # a distinct first line each time: no saved prefix state to reuse
+    req("Request warm. " + long_p)
+    res["long"] = [req(f"Request {i}. " + long_p) for i in range(2)]
     MAX = MAX0
 if mode == "derived":
     a = req(PROMPTS[1], 0.8, 7); b = req(PROMPTS[1], 0.8, 7); c = req(PROMPTS[1], 0.8, 8)
