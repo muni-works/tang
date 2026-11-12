@@ -32,6 +32,7 @@ export MAX_TOKENS=${MAX_TOKENS:-48}
 cargo build --release -p tang-llm --features cuda --bin tang-llm 2>&1 | tail -2
 LLM=${CARGO_TARGET_DIR:-target}/release/tang-llm
 free -g | head -2 | tee "$OUT/mem.txt"
+[ -n "${COLD:-}" ] && mkdir -p "$COLD"
 df -h /tmp "${COLD:-/tmp}" | tee "$OUT/disks.txt"
 
 pid=
