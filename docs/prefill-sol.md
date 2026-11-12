@@ -151,7 +151,7 @@ The run used real weights from `/models/ds41-flash`, layers 0 and 2, native fp8 
 | 64 | 31.95 | 2,003 | ~100 | time only |
 | 256 | 138.31 | 1,851 | ~93 | time only |
 
-Jobs 1112-142555 and 1112-150923 (commit cd29f7a9). Every run printed 318–320 kernels, 249 of them native, and 23 int8 GEMVs with none demoted. A k=1 check with all experts was still running when this was written. It separates whether the k=16 failure comes from the multi-token native path or from the full expert tables.
+Jobs 1112-142555 and 1112-150923 (commit cd29f7a9). Every run printed 318–320 kernels, 249 of them native, and 23 int8 GEMVs with none demoted. A k=1 check with all experts also FAILS (rel err 2.7e-1, 1.94 ms). #227 passed at k=1 with compact routed tables, so the mismatch comes from the full 384-expert tables (`DS_ALL_EXPERTS`), not from the k>1 step. Device timings are still representative of the bytes and kernels, but the full-table native path needs a fix before any of these are trusted.
 
 Throughput is flat from k=16 to k=256, which is the GEMV signature: every token re-reads the weights. The ds-prefill session independently found ~92 tok/s for the whole model, 0.19% of SOL. It is extending the vendor cuBLASLt path to `Fp8B32`/`Mxfp4` on `claude/ds-prefill`.
 
