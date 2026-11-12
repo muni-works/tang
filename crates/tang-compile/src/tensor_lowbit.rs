@@ -708,7 +708,7 @@ mod tests {
         (0..rows * cols)
             .map(|i| {
                 let g: f64 = (0..4).map(|_| u() - 0.5).sum();
-                if i % cols % 61 == 0 {
+                if (i % cols).is_multiple_of(61) {
                     12.0 * g
                 } else {
                     g

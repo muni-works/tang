@@ -365,7 +365,7 @@ mod tests {
                     .filter_map(|j| truth.get(at + j).copied())
                     .map(|t| {
                         i += 1;
-                        if i % 3 == 0 {
+                        if i.is_multiple_of(3) {
                             (t + 1) % vocab(m) as u32
                         } else {
                             t

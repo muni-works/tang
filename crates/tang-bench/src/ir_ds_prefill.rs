@@ -2760,9 +2760,7 @@ pub(crate) mod tests {
                 let want = fg.eval(&inputs(&pg, &w, &all[..grown]), &[pg.logits]);
                 let v = dm.vocab;
                 worst = worst.max(rel(&got[0], &want[0][p0 * v..grown * v]));
-                for c in 0..caches.len() {
-                    caches[c] = got[1 + c].clone();
-                }
+                caches.clone_from_slice(&got[1..1 + caches.len()]);
                 p0 = grown;
             }
             eprintln!(

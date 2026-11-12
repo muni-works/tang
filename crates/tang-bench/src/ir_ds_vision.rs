@@ -1514,7 +1514,7 @@ pub(crate) mod tests {
         let xs: Vec<f64> = (0..n)
             .map(|i| -10.0 + 20.0 * i as f64 / (n - 1) as f64)
             .collect();
-        let got = g.eval(&[xs.clone()], &[y]).remove(0);
+        let got = g.eval(std::slice::from_ref(&xs), &[y]).remove(0);
         let worst = xs
             .iter()
             .zip(&got)
