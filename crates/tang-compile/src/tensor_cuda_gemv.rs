@@ -2339,7 +2339,6 @@ impl Lowering<'_> {
                     if let Some((d2, _)) = reg2.filter(|_| pts[d1] > 4) {
                         if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
                             let bytes = |l: &Leaf| match l.pack {
-                                Some(Packing::U3) => 0.375,
                                 Some(Packing::U4) => 0.5,
                                 Some(Packing::U3) => 0.375,
                                 Some(Packing::Bf16 | Packing::F16) => 2.0,
