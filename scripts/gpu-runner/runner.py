@@ -164,6 +164,16 @@ def model_dir(name, log):
     return local
 
 
+def gpu_name():
+    """This pod's GPU, e.g. "NVIDIA H200"; rows whose output doesn't name one get it."""
+    try:
+        p = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=30)
+        return p.stdout.splitlines()[0].strip() if p.returncode == 0 and p.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def board_rows(out, model, ref, log, env):
     """Board rows from the job's OUT dir (else its log), labeled with the job's
     TANG_* env; appended to the local board and returned in result.json, from
@@ -172,10 +182,11 @@ def board_rows(out, model, ref, log, env):
     if not os.path.exists(parser):  # installed copy: bench_board.py beside runner.py
         parser = os.path.join(HERE, "bench_board.py")
     config = " ".join(f"{k}={v}" for k, v in sorted(env.items()) if k.startswith("TANG_"))
-    p = None
+    p, gpu = None, gpu_name()
     for src in (out, log):
         cmd = [sys.executable, parser, "parse", src, "--model", model, "--branch", ref,
-               "--source", "gpu-runner"] + (["--config", config] if config else [])
+               "--source", "gpu-runner"] + (["--config", config] if config else []) \
+            + (["--gpu", gpu] if gpu else [])
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode == 0 and p.stdout.strip():
             break

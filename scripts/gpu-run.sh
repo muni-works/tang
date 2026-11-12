@@ -2,7 +2,8 @@
 # One GPU job on a warm runner pod; blocks until it's done and prints result.json.
 #
 #   scripts/gpu-run.sh <pod> <ref> <job> [KEY=VAL ...]
-#     pod   jx384ovrji8dj9 | q82kgiy7h4ifcu (or h200-1 / h200-2)
+#     pod   w2myvdc7bi8mke | ez4ue9z5y6yai3 (or h200-1 = prefill/baselines,
+#           h200-2 = coder serving/decode)
 #     ref   branch, tag or commit (pushed to muni-works/tang)
 #     job   check                  tiny parity + short Qwen3-8B timing (~minutes warm)
 #           race:<model>           scripts/derived-race.sh (qwen3-8b) or
@@ -17,8 +18,8 @@
 set -euo pipefail
 pod=${1:?pod}; shift
 case $pod in
-  jx384ovrji8dj9|h200-1) addr="-p 15450 root@157.66.255.42" ;;
-  q82kgiy7h4ifcu|h200-2) addr="-p 19166 root@31.24.80.47" ;;
+  w2myvdc7bi8mke|h200-1) addr="-p 11865 root@213.181.111.134" ;;
+  ez4ue9z5y6yai3|h200-2) addr="-p 13490 root@103.196.86.36" ;;
   *) addr=${GPU_RUN_SSH:?unknown pod $pod; set GPU_RUN_SSH} ;;
 esac
 addr=${GPU_RUN_SSH:-$addr}
