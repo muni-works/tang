@@ -62,6 +62,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let check = std::env::var("DS_NO_CHECK").as_deref() != Ok("1");
+    let native = std::env::var("DS_NATIVE").as_deref() == Ok("1");
     let toks = run.rows_of(&prompt(t_pre + k));
     let all = std::env::var("DS_ALL_EXPERTS").as_deref() == Ok("1");
     let n_exp = run.cfg["n_routed_experts"].as_u64().unwrap_or(384) as usize;
@@ -89,7 +90,17 @@ fn main() {
     let pg = prefill_graph(&dm);
     let mut w = run.dense_inputs(&pg.inputs, &dm).unwrap();
     for (l, u) in used.iter().enumerate() {
-        run.expert_tables(l, u, rows, &dm, &mut w);
+        if check || !native {
+            run.expert_tables(l, u, rows, &dm, &mut w);
+        } else {
+            // time-only native run: the expert bytes come from the checkpoint,
+            // only the slot map is read as values
+            let mut slot = vec![0.0; dm.n_experts];
+            for (r, &e) in u.iter().enumerate() {
+                slot[e] = r as f64;
+            }
+            w.insert(format!("layers.{l}.ffn.expert_slot"), slot);
+        }
     }
     let mut base: Vec<Vec<f64>> = pg
         .inputs
@@ -98,7 +109,7 @@ fn main() {
             if s.name == "tokens" {
                 toks[..t_pre].to_vec()
             } else {
-                w.remove(&s.name).unwrap()
+                w.remove(&s.name).unwrap_or_default()
             }
         })
         .collect();
@@ -107,7 +118,22 @@ fn main() {
     let t0 = Instant::now();
     let st = derived_step(&pg, &dm, k).unwrap();
     let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
-    let pre = pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes);
+    // time-only: zero caches (no interpreter prefill, so any position is cheap)
+    let pre = if check {
+        pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes)
+    } else {
+        nodes
+            .iter()
+            .map(|&n| {
+                let len: usize =
+                    pg.g.shape(n)
+                        .iter()
+                        .map(|d| if *d == Dim::Sym(SEQ) { t_pre } else { d.n() })
+                        .product();
+                vec![0.0; len]
+            })
+            .collect()
+    };
     let caches: Vec<Vec<f64>> = nodes
         .iter()
         .zip(pre)

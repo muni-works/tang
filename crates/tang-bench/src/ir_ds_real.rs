@@ -733,7 +733,23 @@ pub fn lower_native_graph(
             graph.set_precision(n, Precision::storage(*f));
         }
     }
-    let (graph, outs, sched) = graph.schedule_block_weights(outs);
+    // TANG_DS_GROUP=N: routed-expert contractions over >= N positions run
+    // over positions sorted by expert (one weight read per run)
+    let group: usize = std::env::var("TANG_DS_GROUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let (graph, outs) = if group > 0 {
+        let (g, o, eg) = graph.schedule_expert_groups(outs, group);
+        eprintln!(
+            "expert groups: {} routed contractions sorted by expert",
+            eg.grouped.len()
+        );
+        (g, o)
+    } else {
+        (graph, outs.to_vec())
+    };
+    let (graph, outs, sched) = graph.schedule_block_weights(&outs);
     let n = outs.len();
     let mut keep = outs.clone();
     keep.extend(&sched.copies);
