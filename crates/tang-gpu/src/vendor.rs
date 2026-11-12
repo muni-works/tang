@@ -26,6 +26,8 @@ pub struct Spec {
     pub npos: usize,
     /// W's first element (r = k = 0).
     pub wb: usize,
+    /// W's element count (DS formats: where its scales start).
+    pub wn: usize,
     /// X's first element and row stride, in elements.
     pub xb: usize,
     pub xld: usize,
@@ -53,6 +55,7 @@ pub fn parse(source: &str) -> Option<Spec> {
         k: n("k")?,
         npos: n("npos")?,
         wb: n("wb")?,
+        wn: n("wn").unwrap_or(0),
         xb: n("xb")?,
         xld: n("xld")?,
         xn: n("xn")?,
@@ -74,14 +77,29 @@ __device__ __forceinline__ void scale_min_k4(int j, const unsigned char* q, int*
     if (j < 4) { *sc = q[j] & 63; *m = q[j + 4] & 63; }
     else { *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
-// fmt 0 = Q4_K, 1 = Q5_K, 2 = Q8_0; one thread per output element
+__device__ __forceinline__ float e8m0(unsigned s) { return __uint_as_float(s ? (s << 23) : 0x00400000u); }
+__device__ __forceinline__ float fp8e4m3(unsigned b) {
+    const unsigned ex = (b >> 3) & 15u, m = b & 7u;
+    const float f = ex ? __uint_as_float(((ex + 120u) << 23) | (m << 20)) : (float)m * 0.001953125f;
+    return (b & 0x80u) ? -f : f;
+}
+// fmt 0 = Q4_K, 1 = Q5_K, 2 = Q8_0, 3 = Fp8B32, 4 = Mxfp4; one thread per output element.
+// k: W's row length, wn: W's element count (DS scales follow the codes)
 extern "C" __global__ void main0(const unsigned char* __restrict__ w, unsigned short* __restrict__ out,
-                                 unsigned long long base, unsigned long long n, int fmt) {
+                                 unsigned long long base, unsigned long long n, int fmt,
+                                 unsigned long long k, unsigned long long wn) {
     const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const unsigned long long e = base + i;
     float v;
-    if (fmt == 2) {
+    if (fmt == 3) {
+        const unsigned long long row = e / k, col = e % k;
+        v = fp8e4m3(w[e]) * e8m0(w[wn + (row / 32) * (k / 32) + col / 32]);
+    } else if (fmt == 4) {
+        const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        const unsigned q = (w[e / 2] >> (4 * (e & 1))) & 15u;
+        v = (q & 8u ? -lut[q & 7u] : lut[q & 7u]) * e8m0(w[wn / 2 + e / 32]);
+    } else if (fmt == 2) {
         const unsigned char* b = w + (e / 32) * 34;
         v = h2f(b[0] | (b[1] << 8)) * (float)(signed char)b[2 + (e % 32)];
     } else {
@@ -150,6 +168,8 @@ fn fmt_code(w: &str) -> i32 {
         "Q4K" => 0,
         "Q5K" => 1,
         "Q8_0" => 2,
+        "Fp8B32" => 3,
+        "Mxfp4" => 4,
         _ => panic!("vendor GEMM: no dequant for {w}"),
     }
 }
@@ -185,7 +205,14 @@ pub fn run(
         let nw = (s.rows * s.k) as u64;
         let mut l = stream.launch_builder(&lt.deq);
         let (base, fmt) = (s.wb as u64, fmt_code(&s.w));
-        l.arg(w).arg(&mut sc.w).arg(&base).arg(&nw).arg(&fmt);
+        let (wk, wn) = (s.k as u64, s.wn as u64);
+        l.arg(w)
+            .arg(&mut sc.w)
+            .arg(&base)
+            .arg(&nw)
+            .arg(&fmt)
+            .arg(&wk)
+            .arg(&wn);
         unsafe { l.launch(grid(nw as usize)) }.expect("vendor dequant W");
         let nx = (s.npos * s.k) as u64;
         let (xb, ld, xn, k) = (s.xb as u64, s.xld as u64, s.xn as u64, s.k as u64);

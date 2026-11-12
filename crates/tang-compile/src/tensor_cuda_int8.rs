@@ -384,6 +384,24 @@ impl TensorGraph {
         } else {
             None
         };
+        // many positions on an ungathered weight: a vendor GEMM
+        // (`TANG_VENDOR_GEMM`, see `vendor_gemm_min`) when the shape is plain
+        if wa.view.gather.is_none() && xa.view.gather.is_none() && fused.is_none() {
+            if let Some(min) = vendor_gemm_min() {
+                if npos >= min {
+                    let geo = VendorGeo { pts: &pts, rd, kd };
+                    if let Some(src) = vendor_gemm_source(
+                        wfmt,
+                        &geo,
+                        (&wa.view, &ws),
+                        (&xa.view, &xs),
+                        (param(wi)?, param(xi)?),
+                    ) {
+                        return Ok((src, 32, 1));
+                    }
+                }
+            }
+        }
         if s.stage == Stage::Gemv {
             if ds_format(wfmt) && s.pos_tile > 1 {
                 return Err("pos_tile > 1 is not lowered for DS formats".into());
@@ -417,24 +435,6 @@ impl TensorGraph {
                 w_total: ws.iter().product(),
                 wvalid: wvalid.as_deref(),
             }));
-        }
-        // many positions on an ungathered weight: a vendor GEMM
-        // (`TANG_VENDOR_GEMM`, see `vendor_gemm_min`) when the shape is plain
-        if wa.view.gather.is_none() && xa.view.gather.is_none() && fused.is_none() {
-            if let Some(min) = vendor_gemm_min() {
-                if npos >= min {
-                    let geo = VendorGeo { pts: &pts, rd, kd };
-                    if let Some(src) = vendor_gemm_source(
-                        wfmt,
-                        &geo,
-                        (&wa.view, &ws),
-                        (&xa.view, &xs),
-                        (param(wi)?, param(xi)?),
-                    ) {
-                        return Ok((src, 32, 1));
-                    }
-                }
-            }
         }
         let ksplit = s.ksplit as usize;
         if b.per == 32 {
@@ -1598,7 +1598,10 @@ fn vendor_gemm_source(
     (wp, xp): (String, String),
 ) -> Option<String> {
     let (rd, kd) = (geo.rd, geo.kd);
-    if !matches!(wfmt, Format::Q4K | Format::Q5K | Format::Q8_0) {
+    if !matches!(
+        wfmt,
+        Format::Q4K | Format::Q5K | Format::Q8_0 | Format::Fp8B32 | Format::Mxfp4
+    ) {
         return None;
     }
     let rows = geo.pts[rd];
@@ -1618,7 +1621,11 @@ fn vendor_gemm_source(
     }
     let mut coords = vec![0i64; kd + 1];
     let wb = view_offset(wv, ws, &coords);
-    let per = if wfmt == Format::Q8_0 { 32 } else { 256 };
+    let per = match wfmt {
+        Format::Q8_0 | Format::Fp8B32 | Format::Mxfp4 => 32,
+        _ => 256,
+    };
+    let wn: usize = ws.iter().product();
     if wb < 0 || wb % per != 0 {
         return None;
     }
@@ -1645,7 +1652,7 @@ fn vendor_gemm_source(
     let wq = wp.strip_prefix('q')?;
     let xq = xp.strip_prefix('q')?;
     Some(format!(
-        "{VENDOR_TAG}w={wfmt:?} rows={rows} k={k} npos={npos} wb={wb} xb={x0} xld={ld} xn={xn} wq={wq} xq={xq}\nextern \"C\" __global__ void {}() {{}}\n",
+        "{VENDOR_TAG}w={wfmt:?} rows={rows} k={k} npos={npos} wb={wb} wn={wn} xb={x0} xld={ld} xn={xn} wq={wq} xq={xq}\nextern \"C\" __global__ void {}() {{}}\n",
         super::cuda::CUDA_ENTRY
     ))
 }
