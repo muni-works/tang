@@ -790,10 +790,10 @@ mod tests {
             for blk in 0..r * k / per {
                 let o = blk * bytes;
                 // d ≈ 0.004–0.008 (f16 0x1C00 + low bits), dmin likewise
-                wb[o] = wb[o] & 0x3F;
+                wb[o] &= 0x3F;
                 wb[o + 1] = 0x1C;
                 if per == 256 {
-                    wb[o + 2] = wb[o + 2] & 0x3F;
+                    wb[o + 2] &= 0x3F;
                     wb[o + 3] = 0x1C;
                 }
             }
