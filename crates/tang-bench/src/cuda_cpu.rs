@@ -26,6 +26,7 @@ const HEADER: &str = r#"
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <type_traits>
 #include <vector>
 using std::sqrt; using std::exp; using std::log; using std::round; using std::floor;
 using std::ceil; using std::fabs; using std::exp2; using std::log2; using std::tanh;
@@ -122,6 +123,53 @@ template <class T> static inline T __shfl_up_sync(unsigned, T v, unsigned off, i
 template <class T> static inline T __shfl_sync(unsigned, T v, int src, int width = 32) {
     int base = (int)(threadIdx.x & 31) & ~(width - 1); return tang_shfl(v, base + (src % width));
 }
+// wmma (16×16×8 tf32 / 16×16×16 f16, bf16): every lane holds the whole
+// fragment and computes it, the warp kept in step around each call
+namespace nvcuda { namespace wmma {
+struct matrix_a {}; struct matrix_b {}; struct accumulator {};
+struct row_major {}; struct col_major {};
+namespace precision { struct tf32 {}; }
+enum layout_t { mem_row_major, mem_col_major };
+template <class U, int M, int N, int K, class T, class L = void> struct fragment {
+    static constexpr int R = std::is_same<U, matrix_b>::value ? K : M;
+    static constexpr int C = std::is_same<U, matrix_a>::value ? K : N;
+    static constexpr int num_elements = R * C;
+    float x[R * C];
+};
+template <class U, int M, int N, int K, class T, class L, class P>
+static inline void load_matrix_sync(fragment<U, M, N, K, T, L>& f, const P* p, unsigned ldm) {
+    __syncwarp();
+    constexpr bool col = std::is_same<L, col_major>::value;
+    for (int i = 0; i < f.R; i++) for (int j = 0; j < f.C; j++) f.x[i * f.C + j] = (float)(col ? p[j * ldm + i] : p[i * ldm + j]);
+    __syncwarp();
+}
+template <class T, int M, int N, int K>
+static inline void load_matrix_sync(fragment<accumulator, M, N, K, T>& f, const float* p, unsigned ldm, layout_t l) {
+    __syncwarp();
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) f.x[i * N + j] = l == mem_col_major ? p[j * ldm + i] : p[i * ldm + j];
+    __syncwarp();
+}
+template <class T, int M, int N, int K>
+static inline void store_matrix_sync(float* p, const fragment<accumulator, M, N, K, T>& f, unsigned ldm, layout_t l) {
+    __syncwarp();
+    if ((threadIdx.x & 31) == 0)
+        for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) (l == mem_col_major ? p[j * ldm + i] : p[i * ldm + j]) = f.x[i * N + j];
+    __syncwarp();
+}
+template <class U, int M, int N, int K, class T, class L>
+static inline void fill_fragment(fragment<U, M, N, K, T, L>& f, float v) { for (int i = 0; i < f.num_elements; i++) f.x[i] = v; }
+template <class A, class B, class Cf, class Df>
+static inline void mma_sync(Df& d, const A& a, const B& b, const Cf& c) {
+    constexpr int M = A::R, K = A::C, N = B::C;
+    float t[M * N];
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) {
+        float s = c.x[i * N + j];
+        for (int k = 0; k < K; k++) s += a.x[i * K + k] * b.x[k * N + j];
+        t[i * N + j] = s;
+    }
+    for (int i = 0; i < M * N; i++) d.x[i] = t[i];
+}
+}}
 template <class F> static void tang_launch(unsigned blocks, unsigned threads, F f) {
     gridDim = {blocks, 1, 1};
     blockDim = {threads, 1, 1};
@@ -188,7 +236,8 @@ fn host_source(src: &str) -> String {
             r#"asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));"#,
             "f = tang_sw_h2f(h);",
         )
-        .replace("extern \"C\" ", "");
+        .replace("extern \"C\" ", "")
+        .replace("#include <mma.h>", "");
     // the int8 MMA (m16n8k32 s8): each lane gathers its A rows (gq, gq + 8)
     // and B columns (2 tig, + 1) from the lanes holding them, by shuffles
     if let Some(i) = s.find("asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32") {

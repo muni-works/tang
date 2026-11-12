@@ -323,17 +323,19 @@ impl TensorGraph {
     }
 
     /// [`cuda_delta_kernel`](Self::cuda_delta_kernel) for many rows: a
-    /// block per (head, 16 (or 8) state columns) walks the rows in chunks of
+    /// block per (head, `bv` state columns) walks the rows in chunks of
     /// `C = 64`. With `γ` the running sum of `log α` in a chunk and `S₀`
     /// the state entering it, the recurrence
     /// `S_t = α_t(S − β_t k_t(k_tᵀS)) + β_t k_t v_tᵀ` is
     /// `S_t = e^{γ_t}S₀ + Σ_{s≤t} e^{γ_t−γ_s} k_s u_sᵀ` where
     /// `(I + A)U = βV − (βe^γ ⊙ K)S₀`, `A_ts = β_t e^{γ_t−γ_s} k_t·k_s`
-    /// (`s < t`; forward substitution, the chunk's rows in order). Then
-    /// `o_t = scale·(e^{γ_t} q_t·S₀ + Σ_{s≤t} e^{γ_t−γ_s}(q_t·k_s) u_s)` and
-    /// `S₀ ← e^{γ_C}S₀ + Σ_s e^{γ_C−γ_s} k_s u_sᵀ`. The same sums as the
-    /// step kernel, regrouped: matrix products over the chunk instead of
-    /// `C` dependent steps.
+    /// (`s < t`). Then `o_t = scale·(e^{γ_t} q_t·S₀ + Σ_{s≤t}
+    /// e^{γ_t−γ_s}(q_t·k_s) u_s)` and `S₀ ← e^{γ_C}S₀ + Σ_s e^{γ_C−γ_s}
+    /// k_s u_sᵀ`. Every product (`K·Kᵀ`, `K·S₀`, `Q·Kᵀ`, `Q·S₀`, `P·U`,
+    /// `Kᵀ·U`) runs on tf32 `wmma` (16 × 16 × 8, f32 accumulation); the
+    /// triangular solve is one thread per column with `U`'s column in
+    /// registers. Shared buffers are zero-padded to 16 (`n`, `bv` < 16 in
+    /// the test models).
     fn cuda_delta_chunked(&self, root: usize, reads: &[usize]) -> (String, usize, usize) {
         let sc = self.scan_at(TensorId(root as u32)).unwrap();
         let ScanKind::Delta(d) = &sc.kind else {
@@ -347,11 +349,18 @@ impl TensorGraph {
         let tn = ks[sc.dim];
         let lo: usize = ks[sc.dim + 1..p].iter().product();
         let heads: usize = ks[..p].iter().product::<usize>() / tn;
-        // rows a chunk (`TANG_DELTA_CHUNK_ROWS`, 64; 2..=64)
-        let bv = if m.is_multiple_of(16) { 16usize } else { 8 };
-        let cc = env_usize("TANG_DELTA_CHUNK_ROWS", 64).clamp(2, 64);
+        let bv = [64usize, 16, 8]
+            .into_iter()
+            .find(|b| m.is_multiple_of(*b))
+            .unwrap();
         let ncb = m / bv;
-        let ld = n + 1;
+        let cc = 64usize;
+        // rows a chunk that take part (`TANG_DELTA_CHUNK_ROWS`, 64; the
+        // tiles stay 64 wide, the rest zero)
+        let cr = env_usize("TANG_DELTA_CHUNK_ROWS", 64).clamp(2, 64);
+        let np = n.div_ceil(16) * 16;
+        let bp = bv.div_ceil(16) * 16;
+        let (lk, lm, lb) = (np + 4, cc + 4, bp + 4);
         let arg = |i: usize| {
             let s = self.storage(sc.inputs[i]).n();
             format!("q{}", reads.iter().position(|&r| r == s).unwrap())
@@ -363,143 +372,236 @@ impl TensorGraph {
         let al = ia.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
         let be = ib.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
         let ro = d.readout.is_some();
-        // shared floats: K, Q [C][n+1], M [C][C], S₀ [n][bv], U, R, V [C][bv], γ, β [C]
-        let qf = if ro { cc * ld } else { 0 };
-        // γ and β: 64 each (the scan writes a full warp's 64)
-        let smem = 4 * (cc * ld + qf + cc * cc + n * bv + 3 * cc * bv + 128);
+        let qf = if ro { cc * lk } else { 0 };
+        let smem = 4 * (cc * lk + qf + cc * lm + np * lb + 3 * cc * lb + 3 * 64);
         let qload = match iq {
-            Some(i) => format!("            Qs[t * {ld} + x] = {}[p * {n} + x];\n", arg(i)),
+            Some(i) => format!(
+                "            Qs[t * {lk} + x] = (t < nt && x < {n}) ? {}[p * {n} + x] : 0.f;\n",
+                arg(i)
+            ),
             None => String::new(),
+        };
+        // C[rows × cols] (+)= A·B over `kd` (multiples of 16, 16, 8), a
+        // warp per 16 × 16 tile
+        let gemm = |name: &str,
+                    rows: usize,
+                    cols: usize,
+                    kd: usize,
+                    a: &str,
+                    la: usize,
+                    a_col: bool,
+                    b: &str,
+                    lbb: usize,
+                    b_col: bool,
+                    c: &str,
+                    lc: usize,
+                    acc_in: bool| {
+            let fa = if a_col { "FAc" } else { "FA" };
+            let fb = if b_col { "FBc" } else { "FB" };
+            let a_at = if a_col {
+                format!("{a} + (k0) * {la} + r0")
+            } else {
+                format!("{a} + r0 * {la} + (k0)")
+            };
+            let b_at = if b_col {
+                format!("{b} + c0 * {lbb} + (k0)")
+            } else {
+                format!("{b} + (k0) * {lbb} + c0")
+            };
+            format!(
+                r#"        // {name}
+        for (int tile = warp; tile < {nt_}; tile += 8) {{
+            const int r0 = tile / {tc} * 16, c0 = tile % {tc} * 16;
+            FC acc;
+            {init}
+            for (int k0 = 0; k0 < {kd}; k0 += 8) {{
+                {fa} fa_; {fb} fb_;
+                wmma::load_matrix_sync(fa_, {a_at}, {la});
+                wmma::load_matrix_sync(fb_, {b_at}, {lbb});
+                wmma::mma_sync(acc, fa_, fb_, acc);
+            }}
+            wmma::store_matrix_sync({c} + r0 * {lc} + c0, acc, {lc}, wmma::mem_row_major);
+        }}
+        __syncthreads();
+"#,
+                nt_ = (rows / 16) * (cols / 16),
+                tc = cols / 16,
+                init = if acc_in {
+                    format!("wmma::load_matrix_sync(acc, {c} + r0 * {lc} + c0, {lc}, wmma::mem_row_major);")
+                } else {
+                    "wmma::fill_fragment(acc, 0.f);".to_string()
+                },
+            )
         };
         let delta = if d.delta {
             format!(
-                r#"        // A (strictly lower) and R = βV − (βe^γ ⊙ K)S₀
-        gram(Ks, true, nt);
-        for (int e = tid; e < {cc} * {bv}; e += 256) {{
-            const int t = e / {bv}, c = e % {bv};
-            float a = 0.f;
-            if (t < nt) {{ const float* kt = Ks + t * {ld}; for (int x = 0; x < {n}; ++x) a += kt[x] * S0[x * {bv} + c]; }}
-            Rs[e] = bs[t] * (Vs[e] - expf(gs[t]) * a);
+                "{}{}{}",
+                gemm(
+                    "A = K·Kᵀ",
+                    cc,
+                    cc,
+                    np,
+                    "Ks",
+                    lk,
+                    false,
+                    "Ks",
+                    lk,
+                    true,
+                    "Ms",
+                    lm,
+                    false
+                ),
+                format!(
+                    r#"        for (int e = tid; e < {cc} * {cc}; e += 256) {{
+            const int t = e / {cc}, s_ = e % {cc};
+            float& a = Ms[t * {lm} + s_];
+            a = (s_ < t && t < nt) ? a * bs[t] * expf(gs[t] - gs[s_]) : 0.f;
+        }}
+"#
+                ),
+                gemm(
+                    "R = K·S₀",
+                    cc,
+                    bp,
+                    np,
+                    "Ks",
+                    lk,
+                    false,
+                    "S0",
+                    lb,
+                    false,
+                    "Rs",
+                    lb,
+                    false
+                ),
+            ) + &format!(
+                r#"        for (int e = tid; e < {cc} * {bp}; e += 256) {{
+            const int t = e / {bp}, c = e % {bp};
+            Rs[t * {lb} + c] = t < nt ? bs[t] * (Vs[t * {lb} + c] - expf(gs[t]) * Rs[t * {lb} + c]) : 0.f;
         }}
         __syncthreads();
-        // forward substitution: U_t = R_t − Σ_{{s<t}} A_ts U_s, a column per
-        // 16 lanes, U in registers (lane `part` holds rows part + 16·j): no
-        // barrier in the loop
-        {{
-            const int c = col16 < {bv} ? col16 : 0;
-            float u[4] = {{0.f, 0.f, 0.f, 0.f}};
-            for (int t = 0; t < nt; ++t) {{
-                float a = 0.f;
+        // (I + A)U = R: a thread per column, U's column in registers
+        if (tid < {bp}) {{
+            float u[{cc}];
+            #pragma unroll
+            for (int t = 0; t < {cc}; ++t) {{
+                float a = Rs[t * {lb} + tid];
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) {{ const int s_ = part + 16 * j; if (s_ < t) a += Ms[t * {cc} + s_] * u[j]; }}
-                a += __shfl_xor_sync(0xffffffffu, a, 8); a += __shfl_xor_sync(0xffffffffu, a, 4);
-                a += __shfl_xor_sync(0xffffffffu, a, 2); a += __shfl_xor_sync(0xffffffffu, a, 1);
-                if (part == (t & 15)) u[t >> 4] = Rs[t * {bv} + c] - a;
+                for (int s_ = 0; s_ < t; ++s_) a -= Ms[t * {lm} + s_] * u[s_];
+                u[t] = a;
             }}
-            if (col16 < {bv}) {{
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {{ const int s_ = part + 16 * j; if (s_ < {cc}) Us[s_ * {bv} + c] = s_ < nt ? u[j] : 0.f; }}
-            }}
+            #pragma unroll
+            for (int t = 0; t < {cc}; ++t) Us[t * {lb} + tid] = u[t];
         }}
         __syncthreads();
 "#
             )
         } else {
             format!(
-                r#"        for (int e = tid; e < {cc} * {bv}; e += 256) Us[e] = e / {bv} < nt ? bs[e / {bv}] * Vs[e] : 0.f;
-        __syncthreads();
-"#
+                "        for (int e = tid; e < {cc} * {bp}; e += 256) Us[(e / {bp}) * {lb} + e % {bp}] = bs[e / {bp}] * Vs[(e / {bp}) * {lb} + e % {bp}];\n        __syncthreads();\n"
             )
         };
         let readout = match d.readout {
             Some(scale) => format!(
-                r#"        // P = tril(Q Kᵀ ⊙ e^{{γt−γs}}), then o = scale·(e^γ Q S₀ + P U)
-        gram(Qs, false, nt);
-        __syncthreads();
-        for (int e = tid; e < {cc} * {bv}; e += 256) {{
+                "{}{}{}{}{}",
+                gemm("P = Q·Kᵀ", cc, cc, np, "Qs", lk, false, "Ks", lk, true, "Ms", lm, false),
+                format!(
+                    r#"        for (int e = tid; e < {cc} * {cc}; e += 256) {{
+            const int t = e / {cc}, s_ = e % {cc};
+            float& a = Ms[t * {lm} + s_];
+            a = (s_ <= t && t < nt) ? a * expf(gs[t] - gs[s_]) : 0.f;
+        }}
+"#
+                ),
+                gemm("e^γ·Q·S₀", cc, bp, np, "Qs", lk, false, "S0", lb, false, "Rs", lb, false),
+                format!(
+                    "        for (int e = tid; e < {cc} * {bp}; e += 256) Rs[(e / {bp}) * {lb} + e % {bp}] *= expf(gs[e / {bp}]);\n        __syncthreads();\n"
+                ),
+                gemm("O = e^γ·Q·S₀ + P·U", cc, bp, cc, "Ms", lm, false, "Us", lb, false, "Rs", lb, true),
+            ) + &format!(
+                r#"        for (int e = tid; e < nt * {bv}; e += 256) {{
             const int t = e / {bv}, c = e % {bv};
-            if (t < nt) {{
-                float a = 0.f, b = 0.f;
-                const float* qt = Qs + t * {ld};
-                for (int x = 0; x < {n}; ++x) a += qt[x] * S0[x * {bv} + c];
-                for (int s_ = 0; s_ <= t; ++s_) b += Ms[t * {cc} + s_] * Us[s_ * {bv} + c];
-                const long long p = (hi * {tn} + t0 + t) * {lo} + lo;
-                out[p * {m} + cb * {bv} + c] = {scale:.9e}f * (expf(gs[t]) * a + b);
-            }}
+            const long long p = (hi * {tn} + t0 + t) * {lo} + lo;
+            out[p * {m} + cb * {bv} + c] = {scale:.9e}f * Rs[t * {lb} + c];
         }}
         __syncthreads();
 "#
             ),
             None => String::new(),
         };
+        let state = format!(
+            r#"        // S₀ ← e^{{γ_C}} S₀ + Kᵀ·(e^{{γ_C−γ}} ⊙ U)
+        {{
+            const float gc = gs[nt - 1];
+            for (int e = tid; e < {cc} * {bp}; e += 256) {{ const int t = e / {bp}; Us[t * {lb} + e % {bp}] *= t < nt ? expf(gc - gs[t]) : 0.f; }}
+            for (int e = tid; e < {np} * {bp}; e += 256) S0[(e / {bp}) * {lb} + e % {bp}] *= expf(gc);
+            __syncthreads();
+        }}
+{}"#,
+            gemm(
+                "S₀ += Kᵀ·U",
+                np,
+                bp,
+                cc,
+                "Ks",
+                lk,
+                true,
+                "Us",
+                lb,
+                false,
+                "S0",
+                lb,
+                true
+            )
+        );
         let fin = if ro {
             String::new()
         } else {
             format!(
-                "    for (int e = tid; e < {n} * {bv}; e += 256) out[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}] = S0[e];\n",
+                "    for (int e = tid; e < {n} * {bv}; e += 256) out[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}] = S0[(e / {bv}) * {lb} + e % {bv}];\n",
                 nm = n * m
             )
         };
         let src = format!(
             r#"#define TANG_SMEM {smem}
-// Auto-generated by tang-compile: fused delta step (decode), chunked
+// Auto-generated by tang-compile: fused delta step (decode), chunked tf32
+#include <mma.h>
+using namespace nvcuda;
+typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FA;
+typedef wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::col_major> FAc;
+typedef wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> FB;
+typedef wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> FBc;
+typedef wmma::fragment<wmma::accumulator, 16, 16, 8, float> FC;
 extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
-    extern __shared__ float tang_dsm[];
-    float* Ks = tang_dsm;
-    float* Qs = Ks + {cc} * {ld};
+    extern __shared__ float4 tang_dsm4[];
+    float* Ks = (float*)tang_dsm4;
+    float* Qs = Ks + {cc} * {lk};
     float* Ms = Qs + {qf};
-    float* S0 = Ms + {cc} * {cc};
-    float* Us = S0 + {n} * {bv};
-    float* Rs = Us + {cc} * {bv};
-    float* Vs = Rs + {cc} * {bv};
-    float* gs = Vs + {cc} * {bv};
+    float* S0 = Ms + {cc} * {lm};
+    float* Us = S0 + {np} * {lb};
+    float* Rs = Us + {cc} * {lb};
+    float* Vs = Rs + {cc} * {lb};
+    float* gs = Vs + {cc} * {lb};
     float* bs = gs + 64;
-    const int tid = threadIdx.x, col16 = tid / 16, part = tid % 16;
-    // Ms = a C × C Gram of X's rows with K's, 4 × 4 a thread (rows ti + 16a,
-    // columns si + 16b: a warp reads distinct banks of K), masked lower
-    // (strict: × β_t, the delta system; else the readout's) and decayed
-    auto gram = [&](const float* X, bool strict, int nt) {{
-        const int ti = tid / 16, si = tid % 16;
-        for (int t4 = 0; t4 < {cc}; t4 += 64) {{
-        float acc[4][4] = {{}};
-        #pragma unroll 4
-        for (int x = 0; x < {n}; ++x) {{
-            float xa[4], kb[4];
-            #pragma unroll
-            for (int a = 0; a < 4; ++a) xa[a] = X[(ti + 16 * a) % {cc} * {ld} + x];
-            #pragma unroll
-            for (int b = 0; b < 4; ++b) kb[b] = Ks[(si + 16 * b) % {cc} * {ld} + x];
-            #pragma unroll
-            for (int a = 0; a < 4; ++a)
-                #pragma unroll
-                for (int b = 0; b < 4; ++b) acc[a][b] += xa[a] * kb[b];
-        }}
-        #pragma unroll
-        for (int a = 0; a < 4; ++a)
-            #pragma unroll
-            for (int b = 0; b < 4; ++b) {{
-                const int t = ti + 16 * a, s_ = si + 16 * b;
-                if (t >= {cc} || s_ >= {cc}) continue;
-                const bool on = t < nt && (strict ? s_ < t : s_ <= t);
-                Ms[t * {cc} + s_] = on ? acc[a][b] * (strict ? bs[t] : 1.f) * expf(gs[t] - gs[s_]) : 0.f;
-            }}
-        }}
-    }};
+    const int tid = threadIdx.x, warp = tid >> 5;
     const int h = blockIdx.x / {ncb}, cb = blockIdx.x % {ncb};
     const long long hi = h / {lo}, lo = h % {lo};
-    for (int e = tid; e < {n} * {bv}; e += 256) S0[e] = {s0}[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}];
-    for (int t0 = 0; t0 < {tn}; t0 += {cc}) {{
-        const int nt = min({cc}, {tn} - t0);
+    for (int e = tid; e < {np} * {bp}; e += 256) {{
+        const int x = e / {bp}, c = e % {bp};
+        S0[x * {lb} + c] = (x < {n} && c < {bv}) ? {s0}[(long long)h * {nm} + (long long)x * {m} + cb * {bv} + c] : 0.f;
+    }}
+    for (int t0 = 0; t0 < {tn}; t0 += {cr}) {{
+        const int nt = min({cr}, {tn} - t0);
         __syncthreads();
-        for (int e = tid; e < nt * {n}; e += 256) {{
-            const int t = e / {n}, x = e % {n};
-            const long long p = (hi * {tn} + t0 + t) * {lo} + lo;
-            Ks[t * {ld} + x] = {kk}[p * {n} + x];
-{qload}        }}
-        for (int e = tid; e < {cc} * {bv}; e += 256) {{
-            const int t = e / {bv};
+        for (int e = tid; e < {cc} * {np}; e += 256) {{
+            const int t = e / {np}, x = e % {np};
             const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
-            Vs[e] = t < nt ? {vv}[p * {m} + cb * {bv} + e % {bv}] : 0.f;
+            Ks[t * {lk} + x] = (t < nt && x < {n}) ? {kk}[p * {n} + x] : 0.f;
+{qload}        }}
+        for (int e = tid; e < {cc} * {bp}; e += 256) {{
+            const int t = e / {bp}, c = e % {bp};
+            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+            Vs[t * {lb} + c] = (t < nt && c < {bv}) ? {vv}[p * {m} + cb * {bv} + c] : 0.f;
         }}
         // γ: the running sum of log α (one warp's scan of 64), β
         if (tid < 32) {{
@@ -517,22 +619,7 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
             gs[2 * tid] = ex + l[0]; gs[2 * tid + 1] = x;
         }}
         __syncthreads();
-{delta}{readout}        // S₀ ← e^{{γ_C}} S₀ + Σ_s e^{{γ_C−γ_s}} k_s u_sᵀ
-        {{
-            const float gc = gs[nt - 1];
-            // e^{{γ_C−γ_s}}·u_s into R's slots (R is not read again this chunk)
-            __syncthreads();
-            for (int e = tid; e < nt * {bv}; e += 256) Rs[e] = expf(gc - gs[e / {bv}]) * Us[e];
-            __syncthreads();
-            // n × bv outputs, (x, c) and (x + n/2, c) a thread pair per pass
-            for (int e = tid; e < {n} * {bv}; e += 256) {{
-                const int x = e / {bv}, c = e % {bv};
-                float a = 0.f;
-                for (int s_ = 0; s_ < nt; ++s_) a += Ks[s_ * {ld} + x] * Rs[s_ * {bv} + c];
-                S0[e] = expf(gc) * S0[e] + a;
-            }}
-        }}
-    }}
+{delta}{readout}{state}    }}
     __syncthreads();
 {fin}    (void)count;
 }}
