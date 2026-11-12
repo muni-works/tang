@@ -277,6 +277,9 @@ pub mod ir_msl;
 pub mod ir_qwen;
 pub mod qwen_session;
 
+/// Qwen3-Coder-Next served from its derived step (`TANG_CODER_ENGINE=derived`).
+#[cfg(feature = "coder-serve")]
+pub mod coder_serve;
 /// Generated CUDA decode kernels run on the CPU (host g++), for checks
 /// without a GPU.
 pub mod cuda_cpu;

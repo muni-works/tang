@@ -292,6 +292,17 @@ impl FlashServe {
             seed: (req.sampling.seed ^ (req.sampling.seed >> 32)) as u32,
             presence,
         };
+        let constraint = self.constraint(req)?;
+        ensure!(
+            constraint.is_none() || ids.len() >= 2,
+            "prompt too short for structured output"
+        );
+        let host = crate::structured::HostSampling {
+            temperature,
+            top_k,
+            top_p,
+            seed: req.sampling.seed,
+        };
         let (slot, reused, hit) = self.take_slot(&ids, req.cache_key.as_deref())?;
         self.cache.note(hit, ids.len(), reused);
         // An engine without per-row sampling refuses a sampled request: release the slot.

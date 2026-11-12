@@ -1432,6 +1432,59 @@ impl Program {
         }
     }
 
+    /// Raw storage words `range` of `t` (CUDA, device-resident buffers): a
+    /// slice of a row cache without reading the whole buffer. Words, not
+    /// values: a packed format comes back packed, for
+    /// [`write_words`](Self::write_words) to put back.
+    #[cfg(feature = "cuda")]
+    pub fn read_words(&self, rt: &Runtime, t: TensorId, range: std::ops::Range<usize>) -> Vec<f32> {
+        let (Runtime::Cuda(d), Storage::Cuda { slots, host, .. }) = (rt, &self.storage) else {
+            panic!("read_words: CUDA only")
+        };
+        let s = self.slot_of(t);
+        assert!(host[s].is_none(), "read_words of a host-mapped buffer");
+        assert!(range.end <= words(&self.program.buffers[self.buffer_index(t)]));
+        let mut out = vec![0.0f32; range.len()];
+        if !out.is_empty() {
+            d.stream
+                .memcpy_dtoh(&slots[s].slice(range), &mut out)
+                .expect("download");
+        }
+        d.sync();
+        out
+    }
+
+    /// Overwrite raw storage words of `t` from `offset` (the inverse of
+    /// [`read_words`](Self::read_words)).
+    #[cfg(feature = "cuda")]
+    pub fn write_words(&self, rt: &Runtime, t: TensorId, offset: usize, data: &[f32]) {
+        let (Runtime::Cuda(d), Storage::Cuda { slots, host, .. }) = (rt, &self.storage) else {
+            panic!("write_words: CUDA only")
+        };
+        let s = self.slot_of(t);
+        assert!(host[s].is_none(), "write_words of a host-mapped buffer");
+        assert!(offset + data.len() <= words(&self.program.buffers[self.buffer_index(t)]));
+        if data.is_empty() {
+            return;
+        }
+        use cudarc::driver::DevicePtr;
+        let (dst, _sync) = slots[s].device_ptr(&d.stream);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                dst + (offset * 4) as u64,
+                data,
+                d.stream.cu_stream(),
+            )
+        }
+        .expect("upload");
+        d.sync();
+    }
+
+    /// Storage words of `t`'s buffer.
+    pub fn words_of(&self, t: TensorId) -> usize {
+        words(&self.program.buffers[self.buffer_index(t)])
+    }
+
     /// [`read`](Self::read) on a bare wgpu device (work queued in a
     /// [`KernelCache`] batch must be flushed first).
     pub fn read_wgpu(&self, device: &GpuDevice, t: TensorId) -> Vec<f32> {

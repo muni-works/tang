@@ -63,6 +63,9 @@ otel = ["dep:tang-otel", "tang-gpu/otel"]
 # GGUF checkpoints through tang-llm's reader: ir_coder_real (Qwen3-Coder-Next
 # at real size from its derived graph) and the coder_derived runner.
 gguf = ["dep:tang-llm"]
+# Qwen3-Coder-Next served from its derived step (`coder_serve`, TANG_CODER_ENGINE=derived):
+# tang-llm's server and flash engines need its CUDA build.
+coder-serve = ["cuda", "gguf", "tang-llm/cuda", "dep:anyhow"]
 # Reassociable float ops in hot reductions. Requires Rust 1.98+.
 threads = ["tang-la/threads", "tang-tensor/threads", "tang-train/threads", "tang-infer/threads"]
 algebraic = [
@@ -79,6 +82,10 @@ name = "algebraic_reductions"
 [[example]]
 name = "coder_derived"
 required-features = ["cuda", "gguf"]
+
+[[example]]
+name = "coder_serve"
+required-features = ["coder-serve"]
 
 [[example]]
 name = "glm_real_gpu"
@@ -116,6 +123,7 @@ sha2 = "0.10"
 tokenizers = { workspace = true }
 tang-otel = { workspace = true, optional = true }
 tang-llm = { workspace = true, optional = true }
+anyhow = { version = "1", optional = true }
 tang-moe = { workspace = true, optional = true }
 
 [dev-dependencies]
