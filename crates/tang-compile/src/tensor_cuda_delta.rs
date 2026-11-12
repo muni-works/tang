@@ -198,6 +198,15 @@ impl TensorGraph {
         let tn = ks[sc.dim];
         let lo: usize = ks[sc.dim + 1..p].iter().product();
         let heads: usize = ks[..p].iter().product::<usize>() / tn;
+        // many rows (a prefill chunk, `TANG_DELTA_CHUNK_MIN` = 64): the
+        // chunked form
+        if tn >= env_usize("TANG_DELTA_CHUNK_MIN", 64)
+            && m.is_multiple_of(8)
+            && n <= 256
+            && std::env::var("TANG_DELTA_CHUNK").as_deref() != Ok("0")
+        {
+            return self.cuda_delta_chunked(root, reads);
+        }
         let (bv, parts) = Self::delta_threads(n, m).unwrap();
         let (threads, rows, ncb) = (bv * parts, n / parts, m / bv);
         let arg = |i: usize| {
@@ -312,4 +321,203 @@ impl TensorGraph {
         writeln!(src, "    (void)count;\n}}").unwrap();
         (src, threads, heads * ncb)
     }
+
+    /// [`cuda_delta_kernel`](Self::cuda_delta_kernel) for many rows: a
+    /// block per (head, 16 (or 8) state columns) walks the rows in chunks of
+    /// `C = 64`. With `γ` the running sum of `log α` in a chunk and `S₀`
+    /// the state entering it, the recurrence
+    /// `S_t = α_t(S − β_t k_t(k_tᵀS)) + β_t k_t v_tᵀ` is
+    /// `S_t = e^{γ_t}S₀ + Σ_{s≤t} e^{γ_t−γ_s} k_s u_sᵀ` where
+    /// `(I + A)U = βV − (βe^γ ⊙ K)S₀`, `A_ts = β_t e^{γ_t−γ_s} k_t·k_s`
+    /// (`s < t`; forward substitution, the chunk's rows in order). Then
+    /// `o_t = scale·(e^{γ_t} q_t·S₀ + Σ_{s≤t} e^{γ_t−γ_s}(q_t·k_s) u_s)` and
+    /// `S₀ ← e^{γ_C}S₀ + Σ_s e^{γ_C−γ_s} k_s u_sᵀ`. The same sums as the
+    /// step kernel, regrouped: matrix products over the chunk instead of
+    /// `C` dependent steps.
+    fn cuda_delta_chunked(&self, root: usize, reads: &[usize]) -> (String, usize, usize) {
+        let sc = self.scan_at(TensorId(root as u32)).unwrap();
+        let ScanKind::Delta(d) = &sc.kind else {
+            unreachable!()
+        };
+        let (ik, iv, ia, ib, ii, iq) = d.slots();
+        let ks = fixed(self.shape(sc.inputs[ik]));
+        let p = ks.len() - 1;
+        let n = ks[p];
+        let m = *fixed(self.shape(sc.inputs[iv])).last().unwrap();
+        let tn = ks[sc.dim];
+        let lo: usize = ks[sc.dim + 1..p].iter().product();
+        let heads: usize = ks[..p].iter().product::<usize>() / tn;
+        // rows a chunk (`TANG_DELTA_CHUNK_ROWS`, 64; 2..=64)
+        let bv = if m.is_multiple_of(16) { 16usize } else { 8 };
+        let cc = env_usize("TANG_DELTA_CHUNK_ROWS", 64).clamp(2, 64);
+        let ncb = m / bv;
+        let ld = n + 1;
+        let arg = |i: usize| {
+            let s = self.storage(sc.inputs[i]).n();
+            format!("q{}", reads.iter().position(|&r| r == s).unwrap())
+        };
+        let params: Vec<String> = (0..reads.len())
+            .map(|i| format!("const float* __restrict__ q{i}"))
+            .collect();
+        let (kk, vv, s0) = (arg(ik), arg(iv), arg(ii));
+        let al = ia.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
+        let be = ib.map_or("1.0f".to_string(), |i| format!("{}[p]", arg(i)));
+        let ro = d.readout.is_some();
+        // shared floats: K, Q [C][n+1], M [C][C], S₀ [n][bv], U, R, V [C][bv], γ, β [C]
+        let qf = if ro { cc * ld } else { 0 };
+        // γ and β: 64 each (the scan writes a full warp's 64)
+        let smem = 4 * (cc * ld + qf + cc * cc + n * bv + 3 * cc * bv + 128);
+        let qload = match iq {
+            Some(i) => format!("            Qs[t * {ld} + x] = {}[p * {n} + x];\n", arg(i)),
+            None => String::new(),
+        };
+        let delta = if d.delta {
+            format!(
+                r#"        // A (strictly lower) and R = βV − (βe^γ ⊙ K)S₀
+        for (int e = tid; e < {cc} * {cc}; e += 256) {{
+            const int t = e / {cc}, s_ = e % {cc};
+            float a = 0.f;
+            if (s_ < t && t < nt) {{
+                const float* kt = Ks + t * {ld}; const float* ks_ = Ks + s_ * {ld};
+                for (int x = 0; x < {n}; ++x) a += kt[x] * ks_[x];
+                a *= bs[t] * expf(gs[t] - gs[s_]);
+            }}
+            Ms[e] = a;
+        }}
+        for (int e = tid; e < {cc} * {bv}; e += 256) {{
+            const int t = e / {bv}, c = e % {bv};
+            float a = 0.f;
+            if (t < nt) {{ const float* kt = Ks + t * {ld}; for (int x = 0; x < {n}; ++x) a += kt[x] * S0[x * {bv} + c]; }}
+            Rs[e] = bs[t] * (Vs[e] - expf(gs[t]) * a);
+        }}
+        __syncthreads();
+        // forward substitution: U_t = R_t − Σ_{{s<t}} A_ts U_s (16 lanes a column)
+        for (int t = 0; t < nt; ++t) {{
+            float a = 0.f;
+            if (col16 < {bv}) for (int s_ = part; s_ < t; s_ += 16) a += Ms[t * {cc} + s_] * Us[s_ * {bv} + col16];
+            a += __shfl_xor_sync(0xffffffffu, a, 8); a += __shfl_xor_sync(0xffffffffu, a, 4);
+            a += __shfl_xor_sync(0xffffffffu, a, 2); a += __shfl_xor_sync(0xffffffffu, a, 1);
+            if (part == 0 && col16 < {bv}) Us[t * {bv} + col16] = Rs[t * {bv} + col16] - a;
+            __syncthreads();
+        }}
+"#
+            )
+        } else {
+            format!(
+                r#"        for (int e = tid; e < {cc} * {bv}; e += 256) Us[e] = e / {bv} < nt ? bs[e / {bv}] * Vs[e] : 0.f;
+        __syncthreads();
+"#
+            )
+        };
+        let readout = match d.readout {
+            Some(scale) => format!(
+                r#"        // P = tril(Q Kᵀ ⊙ e^{{γt−γs}}), then o = scale·(e^γ Q S₀ + P U)
+        for (int e = tid; e < {cc} * {cc}; e += 256) {{
+            const int t = e / {cc}, s_ = e % {cc};
+            float a = 0.f;
+            if (s_ <= t && t < nt) {{
+                const float* qt = Qs + t * {ld}; const float* ks_ = Ks + s_ * {ld};
+                for (int x = 0; x < {n}; ++x) a += qt[x] * ks_[x];
+                a *= expf(gs[t] - gs[s_]);
+            }}
+            Ms[e] = a;
+        }}
+        __syncthreads();
+        for (int e = tid; e < {cc} * {bv}; e += 256) {{
+            const int t = e / {bv}, c = e % {bv};
+            if (t < nt) {{
+                float a = 0.f, b = 0.f;
+                const float* qt = Qs + t * {ld};
+                for (int x = 0; x < {n}; ++x) a += qt[x] * S0[x * {bv} + c];
+                for (int s_ = 0; s_ <= t; ++s_) b += Ms[t * {cc} + s_] * Us[s_ * {bv} + c];
+                const long long p = (hi * {tn} + t0 + t) * {lo} + lo;
+                out[p * {m} + cb * {bv} + c] = {scale:.9e}f * (expf(gs[t]) * a + b);
+            }}
+        }}
+        __syncthreads();
+"#
+            ),
+            None => String::new(),
+        };
+        let fin = if ro {
+            String::new()
+        } else {
+            format!(
+                "    for (int e = tid; e < {n} * {bv}; e += 256) out[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}] = S0[e];\n",
+                nm = n * m
+            )
+        };
+        let src = format!(
+            r#"#define TANG_SMEM {smem}
+// Auto-generated by tang-compile: fused delta step (decode), chunked
+extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    extern __shared__ float tang_dsm[];
+    float* Ks = tang_dsm;
+    float* Qs = Ks + {cc} * {ld};
+    float* Ms = Qs + {qf};
+    float* S0 = Ms + {cc} * {cc};
+    float* Us = S0 + {n} * {bv};
+    float* Rs = Us + {cc} * {bv};
+    float* Vs = Rs + {cc} * {bv};
+    float* gs = Vs + {cc} * {bv};
+    float* bs = gs + 64;
+    const int tid = threadIdx.x, col16 = tid / 16, part = tid % 16;
+    const int h = blockIdx.x / {ncb}, cb = blockIdx.x % {ncb};
+    const long long hi = h / {lo}, lo = h % {lo};
+    for (int e = tid; e < {n} * {bv}; e += 256) S0[e] = {s0}[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}];
+    for (int t0 = 0; t0 < {tn}; t0 += {cc}) {{
+        const int nt = min({cc}, {tn} - t0);
+        __syncthreads();
+        for (int e = tid; e < nt * {n}; e += 256) {{
+            const int t = e / {n}, x = e % {n};
+            const long long p = (hi * {tn} + t0 + t) * {lo} + lo;
+            Ks[t * {ld} + x] = {kk}[p * {n} + x];
+{qload}        }}
+        for (int e = tid; e < {cc} * {bv}; e += 256) {{
+            const int t = e / {bv};
+            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+            Vs[e] = t < nt ? {vv}[p * {m} + cb * {bv} + e % {bv}] : 0.f;
+        }}
+        // γ: the running sum of log α (one warp's scan of 64), β
+        if (tid < 32) {{
+            float l[2];
+            for (int i = 0; i < 2; ++i) {{
+                const int t = 2 * tid + i;
+                const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+                l[i] = t < nt ? logf({al}) : 0.f;
+                bs[t] = t < nt ? {be} : 0.f;
+            }}
+            float x = l[0] + l[1];
+            for (int o = 1; o < 32; o *= 2) {{ const float y = __shfl_up_sync(0xffffffffu, x, o); if (tid >= o) x += y; }}
+            const float ex = x - (l[0] + l[1]);
+            gs[2 * tid] = ex + l[0]; gs[2 * tid + 1] = x;
+        }}
+        __syncthreads();
+{delta}{readout}        // S₀ ← e^{{γ_C}} S₀ + Σ_s e^{{γ_C−γ_s}} k_s u_sᵀ
+        {{
+            const float gc = gs[nt - 1];
+            for (int e = tid; e < {n} * {bv}; e += 256) {{
+                const int x = e / {bv}, c = e % {bv};
+                float a = 0.f;
+                for (int s_ = 0; s_ < nt; ++s_) a += expf(gc - gs[s_]) * Ks[s_ * {ld} + x] * Us[s_ * {bv} + c];
+                S0[e] = expf(gc) * S0[e] + a;
+            }}
+        }}
+    }}
+    __syncthreads();
+{fin}    (void)count;
+}}
+"#,
+            params = params.join(", "),
+            nm = n * m,
+        );
+        (src, 256, heads * ncb)
+    }
+}
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }

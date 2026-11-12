@@ -1102,6 +1102,22 @@ mod tests {
     }
 
     #[test]
+    fn chunked_delta_scan_on_the_cpu() {
+        // the chunked delta kernel at 4 rows a chunk: the tiny coder's 5-,
+        // 8- and 16-row steps cross chunk boundaries and end mid-chunk
+        std::env::set_var("TANG_DELTA_CHUNK_MIN", "2");
+        std::env::set_var("TANG_DELTA_CHUNK_ROWS", "4");
+        let m = coder();
+        for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
+            let (e, nk) = chunked_then_decode(&m, ks);
+            eprintln!("coder chunked delta, chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}");
+            assert!(e < 1e-4, "{ks:?}: {e}");
+        }
+        std::env::remove_var("TANG_DELTA_CHUNK_MIN");
+        std::env::remove_var("TANG_DELTA_CHUNK_ROWS");
+    }
+
+    #[test]
     fn chunked_prefill_then_decode_on_the_cpu() {
         for m in [qwen(), coder()] {
             for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
