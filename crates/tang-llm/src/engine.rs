@@ -561,7 +561,6 @@ impl<D: ComputeDevice> Engine<D> {
             cache,
             cache_images: Vec::new(),
             cache_key: None,
-            tenant: None,
             cache_used: 0,
             cache_at: crate::retention::now(),
             parked: Vec::new(),
