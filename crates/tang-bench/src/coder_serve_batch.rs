@@ -221,7 +221,7 @@ impl BatchedCoder {
         let ro = RealOpts {
             batch: Some(nb),
             group,
-            block: BlockOpts::batched(),
+            block: Some(BlockOpts::batched()),
         };
         let low_s = lower_real_step_with(&pg, &st_s, &tys, &ro);
         let low_g = lower_real_step_with(&pg, &st_g, &tys, &ro);
