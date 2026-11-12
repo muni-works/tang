@@ -477,9 +477,10 @@ impl TensorGraph {
                         opts,
                     };
                     if let Some(kern) = lw.staged_map(root) {
-                        k.source = lw
+                        let kern = lw
                             .with_side_jobs(&kern, &k.writes)
                             .unwrap_or_else(|| panic!("node {root}: side jobs did not lower"));
+                        k.source = kern.source.clone();
                         k.workgroup_size = kern.threads as u32;
                         k.count = (kern.blocks * kern.threads) as u32;
                         native.push(true);
@@ -599,10 +600,14 @@ impl TensorGraph {
             }
             match got {
                 Some(kern) => {
+                    let kern = if target == DecodeTarget::Cuda {
+                        lw.with_side_jobs(&kern, &k.writes)
+                            .unwrap_or_else(|| panic!("node {root}: side jobs did not lower"))
+                    } else {
+                        kern
+                    };
                     k.source = match target {
-                        DecodeTarget::Cuda => lw
-                            .with_side_jobs(&kern, &k.writes)
-                            .unwrap_or_else(|| panic!("node {root}: side jobs did not lower")),
+                        DecodeTarget::Cuda => kern.source.clone(),
                         DecodeTarget::Msl => {
                             // Metal binds the donor once, read-write, as
                             // `out` (wgpu refuses one buffer bound both ways)
@@ -4292,7 +4297,15 @@ impl Lowering<'_> {
     /// (every thread present, before any early return), its small
     /// reductions staged per block as in `staged_map`, stored to `b{u}`.
     /// One scope, so its names shadow nothing of the kernel's own.
-    fn side_job(&self, u: usize, threads: usize, blocks: usize, ctr: &mut usize) -> Option<String> {
+    fn side_job(
+        &self,
+        u: usize,
+        threads: usize,
+        blocks: usize,
+        bid: &str,
+        nb: &str,
+        ctr: &mut usize,
+    ) -> Option<String> {
         let g = self.g;
         let c = g.comp_at(u)?;
         if c.monoid.is_some()
@@ -4334,7 +4347,7 @@ impl Lowering<'_> {
         }
         writeln!(
             s,
-            "    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < {n}; t += gridDim.x * blockDim.x) {{"
+            "    for (int t = ({bid}) * blockDim.x + threadIdx.x; t < {n}; t += ({nb}) * blockDim.x) {{"
         )
         .unwrap();
         let mut rem = "t".to_string();
@@ -4369,34 +4382,90 @@ impl Lowering<'_> {
     }
 
     /// `kern` with the side jobs `writes` added: their buffers as
-    /// parameters after `out` (in order) and their loops first in the
-    /// body. `kern` unchanged when there are none.
-    fn with_side_jobs(&self, kern: &Kernel, writes: &[TensorId]) -> Option<String> {
+    /// parameters after `out` (in order). By default each side job gets
+    /// blocks of its own past the kernel's (`⌈points / threads⌉`, at most
+    /// 1024), which run it and return, so it runs alongside the kernel's
+    /// work instead of in front of it; the kernel body sees its own
+    /// `gridDim.x`. `TANG_COKERNEL_BLOCKS=0`: the old layout, every side
+    /// job a grid-stride loop at the top run by the kernel's own threads.
+    /// `kern` unchanged when there are none.
+    fn with_side_jobs(&self, kern: &Kernel, writes: &[TensorId]) -> Option<Kernel> {
         if writes.is_empty() {
-            return Some(kern.source.clone());
+            return Some(Kernel {
+                source: kern.source.clone(),
+                threads: kern.threads,
+                blocks: kern.blocks,
+            });
         }
         let src = &kern.source;
         let sig = src.find("main0(")?;
         let close = sig + src[sig..].find(", unsigned count)")?;
         let open = close + src[close..].find('{')?;
+        let own = !std::env::var("TANG_COKERNEL_BLOCKS").is_ok_and(|v| v == "0");
         // temporaries numbered past anything the kernel uses
         let mut ctr = 1_000_000usize;
         let mut jobs = String::new();
-        for &u in writes {
-            jobs.push_str(&self.side_job(u.n(), kern.threads, kern.blocks, &mut ctr)?);
+        let mut extra = 0usize;
+        if own {
+            let b0 = kern.blocks;
+            jobs.push_str(&format!("    if (blockIdx.x >= {b0}u) {{\n    const unsigned tang_sb = blockIdx.x - {b0}u;\n"));
+            for (q, &u) in writes.iter().enumerate() {
+                let n: usize = self
+                    .g
+                    .comp_at(u.n())
+                    .map_or(1, |c| fixed(c.points()).iter().product());
+                let e = n.div_ceil(kern.threads).clamp(1, 1024);
+                jobs.push_str(&format!(
+                    "    {}if (tang_sb < {}u) {{\n",
+                    if q > 0 { "else " } else { "" },
+                    extra + e
+                ));
+                jobs.push_str(&self.side_job(
+                    u.n(),
+                    kern.threads,
+                    e,
+                    &format!("tang_sb - {extra}u"),
+                    &format!("{e}u"),
+                    &mut ctr,
+                )?);
+                jobs.push_str("    }\n");
+                extra += e;
+            }
+            jobs.push_str("    return;\n    }\n");
+        } else {
+            for &u in writes {
+                jobs.push_str(&self.side_job(
+                    u.n(),
+                    kern.threads,
+                    kern.blocks,
+                    "blockIdx.x",
+                    "gridDim.x",
+                    &mut ctr,
+                )?);
+            }
         }
         let params: String = writes
             .iter()
             .map(|u| format!(", float* __restrict__ b{}", u.n()))
             .collect();
+        // the kernel's own body: its grid, not the side jobs' blocks
+        let body = if own {
+            src[open + 1..].replace("gridDim.x", &format!("{}u", kern.blocks))
+        } else {
+            src[open + 1..].to_string()
+        };
         let mut out = String::with_capacity(src.len() + jobs.len() + params.len());
         out.push_str(&src[..close]);
         out.push_str(&params);
         out.push_str(&src[close..=open]);
         out.push('\n');
         out.push_str(&jobs);
-        out.push_str(&src[open + 1..]);
-        Some(out)
+        out.push_str(&body);
+        Some(Kernel {
+            source: out,
+            threads: kern.threads,
+            blocks: kern.blocks + extra,
+        })
     }
 }
 
@@ -4432,7 +4501,7 @@ impl TensorGraph {
         root: usize,
         packed: &HashMap<usize, Packing>,
         opts: &DecodeOpts,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let reads = self.host_kernel_reads(root);
         let lw = Lowering {
             g: self,
@@ -4458,7 +4527,7 @@ impl TensorGraph {
             .filter(|&u| self.nodes[u].host == Some(r))
             .map(|u| TensorId(u as u32))
             .collect();
-        if lw.with_side_jobs(&kern, &writes).is_none() {
+        let Some(all) = lw.with_side_jobs(&kern, &writes) else {
             if std::env::var("TANG_COKERNEL_DEBUG").is_ok() {
                 eprintln!(
                     "cokernel: n{root} lowered ({}) but its side jobs {writes:?} did not",
@@ -4466,8 +4535,9 @@ impl TensorGraph {
                 );
             }
             return None;
-        }
-        Some(kern.threads * kern.blocks)
+        };
+        // blocks with the side jobs' own
+        Some((all.threads, all.blocks))
     }
 
     /// Schedule (decode, CUDA): multi-output kernels (`TNode::host`), so
@@ -4661,6 +4731,12 @@ impl TensorGraph {
             }
         }
         let mut jobs = 0;
+        let own_blocks = !std::env::var("TANG_COKERNEL_BLOCKS").is_ok_and(|v| v == "0");
+        // SMs a host may fill and still leave room (H200: 132)
+        let sms: usize = std::env::var("TANG_COKERNEL_SMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(132);
         for u in (0..n).filter(|_| rules.contains('b')) {
             // a kernel that already hosts side jobs keeps its launch
             if !plain_map(self, u) || self.hosts(u) {
@@ -4683,9 +4759,18 @@ impl TensorGraph {
                     continue;
                 }
                 self.nodes[u].host = Some(TensorId(k as u32));
+                let fits = |(t, b): (usize, usize)| {
+                    if own_blocks {
+                        // the side job's blocks run beside the host's only
+                        // where the host leaves SMs idle
+                        b <= sms
+                    } else {
+                        // enough threads that the loop stays short
+                        t * b * 64 >= un
+                    }
+                };
                 match self.probe_native(k, &packed, opts) {
-                    // enough threads that the loop stays short
-                    Some(t) if t * 64 >= un => {
+                    Some(tb) if fits(tb) => {
                         jobs += 1;
                         break;
                     }
