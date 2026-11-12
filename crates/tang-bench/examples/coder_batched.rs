@@ -59,7 +59,7 @@ fn main() {
             std::env::var("TANG_BATCH_GROUP")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32)
+                .unwrap_or(64)
         },
         |v| v.parse().unwrap(),
     );
