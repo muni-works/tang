@@ -84,12 +84,13 @@ impl BlockOpts {
         if npos <= 1 || matches!(wf, Format::Fp8B32 | Format::Mxfp4) {
             return gemv;
         }
-        // positions a block on the tensor cores (`TANG_BATCH_MMA_PT`, 8):
+        // positions a block on the tensor cores (`TANG_BATCH_MMA_PT`, 16):
         // each block reads its weight rows once for that many positions
+        // (coder-next B=64 at ~6k, H200: 8 → 38.7, 16 → 36.9, 32 → 37.5 ms)
         let mma_pt: u32 = std::env::var("TANG_BATCH_MMA_PT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(16);
         let mma = IntMma {
             stage: Stage::Mma,
             ksplit: if self.ksplit == 0 { 2 } else { self.ksplit },
