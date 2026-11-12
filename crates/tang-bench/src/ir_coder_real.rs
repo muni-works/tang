@@ -31,6 +31,31 @@ pub fn format_of(ty: GgmlType) -> Option<Format> {
     }
 }
 
+/// `vals` (a row-major weight, rows a multiple of 32 long) as GGUF Q8_0
+/// blocks: per 32 values an f16 `d = max|x| / 127` and `round(x / d)` as
+/// int8. How a Q6_K weight goes up once [`lower_real_step_with`] has given
+/// it Q8_0 storage.
+pub fn q8_0_of(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() / 32 * 34);
+    for b in vals.chunks(32) {
+        let amax = b.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let d = amax / 127.0;
+        let dh = tang_llm::gguf::f32_to_f16(d);
+        out.extend_from_slice(&dh.to_le_bytes());
+        // quantize against the scale as stored (f16)
+        let ds = tang_llm::gguf::f16_to_f32(dh);
+        for &x in b {
+            let q = if ds > 0.0 {
+                (x / ds).round().clamp(-127.0, 127.0)
+            } else {
+                0.0
+            };
+            out.push(q as i8 as u8);
+        }
+    }
+    out
+}
+
 /// [`CoderDims`] from the `qwen3next.*` header.
 pub fn dims_from_gguf(g: &Gguf) -> Result<CoderDims, String> {
     let u = |k: &str| -> Result<usize, String> {
@@ -174,6 +199,11 @@ pub fn lower_real_step_with(
         if let Some(f) = gguf_of(k).and_then(format_of) {
             if matches!(f, Format::Q4K | Format::Q5K | Format::Q8_0) {
                 graph.set_precision(input_node(&graph, k), Precision::storage(f));
+            }
+            // Q6_K (one routed down-projection): requantized to Q8_0 at
+            // upload ([`q8_0_of`]) so it rides the int8 kernels too
+            if f == Format::Q6K {
+                graph.set_precision(input_node(&graph, k), Precision::storage(Format::Q8_0));
             }
         }
     }

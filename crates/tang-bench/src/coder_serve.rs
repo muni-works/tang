@@ -25,6 +25,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::time::Instant;
+use tang_compile::tensor::Format;
 
 use anyhow::{ensure, Context, Result};
 use tang_compile::tensor::step::{Rows, StepInput};
@@ -224,6 +225,9 @@ impl DerivedCoder {
             }
             let t = g.info(&pg.inputs[i].name)?;
             let words = match (storage[k], t.ty) {
+                (Some(Format::Q8_0), GgmlType::Q6K) => {
+                    words_of_bytes(&crate::ir_coder_real::q8_0_of(&g.dequantize(t)?))
+                }
                 (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
                 (None, _) => g.dequantize(t)?,
             };

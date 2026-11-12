@@ -25,6 +25,7 @@ use tang_bench::ir_coder_prefill::{derived_step, derived_step_rows, prefill_grap
 use tang_bench::ir_coder_real::*;
 use tang_bench::qwen_session::{runtime, slot_plan};
 use tang_compile::tensor::step::StepInput;
+use tang_compile::tensor::Format;
 use tang_gpu::program::Program;
 use tang_llm::gguf::{GgmlType, Gguf};
 
@@ -206,6 +207,9 @@ fn main() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
         let words = match (storage[k], t.ty) {
+            (Some(Format::Q8_0), GgmlType::Q6K) => {
+                words_of_bytes(&q8_0_of(&g.dequantize(t).unwrap()))
+            }
             (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
             (None, _) => g.dequantize(t).unwrap(),
         };
