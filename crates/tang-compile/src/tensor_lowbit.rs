@@ -239,7 +239,9 @@ impl VqMatrix {
         book: Option<&[f64]>,
         iters: usize,
     ) -> Self {
-        assert!(w.len() == rows * cols && cols.is_multiple_of(VQ_GROUP) && cols.is_multiple_of(VQ_HB));
+        assert!(
+            w.len() == rows * cols && cols.is_multiple_of(VQ_GROUP) && cols.is_multiple_of(VQ_HB)
+        );
         let signs = vq_signs(cols, seed);
         let s64: Vec<f64> = signs.iter().map(|&x| x as f64).collect();
         let mut v = w.to_vec();
@@ -462,7 +464,9 @@ impl AffineMatrix {
         signs: Vec<f32>,
     ) -> Self {
         assert!(bits == 3 || bits == 4);
-        assert!(q.len() == rows * cols && cols.is_multiple_of(AFF_SPAN) && cols.is_multiple_of(VQ_HB));
+        assert!(
+            q.len() == rows * cols && cols.is_multiple_of(AFF_SPAN) && cols.is_multiple_of(VQ_HB)
+        );
         assert!(scales.len() == rows * cols / AFF_GROUP && biases.len() == scales.len());
         assert!(signs.is_empty() || signs.len() == cols);
         let mut codes = vec![0u32; q.len() / AFF_CHUNK * bits];

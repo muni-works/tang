@@ -174,8 +174,12 @@ impl TensorGraph {
     /// `(column block, row parts)`: a block is `bv · parts` threads, each
     /// holding `n / parts` rows of one column.
     fn delta_threads(n: usize, m: usize) -> Option<(usize, usize)> {
-        let parts = [16, 8, 4, 2, 1].into_iter().find(|&x| n.is_multiple_of(x))?;
-        let bv = [16, 8, 4, 2, 1].into_iter().find(|&x| m.is_multiple_of(x))?;
+        let parts = [16, 8, 4, 2, 1]
+            .into_iter()
+            .find(|&x| n.is_multiple_of(x))?;
+        let bv = [16, 8, 4, 2, 1]
+            .into_iter()
+            .find(|&x| m.is_multiple_of(x))?;
         Some((bv, parts))
     }
 
