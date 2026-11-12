@@ -940,6 +940,7 @@ fn poly(x: ExprId, c: &[f64]) -> ExprId {
 
 /// `erfc(y)` for `y ≥ 0.5`, Cody's rational forms (CALERF), and
 /// `erf(x)` for `|x| ≤ 0.5`: about 1e-16 relative on f64.
+#[allow(clippy::excessive_precision)] // Cody's published coefficients, digit for digit
 pub fn erf_expr(x: ExprId) -> ExprId {
     const A: [f64; 5] = [
         1.85777706184603153e-1,
