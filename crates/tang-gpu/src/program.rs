@@ -1439,7 +1439,15 @@ impl Program {
             };
         }
         launch.arg(&k.points);
-        unsafe { launch.launch(cfg) }.expect("launch");
+        if let Err(e) = unsafe { launch.launch(cfg) } {
+            panic!(
+                "launch kernel {i}: {e:?} (count {}, workgroup {}, smem {}): {}",
+                k.count,
+                k.workgroup_size,
+                cfg.shared_mem_bytes,
+                k.source.lines().take(3).collect::<Vec<_>>().join(" | ")
+            );
+        }
     }
 
     /// Read `t` back as f32 (waits for queued work; f16 widened exactly).
