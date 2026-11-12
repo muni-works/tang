@@ -374,16 +374,7 @@ impl TensorGraph {
         let delta = if d.delta {
             format!(
                 r#"        // A (strictly lower) and R = βV − (βe^γ ⊙ K)S₀
-        for (int e = tid; e < {cc} * {cc}; e += 256) {{
-            const int t = e / {cc}, s_ = e % {cc};
-            float a = 0.f;
-            if (s_ < t && t < nt) {{
-                const float* kt = Ks + t * {ld}; const float* ks_ = Ks + s_ * {ld};
-                for (int x = 0; x < {n}; ++x) a += kt[x] * ks_[x];
-                a *= bs[t] * expf(gs[t] - gs[s_]);
-            }}
-            Ms[e] = a;
-        }}
+        gram(Ks, true);
         for (int e = tid; e < {cc} * {bv}; e += 256) {{
             const int t = e / {bv}, c = e % {bv};
             float a = 0.f;
@@ -423,16 +414,7 @@ impl TensorGraph {
         let readout = match d.readout {
             Some(scale) => format!(
                 r#"        // P = tril(Q Kᵀ ⊙ e^{{γt−γs}}), then o = scale·(e^γ Q S₀ + P U)
-        for (int e = tid; e < {cc} * {cc}; e += 256) {{
-            const int t = e / {cc}, s_ = e % {cc};
-            float a = 0.f;
-            if (s_ <= t && t < nt) {{
-                const float* qt = Qs + t * {ld}; const float* ks_ = Ks + s_ * {ld};
-                for (int x = 0; x < {n}; ++x) a += qt[x] * ks_[x];
-                a *= expf(gs[t] - gs[s_]);
-            }}
-            Ms[e] = a;
-        }}
+        gram(Qs, false);
         __syncthreads();
         for (int e = tid; e < {cc} * {bv}; e += 256) {{
             const int t = e / {bv}, c = e % {bv};
@@ -473,6 +455,36 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     float* gs = Vs + {cc} * {bv};
     float* bs = gs + 64;
     const int tid = threadIdx.x, col16 = tid / 16, part = tid % 16;
+    // Ms = a C × C Gram of X's rows with K's, 4 × 4 a thread (rows ti + 16a,
+    // columns si + 16b: a warp reads distinct banks of K), masked lower
+    // (strict: × β_t, the delta system; else the readout's) and decayed
+    auto gram = [&](const float* X, bool strict) {{
+        const int ti = tid / 16, si = tid % 16;
+        for (int t4 = 0; t4 < {cc}; t4 += 64) {{
+        float acc[4][4] = {{}};
+        #pragma unroll 4
+        for (int x = 0; x < {n}; ++x) {{
+            float xa[4], kb[4];
+            #pragma unroll
+            for (int a = 0; a < 4; ++a) xa[a] = X[(ti + 16 * a) % {cc} * {ld} + x];
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) kb[b] = Ks[(si + 16 * b) % {cc} * {ld} + x];
+            #pragma unroll
+            for (int a = 0; a < 4; ++a)
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) acc[a][b] += xa[a] * kb[b];
+        }}
+        #pragma unroll
+        for (int a = 0; a < 4; ++a)
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) {{
+                const int t = ti + 16 * a, s_ = si + 16 * b;
+                if (t >= {cc} || s_ >= {cc}) continue;
+                const bool on = t < nt && (strict ? s_ < t : s_ <= t);
+                Ms[t * {cc} + s_] = on ? acc[a][b] * (strict ? bs[t] : 1.f) * expf(gs[t] - gs[s_]) : 0.f;
+            }}
+        }}
+    }};
     const int h = blockIdx.x / {ncb}, cb = blockIdx.x % {ncb};
     const long long hi = h / {lo}, lo = h % {lo};
     for (int e = tid; e < {n} * {bv}; e += 256) S0[e] = {s0}[(long long)h * {nm} + (long long)(e / {bv}) * {m} + cb * {bv} + e % {bv}];
@@ -508,14 +520,15 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
 {delta}{readout}        // S₀ ← e^{{γ_C}} S₀ + Σ_s e^{{γ_C−γ_s}} k_s u_sᵀ
         {{
             const float gc = gs[nt - 1];
-            // e^{{γ_C−γ_s}} into β's slots (β is not read again this chunk)
+            // e^{{γ_C−γ_s}}·u_s into R's slots (R is not read again this chunk)
             __syncthreads();
-            if (tid < nt) bs[tid] = expf(gc - gs[tid]);
+            for (int e = tid; e < nt * {bv}; e += 256) Rs[e] = expf(gc - gs[e / {bv}]) * Us[e];
             __syncthreads();
+            // n × bv outputs, (x, c) and (x + n/2, c) a thread pair per pass
             for (int e = tid; e < {n} * {bv}; e += 256) {{
                 const int x = e / {bv}, c = e % {bv};
                 float a = 0.f;
-                for (int s_ = 0; s_ < nt; ++s_) a += bs[s_] * Ks[s_ * {ld} + x] * Us[s_ * {bv} + c];
+                for (int s_ = 0; s_ < nt; ++s_) a += Ks[s_ * {ld} + x] * Rs[s_ * {bv} + c];
                 S0[e] = expf(gc) * S0[e] + a;
             }}
         }}
