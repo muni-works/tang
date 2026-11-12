@@ -123,6 +123,17 @@ __device__ __forceinline__ void row_prefetch(const DsW& w, int r, int lane) {
         asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
 }
 
+// One row of a batched rows step (engine.rs `RowP`): its position and its sequence slot's
+// buffers for this layer (window ring, compressor partial groups, compressed KV, indexer
+// keys). A kernel given a non-null table treats row e as its own one-token sequence.
+#ifndef DS_ROWP
+#define DS_ROWP
+struct RowP {
+    unsigned long long ring, kst, sst, ckv, idxk;
+    int pos, pad;
+};
+#endif
+
 extern "C" __global__ void ds_linear(DsW w, const float* x, float* y, int t, int round) { DS_PDL_ENTRY
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
     if (warp >= t * w.rows) return;
@@ -1157,10 +1168,19 @@ extern "C" __global__ void ds_pool(const float* kv, const float* sc, float* out,
 // then ds_rms(nw), into lat[e]. Bit for bit the per-position ring_write + pool + round + rms.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst, const float* sst, const float* kv,
                                                                  const float* sc, float* lat, DsW nw, const int* P,
-                                                                 int r, int hd, float eps) { DS_PDL_ENTRY
+                                                                 int r, int hd, float eps, const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, p0 = P[0], pe = p0 + e;
     float* out = lat + (long long)e * hd;
+    if (rt) {
+        // row e alone: its own slot's partial groups, its position, its kv/score row
+        p0 = rt[e].pos;
+        pe = p0;
+        kst = (const float*)rt[e].kst;
+        sst = (const float*)rt[e].sst;
+        kv += (long long)e * hd;
+        sc += (long long)e * hd;
+    }
     for (int c = threadIdx.x; c < hd; c += blockDim.x) {
         float mx = -DS_INF;
         for (int j = 0; j < r; j++) {
@@ -1203,10 +1223,19 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_pool(const float* kst
 // The rows a batch of t leaves in two rings of r slots (slot (P[0] + e) % r): only each slot's
 // last write, so the batch's rows never race.
 extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, const float* b, int t, int hd, int r,
-                                         const int* P) { DS_PDL_ENTRY
+                                         const int* P, const RowP* rt) { DS_PDL_ENTRY
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)t * hd) return;
     int e = i / hd, c = i % hd;
+    if (rt) {
+        // each row its own sequence: it writes its slot's ring at its position
+        ra = (float*)rt[e].kst;
+        rb = (float*)rt[e].sst;
+        long long o = (long long)(rt[e].pos % r) * hd + c;
+        ra[o] = a[i];
+        rb[o] = b[i];
+        return;
+    }
     if (e + r < t) return;
     long long o = (long long)((P[0] + e) % r) * hd + c;
     ra[o] = a[i];
@@ -1219,9 +1248,18 @@ extern "C" __global__ void ds_ring_last2(float* ra, const float* a, float* rb, c
 // ds_fp4_qdq, into cache row (P[0] + e) / r, by the batch's last row for that cache row.
 extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int hd, float* ckv, float* ik, int ihd,
                                                                  DsW kn, float* idxk, const float2* tab, int rd,
-                                                                 const int* P, int r, int t, float eps) { DS_PDL_ENTRY
+                                                                 const int* P, int r, int t, float eps,
+                                                                 const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int e = blockIdx.x, job = blockIdx.y, p0 = P[0];
+    // row e alone (rt): its position, its slot's caches; it always writes its cache row
+    int el = e;
+    if (rt) {
+        p0 = rt[e].pos;
+        el = 0;
+        ckv = (float*)rt[e].ckv;
+        idxk = (float*)rt[e].idxk;
+    }
     int n = job ? ihd : hd, blk = job ? 32 : 16;
     float* x = job ? ik + (long long)e * ihd : lat + (long long)e * hd;
     if (job) {
@@ -1240,7 +1278,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int 
         for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] = bf(wget(kn, 0, i) * (x[i] * rs));
         __syncthreads();
     }
-    int half = rd / 2, pos = max(p0 + e + 1 - r, 0);
+    int half = rd / 2, pos = max(p0 + el + 1 - r, 0);
     float* tp = x + (n - rd);
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float2 cs = tab[(long long)pos * half + j];
@@ -1258,8 +1296,8 @@ extern "C" __global__ void __launch_bounds__(1024) ds_comp_post(float* lat, int 
         for (int i = 0; i < blk; i++) p[i] = bf(round_fp4(fminf(fmaxf(p[i] / s, -6.f), 6.f)) * s);
     }
     __syncthreads();
-    if (e != t - 1 && (p0 + e + 1) % r != 0) return;
-    float* dst = (job ? idxk : ckv) + (long long)((p0 + e) / r) * n;
+    if (!rt && e != t - 1 && (p0 + e + 1) % r != 0) return;
+    float* dst = (job ? idxk : ckv) + (long long)((p0 + el) / r) * n;
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = x[i];
 }
 
@@ -1850,6 +1888,24 @@ DS_KST(2, 0)
 DS_KST(3, 0)
 DS_KST(2, 1)
 DS_KST(3, 1)
+// The K-split GEMV over t > 8 rows that gives every row exactly its decode (t <= 8) result:
+// the decode's own (S, SB) split (Kernels::ks_split of the weight's shape, not of t), item
+// (chunk c fastest, row group br, K slice sb). Each 8-row chunk has its own partials
+// (part + c * SB * 8 * R2) and counters (cnt + c * nbr), summed in the decode's order.
+#define DS_KSR(F, G)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(256) ds_ksr_f##F##_g##G(                                       \
+        DsW w, DsW w3, const unsigned char* xc, const float* xsc, float* y, int t, int round, const float* rw,  \
+        float lim, int S, int SB, int nbr, float* part, int* cnt) { DS_PDL_ENTRY                                \
+        int nc = (t + 7) / 8, c = blockIdx.x % nc, item = blockIdx.x / nc, r0 = c * 8;                        \
+        long long r2 = G ? 2LL * w.rows : (long long)w.rows;                                                    \
+        lin_mma<F, G>(w, w3, xc + (long long)r0 * w.cols, xsc + (long long)r0 * (w.cols / 32),                 \
+                      y + (long long)r0 * w.rows, min(8, t - r0), round, rw ? rw + r0 : 0, lim, S, SB, nbr,     \
+                      part + (long long)c * SB * 8 * r2, cnt + (long long)c * nbr, 0, 0, 0, item);               \
+    }
+DS_KSR(2, 0)
+DS_KSR(3, 0)
+DS_KSR(2, 1)
+DS_KSR(3, 1)
 // Two K-split GEMVs on the same quantized x in one launch (wq_a and wkv): items 0 .. na - 1 are
 // w's (S, SB, nbr, part, cnt), the rest wb's; x staged once per block. Each output as its own
 // ds_ks_f*_g0 launch, bit for bit.
@@ -2183,9 +2239,10 @@ DS_WO_KS(3)
 extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn, unsigned char* qc, float* qsc,
                                                                 float* kv, DsW kn, const float2* tab, int rd,
                                                                 const int* P, float* ring, int win, float* all,
-                                                                float eps) { DS_PDL_ENTRY
+                                                                float eps, const RowP* rt) { DS_PDL_ENTRY
     __shared__ float red[32];
     int ti = blockIdx.x, isq = blockIdx.y == 0;
+    if (rt) ring = (float*)rt[ti].ring;
     DsW w = isq ? qn : kn;
     int n = w.cols;
     float* r = (isq ? qr : kv) + (long long)ti * n;
@@ -2216,7 +2273,7 @@ extern "C" __global__ void __launch_bounds__(1024) ds_qkv_post(float* qr, DsW qn
         }
         return;
     }
-    int half = rd / 2, pos = P[0] + ti;
+    int half = rd / 2, pos = rt ? rt[ti].pos : P[0] + ti;
     float* tp = r + (n - rd);
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float2 cs = tab[(long long)pos * half + j];
@@ -2667,7 +2724,8 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd(const float* q, con
 extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* part, const float* ml,
                                                                   const float* sink, float* o, int h, int d,
                                                                   int S, const float2* tab, const int* Pp, int rd,
-                                                                  int add, int ps, unsigned char* qc, float* qs) { DS_PDL_ENTRY
+                                                                  int add, int ps, unsigned char* qc, float* qs,
+                                                                  int prow) { DS_PDL_ENTRY
     int b = blockIdx.x, hi = b % h, ti = b / h, tid = threadIdx.x;
     float M = -DS_INF;
     for (int s = 0; s < S; s++) M = fmaxf(M, ml[(((long long)ti * S + s) * h + hi) * 2]);
@@ -2686,7 +2744,8 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fd_comb(const float* p
     int col = 2 * tid;
     float x = bf(a.x / den), y = bf(a.y / den);
     if (tab && col >= d - rd) {
-        int pos = Pp[0] + add + ti * ps;
+        // prow: add is the launch's first row in the RowP table
+        int pos = prow ? Pp[(add + ti) * 12 + 10] : Pp[0] + add + ti * ps;
         float x2 = ds_rope_at(x, y, col, d, rd, tab, pos, 1);
         y = ds_rope_at(x, y, col + 1, d, rd, tab, pos, 1);
         x = x2;
@@ -2726,7 +2785,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                                                               float* ml, int h, int d, int k, float scale, int S,
                                                               const float2* tab, const int* Pp, int rd, int add,
                                                               int ps, int wmode, int win, const int* wsrc, int kc,
-                                                              int r0) { DS_PDL_ENTRY
+                                                              int r0, int prow, const int* Pk) { DS_PDL_ENTRY
     extern __shared__ float fsm[];
     unsigned int* Qs = (unsigned int*)fsm;       // [64][FD_QP]
     unsigned int* Ks = Qs + 64 * FD_QP;          // [FD_KT][FD_QP]
@@ -2739,12 +2798,21 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
     int hg = h / 64, b = blockIdx.x, tid = threadIdx.x;
     int si = b % S, g = (b / S) % hg, ti = b / (S * hg);
     int lane = tid & 31, w = tid >> 5, gq = lane >> 2, tq = lane & 3;
+    // prow: Pp is a rows step's RowP table (row r0 + ti: its position, its slot's window
+    // ring as kv0), Pk the key layer's (its compressed cache as kv1); every row a decode row
+    int spr = Pp[0];
+    if (prow) {
+        const unsigned long long* rp = (const unsigned long long*)Pp + (long long)(r0 + ti) * 6;
+        spr = Pp[(r0 + ti) * 12 + 10];
+        kv0 = (const float*)rp[0];
+        if (Pk) kv1 = (const float*)((const unsigned long long*)Pk)[(long long)(r0 + ti) * 6 + 3];
+    }
     for (int e = tid; e < 64 * 128; e += 256) {
         int hh = e / 128, c4 = e % 128, col = 4 * c4;
         const float* qr = q + ((long long)ti * h + g * 64 + hh) * d;
         float4 v = *(const float4*)(qr + col);
         if (tab && col >= d - rd) {
-            int pos = Pp[0] + add + ti * ps;
+            int pos = prow ? spr + add : Pp[0] + add + ti * ps;
             float a0 = ds_rope_at(v.x, v.y, col, d, rd, tab, pos, 0);
             float a1 = ds_rope_at(v.x, v.y, col + 1, d, rd, tab, pos, 0);
             float a2 = ds_rope_at(v.z, v.w, col + 2, d, rd, tab, pos, 0);
@@ -2770,7 +2838,7 @@ extern "C" __global__ void __launch_bounds__(256) ds_attn_fdm(const float* q, co
                 v = wsrc[(long long)ti * kc + j - win];  // the top-k columns (ds_idx_cat's)
             } else {
                 // the window columns, as dg_win_idx modes 1 / 3 at sp = P[0]
-                int sp = Pp[0];
+                int sp = spr;
                 if (wmode == 1) {
                     int i = (sp % win + 1 + j) % win;
                     v = i > sp ? -1 : i;

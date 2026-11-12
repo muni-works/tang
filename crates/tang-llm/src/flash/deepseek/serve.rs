@@ -27,8 +27,9 @@ use super::engine::GpuModel;
 use super::forward::{self, Decoder, SpecPick, SpecSampler, SpecStep};
 use super::Config;
 use crate::chat::{Chunk, Detok, Parser, Piece, Tags, Template};
+use crate::engine::Outcome;
 use crate::engine::{Finish, Request, Usage};
-use crate::server::Backend;
+use crate::server::{Backend, DynLane, Inflight};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -183,9 +184,339 @@ pub struct DsServe {
     tags: Tags,
     eos: Vec<u32>,
     ctx: usize,
+    /// Continuous batching (`DS_SERVE_SLOTS`, default 1 = one request at a time): which
+    /// sequence slots a running request holds.
+    busy: Vec<bool>,
+    /// Per slot, the tokens a finished request left in it and when (an LRU stamp): a new
+    /// request whose prompt extends them continues that slot instead of prefilling again.
+    parked: Vec<Option<(Vec<usize>, u64)>>,
+    clock: u64,
+}
+
+/// The served sequence slots (`DS_SERVE_SLOTS`; 1 = no batching).
+fn serve_slots() -> usize {
+    std::env::var("DS_SERVE_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// The positions each extra slot holds (`DS_SLOT_CTX`, default 32768, at most the model's
+/// context; slot 0 keeps the full context).
+fn slot_ctx(max: usize) -> usize {
+    std::env::var("DS_SLOT_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32768)
+        .min(max)
+}
+
+/// One sequence of the slot batcher ([`slots_step`]): token ids only, greedy. The text side
+/// (detokenizer, parser, stop strings) is the caller's.
+pub(crate) struct SlotSeq {
+    pub slot: usize,
+    prompt: Vec<usize>,
+    /// Positions fed to the slot (prompt chunks while prefilling, then decode tokens).
+    pos: usize,
+    /// The token to feed at `pos` in the next decode step.
+    feed: Option<usize>,
+    /// Tokens produced so far, and the limit.
+    pub n: usize,
+    max_new: usize,
+    /// Set once the sequence ends; the caller may set it too (a stop string, a cancel).
+    pub done: Option<Finish>,
+    /// Every token the slot holds, in order (the prompt as fed, then the fed outputs): what
+    /// a later request can continue from.
+    pub fed: Vec<usize>,
+    /// Temperature / top-p sampling with its own seeded RNG (`None`: greedy). Each token is
+    /// one `sample` call on that row's logits, as `forward::generate` makes them, so a
+    /// seed gives the same tokens batched or alone.
+    pub pick: Option<SpecSampler>,
+}
+
+impl SlotSeq {
+    pub fn new(slot: usize, prompt: Vec<usize>, max_new: usize) -> Self {
+        Self::resume(slot, prompt, 0, max_new)
+    }
+
+    /// A sequence whose slot already holds `prompt[..held]` (a parked conversation it
+    /// extends): only the rest is prefilled, from position `held`.
+    pub fn resume(slot: usize, prompt: Vec<usize>, held: usize, max_new: usize) -> Self {
+        let fed = prompt[..held].to_vec();
+        Self {
+            slot,
+            prompt,
+            pos: held,
+            feed: None,
+            n: 0,
+            max_new,
+            done: None,
+            fed,
+            pick: None,
+        }
+    }
+
+    /// Sample with `pick` (temperature > 0) instead of greedy.
+    pub fn sampled(mut self, pick: SpecSampler) -> Self {
+        self.pick = (!pick.greedy()).then_some(pick);
+        self
+    }
+
+    fn choose(&mut self, logits: &[f32]) -> usize {
+        match self.pick.as_mut() {
+            Some(p) => p.sample(logits),
+            None => forward::argmax(logits),
+        }
+    }
+
+    /// Still prefilling (prompt tokens left to feed).
+    pub fn prefilling(&self) -> bool {
+        self.pos < self.prompt.len() && self.done.is_none()
+    }
+
+    /// The model's next token `cand` (as `forward::generate`): EOS ends it unproduced; else
+    /// it is produced, and fed next step unless the limit or the slot's cap is reached.
+    fn take(&mut self, cand: usize, eos: &[usize], cap: usize, out: &mut Vec<usize>) {
+        if eos.contains(&cand) {
+            self.done = Some(Finish::Stop);
+            return;
+        }
+        self.n += 1;
+        out.push(cand);
+        if self.n >= self.max_new || self.pos + 1 >= cap {
+            self.done = Some(Finish::Length);
+        } else {
+            self.feed = Some(cand);
+        }
+    }
+}
+
+/// What the slot batcher needs from an engine: one GPU ([`GpuModel`]) or an expert-parallel
+/// group whose ranks all run the same commands.
+pub(crate) trait SlotModel {
+    fn select_slot(&mut self, s: usize) -> Result<()>;
+    fn reset_slot(&mut self) -> Result<()>;
+    /// A forward on the selected slot; the last position's logits.
+    fn forward_last(&mut self, ids: &[usize], sp: usize) -> Result<Vec<f32>>;
+    fn slot_cap(&self, s: usize) -> usize;
+    fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>>;
+    /// [`Self::forward_rows`] with every row's logits `[rows][vocab]` (sampled rows).
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)>;
+}
+
+impl SlotModel for GpuModel {
+    fn select_slot(&mut self, s: usize) -> Result<()> {
+        GpuModel::select_slot(self, s)
+    }
+    fn reset_slot(&mut self) -> Result<()> {
+        self.reset()
+    }
+    fn forward_last(&mut self, ids: &[usize], sp: usize) -> Result<Vec<f32>> {
+        Ok(self.forward(ids, sp, None)?.0)
+    }
+    fn slot_cap(&self, s: usize) -> usize {
+        GpuModel::slot_cap(self, s)
+    }
+    fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        GpuModel::forward_rows(self, rows)
+    }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        GpuModel::forward_rows_logits(self, rows)
+    }
+}
+
+impl SlotModel for super::ep::EpGroup {
+    fn select_slot(&mut self, s: usize) -> Result<()> {
+        super::ep::EpGroup::select_slot(self, s)
+    }
+    fn reset_slot(&mut self) -> Result<()> {
+        self.reset()
+    }
+    fn forward_last(&mut self, ids: &[usize], sp: usize) -> Result<Vec<f32>> {
+        Ok(self.forward(ids, sp)?.0)
+    }
+    fn slot_cap(&self, s: usize) -> usize {
+        super::ep::EpGroup::slot_cap(self, s)
+    }
+    fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        super::ep::EpGroup::forward_rows(self, rows)
+    }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        super::ep::EpGroup::forward_rows_logits(self, rows)
+    }
+}
+
+impl SlotModel for Engine {
+    fn select_slot(&mut self, s: usize) -> Result<()> {
+        match self {
+            Engine::Single(g) => SlotModel::select_slot(g, s),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::select_slot(g, s),
+        }
+    }
+    fn reset_slot(&mut self) -> Result<()> {
+        self.reset()
+    }
+    fn forward_last(&mut self, ids: &[usize], sp: usize) -> Result<Vec<f32>> {
+        match self {
+            Engine::Single(g) => SlotModel::forward_last(g, ids, sp),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::forward_last(g, ids, sp),
+        }
+    }
+    fn slot_cap(&self, s: usize) -> usize {
+        match self {
+            Engine::Single(g) => SlotModel::slot_cap(g, s),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::slot_cap(g, s),
+        }
+    }
+    fn forward_rows(&mut self, rows: &[(usize, usize, usize)]) -> Result<Vec<usize>> {
+        match self {
+            Engine::Single(g) => SlotModel::forward_rows(g, rows),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::forward_rows(g, rows),
+        }
+    }
+    fn forward_rows_logits(
+        &mut self,
+        rows: &[(usize, usize, usize)],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        match self {
+            Engine::Single(g) => SlotModel::forward_rows_logits(g, rows),
+            #[cfg(feature = "ep")]
+            Engine::Ep(g) => SlotModel::forward_rows_logits(g, rows),
+        }
+    }
+}
+
+/// Prompt chunks one batcher step feeds, over all prefilling sequences
+/// (`DS_SERVE_PREFILL_CHUNKS`, default 1; 0 = every prompt whole in its first step). Each
+/// chunk is a [`prefill_chunk`]-token forward, so a long prompt delays the running streams'
+/// next token by at most this many chunks per step.
+fn prefill_chunks_per_step() -> usize {
+    std::env::var("DS_SERVE_PREFILL_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// One batcher step over `seqs` (distinct slots): prompt chunks for the prefilling
+/// sequences, oldest (lowest index) first, at most [`prefill_chunks_per_step`] of them
+/// (each the chunk the single-request path would feed there, so the slot ends in the same
+/// state), then every running sequence decodes one token in ONE
+/// [`GpuModel::forward_rows`] step. Returns the tokens each sequence produced this step
+/// (index-aligned with `seqs`). Greedy.
+pub(crate) fn slots_step(
+    m: &mut dyn SlotModel,
+    seqs: &mut [&mut SlotSeq],
+    eos: &[usize],
+) -> Result<Vec<Vec<usize>>> {
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); seqs.len()];
+    let (chunk, budget) = (prefill_chunk(), prefill_chunks_per_step());
+    let mut left = if budget == 0 { usize::MAX } else { budget };
+    for (i, q) in seqs.iter_mut().enumerate() {
+        while left > 0 && q.prefilling() {
+            m.select_slot(q.slot)?;
+            if q.pos == 0 {
+                m.reset_slot()?;
+            }
+            let end = (q.pos + chunk).min(q.prompt.len());
+            let lg = m.forward_last(&q.prompt[q.pos..end], q.pos)?;
+            q.fed.extend_from_slice(&q.prompt[q.pos..end]);
+            q.pos = end;
+            left = left.saturating_sub(1);
+            if !q.prefilling() {
+                let cap = m.slot_cap(q.slot);
+                let cand = q.choose(&lg);
+                q.take(cand, eos, cap, &mut out[i]);
+            }
+        }
+    }
+    let live: Vec<usize> = (0..seqs.len())
+        .filter(|&i| seqs[i].done.is_none() && seqs[i].feed.is_some() && out[i].is_empty())
+        .collect();
+    if live.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(usize, usize, usize)> = live
+        .iter()
+        .map(|&i| (seqs[i].slot, seqs[i].feed.unwrap(), seqs[i].pos))
+        .collect();
+    // the logits come back only when a row samples
+    let sampled = live.iter().any(|&i| seqs[i].pick.is_some());
+    let (next, lg) = if sampled {
+        m.forward_rows_logits(&rows)?
+    } else {
+        (m.forward_rows(&rows)?, Vec::new())
+    };
+    let nv = if sampled { lg.len() / rows.len() } else { 0 };
+    for (j, &i) in live.iter().enumerate() {
+        let q = &mut *seqs[i];
+        q.fed.push(q.feed.take().unwrap());
+        q.pos += 1;
+        let cap = m.slot_cap(q.slot);
+        let cand = match q.pick.as_mut() {
+            Some(p) => p.sample(&lg[j * nv..(j + 1) * nv]),
+            None => next[j],
+        };
+        q.take(cand, eos, cap, &mut out[i]);
+    }
+    Ok(out)
+}
+
+/// A request in the batch ([`Backend::admit`]): its sequence and its text pipeline.
+struct DsStream {
+    seq: SlotSeq,
+    think: bool,
+    out: Vec<u32>,
+    detok: Detok,
+    parser: Parser,
+    dsml: Dsml,
+    called: bool,
+    stop: Vec<String>,
+    usage: Usage,
+    t0: Instant,
+    t1: Option<Instant>,
 }
 
 impl DsServe {
+    /// The slot for a prompt `ids`: the free parked slot holding the longest strict prefix
+    /// of it (continued from there: `held` > 0), else a free empty slot, else the least
+    /// recently parked one (its tokens dropped).
+    fn pick_slot(&self, ids: &[usize]) -> Result<(usize, usize)> {
+        let free = |i: &usize| !self.busy[*i];
+        let n = self.busy.len();
+        let best = (0..n)
+            .filter(free)
+            .filter_map(|i| {
+                let (t, _) = self.parked[i].as_ref()?;
+                (t.len() < ids.len() && ids.starts_with(t)).then_some((i, t.len()))
+            })
+            .max_by_key(|&(_, l)| l);
+        if let Some(b) = best {
+            return Ok(b);
+        }
+        if let Some(i) = (0..n).filter(free).find(|&i| self.parked[i].is_none()) {
+            return Ok((i, 0));
+        }
+        let i = (0..n)
+            .filter(free)
+            .min_by_key(|&i| self.parked[i].as_ref().map_or(0, |p| p.1))
+            .context("no free sequence slot")?;
+        Ok((i, 0))
+    }
+
     /// `dir`: the checkpoint with `tokenizer.json`, `tokenizer_config.json`,
     /// `chat_template.jinja`, `inference/config.json` and `engram.json`.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -203,7 +534,7 @@ impl DsServe {
             super::obs::quiet(true);
             super::obs::collect(true);
         }
-        let m = Engine::open(dir, devices)?;
+        let mut m = Engine::open(dir, devices)?;
         let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
         let tpl = Template::load(dir)?;
@@ -232,6 +563,24 @@ impl DsServe {
             "tang-llm: deepseek ready in {:.1} s: ctx {ctx}, {how}",
             t.elapsed().as_secs_f64()
         );
+        let slots = serve_slots();
+        if slots > 1 {
+            match &mut m {
+                Engine::Single(g) => {
+                    let cap = slot_ctx(ctx);
+                    g.add_slots(slots, cap)?;
+                    eprintln!("tang-llm: deepseek batching: {slots} slots, {cap} positions each");
+                }
+                #[cfg(feature = "ep")]
+                Engine::Ep(g) => {
+                    let cap = slot_ctx(ctx);
+                    g.add_slots(slots, cap)?;
+                    eprintln!(
+                        "tang-llm: deepseek batching: {slots} slots, {cap} positions each, expert parallel"
+                    );
+                }
+            }
+        }
         Ok(Self {
             m,
             tok,
@@ -239,6 +588,9 @@ impl DsServe {
             tags,
             eos,
             ctx,
+            busy: vec![false; slots],
+            parked: vec![None; slots],
+            clock: 0,
         })
     }
 }
@@ -533,6 +885,203 @@ impl Backend for DsServe {
     fn context_window(&self) -> usize {
         self.ctx
     }
+
+    fn max_batch(&self) -> usize {
+        self.busy.len()
+    }
+
+    fn can_admit(&self, _key: Option<&str>) -> bool {
+        self.busy.len() > 1 && self.busy.iter().any(|b| !b)
+    }
+
+    fn admit(&mut self, req: &Request, _prompt: Option<(String, Vec<u32>)>) -> Result<Inflight> {
+        let think = req.think.unwrap_or(true);
+        let prompt = self
+            .tpl
+            .render(&req.messages, req.tools.as_ref(), Some(think))?;
+        let enc = self
+            .tok
+            .encode(prompt.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids: Vec<usize> = enc.get_ids().iter().map(|&i| i as usize).collect();
+        let (slot, held) = self.pick_slot(&ids)?;
+        let cap = SlotModel::slot_cap(&self.m, slot);
+        let max_new = req
+            .max_tokens
+            .unwrap_or(cap)
+            .min(cap.saturating_sub(ids.len()));
+        if ids.is_empty() || max_new == 0 {
+            bail!(
+                "prompt of {} tokens leaves no room in a {cap}-token slot",
+                ids.len()
+            );
+        }
+        self.busy[slot] = true;
+        self.parked[slot] = None;
+        let mut usage = Usage::default();
+        usage.cached_tokens = held;
+        Ok(Box::new(DsStream {
+            seq: SlotSeq::resume(slot, ids, held, max_new).sampled(SpecSampler::new(
+                req.sampling.temperature,
+                req.sampling.top_p,
+                req.sampling.seed ^ 0x5eed,
+            )),
+            think,
+            out: Vec::new(),
+            detok: Detok::default(),
+            parser: Parser::new(think),
+            dsml: Dsml::default(),
+            called: false,
+            stop: req.stop.clone(),
+            usage,
+            t0: Instant::now(),
+            t1: None,
+        }))
+    }
+
+    fn step(&mut self, lanes: &mut [DynLane<'_>]) -> Result<()> {
+        let eos: Vec<usize> = self.eos.iter().map(|&e| e as usize).collect();
+        let mut streams: Vec<&mut DsStream> = Vec::with_capacity(lanes.len());
+        let mut ons: Vec<&mut dyn FnMut(Piece) -> bool> = Vec::with_capacity(lanes.len());
+        for l in lanes.iter_mut() {
+            let s: &mut DsStream = l
+                .stream
+                .downcast_mut()
+                .context("a stream this backend admitted")?;
+            if s.seq.done.is_none() && l.ctl.cancelled() {
+                s.seq.done = Some(Finish::Cancelled);
+            }
+            streams.push(s);
+            ons.push(&mut *l.on);
+        }
+        let shared = streams
+            .iter()
+            .filter(|s| s.seq.done.is_none() && !s.seq.prefilling())
+            .count();
+        let active: Vec<bool> = streams.iter().map(|s| s.seq.done.is_none()).collect();
+        let was_prefill: Vec<bool> = streams.iter().map(|s| s.seq.prefilling()).collect();
+        let toks = {
+            let mut seqs: Vec<&mut SlotSeq> = streams
+                .iter_mut()
+                .filter(|s| s.seq.done.is_none())
+                .map(|s| &mut s.seq)
+                .collect();
+            slots_step(&mut self.m, &mut seqs, &eos)?
+        };
+        let (tok, tags) = (&self.tok, &self.tags);
+        let decode = |ids: &[u32]| -> Result<String> {
+            tok.decode(ids, false)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))
+        };
+        let mut k = 0;
+        for (li, (s, on)) in streams.iter_mut().zip(ons.iter_mut()).enumerate() {
+            if active[li] {
+                let (produced, pre) = (&toks[k], was_prefill[li]);
+                k += 1;
+                if pre {
+                    s.usage.prefill_chunks += 1;
+                    if !s.seq.prefilling() {
+                        s.usage.prompt_tokens = s.seq.prompt.len();
+                        s.usage.prefill_tok_s =
+                            s.seq.prompt.len() as f64 / s.t0.elapsed().as_secs_f64().max(1e-9);
+                        s.t1 = Some(Instant::now());
+                    }
+                } else {
+                    s.usage.decode_steps += 1;
+                    s.usage.shared_streams += shared.saturating_sub(1);
+                }
+                for &t in produced {
+                    s.usage.completion_tokens += 1;
+                    s.out.push(t as u32);
+                    let chunks = s.detok.push(&s.out, tags, decode)?;
+                    let mut pieces = Vec::new();
+                    for ch in chunks {
+                        pieces.extend(match ch {
+                            Chunk::Text(x) => s.parser.push_text(&x),
+                            Chunk::Tag(tg) => s.parser.push_tag(tg),
+                        });
+                    }
+                    if !emit_pieces(pieces, &mut s.dsml, &mut s.called, &mut **on) {
+                        s.seq.done = Some(Finish::Cancelled);
+                    }
+                    if s.seq.done.is_none() && !s.stop.is_empty() {
+                        let n = s.stop.iter().map(|x| x.len()).max().unwrap_or(0) + 4;
+                        let text = decode(&s.out[s.out.len().saturating_sub(n)..])?;
+                        if s.stop.iter().any(|x| text.ends_with(x.as_str())) {
+                            s.seq.done = Some(Finish::Stop);
+                        }
+                    }
+                }
+            }
+            if s.seq.done.is_some() && s.t1.is_some() {
+                // the tails, once
+                let tail = s.parser.finish();
+                emit_pieces(tail, &mut s.dsml, &mut s.called, &mut **on);
+                for p in s.dsml.finish() {
+                    s.called |= matches!(p, Piece::ToolCall { .. });
+                    on(p);
+                }
+                if s.called && s.seq.done == Some(Finish::Stop) {
+                    s.seq.done = Some(Finish::ToolCalls);
+                }
+                let t1 = s.t1.take().unwrap();
+                s.usage.decode_tok_s =
+                    s.usage.completion_tokens as f64 / t1.elapsed().as_secs_f64().max(1e-9);
+            }
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self, s: Inflight) -> Result<Outcome> {
+        let s: Box<DsStream> = s
+            .downcast()
+            .map_err(|_| anyhow::anyhow!("a stream this backend admitted"))?;
+        if let Some(b) = self.busy.get_mut(s.seq.slot) {
+            *b = false;
+            // park what the slot holds for the conversation's next turn (a cancelled or
+            // failed run's slot may be mid-step: not reused)
+            self.clock += 1;
+            self.parked[s.seq.slot] = match s.seq.done {
+                Some(Finish::Cancelled) | None => None,
+                Some(_) => Some((s.seq.fed.clone(), self.clock)),
+            };
+        }
+        let _ = s.think;
+        Ok(Outcome::Done(
+            s.seq.done.unwrap_or(Finish::Cancelled),
+            s.usage,
+        ))
+    }
+
+    fn stream_state(&self, s: &Inflight) -> (bool, bool) {
+        match s.downcast_ref::<DsStream>() {
+            Some(s) => (s.seq.done.is_some(), s.seq.prefilling()),
+            None => (true, false),
+        }
+    }
+}
+
+/// Text pieces to `on`, DSML tool calls parsed out of the text (as `complete`'s `emit`);
+/// false once `on` refuses one (the client went away).
+fn emit_pieces(
+    pieces: Vec<Piece>,
+    dsml: &mut Dsml,
+    called: &mut bool,
+    on: &mut dyn FnMut(Piece) -> bool,
+) -> bool {
+    for p in pieces {
+        let ps = match p {
+            Piece::Text(s) => dsml.push(&s),
+            other => vec![other],
+        };
+        for p in ps {
+            *called |= matches!(p, Piece::ToolCall { .. });
+            if !on(p) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `tang-llm deepseek-profile`'s settings.
@@ -581,6 +1130,100 @@ pub fn profile(dir: &Path, devices: &[usize], o: &ProfileOpts) -> Result<String>
     obs::collect(false);
     crate::telemetry::ds_flush_orphans();
     Ok(profile_table(&recs, o, load_s, &usage))
+}
+
+/// `deepseek-profile --slots N`: the batched decode's throughput. Opens the model with `N`
+/// sequence slots (`DS_SLOT_CTX` positions each), prefills `prompt_tokens` synthetic tokens
+/// into every slot (slot 0's prompt is the single-request profile's; slots 1.. change one
+/// token, so routing and caches differ), then decodes `steps` tokens in every slot through
+/// the batcher. Reports aggregate decode tok/s, per-step wall times and each slot's first
+/// ids (slot 0's must equal a single-request greedy run of the same prompt).
+pub fn profile_slots(
+    dir: &Path,
+    devices: &[usize],
+    slots: usize,
+    prompt_tokens: usize,
+    steps: usize,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let t0 = Instant::now();
+    let mut m = Engine::open(dir, devices)?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let cfg = m.config().clone();
+    let cap = slot_ctx(cfg.max_seq_len);
+    match &mut m {
+        Engine::Single(g) => g.add_slots(slots, cap)?,
+        #[cfg(feature = "ep")]
+        Engine::Ep(g) => g.add_slots(slots, cap)?,
+    }
+    let v = cfg.vocab_size;
+    let base: Vec<usize> = (0..prompt_tokens.max(1))
+        .map(|i| (i * 7919 + 13) % v)
+        .collect();
+    let mut seqs: Vec<SlotSeq> = (0..slots)
+        .map(|k| {
+            let mut p = base.clone();
+            if k > 0 {
+                let j = p.len() - 1;
+                p[j] = (p[j] + 104729 * k) % v;
+            }
+            SlotSeq::new(k, p, steps + 1)
+        })
+        .collect();
+    let mut gen: Vec<Vec<usize>> = vec![Vec::new(); slots];
+    let t1 = Instant::now();
+    let mut step_ms: Vec<f64> = Vec::new();
+    let mut prefill_s = 0.0;
+    while seqs.iter().any(|q| q.done.is_none()) {
+        let prefilling = seqs.iter().any(|q| q.prefilling());
+        let idx: Vec<usize> = (0..slots).filter(|&i| seqs[i].done.is_none()).collect();
+        let ts = Instant::now();
+        let out = {
+            let mut r: Vec<&mut SlotSeq> = seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+            slots_step(&mut m, &mut r, &[])?
+        };
+        let ms = ts.elapsed().as_secs_f64() * 1e3;
+        if prefilling {
+            prefill_s += ms / 1e3;
+        } else {
+            step_ms.push(ms);
+        }
+        for (j, o) in out.into_iter().enumerate() {
+            gen[idx[j]].extend(o);
+        }
+    }
+    let total_s = t1.elapsed().as_secs_f64();
+    let decode_s: f64 = step_ms.iter().sum::<f64>() / 1e3;
+    let decoded: usize = gen.iter().map(|g| g.len().saturating_sub(1)).sum();
+    let mut sorted = step_ms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| {
+        sorted
+            .get(((sorted.len() as f64 - 1.0) * p) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let mut s = String::new();
+    writeln!(
+        s,
+        "deepseek-profile --slots {slots}: load {load_s:.1} s, prompt {prompt_tokens} tokens x {slots}, prefill {prefill_s:.2} s, {} decode steps in {decode_s:.2} s ({total_s:.2} s total)",
+        step_ms.len()
+    )?;
+    writeln!(
+        s,
+        "decode: {decoded} tokens, aggregate {:.1} tok/s, per step p50 {:.2} ms p90 {:.2} ms max {:.2} ms (rows per step <= {}, DS_ROWS_CHUNK {})",
+        decoded as f64 / decode_s.max(1e-9),
+        pct(0.5),
+        pct(0.9),
+        pct(1.0),
+        slots,
+        std::env::var("DS_ROWS_CHUNK").unwrap_or_else(|_| "8".into())
+    )?;
+    for (k, g) in gen.iter().enumerate().take(4) {
+        let ids: Vec<String> = g.iter().take(16).map(|t| t.to_string()).collect();
+        writeln!(s, "ids slot {k}: {}", ids.join(" "))?;
+    }
+    Ok(s)
 }
 
 fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: &Usage) -> String {
@@ -763,6 +1406,389 @@ fn profile_table(recs: &[super::obs::StepRec], o: &ProfileOpts, load_s: f64, u: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slot batcher on an expert-parallel group (host reduce, two ranks on one GPU):
+    /// four sequences batched give the tokens each gives through the same group alone.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slots_step_ep_matches_alone() {
+        use super::super::ep::{Backend as EpBackend, EpGroup};
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let mut g = EpGroup::open(&dir, &[0, 0], EpBackend::Host).unwrap();
+        let v = g.config().vocab_size;
+        let cap = g.config().max_seq_len.min(512);
+        g.add_slots(4, cap).unwrap();
+        let prompts: Vec<Vec<usize>> = (0..4)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - k;
+                    p[j] = (p[j] + 7919 * k) % v;
+                }
+                p
+            })
+            .collect();
+        let drive = |g: &mut EpGroup, which: &[usize]| -> Vec<Vec<usize>> {
+            let mut seqs: Vec<SlotSeq> = which
+                .iter()
+                .map(|&k| SlotSeq::new(k, prompts[k].clone(), 8))
+                .collect();
+            let mut got = vec![Vec::new(); seqs.len()];
+            while seqs.iter().any(|q| q.done.is_none()) {
+                let idx: Vec<usize> = (0..seqs.len())
+                    .filter(|&i| seqs[i].done.is_none())
+                    .collect();
+                let mut r: Vec<&mut SlotSeq> =
+                    seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+                let out = slots_step(g, &mut r, &[]).unwrap();
+                for (j, o) in out.into_iter().enumerate() {
+                    got[idx[j]].extend(o);
+                }
+            }
+            got
+        };
+        let mut alone = Vec::new();
+        for k in 0..4 {
+            alone.push(drive(&mut g, &[k]).remove(0));
+        }
+        let batched = drive(&mut g, &[0, 1, 2, 3]);
+        for k in 0..4 {
+            eprintln!("ep slot {k}: batched {:?} alone {:?}", batched[k], alone[k]);
+        }
+        assert_eq!(batched, alone, "ep batched != alone");
+    }
+
+    /// Sampled batching: rows at different temperatures / top-p / seeds (and one greedy),
+    /// batched, give each request's tokens from `forward::generate` alone with the same
+    /// seeded sampler (no drafts); the same seed twice gives the same tokens.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slots_step_sampled_matches_generate() {
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        // (temperature, top-p, seed); rows 3 and 4 share a seed and prompt
+        let params = [
+            (0.0f32, 1.0f32, 1u64),
+            (0.8, 1.0, 7),
+            (1.0, 0.9, 11),
+            (0.6, 0.95, 5),
+            (0.6, 0.95, 5),
+        ];
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let v = a.cpu.cfg.vocab_size;
+        let prompts: Vec<Vec<usize>> = (0..params.len())
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 && k < 4 {
+                    let j = p.len() - 1 - k;
+                    p[j] = (p[j] + 7919 * k) % v;
+                }
+                if k == 4 {
+                    p = {
+                        let mut q = ids.clone();
+                        let j = q.len() - 4;
+                        q[j] = (q[j] + 7919 * 3) % v;
+                        q
+                    };
+                }
+                p
+            })
+            .collect();
+        let mut want = Vec::new();
+        for (k, &(t, tp, seed)) in params.iter().enumerate() {
+            a.reset().unwrap();
+            let mut got = Vec::new();
+            let mut pick = SpecSampler::new(t, tp, seed);
+            let mut u = Usage::default();
+            forward::generate(
+                &mut a,
+                &prompts[k],
+                10,
+                &mut pick,
+                false,
+                &[],
+                &mut u,
+                &mut |x| {
+                    got.push(x);
+                    None
+                },
+            )
+            .unwrap();
+            want.push(got);
+        }
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        m.add_slots(params.len(), m.cpu.cfg.max_seq_len.min(512))
+            .unwrap();
+        let mut seqs: Vec<SlotSeq> = params
+            .iter()
+            .enumerate()
+            .map(|(k, &(t, tp, seed))| {
+                SlotSeq::new(k, prompts[k].clone(), 10).sampled(SpecSampler::new(t, tp, seed))
+            })
+            .collect();
+        let mut got = vec![Vec::new(); seqs.len()];
+        while seqs.iter().any(|q| q.done.is_none()) {
+            let idx: Vec<usize> = (0..seqs.len())
+                .filter(|&i| seqs[i].done.is_none())
+                .collect();
+            let mut r: Vec<&mut SlotSeq> = seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+            let out = slots_step(&mut m, &mut r, &[]).unwrap();
+            for (j, o) in out.into_iter().enumerate() {
+                got[idx[j]].extend(o);
+            }
+        }
+        for k in 0..params.len() {
+            eprintln!(
+                "sampled {k} {:?}: batched {:?} alone {:?}",
+                params[k], got[k], want[k]
+            );
+        }
+        assert_eq!(got, want, "sampled batched != alone");
+        assert_eq!(got[3], got[4], "same seed and prompt, same tokens");
+        assert_ne!(got[1], got[0], "a sampled row should leave the greedy path");
+    }
+
+    /// A conversation's next turn continues its parked slot ([`SlotSeq::resume`]): only the
+    /// new tokens are prefilled, and the reply equals `forward::generate` over the whole
+    /// prompt from scratch (greedy). A different slot runs alongside the whole time.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slot_resume_matches_generate() {
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let v = m.cpu.cfg.vocab_size;
+        m.add_slots(2, m.cpu.cfg.max_seq_len.min(512)).unwrap();
+        let run = |m: &mut GpuModel, seqs: &mut Vec<SlotSeq>| -> Vec<Vec<usize>> {
+            let mut got = vec![Vec::new(); seqs.len()];
+            while seqs[0].done.is_none() {
+                let idx: Vec<usize> = (0..seqs.len())
+                    .filter(|&i| seqs[i].done.is_none())
+                    .collect();
+                let mut r: Vec<&mut SlotSeq> =
+                    seqs.iter_mut().filter(|q| q.done.is_none()).collect();
+                let out = slots_step(m, &mut r, &[]).unwrap();
+                for (j, o) in out.into_iter().enumerate() {
+                    got[idx[j]].extend(o);
+                }
+            }
+            got
+        };
+        // turn 1 on slot 0, a neighbour on slot 1
+        let other: Vec<usize> = (0..ids.len()).map(|i| (31 * i + 5) % v).collect();
+        let mut seqs = vec![SlotSeq::new(0, ids.clone(), 5), SlotSeq::new(1, other, 40)];
+        let first = run(&mut m, &mut seqs);
+        let held = seqs[0].fed.clone();
+        assert!(
+            held.len() >= ids.len() + 4,
+            "turn 1 fed {} tokens",
+            held.len()
+        );
+        // turn 2: the held tokens, the unfed last reply token, then a few new ones
+        let mut p2 = held.clone();
+        p2.push(*first[0].last().unwrap());
+        p2.extend((0..6).map(|i| (17 * i + 3) % v));
+        let n1 = std::mem::replace(&mut seqs[0], SlotSeq::resume(0, p2.clone(), held.len(), 6));
+        drop(n1);
+        let second = run(&mut m, &mut seqs);
+        // the reference: the whole turn-2 prompt from scratch
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let mut want = Vec::new();
+        let mut pick = SpecSampler::new(0.0, 1.0, 1);
+        let mut u = Usage::default();
+        forward::generate(&mut a, &p2, 6, &mut pick, false, &[], &mut u, &mut |t| {
+            want.push(t);
+            None
+        })
+        .unwrap();
+        eprintln!("resume: got {:?} want {:?}", second[0], want);
+        assert_eq!(second[0], want, "resumed turn 2");
+    }
+
+    /// The slot batcher against the single-request path: sequences that arrive at different
+    /// steps, with different prompts and limits, batched by [`slots_step`] (prefill on the
+    /// slot, then shared [`GpuModel::forward_rows`] steps), produce exactly the tokens
+    /// `forward::generate` gives each alone (greedy, no drafts), and end the same way.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_tiny_slots_step_matches_generate() {
+        use super::super::forward::tests::tiny;
+        if tang_moe::gpu::Gpu::for_test().is_none()
+            || !Path::new(&tiny()).join("ref/meta.json").exists()
+        {
+            eprintln!("skip: no GPU or no {}", tiny());
+            return;
+        }
+        let dir = Path::new(&tiny()).join("hf");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{}/ref/meta.json", tiny())).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<usize> = meta["steps"][0]["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        // prompts span several chunks, fed one chunk per batcher step (the lone runs chunk
+        // the same way through feed_chunked)
+        std::env::set_var("DS_PREFILL_CHUNK", "4");
+        std::env::set_var("DS_SERVE_PREFILL_CHUNKS", "1");
+        let mut a = GpuModel::open(&dir).unwrap();
+        a.hc_exact = true;
+        let v = a.cpu.cfg.vocab_size;
+        // (prompt, max_new, arrival step); 11 sequences: past the 8-row chunk
+        let reqs: Vec<(Vec<usize>, usize, usize)> = (0..11)
+            .map(|k| {
+                let mut p = ids.clone();
+                if k > 0 {
+                    let j = p.len() - 1 - (k % 3);
+                    p[j] = (p[j] + 7919 * k) % v;
+                    p.truncate(p.len() - k % 2);
+                }
+                (p, 6 + k % 5, k / 2)
+            })
+            .collect();
+        // a token the lone runs produce mid-way, as EOS for every run: some end with Stop
+        let mut want: Vec<(Vec<usize>, Finish)> = Vec::new();
+        let mut eos = Vec::new();
+        for pass in 0..2 {
+            want.clear();
+            for (p, max_new, _) in &reqs {
+                a.reset().unwrap();
+                let mut got = Vec::new();
+                let mut pick = SpecSampler::new(0.0, 1.0, 1);
+                let mut u = Usage::default();
+                let f = forward::generate(
+                    &mut a,
+                    p,
+                    *max_new,
+                    &mut pick,
+                    false,
+                    &eos,
+                    &mut u,
+                    &mut |t| {
+                        got.push(t);
+                        None
+                    },
+                )
+                .unwrap();
+                want.push((got, f));
+            }
+            if pass == 0 {
+                eos = vec![want[1].0[3]];
+            }
+        }
+        assert!(
+            want.iter().any(|w| w.1 == Finish::Stop),
+            "no run hit the EOS"
+        );
+        assert!(
+            want.iter().any(|w| w.1 == Finish::Length),
+            "no run hit its limit"
+        );
+        drop(a);
+        let mut m = GpuModel::open(&dir).unwrap();
+        m.hc_exact = true;
+        let ns = 6; // fewer slots than requests: finished ones free theirs
+        m.add_slots(ns, m.cpu.cfg.max_seq_len.min(512)).unwrap();
+        let mut free: Vec<usize> = (0..ns).collect();
+        let mut queue: Vec<usize> = (0..reqs.len()).collect();
+        let mut running: Vec<(usize, SlotSeq)> = Vec::new();
+        let mut got: Vec<Vec<usize>> = vec![Vec::new(); reqs.len()];
+        let mut fin: Vec<Option<Finish>> = vec![None; reqs.len()];
+        let mut step = 0;
+        while !(queue.is_empty() && running.is_empty()) {
+            queue.retain(|&r| {
+                if reqs[r].2 <= step && !free.is_empty() {
+                    let sl = free.remove(0);
+                    running.push((r, SlotSeq::new(sl, reqs[r].0.clone(), reqs[r].1)));
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut seqs: Vec<&mut SlotSeq> = running.iter_mut().map(|x| &mut x.1).collect();
+            let out = slots_step(&mut m, &mut seqs, &eos).unwrap();
+            for (j, (r, _)) in running.iter().enumerate() {
+                got[*r].extend(&out[j]);
+            }
+            running.retain(|(r, q)| match q.done {
+                Some(f) => {
+                    fin[*r] = Some(f);
+                    free.push(q.slot);
+                    false
+                }
+                None => true,
+            });
+            step += 1;
+            assert!(step < 200, "batcher did not finish");
+        }
+        std::env::remove_var("DS_PREFILL_CHUNK");
+        std::env::remove_var("DS_SERVE_PREFILL_CHUNKS");
+        for r in 0..reqs.len() {
+            eprintln!(
+                "req {r}: batched {:?} {:?} lone {:?} {:?}",
+                got[r], fin[r], want[r].0, want[r].1
+            );
+            assert_eq!(got[r], want[r].0, "req {r} tokens");
+            assert_eq!(fin[r], Some(want[r].1), "req {r} finish");
+        }
+    }
 
     #[test]
     fn dsml_tool_calls_parse_across_chunks() {

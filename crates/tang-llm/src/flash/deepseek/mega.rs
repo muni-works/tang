@@ -494,7 +494,7 @@ mod tests {
                         s,
                         args![
                             o[8].ptr, qn, qc, qs, o[9].ptr, kn, tab.ptr, rdi, pp.ptr, o[6].ptr, wi,
-                            allp, neps
+                            allp, neps, 0u64
                         ],
                     )?;
                 }

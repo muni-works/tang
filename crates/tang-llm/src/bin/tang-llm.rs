@@ -569,9 +569,10 @@ fn serve_flash(args: &[String]) -> Result<()> {
 /// timeline on (docs/observability.md, "DeepSeek").
 #[cfg(feature = "cuda")]
 fn deepseek_profile(args: &[String]) -> Result<()> {
-    let usage = "deepseek-profile <checkpoint dir> [--devices 0,1,..] [--steps N] [--prompt-tokens N] [--direct] [--graph-debug] [--no-spec] [--ctx N]";
+    let usage = "deepseek-profile <checkpoint dir> [--devices 0,1,..] [--steps N] [--prompt-tokens N] [--direct] [--graph-debug] [--no-spec] [--ctx N] [--slots N]";
     let dir = PathBuf::from(args.first().context(usage)?);
     let mut devices: Vec<usize> = Vec::new();
+    let mut slots = 1usize;
     let mut o = tang_llm::flash::deepseek::serve::ProfileOpts {
         steps: 20,
         prompt_tokens: 64,
@@ -588,6 +589,7 @@ fn deepseek_profile(args: &[String]) -> Result<()> {
             "--direct" => o.direct = true,
             "--graph-debug" => o.graph_debug = true,
             "--no-spec" => o.spec = false,
+            "--slots" => slots = val()?.parse()?,
             "--ctx" => std::env::set_var("DS41_CTX", val()?),
             "--devices" => {
                 devices = val()?
@@ -599,6 +601,17 @@ fn deepseek_profile(args: &[String]) -> Result<()> {
         }
     }
     let _otel = tang_llm::telemetry::init();
+    if slots > 1 {
+        let s = tang_llm::flash::deepseek::serve::profile_slots(
+            &dir,
+            &devices,
+            slots,
+            o.prompt_tokens,
+            o.steps,
+        )?;
+        print!("{s}");
+        return Ok(());
+    }
     let table = tang_llm::flash::deepseek::serve::profile(&dir, &devices, &o)?;
     print!("{table}");
     Ok(())
