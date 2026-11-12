@@ -78,6 +78,7 @@ fn req(system: &str, user: &str, key: &str, max: usize) -> Request {
         max_tokens: Some(max),
         stop: vec![],
         cache_key: Some(key.into()),
+        tenant: None,
         prefill_only: false,
     }
 }

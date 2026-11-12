@@ -94,6 +94,8 @@ struct Node {
     identity: Arc<crate::auth::Identity>,
     /// The host name.
     name: String,
+    /// A model downloading onto this node (`POST /models/pull`).
+    pull: Arc<crate::pull::Puller>,
 }
 
 #[derive(Default)]
@@ -483,6 +485,7 @@ where
         crate::auth::identity_path().as_deref(),
     )?);
     let node = Arc::new(Node {
+        pull: Default::default(),
         id: crate::node::node_id(),
         queue: Queue::new(),
         state: Mutex::new(NodeState::default()),
@@ -586,6 +589,8 @@ fn router(
         .route("/node", get(node_info))
         .route("/models/load", post(load_model))
         .route("/models/unload", post(unload_model))
+        .route("/models/pull", post(pull_model).delete(cancel_pull))
+        .route("/models/delete", post(delete_model))
         .with_state(app);
     if let Some(image) = image {
         api = api.merge(image);
@@ -1396,6 +1401,7 @@ fn describe(node: &Node, cache_keys: bool) -> Value {
             })
         })
         .collect();
+    let (pulling, last_pull) = node.pull.json();
     json!({
         "schema": crate::node::SCHEMA,
         "node_id": node.id,
@@ -1406,7 +1412,7 @@ fn describe(node: &Node, cache_keys: bool) -> Value {
         "name": node.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hardware": hw.json(),
-        "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk },
+        "models": { "loaded": loaded, "loading": loading, "on_disk": on_disk, "pulling": pulling, "last_pull": last_pull },
         "queue": { "running": running, "waiting": waiting },
         "image_model": node.image.as_ref().map(|image|json!({
             "id":crate::image_server::MODEL_ID, "path":image.path, "resident":image.resident.load(std::sync::atomic::Ordering::Relaxed),
@@ -1440,6 +1446,98 @@ async fn load_model(State(app): State<App>, Json(body): Json<Value>) -> Response
 /// `POST /models/unload`: free the model's memory.
 async fn unload_model(State(app): State<App>) -> Response {
     control(&app, |reply| Job::Unload { reply }).await
+}
+
+/// `POST /models/pull {"model", "revision"?, "files": [{"path", "url", "sha256", "size"}]}`:
+/// download a model into the Hugging Face cache (see [`crate::pull`]). Answers 202 once it has
+/// started; `/node`'s `models.pulling` follows it and `models.last_pull` says how it ended.
+async fn pull_model(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let spec: crate::pull::Spec = match serde_json::from_value(body) {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let model = spec.model.clone();
+    let hw = (app.node.hardware)();
+    let dtype = app.node.dtype;
+    // Fits the device on its own (the node runs one model; loading swaps the old one out).
+    let fits = move |config: Option<&[u8]>, weights: u64| -> Result<(), String> {
+        let Some(config) = config else { return Ok(()) };
+        let need = crate::node::need_from(config, weights, dtype)
+            .map_err(|e| format!("config.json: {e}"))?;
+        if need.total() > hw.total_bytes {
+            return Err(format!(
+                "{model} needs {} bytes of memory; this node has {}",
+                need.total(),
+                hw.total_bytes
+            ));
+        }
+        Ok(())
+    };
+    let model = spec.model.clone();
+    match app.node.pull.start(spec, fits).await {
+        Ok(total) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "pulling": model, "total_bytes": total })),
+        )
+            .into_response(),
+        Err(crate::pull::Refused::Bad(e)) => error(StatusCode::BAD_REQUEST, e),
+        Err(crate::pull::Refused::Busy(e)) => error(StatusCode::CONFLICT, e),
+        Err(crate::pull::Refused::TooBig(e)) => error(StatusCode::INSUFFICIENT_STORAGE, e),
+    }
+}
+
+/// `DELETE /models/pull`: stop the running pull (what it downloaded stays; pulling the same
+/// model again resumes).
+async fn cancel_pull(State(app): State<App>) -> Response {
+    match app.node.pull.cancel() {
+        Some(model) => Json(json!({ "cancelled": model })).into_response(),
+        None => error(StatusCode::NOT_FOUND, "nothing is being pulled"),
+    }
+}
+
+/// `POST /models/delete {"model": "<repo id>"}`: remove a model from the Hugging Face cache.
+/// Refused for the loaded (or loading) model and one being pulled.
+async fn delete_model(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let Some(model) = body["model"].as_str().map(String::from) else {
+        return error(StatusCode::BAD_REQUEST, "model must be a string");
+    };
+    let check = crate::pull::Spec {
+        model: model.clone(),
+        revision: None,
+        files: vec![crate::pull::File {
+            path: "x".into(),
+            url: "https://x".into(),
+            sha256: "0".repeat(64),
+            size: 0,
+        }],
+    };
+    if let Err(e) = check.check() {
+        return error(StatusCode::BAD_REQUEST, e);
+    }
+    {
+        let st = app.node.state();
+        let busy = st.model.as_ref().map(|m| m.name.as_str()) == Some(model.as_str())
+            || st.loading.as_ref().map(|l| l.0.as_str()) == Some(model.as_str());
+        if busy {
+            return error(
+                StatusCode::CONFLICT,
+                format!("{model} is loaded; unload it first"),
+            );
+        }
+    }
+    if app.node.pull.pulling().as_deref() == Some(model.as_str()) {
+        return error(
+            StatusCode::CONFLICT,
+            format!("{model} is being pulled; cancel it first"),
+        );
+    }
+    match tokio::task::spawn_blocking(move || crate::pull::delete(&model).map(|d| (model, d))).await
+    {
+        Ok(Ok((model, true))) => Json(json!({ "deleted": model })).into_response(),
+        Ok(Ok((model, false))) => error(StatusCode::NOT_FOUND, format!("{model} isn't on disk")),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 /// Run a load or unload on the worker, when no request is running or waiting.
@@ -1784,6 +1882,7 @@ mod tests {
     #[test]
     fn fixed_backend_rejects_swaps_before_resolving_or_loading() {
         let node = std::sync::Arc::new(super::Node {
+            pull: Default::default(),
             id: "test".into(),
             queue: crate::queue::Queue::new(),
             state: std::sync::Mutex::new(super::NodeState::default()),
@@ -2137,6 +2236,7 @@ mod tests {
         crate::telemetry::install(&tp, &mp);
 
         let node = std::sync::Arc::new(super::Node {
+            pull: Default::default(),
             id: "test".into(),
             queue: crate::queue::Queue::new(),
             state: std::sync::Mutex::new(super::NodeState::default()),
@@ -2265,6 +2365,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let node = std::sync::Arc::new(super::Node {
+            pull: Default::default(),
             id: "test".into(),
             queue: crate::queue::Queue::new(),
             state: std::sync::Mutex::new(super::NodeState::default()),
@@ -2384,6 +2485,7 @@ mod step_failures {
 
     fn worker(fail: fn(&[usize]) -> anyhow::Result<()>) -> W {
         let node = std::sync::Arc::new(super::Node {
+            pull: Default::default(),
             id: "test".into(),
             queue: crate::queue::Queue::new(),
             state: std::sync::Mutex::new(super::NodeState::default()),
@@ -2574,6 +2676,7 @@ mod context_limits {
 
     fn worker() -> W {
         let node = std::sync::Arc::new(super::Node {
+            pull: Default::default(),
             id: "test".into(),
             queue: crate::queue::Queue::new(),
             state: std::sync::Mutex::new(super::NodeState::default()),
@@ -2725,6 +2828,10 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             _ => Vec::new(),
         },
         cache_key: body["prompt_cache_key"].as_str().map(String::from),
+        tenant: body["user"]
+            .as_str()
+            .or(body["safety_identifier"].as_str())
+            .map(String::from),
         prefill_only: false,
     })
 }
@@ -3021,6 +3128,7 @@ mod node_auth {
         let identity =
             Arc::new(Identity::load_or_create(Some(&dir.join("node-identity"))).unwrap());
         let node = Arc::new(Node {
+            pull: Default::default(),
             id: "0123456789abcdef0123456789abcdef".into(),
             queue: Queue::new(),
             state: Mutex::new(NodeState::default()),
