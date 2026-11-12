@@ -1019,7 +1019,14 @@ fn gemv_kernel(g: &GemvShape) -> (String, usize, usize) {
     }
     let units = g.k / 128;
     // half-super-blocks a lane (more loads in flight a lane), then lanes a row
-    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL").unwrap_or(2);
+    // by positions (coder-next, H200): one position a weight (decode) runs
+    // best at 1 (4.81 vs 4.94 ms a step), B = 4 streams' routed experts
+    // (40 positions) at 4 (8.45 vs 8.93 ms)
+    let upl: usize = super::tune::knob_parse("TANG_GEMV_UPL").unwrap_or(match g.npos {
+        0..=15 => 1,
+        16..=31 => 2,
+        _ => 4,
+    });
     let lanes = units.div_ceil(upl.max(1)).next_power_of_two().clamp(1, 32);
     let (warps, unroll) = gemv_knobs(g);
     let rpw = 32 / lanes;

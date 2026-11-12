@@ -140,6 +140,10 @@ pub struct DecodeOpts {
     pub mma: bool,
     /// Block shape of those tiles (`MMA_SHAPES` index).
     pub mma_shape: usize,
+    /// No tensor-core tiles for many-row f32 contractions (`TANG_STEP_MMA=0`
+    /// for this program only): batched decode, where B streams' few rows
+    /// were faster on the warp lowering.
+    pub no_step_mma: bool,
 }
 
 /// What [`TensorGraph::to_cuda_decode`] produced.
@@ -322,7 +326,7 @@ impl TensorGraph {
                         .find(|&i| matches!(self.nodes[i].op, Op::Input(j) if j == k))
                 })
                 .collect();
-            if std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
+            if !opts.no_step_mma && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0") {
                 if let Some(g) = self.split_bilinear_avoiding(outputs, &packed_in) {
                     // factors were appended after their readers: lower the
                     // graph renumbered in dependency order, then give the
@@ -419,6 +423,7 @@ impl TensorGraph {
                 continue;
             }
             if target == DecodeTarget::Cuda
+                && !opts.no_step_mma
                 && std::env::var("TANG_STEP_MMA").as_deref() != Ok("0")
                 && self.nodes[root].int_mma.is_none()
                 && self.mma_candidate(root)

@@ -46,7 +46,7 @@ fn main() {
             std::env::var("TANG_BATCH_GROUP")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32)
+                .unwrap_or(64)
         },
         |v| v.parse().unwrap(),
     );
@@ -63,6 +63,10 @@ fn main() {
         batch: Some(nb),
         group,
         block: Some(BlockOpts::batched()),
+        // `TANG_Q6K_Q8=0`: keep Q6_K tensors as f32
+        q6k_as_q8_0: std::env::var("TANG_Q6K_Q8").as_deref() != Ok("0"),
+        // `TANG_KV_F16=1`: K/V caches stored f16
+        kv_f16: std::env::var("TANG_KV_F16").as_deref() == Ok("1"),
     };
     let low = lower_real_step_with(&pg, &st, &tys, &ro);
     let native = low.program.native.iter().filter(|n| **n).count();
@@ -113,7 +117,18 @@ fn main() {
         .kernels
         .iter()
         .map(|k| {
-            let nd = &graph.nodes()[k.node.index()];
+            // (the lowering may add nodes past the returned graph)
+            let Some(nd) = graph.nodes().get(k.node.index()) else {
+                let head: String = k
+                    .source
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                return (format!("n{} (lowering-added)", k.node.index()), head);
+            };
             let what = match graph.comp_at(k.node.index()) {
                 Some(c) => format!(
                     "{:?} red {:?} gathers {} int8 {:?}",
@@ -147,7 +162,7 @@ fn main() {
     for (k, si) in st.inputs.iter().enumerate() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
-        let words = tang_bench::ir_coder_real::encode(&g, t, storage[k]).unwrap();
+        let words = encode(&g, t, storage[k]).unwrap();
         bytes_up += words.len() * 4;
         prog.write(&rt, prog.input(k), &words);
     }
@@ -165,6 +180,26 @@ fn main() {
         .iter()
         .position(|s| matches!(s, StepInput::New(_)))
         .unwrap();
+    // words of an input's buffer: f16 K/V caches (`kv_f16`) hold two a word
+    let kv_packed: Vec<usize> = st
+        .caches
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| ro.kv_f16 && !c.state && c.ring.is_none())
+        .map(|(c, _)| {
+            st.inputs
+                .iter()
+                .position(|s| *s == StepInput::Cache(c))
+                .unwrap()
+        })
+        .collect();
+    let words_of_input = |k: usize| {
+        if kv_packed.contains(&k) {
+            input_len[k].div_ceil(2)
+        } else {
+            input_len[k]
+        }
+    };
     let cache_ins: Vec<usize> = (0..st.inputs.len())
         .filter(|&k| matches!(st.inputs[k], StepInput::Cache(_)))
         .collect();
@@ -202,7 +237,7 @@ fn main() {
         let mut last: Vec<Vec<f32>> = vec![Vec::new(); streams];
         for g0 in (0..streams).step_by(nb) {
             for &k in &cache_ins {
-                prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
+                prog.write(&rt, prog.input(k), &vec![0.0; words_of_input(k)]);
             }
             for i in 0..steps {
                 let toks: Vec<f32> = (0..nb)
@@ -276,7 +311,7 @@ fn main() {
         let nlp: usize = opt("--gen-logprobs").map_or(2, |v| v.parse().unwrap());
         std::fs::create_dir_all(&dir).unwrap();
         for &k in &cache_ins {
-            prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
+            prog.write(&rt, prog.input(k), &vec![0.0; words_of_input(k)]);
         }
         let prompt =
             |s: usize| -> Vec<usize> { base.iter().map(|&t| (t + 7 * s) % vocab).collect() };
