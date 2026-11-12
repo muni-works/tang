@@ -374,7 +374,7 @@ impl TensorGraph {
         let delta = if d.delta {
             format!(
                 r#"        // A (strictly lower) and R = βV − (βe^γ ⊙ K)S₀
-        gram(Ks, true);
+        gram(Ks, true, nt);
         for (int e = tid; e < {cc} * {bv}; e += 256) {{
             const int t = e / {bv}, c = e % {bv};
             float a = 0.f;
@@ -414,7 +414,7 @@ impl TensorGraph {
         let readout = match d.readout {
             Some(scale) => format!(
                 r#"        // P = tril(Q Kᵀ ⊙ e^{{γt−γs}}), then o = scale·(e^γ Q S₀ + P U)
-        gram(Qs, false);
+        gram(Qs, false, nt);
         __syncthreads();
         for (int e = tid; e < {cc} * {bv}; e += 256) {{
             const int t = e / {bv}, c = e % {bv};
@@ -458,7 +458,7 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     // Ms = a C × C Gram of X's rows with K's, 4 × 4 a thread (rows ti + 16a,
     // columns si + 16b: a warp reads distinct banks of K), masked lower
     // (strict: × β_t, the delta system; else the readout's) and decayed
-    auto gram = [&](const float* X, bool strict) {{
+    auto gram = [&](const float* X, bool strict, int nt) {{
         const int ti = tid / 16, si = tid % 16;
         for (int t4 = 0; t4 < {cc}; t4 += 64) {{
         float acc[4][4] = {{}};
