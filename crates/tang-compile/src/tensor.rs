@@ -107,6 +107,9 @@ pub mod opencl_gemv;
 #[path = "tensor_place.rs"]
 pub mod place;
 pub use place::{Boundary, MemorySchedule, Place, Placed};
+/// Sub-4-bit weight formats (affine, codebook VQ, Hadamard), emulated.
+#[path = "tensor_lowbit.rs"]
+pub mod lowbit;
 #[path = "tensor_precision.rs"]
 pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.

@@ -59,6 +59,8 @@ impl PrefillGraph {
 struct B {
     g: TensorGraph,
     inputs: Vec<PrefillInput>,
+    /// [`QwenDims::g3`]
+    g3: bool,
 }
 
 impl B {
@@ -76,16 +78,19 @@ impl B {
         self.input(name, &shape, packing)
     }
 
+    /// A projection's codes, scales, biases ([`QwenDims::g3`]: 3-bit
+    /// decoder blocks).
     fn q4(&mut self, name: &str, rows: usize, cols: usize) -> [TensorId; 3] {
         let groups = cols / GROUP;
+        let (q, sb) = if self.g3 && !name.starts_with("embed") && !name.starts_with("lm_head") {
+            (Packing::U3, Packing::F16)
+        } else {
+            (Packing::U4, Packing::Bf16)
+        };
         [
-            self.fixed(
-                format!("{name}.q"),
-                &[rows, groups, GROUP],
-                Some(Packing::U4),
-            ),
-            self.fixed(format!("{name}.s"), &[rows, groups], Some(Packing::Bf16)),
-            self.fixed(format!("{name}.b"), &[rows, groups], Some(Packing::Bf16)),
+            self.fixed(format!("{name}.q"), &[rows, groups, GROUP], Some(q)),
+            self.fixed(format!("{name}.s"), &[rows, groups], Some(sb)),
+            self.fixed(format!("{name}.b"), &[rows, groups], Some(sb)),
         ]
     }
 
@@ -197,6 +202,7 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
     let mut b = B {
         g: TensorGraph::new(),
         inputs: Vec::new(),
+        g3: dims.g3,
     };
     let tokens = b.input("tokens".into(), &[T], None);
 
@@ -238,6 +244,16 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
         .unwrap();
     let cs = b.g.reshape(cs, &with_t(&[hd])).unwrap();
 
+    // [`QwenDims::hadamard`]: rotate a projection input (identity when 0)
+    let had = (dims.hadamard > 0).then(|| {
+        let hb = dims.hadamard;
+        b.fixed("hadamard".into(), &[hb, hb], None)
+    });
+    let rot = |b: &mut B, x: TensorId, n: usize, site: &str, p: &dyn Fn(&str) -> String| {
+        let Some(h) = had else { return x };
+        let s = b.fixed(p(&format!("{site}.had")), &[n], Some(Packing::F16));
+        super::hadamard_rows(&mut b.g, x, T, n, s, h, dims.hadamard)
+    };
     let mut ks = Vec::new();
     let mut vs = Vec::new();
     let mut keep = Vec::new();
@@ -254,6 +270,7 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
         let kn = b.fixed(p("k_norm"), &[hd], None);
 
         let normed = b.rms_norm(x, d, ln1, eps);
+        let normed = rot(&mut b, normed, d, "qkv", &p);
         let qkv = b.linear(normed, qkv_w);
         let nh = heads + kvh;
         let hss =
@@ -439,9 +456,11 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
             )
             .unwrap();
         let attn = b.g.reshape(attn, &with_t(&[q_rows])).unwrap();
+        let attn = rot(&mut b, attn, q_rows, "o", &p);
         let proj = b.linear(attn, o_w);
         let res1 = b.add(x, proj);
         let normed2 = b.rms_norm(res1, d, ln2, eps);
+        let normed2 = rot(&mut b, normed2, d, "gate", &p);
         let gate = b.linear(normed2, gate_w);
         let up = b.linear(normed2, up_w);
         let act =
@@ -449,6 +468,7 @@ pub fn prefill_graph(dims: &QwenDims) -> PrefillGraph {
                 a[0] / (ExprId::from_f64(1.0) + (-a[0]).exp()) * a[1]
             })
             .unwrap();
+        let act = rot(&mut b, act, ff, "down", &p);
         let down = b.linear(act, down_w);
         let res2 = b.add(res1, down);
         keep.extend([res1, res2]);
@@ -586,7 +606,7 @@ pub fn as_decode_graph(pg: &PrefillGraph, step: &StepGraph, dims: &QwenDims) -> 
             .iter()
             .enumerate()
             .filter(|(_, si)| {
-                matches!(si, StepInput::Same(i) if pg.inputs[*i].packing == Some(Packing::U4))
+                matches!(si, StepInput::Same(i) if matches!(pg.inputs[*i].packing, Some(Packing::U4 | Packing::U3)))
             })
             .map(|(k, _)| k)
             .collect();
@@ -643,6 +663,8 @@ mod tests {
             kv_f16: false,
             vocab_chunks: 1,
             prefill_q4: false,
+            g3: false,
+            hadamard: 0,
         }
     }
 
@@ -667,6 +689,7 @@ mod tests {
                 } else {
                     match s.packing {
                         Some(Packing::U4) => (0..n).map(|_| (rnd() * 15.999).floor()).collect(),
+                        Some(Packing::U3) => (0..n).map(|_| (rnd() * 7.999).floor()).collect(),
                         Some(_) if s.name.ends_with(".s") => {
                             (0..n).map(|_| 0.01 + 0.02 * rnd()).collect()
                         }
@@ -832,7 +855,24 @@ mod tests {
                     f32::from_bits(h(c[0]) | (c.get(1).map_or(0, |&x| h(x)) << 16))
                 })
                 .collect(),
-            Some(Packing::F16) => unimplemented!("f16 inputs"),
+            Some(Packing::F16) => v
+                .chunks(2)
+                .map(|c| {
+                    let h = |x: f64| tang_compile::tensor::precision::f16_bits(x) as u32;
+                    f32::from_bits(h(c[0]) | (c.get(1).map_or(0, |&x| h(x)) << 16))
+                })
+                .collect(),
+            // one bit stream, element i at bit 3i (a 64-bit window per code)
+            Some(Packing::U3) => {
+                let mut w = vec![0u32; (3 * v.len()).div_ceil(32) + 1];
+                for (i, &q) in v.iter().enumerate() {
+                    let both = (q as u64 & 7) << (3 * i % 32);
+                    w[3 * i / 32] |= both as u32;
+                    w[3 * i / 32 + 1] |= (both >> 32) as u32;
+                }
+                w.truncate((3 * v.len()).div_ceil(32));
+                w.into_iter().map(f32::from_bits).collect()
+            }
         }
     }
 
@@ -844,23 +884,78 @@ mod tests {
         }
     }
 
+    /// f16 inputs rounded to f16, so the interpreter sees what the device
+    /// does.
+    fn f16_exact(v: &mut [f64]) {
+        use tang_compile::tensor::precision::{f16_bits, f16_from_bits};
+        for x in v {
+            *x = f16_from_bits(f16_bits(*x));
+        }
+    }
+
     /// A short window's generated CUDA kernels (packed-weight GEMVs with
     /// the rows and weight rows in registers, streamed activations) run on
     /// the CPU (`cuda_cpu`) against the interpreter's window.
     #[test]
     fn short_window_kernels_run_on_the_cpu() {
-        let dims = tiny();
+        window_kernels_on_cpu(&tiny(), &[1, 4, 8]);
+    }
+
+    /// The same with GPTQ 3-bit decoder blocks ([`QwenDims::g3`]: U3 codes,
+    /// f16 scales and biases) through the U3 GEMV paths.
+    #[test]
+    fn g3_window_kernels_run_on_the_cpu() {
+        let dims = QwenDims { g3: true, ..tiny() };
+        let pg = prefill_graph(&dims);
+        let u3 = pg
+            .inputs
+            .iter()
+            .filter(|s| s.packing == Some(Packing::U3))
+            .count();
+        assert_eq!(u3, 5 * dims.layers, "every block projection is U3");
+        window_kernels_on_cpu(&dims, &[1, 4]);
+    }
+
+    /// g3 behind the block-Hadamard rotation ([`QwenDims::hadamard`]):
+    /// every projection input rotated in the graph, fused or not, still
+    /// matches the interpreter.
+    #[test]
+    fn g3_hadamard_window_kernels_run_on_the_cpu() {
+        let dims = QwenDims {
+            g3: true,
+            hadamard: 128,
+            ff: 256,
+            ..tiny()
+        };
+        let pg = prefill_graph(&dims);
+        let had = pg
+            .inputs
+            .iter()
+            .filter(|s| s.name.ends_with(".had"))
+            .count();
+        assert_eq!(
+            had,
+            4 * dims.layers,
+            "qkv, o, gate|up, down rotated per layer"
+        );
+        window_kernels_on_cpu(&dims, &[1, 4]);
+    }
+
+    fn window_kernels_on_cpu(dims: &QwenDims, ks: &[usize]) {
+        let dims = dims.clone();
         let pg = prefill_graph(&dims);
         let mut w = weights(&pg, &dims);
         for s in &pg.inputs {
-            if s.packing == Some(Packing::Bf16) {
-                bf16_exact(w.get_mut(&s.name).unwrap());
+            match s.packing {
+                Some(Packing::Bf16) => bf16_exact(w.get_mut(&s.name).unwrap()),
+                Some(Packing::F16) => f16_exact(w.get_mut(&s.name).unwrap()),
+                _ => {}
             }
         }
         let all = tokens(dims.ctx, dims.vocab);
         let p0 = 5;
         let caches = prefilled_caches(&pg, &dims, &w, &all[..p0]);
-        for k in [1usize, 4, 8] {
+        for &k in ks {
             let step = derived_step(&pg, &dims, k);
             let ins = step_inputs(&pg, &step, &w, &caches, &all[p0..p0 + k], p0);
             let want = step.graph.eval(&ins, &step.outputs[..1]).remove(0);
@@ -928,6 +1023,16 @@ mod tests {
                 dp.program.kernels.len()
             );
             assert!(k == 1 || tiled > 0, "no register-tiled window GEMV");
+            if dims.g3 {
+                // the 3-bit weights take the 32-wide vector path (3 words a chunk)
+                assert!(
+                    dp.program
+                        .kernels
+                        .iter()
+                        .any(|kn| kn.source.contains("make_uint3(__ldg(p)")),
+                    "no U3 vector GEMV"
+                );
+            }
             assert!(e < 1e-4, "window {k}: {e:e}");
         }
     }
@@ -1409,6 +1514,8 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let q4 = QwenDims {
             prefill_q4: true,
+            g3: false,
+            hadamard: 0,
             ff: 40 * GROUP,
             ..tiny()
         };
