@@ -84,10 +84,16 @@ impl BlockOpts {
         if npos <= 1 || matches!(wf, Format::Fp8B32 | Format::Mxfp4) {
             return gemv;
         }
+        // positions a block on the tensor cores (`TANG_BATCH_MMA_PT`, 8):
+        // each block reads its weight rows once for that many positions
+        let mma_pt: u32 = std::env::var("TANG_BATCH_MMA_PT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         let mma = IntMma {
             stage: Stage::Mma,
             ksplit: if self.ksplit == 0 { 2 } else { self.ksplit },
-            pos_tile: 8,
+            pos_tile: mma_pt,
         };
         let big = self.mma_min > 0 && npos >= self.mma_min;
         // a tall dense weight (the LM head) is weight-bound even at few
