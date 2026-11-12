@@ -11,7 +11,7 @@
 #
 # Run from the repo root (gpu-run.sh race:coder-next:scripts/coder-serve-check.sh).
 # Env: MODEL_DIR [/root/models/coder-next], OUT [/root/coder-serve-check], CTX [8192],
-# MAX_TOKENS [128], ENGINES ["hand derived"].
+# MAX_TOKENS [128], LONG_WORDS [1500: long-prompt TTFT], ENGINES ["hand derived"].
 set -euo pipefail
 REPO=${REPO:-$PWD}
 MODEL_DIR=${MODEL_DIR:-/root/models/coder-next}
@@ -85,6 +85,16 @@ th = [threading.Thread(target=run, args=(i,)) for i in range(len(PROMPTS))]
 res["c4"] = out4
 res["c4_wall_ms"] = (time.time() - t0) * 1e3
 res["c4_agg_tok_s"] = sum(x["tokens"] for x in out4) / (res["c4_wall_ms"] / 1e3)
+# long prompt TTFT (LONG_WORDS words of code-ish text, ~1.3 tokens a word; 0: skip)
+import os
+LW = int(os.environ.get("LONG_WORDS", "1500"))
+if LW:
+    words = ("fn step(x: &mut [f32], k: usize) -> f32 { let s = x.iter().sum::<f32>(); s / k as f32 } ").split()
+    long_p = "Summarize what this code does:\n" + " ".join(words[i % len(words)] for i in range(LW))
+    MAX0 = MAX; MAX = 8
+    req(long_p + " warm")
+    res["long"] = [req(long_p) for _ in range(2)]
+    MAX = MAX0
 if mode == "derived":
     a = req(PROMPTS[1], 0.8, 7); b = req(PROMPTS[1], 0.8, 7); c = req(PROMPTS[1], 0.8, 8)
     res["sampled"] = {"same_seed_equal": a["text"] == b["text"], "other_seed_differs": a["text"] != c["text"],
@@ -125,6 +135,7 @@ for e, x in r.items():
       "c4_ttft_ms_median": st.median(y["ttft_ms"] for y in x["c4"]),
       "c4_aggregate_tok_s": x["c4_agg_tok_s"],
     }
+    if "long" in x: s[e]["long_ttft_ms_median"] = st.median(y["ttft_ms"] for y in x["long"])
     if "sampled" in x: s[e]["sampled"] = {k: v for k, v in x["sampled"].items() if k.endswith(("equal", "differs"))}
 if len(r) == 2:
     h, d = r["hand"], r["derived"]
