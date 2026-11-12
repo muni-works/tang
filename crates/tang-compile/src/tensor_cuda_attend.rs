@@ -515,6 +515,9 @@ static inline void tang_mma_bf16(float* c, const unsigned* a, const unsigned* b)
     c[0] += acc[0]; c[1] += acc[1]; c[2] += acc[2]; c[3] += acc[3];
 }
 #else
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
 static __device__ __forceinline__ unsigned short tang_bf(float x) {
     unsigned short h; asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(h) : "f"(x)); return h;
 }
