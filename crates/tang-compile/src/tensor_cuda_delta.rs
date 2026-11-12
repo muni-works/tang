@@ -391,14 +391,26 @@ impl TensorGraph {
             Rs[e] = bs[t] * (Vs[e] - expf(gs[t]) * a);
         }}
         __syncthreads();
-        // forward substitution: U_t = R_t − Σ_{{s<t}} A_ts U_s (16 lanes a column)
-        for (int t = 0; t < nt; ++t) {{
-            float a = 0.f;
-            if (col16 < {bv}) for (int s_ = part; s_ < t; s_ += 16) a += Ms[t * {cc} + s_] * Us[s_ * {bv} + col16];
-            a += __shfl_xor_sync(0xffffffffu, a, 8); a += __shfl_xor_sync(0xffffffffu, a, 4);
-            a += __shfl_xor_sync(0xffffffffu, a, 2); a += __shfl_xor_sync(0xffffffffu, a, 1);
-            if (part == 0 && col16 < {bv}) Us[t * {bv} + col16] = Rs[t * {bv} + col16] - a;
-            __syncthreads();
+        // forward substitution: U_t = R_t − Σ_{{s<t}} A_ts U_s, a column per
+        // 16 lanes, U in registers (lane `part` holds rows part + 16·j): no
+        // barrier in the loop
+        {{
+            const int c = col16 < {bv} ? col16 : 0;
+            float u[4] = {{0.f, 0.f, 0.f, 0.f}};
+            for (int t = 0; t < nt; ++t) {{
+                float a = 0.f;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {{ const int s_ = part + 16 * j; if (s_ < t) a += Ms[t * {cc} + s_] * u[j]; }}
+                a += __shfl_xor_sync(0xffffffffu, a, 8); a += __shfl_xor_sync(0xffffffffu, a, 4);
+                a += __shfl_xor_sync(0xffffffffu, a, 2); a += __shfl_xor_sync(0xffffffffu, a, 1);
+                if (part == (t & 15)) u[t >> 4] = Rs[t * {bv} + c] - a;
+            }}
+            if (col16 < {bv}) {{
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {{ const int s_ = part + 16 * j; if (s_ < {cc}) Us[s_ * {bv} + c] = s_ < nt ? u[j] : 0.f; }}
+            }}
+        }}
+        __syncthreads();
         }}
 "#
             )
@@ -497,10 +509,14 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
 {delta}{readout}        // S₀ ← e^{{γ_C}} S₀ + Σ_s e^{{γ_C−γ_s}} k_s u_sᵀ
         {{
             const float gc = gs[nt - 1];
+            // e^{{γ_C−γ_s}} into β's slots (β is not read again this chunk)
+            __syncthreads();
+            if (tid < nt) bs[tid] = expf(gc - gs[tid]);
+            __syncthreads();
             for (int e = tid; e < {n} * {bv}; e += 256) {{
                 const int x = e / {bv}, c = e % {bv};
                 float a = 0.f;
-                for (int s_ = 0; s_ < nt; ++s_) a += expf(gc - gs[s_]) * Ks[s_ * {ld} + x] * Us[s_ * {bv} + c];
+                for (int s_ = 0; s_ < nt; ++s_) a += bs[s_] * Ks[s_ * {ld} + x] * Us[s_ * {bv} + c];
                 S0[e] = expf(gc) * S0[e] + a;
             }}
         }}
