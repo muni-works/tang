@@ -349,7 +349,9 @@ impl TensorGraph {
         let tn = ks[sc.dim];
         let lo: usize = ks[sc.dim + 1..p].iter().product();
         let heads: usize = ks[..p].iter().product::<usize>() / tn;
-        let bv = [64usize, 16, 8]
+        // state columns a block (`TANG_DELTA_BV`, 32): more blocks vs more
+        // recomputed Gram products
+        let bv = [env_usize("TANG_DELTA_BV", 32), 16, 8]
             .into_iter()
             .find(|b| m.is_multiple_of(*b))
             .unwrap();
