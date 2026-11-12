@@ -17,6 +17,8 @@ fn main() {
         kv_f16: true,
         vocab_chunks: 1,
         prefill_q4: false,
+        g3: false,
+        hadamard: 0,
     };
     let dg = decode_graph(&dims);
     let (g, mut outs) = compiled_decode(&dg, true);

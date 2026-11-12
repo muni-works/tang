@@ -38,6 +38,8 @@ static inline float2 make_float2(float x, float y) { return {x, y}; }
 static inline float4 make_float4(float x, float y, float z, float w) { return {x, y, z, w}; }
 struct uint4 { unsigned x, y, z, w; };
 struct uint2 { unsigned x, y; };
+struct uint3 { unsigned x, y, z; };
+static inline uint3 make_uint3(unsigned x, unsigned y, unsigned z) { return {x, y, z}; }
 struct int4 { int x, y, z, w; };
 #define __device__
 #define __host__

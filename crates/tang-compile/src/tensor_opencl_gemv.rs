@@ -38,6 +38,12 @@ inline float tang_u4(__global const float* b, int a) {
     uint q = (((__global const uint*)b)[a >> 3] >> ((a & 7) * 4)) & 15u;
     return as_float(0x4b000000u | q) - 8388608.0f;
 }
+inline float tang_u3(__global const float* b, int a) {
+    __global const uint* w = (__global const uint*)b;
+    uint bit = 3u * (uint)a, o = bit & 31u, lo = w[bit >> 5] >> o;
+    uint q = (o > 29u ? lo | (w[(bit >> 5) + 1] << (32u - o)) : lo) & 7u;
+    return as_float(0x4b000000u | q) - 8388608.0f;
+}
 inline float tang_bf16(__global const float* b, int a) {
     uint w = ((__global const uint*)b)[a >> 1];
     return as_float((a & 1) ? (w & 0xffff0000u) : (w << 16));
@@ -859,6 +865,7 @@ impl TensorGraph {
                                 Packing::Bf16 => "tang_bf16",
                                 Packing::F16 => "tang_f16",
                                 Packing::U4 => "tang_u4",
+                                Packing::U3 => "tang_u3",
                             };
                             writeln!(
                                 s,
@@ -1086,6 +1093,7 @@ impl TensorGraph {
                     Packing::Bf16 => "tang_bf16",
                     Packing::F16 => "tang_f16",
                     Packing::U4 => "tang_u4",
+                    Packing::U3 => "tang_u3",
                 };
                 for j in 0..rn {
                     writeln!(
