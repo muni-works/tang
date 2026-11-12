@@ -257,6 +257,11 @@ pub fn lower_real_step_with(
         eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
     }
     let program = graph.to_cuda_decode(&outs, &opts);
+    if let Ok(dir) = std::env::var("TANG_DUMP_STEP") {
+        for (j, k) in program.program.kernels.iter().enumerate() {
+            std::fs::write(format!("{dir}/k{j:04}_n{}.cu", k.node.index()), &k.source).unwrap();
+        }
+    }
     RealStep {
         graph,
         outs,
