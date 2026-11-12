@@ -365,13 +365,14 @@ fn many_positions(g: &TensorGraph, i: usize) -> IntMma {
     if positions < num("TANG_INT8_ROWS", 16) as usize {
         return decode;
     }
-    // the tensor-core tile: 1.78k vs 0.84k tok/s for gemv on coder-next
-    // chunked prefill (k = 256, H200)
+    // the tensor-core tiles: 1.78k vs 0.84k tok/s for gemv on coder-next
+    // chunked prefill (k = 256, H200); the 128 × 64 tile for ungathered
+    // weights over a big enough grid (else it lowers as `Mma`): 1.99k
     let stage = match env("TANG_INT8_STAGE").as_deref() {
         Some("gemv") => Stage::Gemv,
         Some("fragment") => Stage::Fragment,
-        Some("tile") => Stage::Tile,
-        _ => Stage::Mma,
+        Some("mma") => Stage::Mma,
+        _ => Stage::Tile,
     };
     IntMma {
         stage,
