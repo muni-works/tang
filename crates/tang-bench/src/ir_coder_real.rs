@@ -251,7 +251,25 @@ pub fn lower_real_step_with(
     // norms into their Q8x32 copies), conv windows into the convs, ring
     // and state updates as side jobs on blocks of their own. On by default (H200: 5.30 -> 5.13 ms,
     // 1924 -> 1649 kernels); TANG_COKERNEL=0 off
-    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_COKERNEL").as_deref() != Some("0")
+    // (decode steps only: a prefill chunk's many-row hosts lower through paths without
+    // side jobs, "a multi-output kernel needs a native lowering")
+    let tok_rows = st
+        .inputs
+        .iter()
+        .position(|s| matches!(s, StepInput::New(_)))
+        .map(|k| {
+            graph.nodes()[input_node(&graph, k).index()]
+                .shape
+                .iter()
+                .map(|d| match d {
+                    tang_compile::tensor::Dim::Fixed(n) => *n,
+                    _ => 1,
+                })
+                .product::<usize>()
+        });
+    if tok_rows.unwrap_or(1) == 1
+        && tang_compile::tensor::tune::step_knob("coder-next", "TANG_COKERNEL").as_deref()
+            != Some("0")
     {
         let (a, b) = graph.schedule_cokernels(&outs, &opts);
         eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");
