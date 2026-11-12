@@ -411,7 +411,6 @@ impl TensorGraph {
             }}
         }}
         __syncthreads();
-        }}
 "#
             )
         } else {
