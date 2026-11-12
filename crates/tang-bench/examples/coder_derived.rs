@@ -133,7 +133,9 @@ fn main() {
     // --group N: routed experts sorted by expert over the chunk's
     // (token, slot) positions once there are N of them (one weight read
     // per expert run: the grouped expert GEMM of layer-wise prefill)
-    let group: usize = opt("--group").map_or(0, |v| v.parse().unwrap());
+    // default 16: a counting sort per routed contraction (`ScanKind::Sort`),
+    // cheap at any chunk size; `--group 0` turns it off
+    let group: usize = opt("--group").map_or(16, |v| v.parse().unwrap());
     let low = lower_real_step_with(
         &pg,
         &st,
