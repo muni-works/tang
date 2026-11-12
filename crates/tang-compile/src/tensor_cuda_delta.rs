@@ -572,6 +572,68 @@ impl TensorGraph {
                 nm = n * m
             )
         };
+        // K, Q (and V) rows: float4 loads, all issued before any store
+        let kq_load = if n.is_multiple_of(4) && bv.is_multiple_of(4) {
+            let q4 = match iq {
+                Some(i) => (
+                    format!("float4 qv[{per}]; ", per = (cc * n / 4).div_ceil(256)),
+                    format!(
+                        "qv[i] = t < nt ? ((const float4*)({}))[(p * {n} + x) / 4] : z4; ",
+                        arg(i)
+                    ),
+                    format!("if (e < {cc} * {n} / 4) *(float4*)(Qs + t * {lk} + x) = qv[i]; "),
+                ),
+                None => (String::new(), String::new(), String::new()),
+            };
+            format!(
+                r#"        {{
+            const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 kv[{per}]; {qd}float4 vv4[{pv}];
+            #pragma unroll
+            for (int i = 0; i < {per}; ++i) {{
+                const int e = tid + 256 * i, t = e / ({n} / 4), x = e % ({n} / 4) * 4;
+                const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+                kv[i] = (e < {cc} * {n} / 4 && t < nt) ? ((const float4*)({kk}))[(p * {n} + x) / 4] : z4; {ql}
+            }}
+            #pragma unroll
+            for (int i = 0; i < {pv}; ++i) {{
+                const int e = tid + 256 * i, t = e / ({bv} / 4), c = e % ({bv} / 4) * 4;
+                const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+                vv4[i] = (e < {cc} * {bv} / 4 && t < nt) ? ((const float4*)({vv}))[(p * {m} + cb * {bv} + c) / 4] : z4;
+            }}
+            #pragma unroll
+            for (int i = 0; i < {per}; ++i) {{
+                const int e = tid + 256 * i, t = e / ({n} / 4), x = e % ({n} / 4) * 4;
+                if (e < {cc} * {n} / 4) *(float4*)(Ks + t * {lk} + x) = kv[i]; {qs}
+            }}
+            #pragma unroll
+            for (int i = 0; i < {pv}; ++i) {{
+                const int e = tid + 256 * i, t = e / ({bv} / 4), c = e % ({bv} / 4) * 4;
+                if (e < {cc} * {bv} / 4) *(float4*)(Vs + t * {lb} + c) = vv4[i];
+            }}
+        }}
+"#,
+                per = (cc * n / 4).div_ceil(256),
+                pv = (cc * bv / 4).div_ceil(256),
+                qd = q4.0,
+                ql = q4.1,
+                qs = q4.2,
+            )
+        } else {
+            format!(
+                r#"        for (int e = tid; e < {cc} * {np}; e += 256) {{
+            const int t = e / {np}, x = e % {np};
+            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+            Ks[t * {lk} + x] = (t < nt && x < {n}) ? {kk}[p * {n} + x] : 0.f;
+{qload}        }}
+        for (int e = tid; e < {cc} * {bp}; e += 256) {{
+            const int t = e / {bp}, c = e % {bp};
+            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
+            Vs[t * {lb} + c] = (t < nt && c < {bv}) ? {vv}[p * {m} + cb * {bv} + c] : 0.f;
+        }}
+"#
+            )
+        };
         let skip = env_usize("TANG_DELTA_SKIP", 0);
         let delta = if skip & 1 != 0 { String::new() } else { delta };
         let readout = if skip & 2 != 0 {
@@ -608,20 +670,14 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
         const int x = e / {bp}, c = e % {bp};
         S0[x * {lb} + c] = (x < {n} && c < {bv}) ? {s0}[(long long)h * {nm} + (long long)x * {m} + cb * {bv} + c] : 0.f;
     }}
+    // the padding columns (x ≥ n of K, Q; c ≥ bv of V) stay zero
+    for (int e = tid; e < {cc} * {lk}; e += 256) {{ Ks[e] = 0.f; {qz}}}
+    for (int e = tid; e < {cc} * {lb}; e += 256) Vs[e] = 0.f;
+    __syncthreads();
     for (int t0 = 0; t0 < {tn}; t0 += {cr}) {{
         const int nt = min({cr}, {tn} - t0);
         __syncthreads();
-        for (int e = tid; e < {cc} * {np}; e += 256) {{
-            const int t = e / {np}, x = e % {np};
-            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
-            Ks[t * {lk} + x] = (t < nt && x < {n}) ? {kk}[p * {n} + x] : 0.f;
-{qload}        }}
-        for (int e = tid; e < {cc} * {bp}; e += 256) {{
-            const int t = e / {bp}, c = e % {bp};
-            const long long p = (hi * {tn} + t0 + min(t, nt - 1)) * {lo} + lo;
-            Vs[t * {lb} + c] = (t < nt && c < {bv}) ? {vv}[p * {m} + cb * {bv} + c] : 0.f;
-        }}
-        // γ: the running sum of log α (one warp's scan of 64), β
+{kq_load}        // γ: the running sum of log α (one warp's scan of 64), β
         if (tid < 32) {{
             float l[2];
             for (int i = 0; i < 2; ++i) {{
@@ -644,6 +700,7 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
 "#,
             params = params.join(", "),
             nm = n * m,
+            qz = if ro { "Qs[e] = 0.f; " } else { "" },
         );
         (src, 256, heads * ncb)
     }
