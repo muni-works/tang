@@ -43,6 +43,8 @@ use tang_expr::{trace, ExprGraph, ExprId, Node};
 pub mod c;
 #[path = "tensor_cuda.rs"]
 pub mod cuda;
+#[path = "tensor_cuda_attend.rs"]
+mod cuda_attend;
 #[path = "tensor_cuda_delta.rs"]
 mod cuda_delta;
 #[path = "tensor_cuda_gemv.rs"]
@@ -115,7 +117,7 @@ pub mod precision;
 /// The declarative schedule search space and the autotuner's cost model.
 #[path = "tensor_scan.rs"]
 pub mod scan;
-pub use scan::{DeltaForm, DeltaStep, Scan, ScanKind, Semiring};
+pub use scan::{AttendStep, DeltaForm, DeltaStep, Scan, ScanKind, Semiring};
 /// Multi-GPU decode: placements, collectives and per-rank programs.
 #[path = "tensor_shard.rs"]
 pub mod shard;

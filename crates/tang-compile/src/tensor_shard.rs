@@ -363,7 +363,7 @@ fn scan_rule(
         ScanKind::Monoid(m) => out.len() - usize::from(m.width > 1),
         ScanKind::Affine { .. } => out.len() - 2,
         // a fused delta step (CUDA decode only) is not split
-        ScanKind::Delta(_) => 0,
+        ScanKind::Delta(_) | ScanKind::Attend(_) => 0,
     };
     let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
     if let Some(Place::S(d)) = ps.first() {

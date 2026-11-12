@@ -101,6 +101,22 @@ impl DeltaStep {
     }
 }
 
+/// [`ScanKind::Attend`]: causal softmax attention of `k` new rows over a
+/// cache, fused (no scores, maxima or sums stored). Inputs `[q, K, V,
+/// pos]`: `q` `[k, kvh·per, hd]` (query head `g·per + r` reads kv head
+/// `g`), `K` `[cap, kvh, hd]`, `V` `[cap, kvh·hd]`, `pos` `[1]` (the
+/// cache rows before this step). Output `[k, kvh, per, hd]`:
+/// `o[t, g, r] = Σ_{j ≤ pos + t} softmax_j(scale·q·K_j)·V_j`. Built by the
+/// CUDA decode lowering from a derived step's attention
+/// (`fuse_attention_rows`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttendStep {
+    pub scale: f64,
+    pub kvh: usize,
+    pub per: usize,
+    pub hd: usize,
+}
+
 #[derive(Clone)]
 pub enum ScanKind {
     /// A tuple monoid; input `s` is state slot `s`.
@@ -120,6 +136,8 @@ pub enum ScanKind {
     },
     /// A fused delta-rule step ([`DeltaStep`]); CUDA decode only.
     Delta(DeltaStep),
+    /// Fused causal attention rows ([`AttendStep`]); CUDA decode only.
+    Attend(AttendStep),
 }
 
 /// The scalar semiring an affine scan's `A_t ⊗ S_{t−1} ⊕ U_t` is taken in.
@@ -215,6 +233,7 @@ impl Scan {
             ScanKind::Monoid(_) => &shapes[0],
             ScanKind::Affine { .. } => &shapes[0][..shapes[0].len() - 2],
             ScanKind::Delta(d) => return self.eval_delta(d, ins, shapes),
+            ScanKind::Attend(a) => return Self::eval_attend(a, ins, shapes),
         };
         let tn = ps[self.dim];
         let outer: usize = ps[..self.dim].iter().product();
@@ -254,7 +273,7 @@ impl Scan {
                 }
                 out
             }
-            ScanKind::Delta(_) => unreachable!(),
+            ScanKind::Delta(_) | ScanKind::Attend(_) => unreachable!(),
             ScanKind::Affine { ring, bands, .. } => {
                 let n = shapes[1][shapes[1].len() - 2];
                 let k = shapes[0][shapes[0].len() - 1];
@@ -305,7 +324,42 @@ impl Scan {
             ScanKind::Monoid(_) => s.to_vec(),
             ScanKind::Affine { .. } => s[..s.len() - 2].to_vec(),
             ScanKind::Delta(_) => s[..s.len() - 1].to_vec(),
+            ScanKind::Attend(_) => s.to_vec(),
         }
+    }
+
+    /// [`ScanKind::Attend`] on the interpreter.
+    fn eval_attend(a: &AttendStep, ins: &[&[f64]], shapes: &[Vec<usize>]) -> Vec<f64> {
+        let (kvh, per, hd) = (a.kvh, a.per, a.hd);
+        let k = shapes[0][0];
+        let cap = shapes[1][0];
+        let pos = ins[3][0].round() as usize;
+        let mut out = vec![0.0; k * kvh * per * hd];
+        let mut s = vec![0.0; cap];
+        for t in 0..k {
+            let n = (pos + t + 1).min(cap);
+            for g in 0..kvh {
+                for r in 0..per {
+                    let q = &ins[0][((t * kvh + g) * per + r) * hd..][..hd];
+                    let mut m = f64::NEG_INFINITY;
+                    for (j, sj) in s.iter_mut().enumerate().take(n) {
+                        let kj = &ins[1][(j * kvh + g) * hd..][..hd];
+                        *sj = a.scale * q.iter().zip(kj).map(|(x, y)| x * y).sum::<f64>();
+                        m = m.max(*sj);
+                    }
+                    let o = &mut out[((t * kvh + g) * per + r) * hd..][..hd];
+                    let mut l = 0.0;
+                    for (j, sj) in s.iter().enumerate().take(n) {
+                        let p = (sj - m).exp();
+                        l += p;
+                        let vj = &ins[2][(j * kvh + g) * hd..][..hd];
+                        o.iter_mut().zip(vj).for_each(|(x, v)| *x += p * v);
+                    }
+                    o.iter_mut().for_each(|x| *x /= l);
+                }
+            }
+        }
+        out
     }
 
     /// [`ScanKind::Delta`] on the interpreter: the recurrence from `init`,
@@ -857,6 +911,7 @@ impl TensorGraph {
                 Ok(gs)
             }
             ScanKind::Delta(_) => err("scan backward: a fused delta step has no backward"),
+            ScanKind::Attend(_) => err("scan backward: fused attention rows have no backward"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 let tn = ps[dim]
@@ -1281,10 +1336,10 @@ impl TensorGraph {
     /// chunked schedule is the fast path for delta-rule scans on CUDA.
     pub(super) fn scan_kernel(&self, j: usize) -> WgslKernel {
         let sc = self.scan_at(TensorId(j as u32)).unwrap();
-        if matches!(sc.kind, ScanKind::Delta(_)) {
+        if matches!(sc.kind, ScanKind::Delta(_) | ScanKind::Attend(_)) {
             // native only (the CUDA decode lowering replaces it)
             return WgslKernel {
-                source: "// fused delta step: CUDA decode only\n".into(),
+                source: "// fused step: CUDA decode only\n".into(),
                 node: TensorId(j as u32),
                 reads: {
                     let mut r: Vec<TensorId> = Vec::new();
@@ -1358,7 +1413,7 @@ impl TensorGraph {
         };
         let lines;
         match &sc.kind {
-            ScanKind::Delta(_) => unreachable!("returned above"),
+            ScanKind::Delta(_) | ScanKind::Attend(_) => unreachable!("returned above"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 super::wgsl::emit_combine(&mut s, j, m, Format::F32);
