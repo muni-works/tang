@@ -180,7 +180,7 @@ pub fn lower_real_step_with(
     let mut outs = st.outputs.clone();
     outs.extend(st.caches.iter().map(|c| c.updated));
     let (graph, outs) = if ro.group > 0 {
-        let (g, o, eg) = graph.schedule_expert_groups(&outs, ro.group);
+        let (g, o, eg) = graph.schedule_expert_groups(&outs, ro.group, true);
         eprintln!(
             "expert groups: {} routed contractions sorted by expert",
             eg.grouped.len()

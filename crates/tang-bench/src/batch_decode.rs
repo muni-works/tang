@@ -117,7 +117,7 @@ pub fn lower(
     ids.extend(st.caches.iter().map(|c| c.updated));
     let g = st.graph.bind(&[("B", nb)]).unwrap();
     let (g, ids, ng) = if group > 0 {
-        let (g, ids, eg) = g.schedule_expert_groups(&ids, group);
+        let (g, ids, eg) = g.schedule_expert_groups(&ids, group, false);
         (g, ids, eg.grouped.len())
     } else {
         (g, ids, 0)
@@ -296,7 +296,7 @@ pub fn int8_case(
     g.set_precision(w, Precision::storage(rf));
     g.set_precision(v, Precision::storage(Format::Q8_0));
     let (g, outs) = if group > 0 {
-        let (g, o, _) = g.schedule_expert_groups(&[y, z], group);
+        let (g, o, _) = g.schedule_expert_groups(&[y, z], group, true);
         (g, o)
     } else {
         (g, vec![y, z])
@@ -456,7 +456,7 @@ mod tests {
         let all: Vec<usize> = (0..nb).collect();
         let ins = step_inputs(&m, &st, &w, &toks, &ps, &caches, &all);
         let want = g.eval(&ins, &ids);
-        let (gg, gids, eg) = g.schedule_expert_groups(&ids, 2);
+        let (gg, gids, eg) = g.schedule_expert_groups(&ids, 2, false);
         assert!(!eg.grouped.is_empty(), "nothing grouped");
         let got = gg.eval(&ins, &gids);
         for (a, b) in got.iter().zip(&want) {
