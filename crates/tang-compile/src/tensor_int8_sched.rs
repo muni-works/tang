@@ -350,7 +350,7 @@ impl TensorGraph {
 
 /// The schedule of int8 contraction `i`: the decode GEMV for few
 /// positions; for a many-row step (`TANG_INT8_ROWS`, default 16, positions
-/// or more) the MMA tile (`TANG_INT8_STAGE` `gemv` / `mma` / `fragment`,
+/// or more) the MMA tile (`TANG_INT8_STAGE` `gemv` / `mma` / `fragment` / `tile`,
 /// `TANG_INT8_KSPLIT`, `TANG_INT8_POS_TILE` override).
 fn many_positions(g: &TensorGraph, i: usize) -> IntMma {
     let env = |k: &str| std::env::var(k).ok();
@@ -370,6 +370,7 @@ fn many_positions(g: &TensorGraph, i: usize) -> IntMma {
     let stage = match env("TANG_INT8_STAGE").as_deref() {
         Some("gemv") => Stage::Gemv,
         Some("fragment") => Stage::Fragment,
+        Some("tile") => Stage::Tile,
         _ => Stage::Mma,
     };
     IntMma {

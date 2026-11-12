@@ -24,6 +24,7 @@ use std::fmt::Write;
 use super::{Format, IntMma, Op, Stage, TensorGraph, TensorId, View};
 
 /// Byte layout of a GGUF k-quant super-block of 256.
+#[derive(Clone, Copy)]
 struct Blk {
     bytes: usize,
     /// Elements a block (256 for the k-quants, 32 for Q8_0).
@@ -416,6 +417,30 @@ impl TensorGraph {
                 fmt: wfmt,
                 w_total: ws.iter().product(),
                 wvalid: wvalid.as_deref(),
+            }));
+        }
+        // the prefill tile: an ungathered weight whose slice no position moves
+        if s.stage == Stage::Tile
+            && wa.view.gather.is_none()
+            && xkey.is_none()
+            && wa
+                .view
+                .forms
+                .iter()
+                .all(|f| (0..rd).all(|d| f.coefs[d] == 0))
+        {
+            return Ok(tile_kernel(&TileShape {
+                reads: reads.len(),
+                npos,
+                rows,
+                k,
+                b,
+                decode: &decode,
+                w_off: &w_off,
+                x_off: &x_off,
+                x_total,
+                wp: &param(wi)?,
+                xp: &param(xi)?,
             }));
         }
         let ksplit = s.ksplit as usize;
@@ -1530,4 +1555,200 @@ fn gemv_kernel_ds(g: &GemvShape) -> (String, usize, usize) {
     )
     .unwrap();
     (src, warps * 32, g.npos * row_blocks)
+}
+
+/// What [`tile_kernel`] needs of a contraction.
+struct TileShape<'a> {
+    reads: usize,
+    npos: usize,
+    rows: usize,
+    k: usize,
+    b: Blk,
+    /// Position decode (`P` → the position names) for the offsets.
+    decode: &'a str,
+    /// W's slice base in elements (no position moves it).
+    w_off: &'a str,
+    /// X's row base in elements at position `P`.
+    x_off: &'a str,
+    x_total: usize,
+    wp: &'a str,
+    xp: &'a str,
+}
+
+/// [`Stage::Tile`]: a block takes 128 weight rows × 64 positions. Each
+/// k-step (256 columns of Q4_K / Q5_K, 128 of Q8_0) stages the block's
+/// weight bytes and the 64 positions' Q8x32 codes and scales in shared
+/// memory once; 8 warps (4 row groups × 2 position groups) each run 2 × 4
+/// m16n8k32 int8 MMAs a 32-column sub-block from it and scale the integer
+/// dot as the [`Stage::Mma`] tile does (`d·scale` and `dmin·min` a
+/// sub-block for K-quants, `d` for Q8_0).
+fn tile_kernel(t: &TileShape) -> (String, usize, usize) {
+    let b = t.b;
+    let kq = b.per == 256;
+    // k-step: columns, sub-blocks of 32, weight bytes a row
+    let ks = if kq { 256 } else { 128 };
+    let nsub = ks / 32;
+    let rb = if kq { b.bytes } else { 4 * b.bytes };
+    let row_bytes = t.k / b.per * b.bytes;
+    let steps = t.k / ks;
+    let row_blocks = t.rows.div_ceil(128);
+    let groups = t.npos.div_ceil(64);
+    let params: Vec<String> = (0..t.reads)
+        .map(|i| format!("const float* __restrict__ q{i}"))
+        .collect();
+    // one sub-block's A fragment of the 16-row tile at `ra` (rows ra + gq, + 8)
+    let afrag = if kq {
+        let mut a = String::new();
+        for cc in 0..4 {
+            let (row, h) = (if cc & 1 == 1 { "rB" } else { "rA" }, cc >> 1);
+            write!(
+                a,
+                "                {{ const unsigned w = *(const unsigned*)({row} + {qs} + (s >> 1) * 32 + {h16} + tig * 4); a[mt][{cc}] = (s & 1) ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu);",
+                qs = b.qs,
+                h16 = 16 * h
+            )
+            .unwrap();
+            if b.five {
+                write!(
+                    a,
+                    " a[mt][{cc}] |= (((*(const unsigned*)({row} + 16 + {h16} + tig * 4)) >> s) & 0x01010101u) << 4;",
+                    h16 = 16 * h
+                )
+                .unwrap();
+            }
+            a.push_str(" }\n");
+        }
+        a
+    } else {
+        "                a[mt][0] = tang_s32h(rA + s * 34 + 2 + tig * 4); a[mt][2] = tang_s32h(rA + s * 34 + 18 + tig * 4);\n                a[mt][1] = tang_s32h(rB + s * 34 + 2 + tig * 4); a[mt][3] = tang_s32h(rB + s * 34 + 18 + tig * 4);\n".to_string()
+    };
+    // a row's (d·scale, dmin·min) for sub-block s
+    let scale = if kq {
+        r#"    auto sc = [&](const unsigned char* r, int s, float& fs, float& fm) {
+        const unsigned dw = *(const unsigned*)r;
+        const unsigned s0 = *(const unsigned*)(r + 4), s1 = *(const unsigned*)(r + 8), s2 = *(const unsigned*)(r + 12);
+        const int sh = 8 * (s & 3);
+        unsigned scv, mv;
+        if (s < 4) { scv = (s0 >> sh) & 0x3Fu; mv = (s1 >> sh) & 0x3Fu; }
+        else { scv = ((s2 >> sh) & 0x0Fu) | (((s0 >> sh) >> 6 & 0x03u) << 4); mv = (((s2 >> sh) >> 4) & 0x0Fu) | (((s1 >> sh) >> 6 & 0x03u) << 4); }
+        fs = tang_h2f_bits((unsigned short)(dw & 0xFFFFu)) * (float)scv;
+        fm = tang_h2f_bits((unsigned short)(dw >> 16)) * (float)mv;
+    };
+"#
+    } else {
+        r#"    auto sc = [&](const unsigned char* r, int s, float& fs, float& fm) {
+        fs = tang_h2f_bits(*(const unsigned short*)(r + s * 34)); fm = 0.f;
+    };
+"#
+    };
+    let mut src = String::new();
+    src.push_str(HELPERS);
+    write!(
+        src,
+        r#"__device__ __forceinline__ unsigned tang_s32h(const unsigned char* p) {{
+    const unsigned short* h = (const unsigned short*)p;
+    return (unsigned)h[0] | ((unsigned)h[1] << 16);
+}}
+extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restrict__ out, unsigned count) {{
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gq = lane >> 2, tig = lane & 3;
+    const int grp = blockIdx.x / {row_blocks}, rbk = blockIdx.x % {row_blocks};
+    if (grp >= {groups}) return;
+    const int pos0 = grp * 64, row0 = rbk * 128;
+    const int wr = warp >> 1, wc = warp & 1;
+    __shared__ __align__(16) unsigned char Ws[128 * {rb}];
+    __shared__ __align__(16) signed char Xs[64 * {ks}];
+    __shared__ float2 XSs[64 * {nsub}];
+    __shared__ long long xoff[64];
+    if (tid < 64) {{
+        const long long P = min(pos0 + tid, {npos} - 1);
+{decode}        xoff[tid] = ({x_off});
+    }}
+    const unsigned char* wbase;
+    {{ const long long P = pos0;
+{decode}      const long long KEY = 0; (void)KEY;
+      wbase = (const unsigned char*)({wp}) + ({w_off}) / {per} * {bytes}; }}
+    const signed char* xcodes = (const signed char*)({xp});
+    const float2* xsc = (const float2*)((const unsigned char*)({xp}) + {x_total});
+{scale}    float acc[2][4][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+    for (int st = 0; st < {steps}; st++) {{
+        __syncthreads();
+        for (int u = tid; u < 128 * {rb} / 8; u += 256) {{
+            const int r = u / ({rb} / 8), w = u % ({rb} / 8);
+            const unsigned char* g = wbase + (size_t)min(row0 + r, {rows} - 1) * {row_bytes} + (size_t)st * {rb};
+            ((uint2*)(Ws + r * {rb}))[w] = __ldg((const uint2*)g + w);
+        }}
+        for (int u = tid; u < 64 * {ks} / 16; u += 256) {{
+            const int p = u / ({ks} / 16), w = u % ({ks} / 16);
+            ((uint4*)(Xs + p * {ks}))[w] = __ldg((const uint4*)(xcodes + xoff[p] + (size_t)st * {ks}) + w);
+        }}
+        for (int u = tid; u < 64 * {nsub}; u += 256) {{
+            const int p = u / {nsub}, j = u % {nsub};
+            XSs[u] = __ldg(xsc + xoff[p] / 32 + st * {nsub} + j);
+        }}
+        __syncthreads();
+        #pragma unroll
+        for (int s = 0; s < {nsub}; s++) {{
+            unsigned a[2][4];
+            float fs[2][2], fm[2][2];
+            #pragma unroll
+            for (int mt = 0; mt < 2; mt++) {{
+                const unsigned char* rA = Ws + (wr * 32 + mt * 16 + gq) * {rb};
+                const unsigned char* rB = rA + 8 * {rb};
+{afrag}                sc(rA, s, fs[mt][0], fm[mt][0]);
+                sc(rB, s, fs[mt][1], fm[mt][1]);
+            }}
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {{
+                const int pp = wc * 32 + nt * 8;
+                const signed char* xs_ = Xs + (pp + gq) * {ks} + s * 32;
+                const unsigned b0 = *(const unsigned*)(xs_ + tig * 4), b1 = *(const unsigned*)(xs_ + 16 + tig * 4);
+                const float2 x0 = XSs[(pp + 2 * tig) * {nsub} + s], x1 = XSs[(pp + 2 * tig + 1) * {nsub} + s];
+                #pragma unroll
+                for (int mt = 0; mt < 2; mt++) {{
+                    int d[4];
+                    tang_mma_s8(d, a[mt], b0, b1);
+                    acc[mt][nt][0] = fmaf(fs[mt][0] * x0.x, (float)d[0], fmaf(-fm[mt][0], x0.y, acc[mt][nt][0]));
+                    acc[mt][nt][1] = fmaf(fs[mt][0] * x1.x, (float)d[1], fmaf(-fm[mt][0], x1.y, acc[mt][nt][1]));
+                    acc[mt][nt][2] = fmaf(fs[mt][1] * x0.x, (float)d[2], fmaf(-fm[mt][1], x0.y, acc[mt][nt][2]));
+                    acc[mt][nt][3] = fmaf(fs[mt][1] * x1.x, (float)d[3], fmaf(-fm[mt][1], x1.y, acc[mt][nt][3]));
+                }}
+            }}
+        }}
+    }}
+    #pragma unroll
+    for (int mt = 0; mt < 2; mt++) {{
+        const int ra = row0 + wr * 32 + mt * 16 + gq;
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {{
+            const int pa = pos0 + wc * 32 + nt * 8 + 2 * tig;
+            if (pa < {npos}) {{
+                if (ra < {rows}) out[(long long)pa * {rows} + ra] = acc[mt][nt][0];
+                if (ra + 8 < {rows}) out[(long long)pa * {rows} + ra + 8] = acc[mt][nt][2];
+            }}
+            if (pa + 1 < {npos}) {{
+                if (ra < {rows}) out[(long long)(pa + 1) * {rows} + ra] = acc[mt][nt][1];
+                if (ra + 8 < {rows}) out[(long long)(pa + 1) * {rows} + ra + 8] = acc[mt][nt][3];
+            }}
+        }}
+    }}
+}}
+"#,
+        params = params.join(", "),
+        npos = t.npos,
+        rows = t.rows,
+        decode = t.decode,
+        x_off = t.x_off,
+        w_off = t.w_off,
+        wp = t.wp,
+        xp = t.xp,
+        x_total = t.x_total,
+        per = b.per,
+        bytes = b.bytes,
+    )
+    .unwrap();
+    (src, 256, groups * row_blocks)
 }
