@@ -367,9 +367,19 @@ fn f32_bytes(p: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), std::mem::size_of_val(p)) }
 }
 
+/// A temporary file extension no other writer (thread, process, pod on the shared volume) uses.
+fn tmp_ext() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!("tmp{}-{n}-{t}", std::process::id())
+}
+
 /// Write `bytes` to `path` complete or not at all.
 fn put(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = path.with_extension(tmp_ext());
     std::fs::File::create(&tmp)
         .and_then(|mut f| f.write_all(bytes))
         .and_then(|_| std::fs::rename(&tmp, path))
@@ -470,7 +480,7 @@ fn enforce(hot: &Path, cold: Option<&Path>, hot_budget: u64, cold_budget: u64) {
             {
                 let dst = to.join(sub).join(name);
                 if std::fs::rename(&p, &dst).is_err() {
-                    let tmp = dst.with_extension(format!("tmp{}", std::process::id()));
+                    let tmp = dst.with_extension(tmp_ext());
                     let _ = std::fs::copy(&p, &tmp).and_then(|_| std::fs::rename(&tmp, &dst));
                 }
             }
