@@ -93,6 +93,7 @@ fn requests() -> Vec<(&'static str, Request)> {
         max_tokens: Some(max),
         stop: stop.iter().map(|s| s.to_string()).collect(),
         cache_key: None,
+        tenant: None,
         prefill_only: false,
     };
     let edit = format!(

@@ -64,6 +64,10 @@ pub struct Request {
     /// The conversation this continues (`prompt_cache_key`), so it runs in that
     /// conversation's KV slot.
     pub cache_key: Option<String>,
+    /// Who sent it (OpenAI's `user` or `safety_identifier`; the gateway sets it to the account):
+    /// prefix states past the shared part of a prompt are reused only within a
+    /// tenant unless `TANG_SERVE_SHARE=all` (see `flash::serve::Share`).
+    pub tenant: Option<String>,
     /// Only prefill (warm the cache for a request that will follow); nothing is generated.
     pub prefill_only: bool,
 }
@@ -557,6 +561,7 @@ impl<D: ComputeDevice> Engine<D> {
             cache,
             cache_images: Vec::new(),
             cache_key: None,
+            tenant: None,
             cache_used: 0,
             cache_at: crate::retention::now(),
             parked: Vec::new(),

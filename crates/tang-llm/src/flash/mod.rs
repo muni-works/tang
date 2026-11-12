@@ -21,6 +21,7 @@ pub mod fa2;
 pub mod glm5;
 #[cfg(feature = "cuda")]
 pub mod kernels;
+pub mod kvstore;
 pub mod mtp;
 #[cfg(feature = "cuda")]
 pub mod mtp_gpu;

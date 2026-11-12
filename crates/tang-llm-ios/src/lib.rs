@@ -139,6 +139,7 @@ fn run(e: &mut Engine<MetalDevice>, messages: Value, max_tokens: usize) -> Resul
         max_tokens: Some(max_tokens),
         stop: Vec::new(),
         cache_key: None,
+        tenant: None,
         prefill_only: false,
     };
     let mut text = String::new();
@@ -221,6 +222,7 @@ pub unsafe extern "C" fn tang_chat(
             max_tokens: Some(max_tokens as usize),
             stop: Vec::new(),
             cache_key: None,
+            tenant: None,
             prefill_only: false,
         };
         let t = Instant::now();

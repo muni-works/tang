@@ -2725,6 +2725,10 @@ pub fn parse(body: &Value) -> Result<Request, String> {
             _ => Vec::new(),
         },
         cache_key: body["prompt_cache_key"].as_str().map(String::from),
+        tenant: body["user"]
+            .as_str()
+            .or(body["safety_identifier"].as_str())
+            .map(String::from),
         prefill_only: false,
     })
 }
