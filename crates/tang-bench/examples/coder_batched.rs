@@ -200,6 +200,26 @@ fn main() {
         .iter()
         .position(|s| matches!(s, StepInput::New(_)))
         .unwrap();
+    // words of an input's buffer: f16 K/V caches (`kv_f16`) hold two a word
+    let kv_packed: Vec<usize> = st
+        .caches
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| ro.kv_f16 && !c.state && c.ring.is_none())
+        .map(|(c, _)| {
+            st.inputs
+                .iter()
+                .position(|s| *s == StepInput::Cache(c))
+                .unwrap()
+        })
+        .collect();
+    let words_of_input = |k: usize| {
+        if kv_packed.contains(&k) {
+            input_len[k].div_ceil(2)
+        } else {
+            input_len[k]
+        }
+    };
     let cache_ins: Vec<usize> = (0..st.inputs.len())
         .filter(|&k| matches!(st.inputs[k], StepInput::Cache(_)))
         .collect();
@@ -237,7 +257,7 @@ fn main() {
         let mut last: Vec<Vec<f32>> = vec![Vec::new(); streams];
         for g0 in (0..streams).step_by(nb) {
             for &k in &cache_ins {
-                prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
+                prog.write(&rt, prog.input(k), &vec![0.0; words_of_input(k)]);
             }
             for i in 0..steps {
                 let toks: Vec<f32> = (0..nb)
@@ -311,7 +331,7 @@ fn main() {
         let nlp: usize = opt("--gen-logprobs").map_or(2, |v| v.parse().unwrap());
         std::fs::create_dir_all(&dir).unwrap();
         for &k in &cache_ins {
-            prog.write(&rt, prog.input(k), &vec![0.0; input_len[k]]);
+            prog.write(&rt, prog.input(k), &vec![0.0; words_of_input(k)]);
         }
         let prompt =
             |s: usize| -> Vec<usize> { base.iter().map(|&t| (t + 7 * s) % vocab).collect() };
