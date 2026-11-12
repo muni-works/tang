@@ -31,6 +31,32 @@ pub fn format_of(ty: GgmlType) -> Option<Format> {
     }
 }
 
+/// GGUF tensor `t` as the device words of a step input stored as `to` ([`RealStep::storage`]):
+/// its own bytes when the step keeps its encoding, dequantized f32 when the step stores f32,
+/// and an error for any other pairing, so a weight is never uploaded in an encoding its
+/// kernels don't read. A new conversion is a new arm here.
+pub fn encode(
+    g: &Gguf,
+    t: &tang_llm::gguf::TensorInfo,
+    to: Option<Format>,
+) -> Result<Vec<f32>, String> {
+    let words = |b: &[u8]| -> Vec<f32> {
+        b.chunks(4)
+            .map(|c| {
+                let mut a = [0u8; 4];
+                a[..c.len()].copy_from_slice(c);
+                f32::from_le_bytes(a)
+            })
+            .collect()
+    };
+    match (t.ty, to) {
+        (ty, Some(f)) if format_of(ty) == Some(f) => Ok(words(g.bytes(t))),
+        (GgmlType::F32, None) => Ok(words(g.bytes(t))),
+        (_, None) => g.dequantize(t).map_err(|e| format!("{}: {e}", t.name)),
+        (ty, Some(f)) => Err(format!("{}: stored {ty:?}, the step wants {f:?}", t.name)),
+    }
+}
+
 /// [`CoderDims`] from the `qwen3next.*` header.
 pub fn dims_from_gguf(g: &Gguf) -> Result<CoderDims, String> {
     let u = |k: &str| -> Result<usize, String> {

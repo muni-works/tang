@@ -26,20 +26,7 @@ use tang_bench::ir_coder_real::*;
 use tang_bench::qwen_session::{runtime, slot_plan};
 use tang_compile::tensor::step::StepInput;
 use tang_gpu::program::Program;
-use tang_llm::gguf::{GgmlType, Gguf};
-
-fn words_of_bytes(b: &[u8]) -> Vec<f32> {
-    let mut w: Vec<f32> = b
-        .chunks(4)
-        .map(|c| {
-            let mut a = [0u8; 4];
-            a[..c.len()].copy_from_slice(c);
-            f32::from_le_bytes(a)
-        })
-        .collect();
-    w.shrink_to_fit();
-    w
-}
+use tang_llm::gguf::Gguf;
 
 macro_rules! profile {
     ($prog:expr, $rt:expr, $kinfo:expr) => {{
@@ -203,10 +190,7 @@ fn main() {
     for (k, si) in st.inputs.iter().enumerate() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
-        let words = match (storage[k], t.ty) {
-            (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
-            (None, _) => g.dequantize(t).unwrap(),
-        };
+        let words = tang_bench::ir_coder_real::encode(&g, t, storage[k]).unwrap();
         bytes_up += words.len() * 4;
         prog.write(&rt, prog.input(k), &words);
     }
