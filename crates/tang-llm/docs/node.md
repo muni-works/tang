@@ -8,6 +8,9 @@ answers `401 {"error": "not paired"}`. Pairing, the node identity and the auth r
 
 - `GET /node`: the machine, its model, measured rates, the queue and the KV it holds.
 - `POST /models/load`, `POST /models/unload`: swap the model, only into free memory.
+- `POST /models/pull`, `DELETE /models/pull`, `POST /models/delete`: download a model from
+  frog's weight mirror into the Hugging Face cache, cancel that, remove one (see
+  [Downloads](#downloads)).
 - `x-frog-priority: interactive | background` on `/v1/chat/completions` and `/v1/prefill`.
 
 ## `GET /node`
@@ -112,6 +115,9 @@ Fields:
   cached ones don't count), a decode once it generated at least 16 tokens; decode includes
   speculative decoding. A background prefill that gave way counts each of its runs.
 - `models.loading`: `{id, elapsed_ms}` while a load runs, else `null`.
+- `models.pulling`: `{model, done_bytes, total_bytes}` while a pull runs, else `null`.
+  `models.last_pull`: `{model, ok, cancelled, error}` for the last pull that ended since the
+  server started, else `null`.
 - `models.on_disk`: checkpoints in the Hugging Face cache (`HF_HUB_CACHE`, `$HF_HOME/hub` or
   `~/.cache/huggingface/hub`) that have a config, tokenizer and safetensors. `id` is what
   `/models/load` takes. `load_bytes` is what a load must find free: the weights as this server
@@ -161,6 +167,69 @@ version of loading follows from that:
 
 Loading uses the command line's settings for every model (context, dtype, KV slots and budget,
 speculative decoding); KV on disk and the draft store are per model as before.
+
+## Downloads
+
+A node downloads only what it's told to, file by file, from URLs it's given (frog's curated
+catalog, served from the `frog-weights` R2 bucket at `weights.frog.toys`; Hugging Face is only
+the mirror script's source). `src/pull.rs`.
+
+- `POST /models/pull`:
+
+  ```json
+  {
+    "model": "mlx-community/Qwen3-0.6B-4bit",
+    "revision": "73e3e38d981303bc594367cd910ea6eb48349da8",
+    "files": [
+      { "path": "config.json", "url": "https://weights.frog.toys/mlx-community/Qwen3-0.6B-4bit/73e3…/config.json",
+        "sha256": "…", "size": 937 },
+      …
+    ]
+  }
+  ```
+
+  A catalog entry from `scripts/mirror-weights.sh` carries exactly these (`id` is `model`).
+  `revision` is optional (without it the snapshot is named from the files' hashes).
+  - **202** `{"pulling", "total_bytes"}` once it has started; follow `models.pulling` in
+    `/node` and read `models.last_pull` for how it ended.
+  - **507** up front if it won't fit: in memory, when the files include `config.json` (fetched
+    first, then `node::need` on the listed safetensors bytes against `hardware.total_bytes`,
+    the device on its own since a node runs one model), or on disk (bytes still to download
+    against the free space of the hub cache's filesystem).
+  - **409** while another pull runs (one at a time per node). **400** for a malformed body: the
+    model must be `org/name`, file paths relative without `..`, sha256 64 hex digits, URLs http(s).
+  - Files land in the Hugging Face cache layout: `blobs/<sha256>` (downloaded to
+    `blobs/<sha256>.part` first, checked against its size and sha256, then renamed),
+    `snapshots/<revision>/<path>` symlinked to the blob, and `refs/main` written last. A model
+    shows up in `on_disk` (and `/models/load` finds it) only once all of that is done.
+  - A `.part` file left by a cancelled or failed pull is resumed with `Range: bytes=<n>-` the
+    next time the same model is pulled (a server that answers 200 instead of 206 restarts that
+    file). A file whose sha256 doesn't match is deleted and fails the pull.
+- `DELETE /models/pull` stops the running pull: **200** `{"cancelled": <model>}`, **404** if none.
+  What it downloaded stays for a later resume; `last_pull.cancelled` is `true`.
+- `POST /models/delete {"model": "<repo id>"}` removes the model's whole directory from the hub
+  cache: **200** `{"deleted"}`, **404** if it isn't there, **409** for the loaded or loading
+  model (unload first) or the one being pulled (cancel first), **400** for anything but `org/name`.
+
+### Supported families
+
+What the generic path (`/models/load`, not Flash mode) serves. Checked on an RTX 3090 (mew) by
+loading each through `/models/load` and running one chat completion.
+
+tang d6a4c7ce, `--features cuda`, `serve --device cuda --ctx 4096`, ~9 GB of the 3090's VRAM free
+(other servers held the rest), 2026-11-12. Decode tok/s is the server's `predicted_per_second`
+for one 64-token reply (speculative drafting on, the default).
+
+| Family | Checkpoint | Loads | Coherent | Decode tok/s | Notes |
+|---|---|---|---|---|---|
+| Qwen3 dense, MLX 4-bit | mlx-community/Qwen3-0.6B-4bit | yes, 3.4 s | yes | 447 | 0.34 GB weights. Also pulled from a mirror with `/models/pull` and served on CPU |
+| Qwen3 dense, bf16 | Qwen/Qwen3-0.6B | yes, 1.3 s | yes | 328 | 1.5 GB; with `--q4`: 0.42 GB, 424 tok/s |
+| Qwen3-VL | Qwen/Qwen3-VL-2B-Instruct | yes, 5.2 s | yes (text) | 183 | 4.3 GB; images not tried here |
+| Gemma 3 | unsloth/gemma-3-1b-it | yes, 2.7 s | yes | 211 | 2.0 GB. 4B: bf16 needs 10.8 GB (refused with 9 GB free); `--q4` loads in 43 s, 145 tok/s |
+| gpt-oss | openai/gpt-oss-20b | fit check refuses | untested | – | needs 15.2 GB (13.8 GB MXFP4 weights + headroom); not run on a 24 GB-free GPU yet |
+
+Notes: Qwen3 thinks by default, so a short `max_tokens` can go entirely to `reasoning_content`.
+`google/gemma-3-*` is gated on Hugging Face; the mirror copies it with its licence (`gemma`).
 
 ## Priority
 

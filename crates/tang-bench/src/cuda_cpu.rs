@@ -7,7 +7,7 @@
 //! ones included) against the interpreter without a GPU. Block-format
 //! buffers (GGUF / DeepSeek weights, Q8x32 activations) hold their raw
 //! words as on the device; `dp4a`, `__byte_perm` and the f16 conversion are
-//! emulated (not the int8 MMA: the int8 GEMV's `Gemv` stage only). One OS
+//! emulated, the int8 MMA by warp shuffles. One OS
 //! thread per CUDA thread, blocks one after the other.
 
 use std::fmt::Write as _;
@@ -26,6 +26,7 @@ const HEADER: &str = r#"
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <type_traits>
 #include <vector>
 using std::sqrt; using std::exp; using std::log; using std::round; using std::floor;
 using std::ceil; using std::fabs; using std::exp2; using std::log2; using std::tanh;
@@ -46,6 +47,7 @@ struct int4 { int x, y, z, w; };
 #define __forceinline__ inline
 #define __global__
 #define __shared__ static
+#define __align__(n) __attribute__((aligned(n)))
 #define __launch_bounds__(...)
 #define __restrict__ __restrict
 #define __noinline__
@@ -121,6 +123,53 @@ template <class T> static inline T __shfl_up_sync(unsigned, T v, unsigned off, i
 template <class T> static inline T __shfl_sync(unsigned, T v, int src, int width = 32) {
     int base = (int)(threadIdx.x & 31) & ~(width - 1); return tang_shfl(v, base + (src % width));
 }
+// wmma (16×16×8 tf32 / 16×16×16 f16, bf16): every lane holds the whole
+// fragment and computes it, the warp kept in step around each call
+namespace nvcuda { namespace wmma {
+struct matrix_a {}; struct matrix_b {}; struct accumulator {};
+struct row_major {}; struct col_major {};
+namespace precision { struct tf32 {}; }
+enum layout_t { mem_row_major, mem_col_major };
+template <class U, int M, int N, int K, class T, class L = void> struct fragment {
+    static constexpr int R = std::is_same<U, matrix_b>::value ? K : M;
+    static constexpr int C = std::is_same<U, matrix_a>::value ? K : N;
+    static constexpr int num_elements = R * C;
+    float x[R * C];
+};
+template <class U, int M, int N, int K, class T, class L, class P>
+static inline void load_matrix_sync(fragment<U, M, N, K, T, L>& f, const P* p, unsigned ldm) {
+    __syncwarp();
+    constexpr bool col = std::is_same<L, col_major>::value;
+    for (int i = 0; i < f.R; i++) for (int j = 0; j < f.C; j++) f.x[i * f.C + j] = (float)(col ? p[j * ldm + i] : p[i * ldm + j]);
+    __syncwarp();
+}
+template <class T, int M, int N, int K>
+static inline void load_matrix_sync(fragment<accumulator, M, N, K, T>& f, const float* p, unsigned ldm, layout_t l) {
+    __syncwarp();
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) f.x[i * N + j] = l == mem_col_major ? p[j * ldm + i] : p[i * ldm + j];
+    __syncwarp();
+}
+template <class T, int M, int N, int K>
+static inline void store_matrix_sync(float* p, const fragment<accumulator, M, N, K, T>& f, unsigned ldm, layout_t l) {
+    __syncwarp();
+    if ((threadIdx.x & 31) == 0)
+        for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) (l == mem_col_major ? p[j * ldm + i] : p[i * ldm + j]) = f.x[i * N + j];
+    __syncwarp();
+}
+template <class U, int M, int N, int K, class T, class L>
+static inline void fill_fragment(fragment<U, M, N, K, T, L>& f, float v) { for (int i = 0; i < f.num_elements; i++) f.x[i] = v; }
+template <class A, class B, class Cf, class Df>
+static inline void mma_sync(Df& d, const A& a, const B& b, const Cf& c) {
+    constexpr int M = A::R, K = A::C, N = B::C;
+    float t[M * N];
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) {
+        float s = c.x[i * N + j];
+        for (int k = 0; k < K; k++) s += a.x[i * K + k] * b.x[k * N + j];
+        t[i * N + j] = s;
+    }
+    for (int i = 0; i < M * N; i++) d.x[i] = t[i];
+}
+}}
 template <class F> static void tang_launch(unsigned blocks, unsigned threads, F f) {
     gridDim = {blocks, 1, 1};
     blockDim = {threads, 1, 1};
@@ -149,6 +198,27 @@ template <class F> static void tang_launch(unsigned blocks, unsigned threads, F 
 }
 "#;
 
+/// [`host_source`]'s stand-in for the `mma.sync` m16n8k32 s8 asm in
+/// `tang_mma_s8(d, a, b0, b1)` (fragment layout as the PTX ISA's).
+const MMA_S8_EMU: &str = r#"{
+        const int tang_l = (int)(threadIdx.x & 31), tang_gq = tang_l >> 2, tang_tg = tang_l & 3;
+        int tang_acc[4] = {0, 0, 0, 0};
+        for (int t = 0; t < 4; t++)
+            for (int h = 0; h < 2; h++) {
+                const unsigned r0 = __shfl_sync(0xffffffffu, a[2 * h], tang_gq * 4 + t);
+                const unsigned r1 = __shfl_sync(0xffffffffu, a[2 * h + 1], tang_gq * 4 + t);
+                const unsigned bv = h ? b1 : b0;
+                const unsigned c0 = __shfl_sync(0xffffffffu, bv, (2 * tang_tg) * 4 + t);
+                const unsigned c1 = __shfl_sync(0xffffffffu, bv, (2 * tang_tg + 1) * 4 + t);
+                tang_acc[0] = __dp4a((int)r0, (int)c0, tang_acc[0]);
+                tang_acc[1] = __dp4a((int)r0, (int)c1, tang_acc[1]);
+                tang_acc[2] = __dp4a((int)r1, (int)c0, tang_acc[2]);
+                tang_acc[3] = __dp4a((int)r1, (int)c1, tang_acc[3]);
+            }
+        d[0] = tang_acc[0]; d[1] = tang_acc[1]; d[2] = tang_acc[2]; d[3] = tang_acc[3];
+    }
+"#;
+
 /// A kernel source made host C++: the PTX `asm` conversions replaced,
 /// `extern "C"` dropped (each kernel lives in its own namespace), dynamic
 /// shared memory as a static array of `TANG_SMEM` bytes.
@@ -166,11 +236,13 @@ fn host_source(src: &str) -> String {
             r#"asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));"#,
             "f = tang_sw_h2f(h);",
         )
-        .replace("extern \"C\" ", "");
-    // the int8 MMA (not emulated: only the Gemv stage runs here)
-    if let Some(i) = s.find("asm volatile(\"mma.sync") {
+        .replace("extern \"C\" ", "")
+        .replace("#include <mma.h>", "");
+    // the int8 MMA (m16n8k32 s8): each lane gathers its A rows (gq, gq + 8)
+    // and B columns (2 tig, + 1) from the lanes holding them, by shuffles
+    if let Some(i) = s.find("asm volatile(\"mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32") {
         let end = i + s[i..].find(");\n").unwrap() + 2;
-        s.replace_range(i..end, "std::abort();");
+        s.replace_range(i..end, MMA_S8_EMU);
     }
     let smem = src
         .lines()
@@ -736,6 +808,113 @@ mod tests {
         }
     }
 
+    /// The prefill GEMM tile ([`Stage::Tile`]) on Q4_K / Q5_K / Q8_0
+    /// weights, 80 positions × 144 rows (both tile edges partial), against
+    /// the decode GEMV and the 8-position MMA tile: same products and
+    /// scales, only the summation order differs.
+    #[test]
+    fn int8_tile_matches_gemv_and_mma() {
+        use tang_compile::tensor::{
+            Arg, Dim, Format, IntMma, Monoid, Precision, Stage, TensorGraph, View,
+        };
+        let (p, r, k) = (80usize, 144usize, 512usize);
+        // a 2 × 2 grid: below the GPU's small-grid cutoff
+        std::env::set_var("TANG_INT8_TILE_MIN", "0");
+        for f in [Format::Q4K, Format::Q5K, Format::Q8_0] {
+            let (per, bytes) = match f {
+                Format::Q4K => (256, 144),
+                Format::Q5K => (256, 176),
+                _ => (32, 34),
+            };
+            // raw weight bytes: pseudo-random codes, small f16 scales
+            let row_bytes = k / per * bytes;
+            let mut wb = vec![0u8; r * row_bytes];
+            let mut st = 0x9e3779b9u32;
+            for v in wb.iter_mut() {
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                *v = st as u8;
+            }
+            for blk in 0..r * k / per {
+                let o = blk * bytes;
+                // d ≈ 0.004–0.008 (f16 0x1C00 + low bits), dmin likewise
+                wb[o] &= 0x3F;
+                wb[o + 1] = 0x1C;
+                if per == 256 {
+                    wb[o + 2] &= 0x3F;
+                    wb[o + 3] = 0x1C;
+                }
+            }
+            let words: Vec<f32> = wb
+                .chunks(4)
+                .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect();
+            let xs: Vec<f32> = (0..p * k)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let mut g = TensorGraph::new();
+            let x = g.input(&[Dim::Fixed(p), Dim::Fixed(k)]);
+            let w = g.input(&[Dim::Fixed(r), Dim::Fixed(k)]);
+            g.set_precision(w, Precision::storage(f));
+            let c = g
+                .comp(
+                    &[Dim::Fixed(p), Dim::Fixed(r)],
+                    &[Dim::Fixed(k)],
+                    vec![
+                        Arg {
+                            src: w,
+                            view: View::pick(3, &[Some(1), Some(2)]),
+                        },
+                        Arg {
+                            src: x,
+                            view: View::pick(3, &[Some(0), Some(2)]),
+                        },
+                    ],
+                    Some(Monoid::sum()),
+                    |v| vec![v[0] * v[1]],
+                )
+                .unwrap();
+            let (g, outs, sched) = g.schedule_block_weights(&[c]);
+            let mut keep = outs.clone();
+            keep.extend(&sched.copies);
+            let ci = (0..g.nodes().len())
+                .find(|&i| g.nodes()[i].int_mma.is_some())
+                .expect("an int8 contraction");
+            let run = |stage: Stage| {
+                let mut g = g.clone();
+                g.set_int_mma(
+                    tang_compile::tensor::TensorId::from_index(ci),
+                    Some(IntMma {
+                        stage,
+                        ksplit: 1,
+                        pos_tile: 1,
+                    }),
+                );
+                let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
+                let src = dp
+                    .program
+                    .kernels
+                    .iter()
+                    .any(|k| k.source.contains("float2* XSs = Ss + 128"));
+                assert_eq!(src, stage == Stage::Tile, "{f:?} {stage:?}: tile kernel");
+                super::run(&dp, &[xs.clone(), words.clone()], &outs).remove(0)
+            };
+            let gemv = run(Stage::Gemv);
+            let mma = run(Stage::Mma);
+            let tile = run(Stage::Tile);
+            let scale = gemv.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = |a: &[f32], b: &[f32]| {
+                a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+            };
+            let (dm, dt) = (diff(&gemv, &mma), diff(&gemv, &tile));
+            eprintln!("{f:?}: max |out| {scale:.3}, mma vs gemv {dm:.2e}, tile vs gemv {dt:.2e}");
+            assert!(scale > 0.0 && gemv.iter().all(|v| v.is_finite()));
+            assert!(dt < 1e-5 && dm < 1e-5, "{f:?}: mma {dm:.2e} tile {dt:.2e}");
+            let _ = keep;
+        }
+    }
+
     /// Top-k reductions (k = 512 over rows longer than a chunk, with
     /// ties; argmax over a vocab-sized row) lower to the block-select
     /// kernel, and it agrees with the interpreter.
@@ -856,6 +1035,19 @@ mod tests {
     /// reads them. The logits of every step against the full prefill on
     /// the interpreter: `(worst rel err, kernels per step)`.
     pub(crate) fn chunked_then_decode(m: &Model, ks: &[usize]) -> (f64, Vec<usize>) {
+        let (e, nk, _) = chunked_then_decode_grouped(m, ks, 0);
+        (e, nk)
+    }
+
+    /// [`chunked_then_decode`] with routed experts sorted by expert
+    /// (`schedule_expert_groups`) in steps of at least `group` (token,
+    /// slot) positions (0: never); also returns the caches after the last
+    /// step.
+    pub(crate) fn chunked_then_decode_grouped(
+        m: &Model,
+        ks: &[usize],
+        group: usize,
+    ) -> (f64, Vec<usize>, Vec<Vec<f32>>) {
         let w = weights(m);
         let total: usize = ks.iter().sum();
         assert!(total <= m.cap);
@@ -901,7 +1093,13 @@ mod tests {
                 .collect();
             let mut ids = st.outputs.clone();
             ids.extend(st.caches.iter().map(|c| c.updated));
-            let (g, outs) = st.graph.substitute_maps(&ids);
+            let (g, ids) = if group > 0 {
+                let (g, ids, _) = st.graph.schedule_expert_groups(&ids, group);
+                (g, ids)
+            } else {
+                (st.graph.clone(), ids)
+            };
+            let (g, outs) = g.substitute_maps(&ids);
             let (g, outs) = g.eliminate_common(&outs);
             let dp = g.to_cuda_decode(&outs, &DecodeOpts::default());
             nks.push(dp.program.kernels.len());
@@ -925,7 +1123,7 @@ mod tests {
             *cs = got[1..].to_vec();
             pos = grown;
         }
-        (worst, nks)
+        (worst, nks, caches.unwrap_or_default())
     }
 
     /// The many-row contraction split (`split_bilinear`) on the tiny coder
@@ -972,6 +1170,22 @@ mod tests {
     }
 
     #[test]
+    fn chunked_delta_scan_on_the_cpu() {
+        // the chunked delta kernel at 4 rows a chunk: the tiny coder's 5-,
+        // 8- and 16-row steps cross chunk boundaries and end mid-chunk
+        std::env::set_var("TANG_DELTA_CHUNK_MIN", "2");
+        std::env::set_var("TANG_DELTA_CHUNK_ROWS", "4");
+        let m = coder();
+        for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
+            let (e, nk) = chunked_then_decode(&m, ks);
+            eprintln!("coder chunked delta, chunks {ks:?}: {nk:?} kernels, logits rel err {e:.2e}");
+            assert!(e < 1e-4, "{ks:?}: {e}");
+        }
+        std::env::remove_var("TANG_DELTA_CHUNK_MIN");
+        std::env::remove_var("TANG_DELTA_CHUNK_ROWS");
+    }
+
+    #[test]
     fn chunked_prefill_then_decode_on_the_cpu() {
         for m in [qwen(), coder()] {
             for ks in [&[8usize, 8, 1, 1][..], &[16, 1, 1, 1][..], &[5, 3, 1][..]] {
@@ -982,6 +1196,31 @@ mod tests {
                 );
                 assert!(e < 1e-4, "{} {ks:?}: {e}", m.name);
             }
+        }
+    }
+
+    /// Layer-wise prefill: the whole prompt as one step (every layer over
+    /// all its tokens before the next), routed experts grouped by expert
+    /// over the (token, slot) positions, gives the logits of the full
+    /// prefill and the caches of 4-token chunked prefill.
+    #[test]
+    fn layerwise_prefill_matches_chunked_on_the_cpu() {
+        let m = coder();
+        let (ec, _, cc) = chunked_then_decode_grouped(&m, &[4, 4, 4, 4, 1], 0);
+        for group in [0, 2] {
+            let (el, nk, cl) = chunked_then_decode_grouped(&m, &[16, 1], group);
+            let mut worst = 0.0f64;
+            for (a, b) in cl.iter().zip(&cc) {
+                let a: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+                let b: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+                worst = worst.max(rel(&a, &b));
+            }
+            eprintln!(
+                "layer-wise k = 16 (group {group}): {nk:?} kernels, logits {el:.2e} \
+                 (chunked {ec:.2e}), caches vs chunked {worst:.2e}"
+            );
+            assert!(el < 1e-4 && ec < 1e-4, "{el} {ec}");
+            assert!(worst < 1e-4, "caches {worst}");
         }
     }
 }

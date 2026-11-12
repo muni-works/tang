@@ -56,6 +56,7 @@ fn request(i: usize, tokens: usize) -> Request {
         max_tokens: Some(tokens),
         stop: vec![],
         cache_key: None,
+        tenant: None,
         prefill_only: false,
     }
 }

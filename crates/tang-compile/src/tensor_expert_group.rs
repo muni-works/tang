@@ -6,15 +6,15 @@
 //! schedule's runs, [`BlockOpts::mma_min`](super::int8_sched::BlockOpts)):
 //!
 //! ```text
-//! key[p]   = idx(p)·P + p            (p flattened row-major over the positions)
-//! rank[p]  = #{p' : key[p'] < key[p]}
+//! rank[p]  = #{p' : (idx(p'), p') < (idx(p), p)}   (p flattened row-major, compared
+//!                                               lexicographically: exact in f32)
 //! sidx[q]  = idx at rank q,  srow[q] = X's row at rank q
 //! C'[q, r] = Σ_k W[sidx[q], r, k] · Xrows[srow[q], k]
 //! C[p, r]  = C'[rank[p], r]          (a gathered read, inlined into readers)
 //! ```
 //!
 //! All ordinary comps (`O(P²)` compares for the rank and the two picks, a
-//! few hundred thousand at `P = 640`). The keys are distinct, so the sort is
+//! few hundred thousand at `P = 640`). The (idx, p) pairs are distinct, so the sort is
 //! a permutation and the result is the same sums as before, term for term.
 
 use super::{Arg, Dim, Form, Gather, Monoid, MonoidKind, Op, TensorGraph, TensorId, View};
@@ -231,39 +231,42 @@ impl TensorGraph {
                 |v| vec![v[0]],
             )
             .expect("expert index");
-        // key = idx·P + flat(p)
-        let mut kargs = vec![a(idx, ident.clone())];
-        kargs.extend(iotas.iter().map(|&t| a(t, ident.clone())));
+        // flat(p), row-major over the positions
+        let fargs: Vec<Arg> = iotas.iter().map(|&t| a(t, ident.clone())).collect();
         let st = strides.clone();
-        let key = ng
-            .comp(pos, &[] as &[usize], kargs, None, move |v| {
-                let mut e = v[0] * ExprId::from_f64(npos as f64);
+        let flat = ng
+            .comp(pos, &[] as &[usize], fargs, None, move |v| {
+                let mut e = ExprId::ZERO;
                 for (d, &s) in st.iter().enumerate() {
-                    e += v[1 + d] * ExprId::from_f64(s as f64);
+                    e += v[d] * ExprId::from_f64(s as f64);
                 }
                 vec![e]
             })
-            .expect("sort key");
-        // rank[p] = #{p' : key[p'] < key[p]}, space [p | p']
+            .expect("flat position");
+        // rank[p] = #{p' : (idx[p'], p') < (idx[p], p)}, space [p | p'],
+        // compared lexicographically (a key idx·P + p passes 2²⁴ and stops
+        // being exact in f32 once P·n_expert does: 4096 tokens × top-10 ×
+        // 512 experts)
+        let here = View::pick(2 * m, &(0..m).map(Some).collect::<Vec<_>>());
+        let there = View::pick(2 * m, &(m..2 * m).map(Some).collect::<Vec<_>>());
         let rank = ng
             .comp(
                 pos,
                 pos,
                 vec![
-                    a(
-                        key,
-                        View::pick(2 * m, &(0..m).map(Some).collect::<Vec<_>>()),
-                    ),
-                    a(
-                        key,
-                        View::pick(2 * m, &(m..2 * m).map(Some).collect::<Vec<_>>()),
-                    ),
+                    a(idx, here.clone()),
+                    a(idx, there.clone()),
+                    a(flat, here),
+                    a(flat, there),
                 ],
                 Some(Monoid::sum()),
                 |v| {
-                    let d = v[0] - v[1];
+                    let (di, dj) = (v[0] - v[1], v[1] - v[0]);
+                    let dp = v[2] - v[3];
                     vec![tang_expr::with_graph(|eg| {
-                        eg.select(d, ExprId::ONE, ExprId::ZERO)
+                        let later = eg.select(dp, ExprId::ONE, ExprId::ZERO);
+                        let tie = eg.select(dj, ExprId::ZERO, later);
+                        eg.select(di, ExprId::ONE, tie)
                     })]
                 },
             )

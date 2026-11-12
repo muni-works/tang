@@ -285,9 +285,18 @@ pub const HEADROOM_SCRATCH: u64 = 1 << 30;
 /// What loading the checkpoint in `dir` as `dtype` takes. Pre-quantized (MLX 4-bit)
 /// checkpoints load as they are; others are converted from their stored precision.
 pub fn need(dir: &Path, dtype: Dtype) -> anyhow::Result<Need> {
-    let cfg = crate::Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
-    let raw: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-    let file = weight_bytes(dir);
+    need_from(
+        &std::fs::read(dir.join("config.json"))?,
+        weight_bytes(dir),
+        dtype,
+    )
+}
+
+/// [`need`] from a `config.json`'s bytes and the checkpoint's safetensors bytes, before the
+/// weights are on disk (`/models/pull` checks a model fits before downloading it).
+pub fn need_from(config: &[u8], file: u64, dtype: Dtype) -> anyhow::Result<Need> {
+    let cfg = crate::Config::from_json(config)?;
+    let raw: Value = serde_json::from_slice(config)?;
     let weights = if cfg.quantization.is_some() {
         file
     } else {

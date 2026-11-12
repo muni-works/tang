@@ -27,6 +27,7 @@ pub mod model;
 pub mod model_id;
 pub mod node;
 pub mod pair;
+pub mod pull;
 pub mod queue;
 pub mod qwen3vl;
 pub mod retention;
