@@ -143,6 +143,9 @@ pub fn batch_graph(
                     ScanKind::Delta(_) => {
                         return err(format!("batch_graph: scan {i} is a fused delta step"))
                     }
+                    ScanKind::Sort { .. } => {
+                        return err(format!("batch_graph: scan {i} is an expert sort"))
+                    }
                 }
             }
             Op::Operator(_) => return err("batch_graph: operator nodes are not batched"),

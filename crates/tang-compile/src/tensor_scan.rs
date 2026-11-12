@@ -120,6 +120,14 @@ pub enum ScanKind {
     },
     /// A fused delta-rule step ([`DeltaStep`]); CUDA decode only.
     Delta(DeltaStep),
+    /// Positions sorted by an expert index (a counting sort): input
+    /// `idx [P]` (values in `0..experts`), output `[2, P]` with row 0
+    /// `rank[p]` (where position `p` lands) and row 1 `order[q]` (the
+    /// position at rank `q`). Positions sharing an index are consecutive,
+    /// in position order on the interpreter (any order on CUDA: each
+    /// sorted row is computed on its own). Built by
+    /// [`TensorGraph::expert_sort`]; CUDA decode only.
+    Sort { experts: usize },
 }
 
 /// The scalar semiring an affine scan's `A_t ⊗ S_{t−1} ⊕ U_t` is taken in.
@@ -215,6 +223,7 @@ impl Scan {
             ScanKind::Monoid(_) => &shapes[0],
             ScanKind::Affine { .. } => &shapes[0][..shapes[0].len() - 2],
             ScanKind::Delta(d) => return self.eval_delta(d, ins, shapes),
+            ScanKind::Sort { experts } => return Self::eval_sort(*experts, ins[0]),
         };
         let tn = ps[self.dim];
         let outer: usize = ps[..self.dim].iter().product();
@@ -254,7 +263,7 @@ impl Scan {
                 }
                 out
             }
-            ScanKind::Delta(_) => unreachable!(),
+            ScanKind::Delta(_) | ScanKind::Sort { .. } => unreachable!(),
             ScanKind::Affine { ring, bands, .. } => {
                 let n = shapes[1][shapes[1].len() - 2];
                 let k = shapes[0][shapes[0].len() - 1];
@@ -305,7 +314,30 @@ impl Scan {
             ScanKind::Monoid(_) => s.to_vec(),
             ScanKind::Affine { .. } => s[..s.len() - 2].to_vec(),
             ScanKind::Delta(_) => s[..s.len() - 1].to_vec(),
+            ScanKind::Sort { .. } => s.to_vec(),
         }
+    }
+
+    /// [`ScanKind::Sort`] on the interpreter: a stable counting sort.
+    fn eval_sort(experts: usize, idx: &[f64]) -> Vec<f64> {
+        let np = idx.len();
+        let key = |v: f64| (v.round().max(0.0) as usize).min(experts.saturating_sub(1));
+        let mut off = vec![0usize; experts + 1];
+        for &v in idx {
+            off[key(v) + 1] += 1;
+        }
+        for e in 0..experts {
+            off[e + 1] += off[e];
+        }
+        let mut out = vec![0.0; 2 * np];
+        for (p, &v) in idx.iter().enumerate() {
+            let e = key(v);
+            let r = off[e];
+            off[e] += 1;
+            out[p] = r as f64;
+            out[np + r] = p as f64;
+        }
+        out
     }
 
     /// [`ScanKind::Delta`] on the interpreter: the recurrence from `init`,
@@ -460,6 +492,26 @@ impl TensorGraph {
                 kind: ScanKind::Monoid(monoid),
             },
             shape,
+        ))
+    }
+
+    /// [`ScanKind::Sort`] of `idx [P]` (expert ids in `0..experts`):
+    /// `[2, P]`, row 0 the rank of each position, row 1 the position at
+    /// each rank.
+    pub fn expert_sort(&mut self, idx: TensorId, experts: usize) -> Result<TensorId, ShapeError> {
+        let s = self.shape(idx).to_vec();
+        if s.len() != 1 {
+            return err(format!("expert_sort: idx {s:?} must be [P]"));
+        }
+        Ok(self.push_scan(
+            Scan {
+                inputs: vec![idx],
+                dim: 0,
+                exclusive: false,
+                reverse: false,
+                kind: ScanKind::Sort { experts },
+            },
+            vec![Dim::Fixed(2), s[0].clone()],
         ))
     }
 
@@ -857,6 +909,7 @@ impl TensorGraph {
                 Ok(gs)
             }
             ScanKind::Delta(_) => err("scan backward: a fused delta step has no backward"),
+            ScanKind::Sort { .. } => err("scan backward: an expert sort has no backward"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 let tn = ps[dim]
@@ -1281,7 +1334,7 @@ impl TensorGraph {
     /// chunked schedule is the fast path for delta-rule scans on CUDA.
     pub(super) fn scan_kernel(&self, j: usize) -> WgslKernel {
         let sc = self.scan_at(TensorId(j as u32)).unwrap();
-        if matches!(sc.kind, ScanKind::Delta(_)) {
+        if matches!(sc.kind, ScanKind::Delta(_) | ScanKind::Sort { .. }) {
             // native only (the CUDA decode lowering replaces it)
             return WgslKernel {
                 source: "// fused delta step: CUDA decode only\n".into(),
@@ -1358,7 +1411,7 @@ impl TensorGraph {
         };
         let lines;
         match &sc.kind {
-            ScanKind::Delta(_) => unreachable!("returned above"),
+            ScanKind::Delta(_) | ScanKind::Sort { .. } => unreachable!("returned above"),
             ScanKind::Monoid(m) => {
                 let w = m.width;
                 super::wgsl::emit_combine(&mut s, j, m, Format::F32);
