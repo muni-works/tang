@@ -21,8 +21,15 @@ use tang_expr::{ExprGraph, ExprId, Node};
 pub(super) const MMA_ROWS: usize = 64;
 /// Reduce length below which a contraction stays a warp reduction.
 pub(super) const MMA_RED: usize = 256;
-/// Largest materialized factor, in elements (2 GB of f32).
-const MAX_FACTOR: usize = 1 << 29;
+/// Largest materialized factor, in elements (`TANG_SPLIT_MAX`; default
+/// 2³¹, 8 GB of f32: an 8k-token prefill step's attention weights at 8k
+/// context are 4.4 GB; past the cap p·v stays a warp reduction, ~50× slower)
+fn max_factor() -> usize {
+    std::env::var("TANG_SPLIT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 31)
+}
 
 /// The dims a read depends on: nonzero coefficients over the comp space.
 fn dims_of(v: &View, rank: usize) -> Vec<bool> {
@@ -229,9 +236,9 @@ impl TensorGraph {
                 // A: space (points without the columns, j), body with B = 1
                 let keep: Vec<usize> = (0..np).filter(|&d| !cols[d]).collect();
                 let rows: usize = keep.iter().map(|&d| c.points()[d].n()).product();
-                // the factor is [rows, red]: at most 2 GB of f32
+                // the factor is [rows, red]: at most `max_factor()` elements
                 let red_n = c.red[0].n();
-                if rows < min_rows || rows.saturating_mul(red_n) > MAX_FACTOR {
+                if rows < min_rows || rows.saturating_mul(red_n) > max_factor() {
                     continue;
                 }
                 let mut ashape: Vec<_> = keep.iter().map(|&d| c.points()[d]).collect();
