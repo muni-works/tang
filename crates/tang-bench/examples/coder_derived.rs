@@ -138,8 +138,9 @@ fn main() {
             group,
             batch: (batch > 1).then_some(batch),
             // the Q6_K routed down-projection on the int8 kernels: grouped,
-            // an f32 copy is a gathered contraction no MMA tile reads
-            q6k_as_q8_0: true,
+            // an f32 copy is a gathered contraction no MMA tile reads.
+            // `TANG_Q6K_Q8=0` keeps it f32 (the ungrouped arm's upload)
+            q6k_as_q8_0: std::env::var("TANG_Q6K_Q8").as_deref() != Ok("0"),
             ..Default::default()
         },
     );

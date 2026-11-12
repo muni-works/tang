@@ -511,7 +511,7 @@ impl TensorGraph {
                 reverse: false,
                 kind: ScanKind::Sort { experts },
             },
-            vec![Dim::Fixed(2), s[0].clone()],
+            vec![Dim::Fixed(2), s[0]],
         ))
     }
 
