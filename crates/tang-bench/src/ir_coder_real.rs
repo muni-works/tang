@@ -240,8 +240,12 @@ pub fn lower_real_step_with(
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
     // evaluated in their readers. On by default: with cokernels (side jobs on
     // their own blocks) H200 5.12 -> 4.83 ms, 1649 -> 1385 kernels; TANG_STAGED_MAP=0 off
-    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
-        != Some("0")
+    // (not for B > 1 streams: there the staged maps cost more than they
+    // save (B=4 H200: 9.1 vs 10.4 ms) and broke the predicated in-place
+    // cache update)
+    if ro.batch.unwrap_or(1) <= 1
+        && tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
+            != Some("0")
     {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
