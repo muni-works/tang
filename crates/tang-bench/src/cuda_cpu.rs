@@ -769,6 +769,8 @@ mod tests {
             Arg, Dim, Format, IntMma, Monoid, Precision, Stage, TensorGraph, View,
         };
         let (p, r, k) = (80usize, 144usize, 512usize);
+        // a 2 × 2 grid: below the GPU's small-grid cutoff
+        std::env::set_var("TANG_INT8_TILE_MIN", "0");
         for f in [Format::Q4K, Format::Q5K, Format::Q8_0] {
             let (per, bytes) = match f {
                 Format::Q4K => (256, 144),
@@ -845,7 +847,7 @@ mod tests {
                     .program
                     .kernels
                     .iter()
-                    .any(|k| k.source.contains("Ws[128 *"));
+                    .any(|k| k.source.contains("float2* XSs = Ss + 128"));
                 assert_eq!(src, stage == Stage::Tile, "{f:?} {stage:?}: tile kernel");
                 super::run(&dp, &[xs.clone(), words.clone()], &outs).remove(0)
             };

@@ -428,6 +428,13 @@ impl TensorGraph {
                 .forms
                 .iter()
                 .all(|f| (0..rd).all(|d| f.coefs[d] == 0))
+            // fewer blocks than SMs (`TANG_INT8_TILE_MIN`, 128): the 8-position
+            // tile's grid fills the GPU better
+            && rows.div_ceil(128) * npos.div_ceil(64)
+                >= std::env::var("TANG_INT8_TILE_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(128)
         {
             return Ok(tile_kernel(&TileShape {
                 reads: reads.len(),
@@ -1589,6 +1596,8 @@ fn tile_kernel(t: &TileShape) -> (String, usize, usize) {
     let ks = if kq { 256 } else { 128 };
     let nsub = ks / 32;
     let rb = if kq { b.bytes } else { 4 * b.bytes };
+    // a position's codes are 16 bytes wider than a k-step, so the 8 rows of
+    // a B fragment land on distinct banks
     let row_bytes = t.k / b.per * b.bytes;
     let steps = t.k / ks;
     let row_blocks = t.rows.div_ceil(128);
@@ -1641,7 +1650,9 @@ fn tile_kernel(t: &TileShape) -> (String, usize, usize) {
     };
 "#
     };
-    let mut src = String::new();
+    let xst = ks + 16;
+    let smem = 128 * rb + 64 * xst + (128 + 64) * nsub * 8;
+    let mut src = format!("#define TANG_SMEM {smem}\n");
     src.push_str(HELPERS);
     write!(
         src,
@@ -1655,9 +1666,11 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
     if (grp >= {groups}) return;
     const int pos0 = grp * 64, row0 = rbk * 128;
     const int wr = warp >> 1, wc = warp & 1;
-    __shared__ __align__(16) unsigned char Ws[128 * {rb}];
-    __shared__ __align__(16) signed char Xs[64 * {ks}];
-    __shared__ float2 XSs[64 * {nsub}];
+    extern __shared__ float4 tang_dsm[];
+    unsigned char* Ws = (unsigned char*)tang_dsm;
+    signed char* Xs = (signed char*)(Ws + 128 * {rb});
+    float2* Ss = (float2*)(Xs + 64 * {xst});
+    float2* XSs = Ss + 128 * {nsub};
     __shared__ long long xoff[64];
     if (tid < 64) {{
         const long long P = min(pos0 + tid, {npos} - 1);
@@ -1683,11 +1696,17 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
         }}
         for (int u = tid; u < 64 * {ks} / 16; u += 256) {{
             const int p = u / ({ks} / 16), w = u % ({ks} / 16);
-            ((uint4*)(Xs + p * {ks}))[w] = __ldg((const uint4*)(xcodes + xoff[p] + (size_t)st * {ks}) + w);
+            ((uint4*)(Xs + p * {xst}))[w] = __ldg((const uint4*)(xcodes + xoff[p] + (size_t)st * {ks}) + w);
         }}
         for (int u = tid; u < 64 * {nsub}; u += 256) {{
             const int p = u / {nsub}, j = u % {nsub};
             XSs[u] = __ldg(xsc + xoff[p] / 32 + st * {nsub} + j);
+        }}
+        __syncthreads();
+        for (int u = tid; u < 128 * {nsub}; u += 256) {{
+            float fs_, fm_;
+            sc(Ws + (u / {nsub}) * {rb}, u % {nsub}, fs_, fm_);
+            Ss[u] = make_float2(fs_, fm_);
         }}
         __syncthreads();
         #pragma unroll
@@ -1698,13 +1717,14 @@ extern "C" __global__ void __launch_bounds__(256) main0({params}, float* __restr
             for (int mt = 0; mt < 2; mt++) {{
                 const unsigned char* rA = Ws + (wr * 32 + mt * 16 + gq) * {rb};
                 const unsigned char* rB = rA + 8 * {rb};
-{afrag}                sc(rA, s, fs[mt][0], fm[mt][0]);
-                sc(rB, s, fs[mt][1], fm[mt][1]);
+{afrag}                const int ri = wr * 32 + mt * 16 + gq;
+                const float2 sa = Ss[ri * {nsub} + s], sb = Ss[(ri + 8) * {nsub} + s];
+                fs[mt][0] = sa.x; fm[mt][0] = sa.y; fs[mt][1] = sb.x; fm[mt][1] = sb.y;
             }}
             #pragma unroll
             for (int nt = 0; nt < 4; nt++) {{
                 const int pp = wc * 32 + nt * 8;
-                const signed char* xs_ = Xs + (pp + gq) * {ks} + s * 32;
+                const signed char* xs_ = Xs + (pp + gq) * {xst} + s * 32;
                 const unsigned b0 = *(const unsigned*)(xs_ + tig * 4), b1 = *(const unsigned*)(xs_ + 16 + tig * 4);
                 const float2 x0 = XSs[(pp + 2 * tig) * {nsub} + s], x1 = XSs[(pp + 2 * tig + 1) * {nsub} + s];
                 #pragma unroll
