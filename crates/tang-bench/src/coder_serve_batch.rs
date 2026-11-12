@@ -38,6 +38,11 @@ use crate::ir_coder_real::{bind, dims_from_gguf, lower_real_step, lower_real_ste
 use crate::ir_sample::{append_argmax, append_sampler_topk, SEED, TEMPERATURE, TOP_K, TOP_P};
 use crate::qwen_session::{runtime, slot_plan};
 
+/// `TANG_CODER_DERIVED_TRACE=1`: every step's path, slot, position and tokens on stderr.
+fn trace() -> bool {
+    std::env::var("TANG_CODER_DERIVED_TRACE").as_deref() == Ok("1")
+}
+
 fn words_of_bytes(b: &[u8]) -> Vec<f32> {
     b.chunks(4)
         .map(|c| {
@@ -504,6 +509,17 @@ impl BatchedCoder {
             }
         }
         let t = p.read(&self.rt, st.outs[1]);
+        if trace() {
+            for &(s, tk) in rows {
+                eprintln!(
+                    "trace batched{} slot {s} pos {} in {tk} out {} params {:?}",
+                    if all_greedy { " greedy" } else { "" },
+                    self.slots[s].tokens.len(),
+                    t[s] as u32,
+                    self.slots[s].params
+                );
+            }
+        }
         for &(s, tk) in rows {
             self.slots[s].tokens.push(tk);
         }
@@ -533,7 +549,11 @@ impl BatchedCoder {
         }
         self.slots[s].tokens.push(tok);
         self.ran.set(Ran::Solo);
-        Ok(read.then(|| p.read(&self.rt, st.outs[1])[0] as u32))
+        let out = read.then(|| p.read(&self.rt, st.outs[1])[0] as u32);
+        if trace() {
+            eprintln!("trace solo slot {s} pos {pos} in {tok} out {out:?}");
+        }
+        Ok(out)
     }
 
     fn greedy_slot(&self, s: usize) -> bool {
@@ -711,6 +731,9 @@ impl ServeEngine for BatchedCoder {
         let s = (0..self.b)
             .find(|&s| !self.slots[s].allocated)
             .context("every sequence slot is allocated")?;
+        if trace() {
+            eprintln!("trace alloc slot {s}");
+        }
         self.clear_slot(s);
         self.slots[s].allocated = true;
         Ok(s)
