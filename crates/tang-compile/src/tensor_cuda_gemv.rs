@@ -876,6 +876,79 @@ impl TensorGraph {
 }
 
 impl TensorGraph {
+    /// Schedule (decode): a pointwise map stored as Q8x32 (a SwiGLU
+    /// `silu(g)·u`, a GDN output `norm(o)·silu(z)` before its projection)
+    /// whose every reader is an int8 GEMV on the `Gemv` stage is marked
+    /// inline, so each GEMV block recomputes the position's row and
+    /// quantizes it in shared memory (`gemv_prologue`) instead of a kernel
+    /// writing it first. Only maps over materialized f32 buffers read
+    /// affinely, with a row length a multiple of 256. Returns how many.
+    pub fn schedule_gemv_prologues(&mut self, outputs: &[TensorId]) -> usize {
+        let n = self.nodes.len();
+        let live = self.live(outputs);
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in (0..n).filter(|&i| live[i]) {
+            match &self.nodes[i].op {
+                Op::Comp(c) => {
+                    for a in &c.args {
+                        if !readers[a.src.n()].contains(&i) {
+                            readers[a.src.n()].push(i);
+                        }
+                    }
+                }
+                Op::Iota(_) | Op::Input(_) => {}
+                _ => self
+                    .deps(i)
+                    .into_iter()
+                    .for_each(|p| readers[p].push(usize::MAX)),
+            }
+        }
+        let mut count = 0;
+        for x in (0..n).filter(|&x| live[x]) {
+            let Some(c) = self.comp_at(x) else { continue };
+            let nd = &self.nodes[x];
+            if nd.precision.storage != super::Format::Q8x32
+                || nd.inline
+                || nd.host.is_some()
+                || self.hosts(x)
+                || outputs.iter().any(|o| o.n() == x)
+                || c.monoid.is_some()
+                || !c.red.is_empty()
+                || c.tuple != 0
+                || c.width() != 1
+                || readers[x].is_empty()
+            {
+                continue;
+            }
+            let k = c.points().last().and_then(|d| d.fixed()).unwrap_or(0);
+            if k == 0 || !k.is_multiple_of(256) {
+                continue;
+            }
+            let plain = c.args.iter().all(|a| {
+                let j = a.src.n();
+                !a.view.is_gather()
+                    && !a.view.guard
+                    && !self.nodes[j].inline
+                    && self.nodes[j].host.is_none()
+                    && self.nodes[j].precision.storage == super::Format::F32
+                    && !matches!(self.nodes[j].op, Op::Iota(_))
+            });
+            let gemvs = readers[x].iter().all(|&r| {
+                r != usize::MAX
+                    && self.nodes[r].int_mma.as_ref().is_some_and(|m| {
+                        m.stage == super::Stage::Gemv && m.ksplit <= 1 && m.pos_tile <= 1
+                    })
+            });
+            if plain && gemvs {
+                self.nodes[x].inline = true;
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+impl TensorGraph {
     /// Schedule (decode): a small materialized map (≤ 1024 points; a GDN
     /// layer's per-head gates `α = exp(softplus(·)·A)`, `β = σ(·)`) read
     /// only by comps is evaluated inside each reader instead of launched
