@@ -2327,6 +2327,7 @@ impl Lowering<'_> {
                         if std::env::var("TANG_WIN_JOINT").as_deref() != Ok("0") {
                             let bytes = |l: &Leaf| match l.pack {
                                 Some(Packing::U4) => 0.5,
+                                Some(Packing::U3) => 0.375,
                                 Some(Packing::Bf16 | Packing::F16) => 2.0,
                                 None => 4.0,
                             };
@@ -4391,7 +4392,10 @@ impl Lowering<'_> {
             let b0 = kern.blocks;
             jobs.push_str(&format!("    if (blockIdx.x >= {b0}u) {{\n    const unsigned tang_sb = blockIdx.x - {b0}u;\n"));
             for (q, &u) in writes.iter().enumerate() {
-                let n: usize = self.g.comp_at(u.n()).map_or(1, |c| fixed(c.points()).iter().product());
+                let n: usize = self
+                    .g
+                    .comp_at(u.n())
+                    .map_or(1, |c| fixed(c.points()).iter().product());
                 let e = n.div_ceil(kern.threads).clamp(1, 1024);
                 jobs.push_str(&format!(
                     "    {}if (tang_sb < {}u) {{\n",
@@ -4479,7 +4483,7 @@ impl TensorGraph {
         root: usize,
         packed: &HashMap<usize, Packing>,
         opts: &DecodeOpts,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let reads = self.host_kernel_reads(root);
         let lw = Lowering {
             g: self,
@@ -4505,7 +4509,7 @@ impl TensorGraph {
             .filter(|&u| self.nodes[u].host == Some(r))
             .map(|u| TensorId(u as u32))
             .collect();
-        if lw.with_side_jobs(&kern, &writes).is_none() {
+        let Some(all) = lw.with_side_jobs(&kern, &writes) else {
             if std::env::var("TANG_COKERNEL_DEBUG").is_ok() {
                 eprintln!(
                     "cokernel: n{root} lowered ({}) but its side jobs {writes:?} did not",
@@ -4513,8 +4517,9 @@ impl TensorGraph {
                 );
             }
             return None;
-        }
-        Some(kern.threads * kern.blocks)
+        };
+        // blocks with the side jobs' own
+        Some((all.threads, all.blocks))
     }
 
     /// Schedule (decode, CUDA): multi-output kernels (`TNode::host`), so
@@ -4708,6 +4713,12 @@ impl TensorGraph {
             }
         }
         let mut jobs = 0;
+        let own_blocks = !std::env::var("TANG_COKERNEL_BLOCKS").is_ok_and(|v| v == "0");
+        // SMs a host may fill and still leave room (H200: 132)
+        let sms: usize = std::env::var("TANG_COKERNEL_SMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(132);
         for u in (0..n).filter(|_| rules.contains('b')) {
             // a kernel that already hosts side jobs keeps its launch
             if !plain_map(self, u) || self.hosts(u) {
@@ -4730,9 +4741,18 @@ impl TensorGraph {
                     continue;
                 }
                 self.nodes[u].host = Some(TensorId(k as u32));
+                let fits = |(t, b): (usize, usize)| {
+                    if own_blocks {
+                        // the side job's blocks run beside the host's only
+                        // where the host leaves SMs idle
+                        b <= sms
+                    } else {
+                        // enough threads that the loop stays short
+                        t * b * 64 >= un
+                    }
+                };
                 match self.probe_native(k, &packed, opts) {
-                    // enough threads that the loop stays short
-                    Some(t) if t * 64 >= un => {
+                    Some(tb) if fits(tb) => {
                         jobs += 1;
                         break;
                     }
