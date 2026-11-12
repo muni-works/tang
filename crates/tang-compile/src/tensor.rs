@@ -1880,6 +1880,14 @@ impl TensorGraph {
                 }
             }
         }
+        // ... and through reshapes (a reshape of a spliced map dissolves)
+        for i in (0..n).rev() {
+            if op_read[i] {
+                if let Op::Reshape(src) = self.nodes[i].op {
+                    op_read[src.n()] = true;
+                }
+            }
+        }
         // a map read through a guarded view must stay materialized
         let mut guarded = vec![false; n];
         for i in (0..n).filter(|&i| live[i]) {
