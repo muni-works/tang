@@ -62,6 +62,9 @@ mod cuda_split;
 pub mod discover;
 #[path = "tensor_discover_catalog.rs"]
 pub mod discover_catalog;
+/// Routed contractions over positions sorted by expert (batched decode).
+#[path = "tensor_expert_group.rs"]
+pub mod expert_group;
 #[cfg(test)]
 #[path = "tensor_gather_tests.rs"]
 mod gather_tests;

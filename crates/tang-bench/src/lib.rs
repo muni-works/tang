@@ -277,6 +277,8 @@ pub mod ir_msl;
 pub mod ir_qwen;
 pub mod qwen_session;
 
+/// Batched decode: B streams through one derived step (CPU checks, int8 cases).
+pub mod batch_decode;
 /// Qwen3-Coder-Next served from its derived step (`TANG_CODER_ENGINE=derived`).
 #[cfg(feature = "coder-serve")]
 pub mod coder_serve;
