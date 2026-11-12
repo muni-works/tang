@@ -864,6 +864,12 @@ pub enum Stage {
     /// The MMA's own k order: two 4-byte loads a lane (columns `4·tig..`
     /// and `16 + 4·tig..`), on both operands.
     Mma,
+    /// The prefill GEMM tile for an ungathered weight: a block takes 128
+    /// weight rows × 64 positions, stages one k-step of both operands in
+    /// shared memory once and runs every warp's 32 × 32 sub-tile from it,
+    /// so the weights are read once per 64 positions (not once per run of
+    /// 8). A gathered weight or activation falls back to [`Stage::Mma`].
+    Tile,
     /// No MMA: the narrow schedule for few points a weight slice (decode,
     /// batch 1). Each output `(p, r)` is a dot of one weight row with one
     /// activation row on `dp4a`, the row's half-super-blocks spread over
