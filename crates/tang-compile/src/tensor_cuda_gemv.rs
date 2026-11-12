@@ -903,6 +903,9 @@ impl TensorGraph {
                     .for_each(|p| readers[p].push(usize::MAX)),
             }
         }
+        // every GEMV block recomputes the row: short rows only
+        // (TANG_GEMV_PROLOGUE_MAXK, default 512)
+        let max_k: usize = super::tune::knob_parse("TANG_GEMV_PROLOGUE_MAXK").unwrap_or(512);
         let mut count = 0;
         for x in (0..n).filter(|&x| live[x]) {
             let Some(c) = self.comp_at(x) else { continue };
@@ -921,7 +924,7 @@ impl TensorGraph {
                 continue;
             }
             let k = c.points().last().and_then(|d| d.fixed()).unwrap_or(0);
-            if k == 0 || !k.is_multiple_of(256) {
+            if k == 0 || !k.is_multiple_of(256) || k > max_k {
                 continue;
             }
             let plain = c.args.iter().all(|a| {
