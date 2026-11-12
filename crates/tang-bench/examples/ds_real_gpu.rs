@@ -14,6 +14,11 @@
 //! pure step). Otherwise every weight is uploaded dequantized to f32.
 //! `DS_TIME_ITERS` (default 20): timed steps after the check.
 //!
+//! Chunked device prefill: `DS_STEP_K=k` derives the step appending `k`
+//! tokens (tok/s = k / step time). `DS_ALL_EXPERTS=1` keeps all routed
+//! experts in the tables (no `routed-*.txt` needed; real expert bytes).
+//! `DS_NO_CHECK=1` skips the interpreter step and only times the device.
+//!
 //! ```text
 //! DS41_DIR=/workspace/ds41-l02 DS_NATIVE=1 ds_real_gpu
 //! ```
@@ -52,8 +57,20 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let toks = run.rows_of(&prompt(t_pre + 1));
-    let used = run.read_routed(toks.len()).unwrap_or_else(|e| {
+    let k: usize = std::env::var("DS_STEP_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let check = std::env::var("DS_NO_CHECK").as_deref() != Ok("1");
+    let toks = run.rows_of(&prompt(t_pre + k));
+    let all = std::env::var("DS_ALL_EXPERTS").as_deref() == Ok("1");
+    let n_exp = run.cfg["n_routed_experts"].as_u64().unwrap_or(384) as usize;
+    let used = if all {
+        Ok(vec![(0..n_exp).collect::<Vec<_>>(); run.layer_ids.len()])
+    } else {
+        run.read_routed(toks.len())
+    };
+    let used = used.unwrap_or_else(|e| {
         panic!(
             "{}: {e} (run ir_ds_real::tests::real_layers_match_reference first)",
             run.routed_path(toks.len()).display()
@@ -65,7 +82,7 @@ fn main() {
         &run.layer_ids,
         run.vocab_ids.len(),
         rows,
-        8.max(t_pre + 1),
+        8.max(t_pre + k),
     );
     clamp_index_topk(&mut dm);
     let t0 = Instant::now();
@@ -88,7 +105,7 @@ fn main() {
     eprintln!("weights loaded: {:.1?}", t0.elapsed());
 
     let t0 = Instant::now();
-    let st = derived_step(&pg, &dm, 1).unwrap();
+    let st = derived_step(&pg, &dm, k).unwrap();
     let nodes: Vec<TensorId> = st.caches.iter().map(|c| c.node).collect();
     let pre = pg.g.bind(&[(SEQ, t_pre)]).unwrap().eval(&base, &nodes);
     let caches: Vec<Vec<f64>> = nodes
@@ -109,14 +126,18 @@ fn main() {
         .iter()
         .map(|&x| match x {
             StepInput::Pos => vec![t_pre as f64],
-            StepInput::New(_) => toks[t_pre..t_pre + 1].to_vec(),
+            StepInput::New(_) => toks[t_pre..t_pre + k].to_vec(),
             StepInput::Same(i) => std::mem::take(&mut base[i]),
             StepInput::Cache(c) => caches[c].clone(),
         })
         .collect();
     let mut ids = st.outputs.clone();
     ids.extend(st.caches.iter().map(|c| c.updated));
-    let want = st.graph.eval(&step_ins, &ids);
+    let want = if check {
+        st.graph.eval(&step_ins, &ids)
+    } else {
+        Vec::new()
+    };
     eprintln!("CPU prefill + interpreter step: {:.1?}", t0.elapsed());
 
     let rt = runtime();
@@ -127,7 +148,11 @@ fn main() {
     if std::env::var("DS_NATIVE").as_deref() == Ok("1") {
         let t0 = Instant::now();
         let ns = lower_native_step(&pg, &st, &|n| native_format_of(&run, n));
-        let emu = ns.graph.eval_emulated(&step_ins, &ns.outs);
+        let emu = if check {
+            ns.graph.eval_emulated(&step_ins, &ns.outs)
+        } else {
+            Vec::new()
+        };
         let words = run
             .native_words(&pg, &st, &ns, &used, rows, &step_ins)
             .unwrap();
@@ -145,6 +170,18 @@ fn main() {
             t0.elapsed()
         );
         prog.run(&rt);
+        if !check {
+            let ms = prog.time(&rt, iters);
+            println!(
+                "deepseek-v4.1 real size, layers {:?}, {k}-token step at position {t_pre} \
+                 ({} expert rows): {nk} kernels ({native} native), {ms:.3} ms device \
+                 (native fp8 / fp4), {:.1} tok/s (no check)",
+                run.layer_ids,
+                rows,
+                k as f64 * 1e3 / ms
+            );
+            return;
+        }
         let (mut worst, mut worst_pure) = (0.0f64, 0.0f64);
         let mut top1 = true;
         let argmax = |r: &[f64]| (0..r.len()).max_by(|&a, &b| r[a].total_cmp(&r[b])).unwrap();
@@ -159,7 +196,8 @@ fn main() {
             };
             let (g, e, p) = (keep(&got), keep(e), keep(p));
             if j == 0 {
-                top1 = argmax(&g[..dm.vocab]) == argmax(&p[..dm.vocab]);
+                let last = g.len() - dm.vocab;
+                top1 = argmax(&g[last..]) == argmax(&p[last..]);
             }
             worst = worst.max(rel(&g, &e));
             worst_pure = worst_pure.max(rel(&g, &p));
