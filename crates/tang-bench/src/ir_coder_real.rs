@@ -238,10 +238,10 @@ pub fn lower_real_step_with(
     };
     // norms' and gates' statistics recomputed inside their maps (one
     // kernel a norm, Q8x32 stores included), small maps (the GDN gates)
-    // evaluated in their readers; opt-in with TANG_STAGED_MAP=1 (measured
-    // slower on coder-next: 6.18 vs 5.885 ms)
+    // evaluated in their readers. On by default: with cokernels (side jobs on
+    // their own blocks) H200 5.12 -> 4.83 ms, 1649 -> 1385 kernels; TANG_STAGED_MAP=0 off
     if tang_compile::tensor::tune::step_knob("coder-next", "TANG_STAGED_MAP").as_deref()
-        == Some("1")
+        != Some("0")
     {
         let inplace: Vec<_> = opts.inplace.iter().map(|&(t, _)| t).collect();
         graph.schedule_staged_stats(&outs, &inplace);
@@ -249,9 +249,9 @@ pub fn lower_real_step_with(
     }
     // multi-output kernels: residual adds folded into their norms (and
     // norms into their Q8x32 copies), conv windows into the convs, ring
-    // and state updates as side jobs of earlier launches. Opt-in with TANG_COKERNEL=1 (measured
-    // slower on coder-next: 6.43 vs 6.18 ms); the megakernel builds on it
-    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_COKERNEL").as_deref() == Some("1")
+    // and state updates as side jobs on blocks of their own. On by default (H200: 5.30 -> 5.13 ms,
+    // 1924 -> 1649 kernels); TANG_COKERNEL=0 off
+    if tang_compile::tensor::tune::step_knob("coder-next", "TANG_COKERNEL").as_deref() != Some("0")
     {
         let (a, b) = graph.schedule_cokernels(&outs, &opts);
         eprintln!("multi-output kernels: {a} nodes inlined and stored, {b} side jobs");

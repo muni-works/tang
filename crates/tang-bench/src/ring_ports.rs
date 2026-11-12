@@ -208,13 +208,14 @@ mod tests {
     #[test]
     fn glm_kda_rings() {
         use crate::ir_glm_prefill::*;
-        for (name, d) in [(
-            "KDA only",
-            GlmDims {
-                layers: vec![(Mixer::Kda, Ffn::Moe)],
-                ..GlmDims::tiny()
-            },
-        )] {
+        {
+            let (name, d) = (
+                "KDA only",
+                GlmDims {
+                    layers: vec![(Mixer::Kda, Ffn::Moe)],
+                    ..GlmDims::tiny()
+                },
+            );
             let pg = prefill_graph(&d);
             let m = Model {
                 g: &pg.g,

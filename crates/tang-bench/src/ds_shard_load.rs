@@ -595,7 +595,7 @@ pub mod synth {
             }
         }
         let mut h = serde_json::to_vec(&serde_json::Value::Object(hdr)).unwrap();
-        while h.len() % 8 != 0 {
+        while !h.len().is_multiple_of(8) {
             h.push(b' ');
         }
         let mut f = Vec::with_capacity(8 + h.len() + data.len());
@@ -656,7 +656,7 @@ mod tests {
                     let es = s[1..].to_vec();
                     entries.push((
                         n,
-                        if es[0] % 32 == 0 && es[1] % 32 == 0 {
+                        if es[0].is_multiple_of(32) && es[1].is_multiple_of(32) {
                             Entry::Fp4(es, x)
                         } else {
                             Entry::F32(es, x)
@@ -670,8 +670,8 @@ mod tests {
                 && !name.contains("norm")
                 && !name.contains("engram")
                 && s.len() == 2
-                && s[0] % 32 == 0
-                && s[1] % 32 == 0;
+                && s[0].is_multiple_of(32)
+                && s[1].is_multiple_of(32);
             entries.push((
                 name.clone(),
                 if quant {

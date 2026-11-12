@@ -789,7 +789,7 @@ mod tests {
             let vals: Vec<f64> = (0..rows * n)
                 .map(|i| ((i * 7919 + 13) % 97) as f64 * 0.25 - 9.0)
                 .collect();
-            let want = g.eval(&[vals.clone()], &[top]).remove(0);
+            let want = g.eval(std::slice::from_ref(&vals), &[top]).remove(0);
             let dp = g.to_cuda_decode(&[top], &DecodeOpts::default());
             let src = &dp
                 .program

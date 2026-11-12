@@ -319,8 +319,7 @@ fn moments_f64(x: &[f64], mean: f64) -> (f64, f64, f64) {
 
 fn sum_f32_scalar(x: &[f32]) -> f32 {
     let mut a = [0.0f32; 4];
-    let chunks = x.chunks_exact(4);
-    let rem = chunks.remainder();
+    let (chunks, rem) = x.as_chunks::<4>();
     for c in chunks {
         a[0] += c[0];
         a[1] += c[1];
@@ -336,8 +335,7 @@ fn sum_f32_scalar(x: &[f32]) -> f32 {
 
 fn sum_f64_scalar(x: &[f64]) -> f64 {
     let mut a = [0.0f64; 4];
-    let chunks = x.chunks_exact(4);
-    let rem = chunks.remainder();
+    let (chunks, rem) = x.as_chunks::<4>();
     for c in chunks {
         a[0] += c[0];
         a[1] += c[1];

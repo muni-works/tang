@@ -940,6 +940,7 @@ fn poly(x: ExprId, c: &[f64]) -> ExprId {
 
 /// `erfc(y)` for `y ≥ 0.5`, Cody's rational forms (CALERF), and
 /// `erf(x)` for `|x| ≤ 0.5`: about 1e-16 relative on f64.
+#[allow(clippy::excessive_precision)] // Cody's published coefficients, digit for digit
 pub fn erf_expr(x: ExprId) -> ExprId {
     const A: [f64; 5] = [
         1.85777706184603153e-1,
@@ -1513,7 +1514,7 @@ pub(crate) mod tests {
         let xs: Vec<f64> = (0..n)
             .map(|i| -10.0 + 20.0 * i as f64 / (n - 1) as f64)
             .collect();
-        let got = g.eval(&[xs.clone()], &[y]).remove(0);
+        let got = g.eval(std::slice::from_ref(&xs), &[y]).remove(0);
         let worst = xs
             .iter()
             .zip(&got)

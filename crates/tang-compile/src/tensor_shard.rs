@@ -368,9 +368,15 @@ fn scan_rule(
     let ps: Vec<Place> = sc.inputs.iter().map(|t| place[t.n()].clone()).collect();
     if let Some(Place::S(d)) = ps.first() {
         let d = *d;
+        // a delta form's inputs (after `A`, `U`) only feed the fused CUDA
+        // lowering; a split scan drops the form (see `rank_program`)
+        let n = match &sc.kind {
+            ScanKind::Affine { form: Some(_), .. } => 2,
+            _ => ps.len(),
+        };
         let ok = d < lead
             && d != sc.dim
-            && ps
+            && ps[..n]
                 .iter()
                 .zip(&sc.inputs)
                 .all(|(p, t)| *p == Place::S(d) && g.nodes[t.n()].shape.len() > d);
@@ -876,6 +882,13 @@ pub fn rank_program(
                 }
             }
             Op::Scan(sc) => {
+                // split: the delta form describes the full-size scan, so
+                // the rank scans its slice of `A`, `U` without it
+                if let (Place::S(_), ScanKind::Affine { form, .. }) = (p, &mut sc.kind) {
+                    if form.take().is_some() {
+                        sc.inputs.truncate(2);
+                    }
+                }
                 for (k, t) in sc.inputs.iter_mut().enumerate() {
                     let s = t.n();
                     *t = match an.conv[i][k] {

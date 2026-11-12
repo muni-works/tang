@@ -80,7 +80,7 @@ impl TensorGraph {
                     break;
                 }
             }
-            if plan.is_empty() || !Self::delta_threads(n, m).is_some() {
+            if plan.is_empty() || Self::delta_threads(n, m).is_none() {
                 continue;
             }
             // f32 buffers only

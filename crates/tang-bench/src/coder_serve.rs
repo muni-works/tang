@@ -14,7 +14,10 @@
 //!   `(seed, position)`); greedy is a bit-exact first-maximum argmax of the logits. Logits
 //!   are read back only when the server asks for them. No presence penalty (ignored, once
 //!   noted).
-//! - **Prefill** is one decode step a token (no chunked/wide prefill on this path yet).
+//! - **Prefill** runs in chunks: a ladder of [`Rows::Last`] chunk steps (k = 256, 32, 4 by
+//!   default, `TANG_CODER_DERIVED_CHUNKS`; `0` for one step a token), one program per slot
+//!   and k sharing that slot's weights and caches; the last prompt token always goes through
+//!   the sampled step, so its token comes out as in decode.
 //! - **Snapshots**: the running state is the GDN rings and states (read off the device),
 //!   the positional state the K/V rows of a span — exact restores, no replay.
 //! - **Drafts**: verify steps the chain token by token and stops at the first mismatch, so
@@ -24,7 +27,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
-use tang_compile::tensor::step::StepInput;
+use tang_compile::tensor::step::{Rows, StepInput};
 use tang_compile::tensor::TensorId;
 use tang_gpu::program::{Program, Runtime, Shared};
 use tang_llm::flash::engine::{Positional, RunningState, WinStats};
@@ -64,6 +67,27 @@ fn words_of_bytes(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// `TANG_CODER_DERIVED_GAPS=1`: each greedy token's top-1/top-2 logit gap on stderr (the
+/// near-tie bar for greedy differences against the hand engine).
+fn gap_log(s: usize, pos: usize, l: &[f32]) {
+    if std::env::var("TANG_CODER_DERIVED_GAPS").as_deref() != Ok("1") {
+        return;
+    }
+    let (mut a, mut b) = (0usize, usize::MAX);
+    for (i, &x) in l.iter().enumerate().skip(1) {
+        if x > l[a] {
+            b = a;
+            a = i;
+        } else if b == usize::MAX || x > l[b] {
+            b = i;
+        }
+    }
+    eprintln!(
+        "gap slot {s} pos {pos} top1 {a} top2 {b} gap {:.5}",
+        l[a] - l[b]
+    );
+}
+
 struct Slot {
     prog: Program,
     tokens: Vec<u32>,
@@ -75,6 +99,18 @@ struct Slot {
     gprog: Option<Program>,
     /// The last step ran on `gprog` (its logits, a host argmax for the token).
     last_greedy: Cell<bool>,
+    /// One prefill chunk program a [`ChunkVar`], sharing `prog`'s weights and caches.
+    chunks: Vec<Program>,
+}
+
+/// A prefill chunk step of `k` tokens ([`Rows::Last`]: logits of the last row only).
+struct ChunkVar {
+    k: usize,
+    pos_in: usize,
+    tok_in: usize,
+    swaps: Vec<(usize, TensorId)>,
+    /// The last row's logits.
+    logits: TensorId,
 }
 
 /// The greedy step's own inputs and outputs (`[logits, updated caches…]`).
@@ -110,6 +146,8 @@ pub struct DerivedCoder {
     logits_slot: usize,
     presence_noted: Cell<bool>,
     greedy: Option<GreedyVar>,
+    /// Prefill chunk sizes, largest first (empty: one step a token).
+    chunk_vars: Vec<ChunkVar>,
 }
 
 impl DerivedCoder {
@@ -290,9 +328,99 @@ impl DerivedCoder {
                 swaps: swaps2,
             });
         }
+        // prefill chunks: TANG_CODER_DERIVED_CHUNKS="256,32,4" (default), "0": none
+        let ks: Vec<usize> = match std::env::var("TANG_CODER_DERIVED_CHUNKS") {
+            Ok(v) => v
+                .split(',')
+                .filter_map(|t| t.trim().parse().ok())
+                .filter(|&k| k > 1 && k <= ctx)
+                .collect(),
+            Err(_) => vec![256, 32, 4].into_iter().filter(|&k| k <= ctx).collect(),
+        };
+        let mut ks = ks;
+        ks.sort_unstable_by(|a, b| b.cmp(a));
+        ks.dedup();
+        let mut chunk_vars = Vec::new();
+        let mut cprogs: Vec<Vec<Program>> = (0..progs.len()).map(|_| Vec::new()).collect();
+        for &k in &ks {
+            let tc = Instant::now();
+            let stc = crate::ir_coder_prefill::derived_step_rows(&pg, k, ctx, Rows::Last)
+                .map_err(|e| anyhow::anyhow!("derive_step (chunk {k}): {e}"))?;
+            let lowc = lower_real_step(&pg, &stc, &tys);
+            let planc = slot_plan(&lowc.program.program, &lowc.outs, &lowc.inplace);
+            let emptyc: Vec<&[f32]> = vec![&[]; stc.inputs.len()];
+            let mut map = Vec::new();
+            for (kc, si) in stc.inputs.iter().enumerate() {
+                let k1 = match *si {
+                    StepInput::Same(i) if Some(i) != params_k => input_k(StepInput::Same(i)),
+                    StepInput::Cache(cc) => st
+                        .caches
+                        .iter()
+                        .position(|c| c.node == stc.caches[cc].node)
+                        .and_then(|c1| input_k(StepInput::Cache(c1))),
+                    _ => None,
+                };
+                if let Some(k1) = k1 {
+                    map.push((kc, k1));
+                }
+            }
+            ensure!(
+                stc.caches.len() == st.caches.len()
+                    && stc
+                        .caches
+                        .iter()
+                        .all(|c| st.caches.iter().any(|c1| c1.node == c.node)),
+                "chunk {k}: caches differ from the decode step's"
+            );
+            for (s, p1) in progs.iter().enumerate() {
+                let shared: Vec<Shared<'_>> = map
+                    .iter()
+                    .map(|&(kc, k1)| Shared {
+                        input: kc,
+                        from: p1,
+                        tensor: p1.input(k1),
+                    })
+                    .collect();
+                cprogs[s].push(Program::with_shared(
+                    &rt,
+                    lowc.program.program.clone(),
+                    &emptyc,
+                    &planc,
+                    &shared,
+                ));
+            }
+            let inc = |want: StepInput| stc.inputs.iter().position(|s| *s == want);
+            let swapsc = stc
+                .caches
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.state || c.ring.is_some())
+                .map(|(c, _)| (inc(StepInput::Cache(c)).unwrap(), lowc.outs[1 + c]))
+                .collect();
+            chunk_vars.push(ChunkVar {
+                k,
+                pos_in: inc(StepInput::Pos).context("chunk pos input")?,
+                tok_in: stc
+                    .inputs
+                    .iter()
+                    .position(|s| matches!(s, StepInput::New(_)))
+                    .context("chunk token input")?,
+                swaps: swapsc,
+                logits: lowc.outs[0],
+            });
+            eprintln!(
+                "coder derived: prefill chunk {k}: {} kernels, built in {:.1} s",
+                lowc.program.program.kernels.len(),
+                tc.elapsed().as_secs_f64()
+            );
+        }
         let capture = std::env::var("TANG_CODER_DERIVED_GRAPH").as_deref() != Ok("0");
         if capture {
-            for p in progs.iter_mut().chain(gprogs.iter_mut().flatten()) {
+            for p in progs
+                .iter_mut()
+                .chain(gprogs.iter_mut().flatten())
+                .chain(cprogs.iter_mut().flatten())
+            {
                 p.capture(&rt);
             }
         }
@@ -328,13 +456,15 @@ impl DerivedCoder {
         let slots: Vec<Slot> = progs
             .into_iter()
             .zip(gprogs)
-            .map(|(prog, gprog)| Slot {
+            .zip(cprogs)
+            .map(|((prog, gprog), chunks)| Slot {
                 prog,
                 tokens: Vec::new(),
                 params: greedy,
                 allocated: false,
                 gprog,
                 last_greedy: Cell::new(false),
+                chunks,
             })
             .collect();
         let mut me = DerivedCoder {
@@ -355,6 +485,7 @@ impl DerivedCoder {
             logits_slot: 0,
             presence_noted: Cell::new(false),
             greedy: greedy_var,
+            chunk_vars,
         };
         for s in 0..me.slots.len() {
             me.write_params(s);
@@ -509,6 +640,7 @@ impl DerivedCoder {
                 a = i;
             }
         }
+        gap_log(s, sl.tokens.len(), l);
         a as u32
     }
 
@@ -528,6 +660,81 @@ impl DerivedCoder {
             wall_ms: t0.elapsed().as_secs_f64() * 1e3,
             ..WinStats::default()
         };
+        Ok(next)
+    }
+
+    /// Prefill `ids` into slot `s`: the chunk ladder over all but the last token (largest
+    /// chunk that fits first), then the rest one step at a time, the last through the
+    /// sampled step.
+    fn prefill_chunked(&mut self, s: usize, ids: &[u32]) -> Result<u32> {
+        let t0 = Instant::now();
+        let mut done = 0;
+        // a greedy slot whose ids the ladder covers exactly chunks them all and takes the
+        // token as the host argmax of the last chunk's logits (the server prefills in
+        // windows, so most windows end on a chunk boundary)
+        let smallest = self.chunk_vars.last().map_or(0, |c| c.k);
+        let whole = smallest > 0
+            && ids.len() % smallest == 0
+            && self.slots[s].params[TEMPERATURE] <= 0.0
+            && std::env::var("TANG_CODER_DERIVED_CHUNK_WHOLE").as_deref() != Ok("0");
+        let body = if whole {
+            ids.len()
+        } else {
+            ids.len().saturating_sub(1)
+        };
+        let mut last_chunk = None;
+        for (v, cv) in self.chunk_vars.iter().enumerate() {
+            while body - done >= cv.k {
+                let pos = self.slots[s].tokens.len();
+                ensure!(
+                    pos + cv.k <= self.ctx,
+                    "slot {s} is past its context ({} tokens)",
+                    self.ctx
+                );
+                let toks: Vec<f32> = ids[done..done + cv.k].iter().map(|&t| t as f32).collect();
+                let p = &self.slots[s].chunks[v];
+                p.write(&self.rt, p.input(cv.pos_in), &[pos as f32]);
+                p.write(&self.rt, p.input(cv.tok_in), &toks);
+                p.run(&self.rt);
+                for &(k, upd) in &cv.swaps {
+                    p.copy(&self.rt, p.input(k), p, upd);
+                }
+                self.slots[s]
+                    .tokens
+                    .extend_from_slice(&ids[done..done + cv.k]);
+                done += cv.k;
+                last_chunk = Some(v);
+            }
+        }
+        let chunked = done;
+        let next = match last_chunk {
+            Some(v) if done == ids.len() => {
+                let cv = &self.chunk_vars[v];
+                let l = self.slots[s].chunks[v].read(&self.rt, cv.logits);
+                let l = &l[l.len() - self.vocab..];
+                let mut a = 0;
+                for (i, &x) in l.iter().enumerate() {
+                    if x > l[a] {
+                        a = i;
+                    }
+                }
+                gap_log(s, self.slots[s].tokens.len(), l);
+                a as u32
+            }
+            _ => self.feed(s, &ids[done..])?,
+        };
+        self.last = WinStats {
+            t: ids.len(),
+            wall_ms: t0.elapsed().as_secs_f64() * 1e3,
+            ..WinStats::default()
+        };
+        if std::env::var("TANG_CODER_DERIVED_PREFILL_LOG").as_deref() == Ok("1") {
+            eprintln!(
+                "coder derived: prefill {} tokens ({chunked} chunked) in {:.1} ms",
+                ids.len(),
+                self.last.wall_ms
+            );
+        }
         Ok(next)
     }
 
@@ -587,7 +794,7 @@ impl ServeEngine for DerivedCoder {
         self.restore_positional_at(0, p, from)
     }
     fn prefill(&mut self, ids: &[u32], _chunk: usize) -> Result<u32> {
-        self.feed(0, ids)
+        self.prefill_chunked(0, ids)
     }
     /// The caller has extended `tokens` through the window: step `tokens[pos0..pos0 + t]`.
     fn window(&mut self, pos0: usize, t: usize) -> Result<Vec<u32>> {
@@ -662,7 +869,7 @@ impl ServeEngine for DerivedCoder {
         self.slots[slot].allocated = false;
     }
     fn prefill_slot(&mut self, slot: usize, ids: &[u32]) -> Result<u32> {
-        self.feed(slot, ids)
+        self.prefill_chunked(slot, ids)
     }
     /// Every row's step queued back to back, then their tokens read.
     fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>> {
