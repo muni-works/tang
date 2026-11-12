@@ -336,6 +336,7 @@ impl TensorGraph {
     /// triangular solve is one thread per column with `U`'s column in
     /// registers. Shared buffers are zero-padded to 16 (`n`, `bv` < 16 in
     /// the test models).
+    #[allow(clippy::format_in_format_args)]
     fn cuda_delta_chunked(&self, root: usize, reads: &[usize]) -> (String, usize, usize) {
         let sc = self.scan_at(TensorId(root as u32)).unwrap();
         let ScanKind::Delta(d) = &sc.kind else {
