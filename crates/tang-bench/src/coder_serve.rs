@@ -33,7 +33,7 @@ use tang_gpu::program::{Program, Runtime, Shared};
 use tang_llm::flash::engine::{Positional, RunningState, WinStats};
 use tang_llm::flash::sampler::{RowSampling, Sampler};
 use tang_llm::flash::serve::ServeEngine;
-use tang_llm::gguf::{GgmlType, Gguf};
+use tang_llm::gguf::Gguf;
 
 use crate::ir_coder_prefill::{prefill_graph, CoderInput};
 use crate::ir_coder_real::{bind, dims_from_gguf, lower_real_step};
@@ -196,6 +196,29 @@ impl DerivedCoder {
         );
         let plan = slot_plan(&low.program.program, &low.outs, &low.inplace);
         let empty: Vec<&[f32]> = vec![&[]; st.inputs.len()];
+        if !low.f32_inputs.is_empty() {
+            eprintln!(
+                "coder derived: {} quantized weight(s) stored as f32 (no native kernel reads them): {}",
+                low.f32_inputs.len(),
+                low.f32_inputs.join(", ")
+            );
+        }
+        // slot clears and snapshots count caches in f32 words: refuse any other encoding
+        for (c, _) in st.caches.iter().enumerate() {
+            let k = st
+                .inputs
+                .iter()
+                .position(|s| *s == StepInput::Cache(c))
+                .context("cache input")?;
+            let node = (0..low.graph.nodes().len())
+                .find(|&i| matches!(low.graph.nodes()[i].op, tang_compile::tensor::Op::Input(j) if j == k))
+                .context("cache input node")?;
+            let f = low.graph.nodes()[node].precision.storage;
+            ensure!(
+                f == tang_compile::tensor::Format::F32,
+                "cache {c} is stored {f:?}; the serve engine's slot clears and snapshots assume f32"
+            );
+        }
         let wprog = low.program.program;
         let storage = low.storage;
         let outs = low.outs;
@@ -223,10 +246,8 @@ impl DerivedCoder {
                 continue;
             }
             let t = g.info(&pg.inputs[i].name)?;
-            let words = match (storage[k], t.ty) {
-                (Some(_), _) | (None, GgmlType::F32) => words_of_bytes(g.bytes(t)),
-                (None, _) => g.dequantize(t)?,
-            };
+            let words =
+                crate::ir_coder_real::encode(&g, t, storage[k]).map_err(anyhow::Error::msg)?;
             bytes += words.len() * 4;
             first.write(&rt, first.input(k), &words);
             weights.push(k);

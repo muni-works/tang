@@ -162,7 +162,7 @@ fn main() {
     for (k, si) in st.inputs.iter().enumerate() {
         let StepInput::Same(i) = *si else { continue };
         let t = g.info(&pg.inputs[i].name).unwrap();
-        let words = weight_words(&g, t, storage[k]);
+        let words = encode(&g, t, storage[k]).unwrap();
         bytes_up += words.len() * 4;
         prog.write(&rt, prog.input(k), &words);
     }
