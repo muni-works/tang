@@ -507,6 +507,9 @@ mod tests {
     }
 
     fn grouped_real(n_expert: usize, n_used: usize, nb: usize) {
+        // the CPU harness emulates no tensor cores: keep many-row f32
+        // contractions (attention at d = 256) on the warp lowering
+        std::env::set_var("TANG_STEP_MMA", "0");
         use crate::ir_coder_prefill::*;
         use crate::ir_coder_real::*;
         use tang_compile::tensor::int8_sched::BlockOpts;
