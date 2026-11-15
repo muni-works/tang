@@ -7,7 +7,8 @@
 //! measured rates, queue and KV blocks; `POST /models/load` and `/models/unload` swap the model
 //! (one per process), loading only into free memory. Requests carry `x-frog-priority:
 //! interactive | background`: interactive ones run first, and a background prefill gives way
-//! between chunks when an interactive request is waiting (see [`crate::queue`]).
+//! between chunks when an interactive request is waiting (see [`crate::queue`]). A
+//! `/v1/prefill` without the header is background: a warm-up is a head start nobody waits on.
 //!
 //! The model lives on one worker thread (GPU state isn't shareable); requests queue for it.
 //! Flash GGUF serving uses the same queue and HTTP routes, with prompt rendering on the
@@ -1590,6 +1591,16 @@ fn request_id(headers: &HeaderMap) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// A request's `x-frog-priority`. Without one, a chat is interactive and a prefill
+/// (`/v1/prefill`) background: nobody waits on a warm-up, so it gives way to the requests
+/// people do wait on, the one it warms included, instead of holding them up.
+fn priority(headers: &HeaderMap, prefill_only: bool) -> Result<Priority, String> {
+    match headers.get("x-frog-priority").and_then(|v| v.to_str().ok()) {
+        None if prefill_only => Ok(Priority::Background),
+        named => Priority::parse(named),
+    }
+}
+
 /// Queue a request for the loaded model, at its `x-frog-priority`, with its prompt counted.
 #[allow(clippy::result_large_err)]
 async fn submit(
@@ -1597,8 +1608,8 @@ async fn submit(
     headers: &HeaderMap,
     req: Request,
 ) -> Result<(String, mpsc::UnboundedReceiver<Out>), Response> {
-    let priority = Priority::parse(headers.get("x-frog-priority").and_then(|v| v.to_str().ok()))
-        .map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    let priority =
+        priority(headers, req.prefill_only).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
     let (model, prompter) = {
         let st = app.node.state();
         let m = st
@@ -1811,6 +1822,25 @@ fn normalize_messages(messages: &Value) -> Result<(Value, Vec<Vec<u8>>), String>
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{Backend, Outcome, Request};
+
+    #[test]
+    fn a_prefill_without_a_priority_is_background() {
+        use crate::queue::Priority;
+        use axum::http::HeaderMap;
+        let none = HeaderMap::new();
+        let mut interactive = HeaderMap::new();
+        interactive.insert("x-frog-priority", "interactive".parse().unwrap());
+        let mut bogus = HeaderMap::new();
+        bogus.insert("x-frog-priority", "urgent".parse().unwrap());
+        assert_eq!(super::priority(&none, true), Ok(Priority::Background));
+        assert_eq!(super::priority(&none, false), Ok(Priority::Interactive));
+        assert_eq!(
+            super::priority(&interactive, true),
+            Ok(Priority::Interactive),
+            "a client that names one gets it"
+        );
+        assert!(super::priority(&bogus, true).is_err());
+    }
 
     struct FixedBackend {
         failed: bool,

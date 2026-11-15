@@ -12,6 +12,7 @@ answers `401 {"error": "not paired"}`. Pairing, the node identity and the auth r
   frog's weight mirror into the Hugging Face cache, cancel that, remove one (see
   [Downloads](#downloads)).
 - `x-frog-priority: interactive | background` on `/v1/chat/completions` and `/v1/prefill`.
+  Without it, a chat is interactive and a prefill background.
 
 ## `GET /node`
 
