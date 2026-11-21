@@ -105,3 +105,23 @@ removed from `forward.rs`; re-add them where the comparison needs them).
 - 128 experts, top-8, expert FFN 1152, `expert_weights_scale` 8.0, SITU β 4.0 / λ 25.0.
 - Sliding window 1024; layers 5, 11, 17, 23 are global (`sliding_window_pattern`).
 - No RoPE: `rope.dimension_count` is 0.
+
+## The compiled graph (in progress)
+
+`crates/tang-bench/src/ir_inkling_prefill.rs` writes the model once as a full-sequence graph over
+a symbolic `T`, for `derive_step` to take decode from — the same shape as `ir_glm_prefill.rs`.
+It builds, binds and evaluates, and covers the whole structure: the looped core with its four
+control gates, the block attention residuals, the relative-bias gather (an affine view of the
+table by distance `i − j`, so no gather is needed), the sink, the clips, the log-scaled positions,
+the causal short convolutions, and the top-k MoE with SITU.
+
+**It does not yet match the hand path.** On the tiny model the logits agree to 0.011 on one token
+and drift with position (0.026 at 2, 0.62 at 3), and `blk.0.attn_out` comes out **zero** while the
+layer output and the logits are non-zero — so the attention output is being lost somewhere the
+rest of the pipeline compensates for. That is the bug to chase first: a zero there means the
+`attn` comp's reduce dims or its views are wrong, and everything downstream is riding on the FFN
+alone.
+
+`cargo test -p tang-bench --lib ir_inkling` runs the comparison (it asserts < 0.5, not 1e-3,
+until this is fixed). `tang_llm::flash::inkling::tiny` is public now so the bench crate can feed
+the same weights to both paths.

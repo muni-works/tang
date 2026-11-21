@@ -298,6 +298,7 @@ mod gpu_ds;
 pub mod ir_coder_real;
 /// GLM-5.3 as one prefill graph over symbolic T; its step via `derive_step`.
 pub mod ir_glm_prefill;
+pub mod ir_inkling_prefill;
 /// GLM-5.3 at real size from its derived graph (GGUF binding, hand-engine reference).
 #[cfg(any(feature = "gguf", test))]
 pub mod ir_glm_real;

@@ -22,6 +22,9 @@
 //! The reference for all of it is llama.cpp's `src/models/inkling2.cpp` and `inkling2-loop.cpp`.
 
 pub mod forward;
+/// A synthetic tiny `inkling2_loop` GGUF (used by this crate's tests and by tang-bench's
+/// cross-check of the compiled graph against this hand path).
+pub mod tiny;
 #[cfg(test)]
 mod tests;
 
