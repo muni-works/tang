@@ -12,6 +12,16 @@ pub struct Template {
     eos: String,
 }
 
+/// Drop Hugging Face's `{% generation %}` / `{% endgeneration %}` markers: they tell the
+/// tokenizer which span to mask when training, and render as nothing. minijinja has no such tag,
+/// so a template carrying them (Inkling 2 Mini's does) would fail to parse.
+fn strip_generation_tags(src: &str) -> String {
+    src.replace("{%- generation -%}", "")
+        .replace("{% generation %}", "")
+        .replace("{%- endgeneration -%}", "")
+        .replace("{% endgeneration %}", "")
+}
+
 impl Template {
     /// Load `chat_template` (and bos/eos strings) from `tokenizer_config.json`.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -40,6 +50,7 @@ impl Template {
                     .to_string(),
             },
         };
+        let source = strip_generation_tags(&source);
         let special = |k: &str| match &cfg[k] {
             Value::String(s) => s.clone(),
             v => v["content"].as_str().unwrap_or_default().to_string(),
@@ -59,6 +70,7 @@ impl Template {
 
     /// A template from its Jinja source and bos/eos strings (e.g. a GGUF's metadata).
     pub fn from_source(source: String, bos: String, eos: String) -> Result<Self> {
+        let source = strip_generation_tags(&source);
         let mut env = minijinja::Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -684,6 +696,17 @@ fn push(out: &mut Vec<Piece>, p: Piece) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hugging Face's `{% generation %}` markers (Inkling 2 Mini's template) carry no output;
+    /// they must be stripped, not passed to minijinja, which has no such tag.
+    #[test]
+    fn generation_markers_are_stripped() {
+        let src = "{% for m in messages %}{% generation %}{{ m.role }}{% endgeneration %};{% endfor %}";
+        let t = Template::from_source(src.into(), String::new(), String::new()).unwrap();
+        let ms = serde_json::json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(t.render(&ms, None, None).unwrap(), "user;");
+        assert_eq!(strip_generation_tags("a{%- generation -%}b{%- endgeneration -%}c"), "abc");
+    }
 
     #[test]
     fn null_message_fields_are_undefined_to_the_template() {

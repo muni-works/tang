@@ -386,6 +386,9 @@ fn main() -> Result<()> {
     if cmd == "glm5-ref" {
         return tang_llm::flash::glm5::forward::cli(&args[1..]);
     }
+    if cmd == "inkling-ref" {
+        return tang_llm::flash::inkling::forward::cli(&args[1..]);
+    }
     // DeepSeek-V4.1-Flash: deepseek-serve <checkpoint dir> [--host H] [--port P] [--ctx N]
     #[cfg(feature = "cuda")]
     if cmd == "deepseek-serve" {

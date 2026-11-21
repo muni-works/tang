@@ -16,6 +16,10 @@ use std::path::Path;
 pub const QWEN35_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// `tokenizer.ggml.pre = "glm4"` (GLM-5.3-Flash): like Qwen's but numbers chunk in 1–3 digits.
 pub const GLM4_SPLIT: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// `tokenizer.ggml.pre = "inkling2"` (Inkling 2 Mini): llama.cpp maps it to
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O`, and the checkpoint's own `tokenizer.json` uses the same
+/// regex, so this is that pattern verbatim.
+pub const INKLING2_SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct FlashTokenizer {
     pub tok: tokenizers::Tokenizer,
@@ -47,13 +51,13 @@ impl FlashTokenizer {
             "only byte-level BPE (gpt2) GGUF tokenizers are supported"
         );
         ensure!(
-            pre.starts_with("qwen") || pre == "glm4",
+            pre.starts_with("qwen") || pre == "glm4" || pre == "inkling2",
             "pre-tokenizer {pre} isn't supported"
         );
-        let split = if pre == "glm4" {
-            GLM4_SPLIT
-        } else {
-            QWEN35_SPLIT
+        let split = match pre {
+            "glm4" => GLM4_SPLIT,
+            "inkling2" => INKLING2_SPLIT,
+            _ => QWEN35_SPLIT,
         };
         let mut vocab = serde_json::Map::new();
         let mut added = Vec::new();
