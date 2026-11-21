@@ -19,6 +19,7 @@ pub mod derived_ops;
 pub mod engine;
 pub mod fa2;
 pub mod glm5;
+pub mod inkling;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 #[cfg(feature = "cuda")]
