@@ -6,7 +6,7 @@
 //! block size 2, 4 heads (2 KV), head dim 4, 8 experts taking 2, conv kernel 4, relative bias
 //! 2 rows × 4 columns, vocabulary 16.
 
-use super::forward::InklingRef;
+use super::forward::{InklingRef, Session};
 use crate::gguf::Value;
 use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
@@ -330,18 +330,45 @@ fn tiny_model_opens_and_runs_deterministically() {
     assert_eq!(m.hp.layer_phys(N_LAYER + (LOOP_END - LOOP_START) - 1), LOOP_END - 1);
 
     let ids = [1u32, 5, 9, 2];
-    let a = m.forward(&ids, false).unwrap();
+    let a = m.forward(&mut Session::new(&m), &ids, false).unwrap();
     assert_eq!(a.len(), N_VOCAB_UNPADDED);
     assert!(a.iter().all(|v| v.is_finite()), "non-finite logits");
     // Every logit is inside the soft cap.
     assert!(a.iter().all(|v| v.abs() <= 30.0));
     // Same input, same output.
-    let b = m.forward(&ids, false).unwrap();
+    let b = m.forward(&mut Session::new(&m), &ids, false).unwrap();
     assert_eq!(a, b);
     // All positions when asked.
-    let all = m.forward(&ids, true).unwrap();
+    let all = m.forward(&mut Session::new(&m), &ids, true).unwrap();
     assert_eq!(all.len(), ids.len() * N_VOCAB_UNPADDED);
     assert_eq!(&all[(ids.len() - 1) * N_VOCAB_UNPADDED..], &a[..]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn incremental_decoding_matches_a_full_run() {
+    // The session keeps the KV and convolution state, so stepping one token at a time must land
+    // on the same logits as running the whole prefix in one call.
+    let dir = tmp("session");
+    let p = write(&dir).unwrap();
+    let m = InklingRef::open(&p).unwrap();
+    let ids = [3u32, 7, 1, 12, 5];
+    let full = m.forward(&mut Session::new(&m), &ids, false).unwrap();
+
+    let mut s = Session::new(&m);
+    let first = m.forward(&mut s, &ids[..1], false).unwrap();
+    assert!(first.iter().all(|v| v.is_finite()));
+    let mut last = first;
+    for &id in &ids[1..] {
+        last = m.forward(&mut s, &[id], false).unwrap();
+    }
+    assert_eq!(s.pos, ids.len());
+    let d = last
+        .iter()
+        .zip(&full)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(d < 1e-3, "incremental vs full: {d}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -353,9 +380,9 @@ fn the_loop_changes_the_answer() {
     let p = write(&dir).unwrap();
     let mut m = InklingRef::open(&p).unwrap();
     let ids = [3u32, 7, 1];
-    let three = m.forward(&ids, false).unwrap();
+    let three = m.forward(&mut Session::new(&m), &ids, false).unwrap();
     m.hp.n_passes = 1;
-    let one = m.forward(&ids, false).unwrap();
+    let one = m.forward(&mut Session::new(&m), &ids, false).unwrap();
     assert_ne!(three, one, "the extra passes had no effect");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -369,7 +396,7 @@ fn past_the_window_a_local_layer_forgets() {
     let p = write(&dir).unwrap();
     let m = InklingRef::open(&p).unwrap();
     let ids: Vec<u32> = (0..(N_SWA as u32 + 5)).map(|i| i % N_VOCAB as u32).collect();
-    let a = m.forward(&ids, false).unwrap();
+    let a = m.forward(&mut Session::new(&m), &ids, false).unwrap();
     assert!(a.iter().all(|v| v.is_finite()));
     let _ = std::fs::remove_dir_all(dir);
 }

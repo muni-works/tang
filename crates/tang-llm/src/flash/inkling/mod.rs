@@ -86,6 +86,8 @@ pub struct Hparams {
     pub n_passes: usize,
     /// `loop.gate_rank` (64): the control gates' low rank.
     pub gate_rank: usize,
+    /// `tokenizer.ggml.eos_token_id`, and the end-of-turn id when the GGUF carries one.
+    pub eos_ids: Vec<u32>,
 }
 
 impl Hparams {
@@ -154,6 +156,10 @@ impl Hparams {
             loop_end: u("loop.end")?,
             n_passes: u("loop.count")?,
             gate_rank: u("loop.gate_rank")?,
+            eos_ids: ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"]
+                .iter()
+                .filter_map(|k| g.meta_u64(k).ok().map(|v| v as u32))
+                .collect(),
         })
     }
 
@@ -235,6 +241,11 @@ impl Hparams {
         );
         ensure!(self.log_scale_floor > 0, "log_scale_floor must be positive");
         Ok(())
+    }
+
+    /// The token ids that end a turn.
+    pub fn eos(&self) -> &[u32] {
+        &self.eos_ids
     }
 
     /// The physical layer a cache slot's weights come from: slots past `n_layer` replay the

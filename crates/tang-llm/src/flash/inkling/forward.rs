@@ -74,7 +74,9 @@ impl InklingRef {
     }
 
     /// Logits for the last position, or for every position when `all`.
-    pub fn forward(&self, ids: &[u32], all: bool) -> Result<Vec<f32>> {
+    /// Run `ids` through the model, continuing from `session`'s state. The returned logits are
+    /// for the last position, or for every new position when `all`.
+    pub fn forward(&self, session: &mut Session, ids: &[u32], all: bool) -> Result<Vec<f32>> {
         ensure!(!ids.is_empty(), "no tokens");
         for &id in ids {
             ensure!(
@@ -83,7 +85,7 @@ impl InklingRef {
                 self.hp.n_vocab
             );
         }
-        let mut run = Run::new(self, ids.len());
+        let mut run = Run::new(self, ids.len(), &mut session.slots);
         let n = ids.len();
         let e = self.hp.n_embd;
 
@@ -150,6 +152,7 @@ impl InklingRef {
             out.cols,
             hp.n_vocab_unpadded
         );
+        session.pos += n;
         let n_out = if all { n } else { 1 };
         let first = if all { 0 } else { n - 1 };
         let mut logits = Vec::with_capacity(n_out * hp.n_vocab_unpadded);
@@ -183,7 +186,9 @@ fn dense(g: &Gguf, name: &str) -> Result<Mat> {
         rows: ti.dims[1] as usize,
         cols: ti.dims[0] as usize,
         data: g.dequantize(ti)?,
-        act: Act::F32,
+        // llama.cpp's CPU backend quantizes the activation to Q8_0 (or Q8_K for K-quants) before
+        // a quantized matmul; matching that keeps this reference close to its numbers.
+        act: Act::for_weight(ti.ty),
     })
 }
 
@@ -193,7 +198,7 @@ fn expert_mat(g: &Gguf, ti: &TensorInfo, e: usize) -> Result<Mat> {
         rows: ti.dims[1] as usize,
         cols: ti.dims[0] as usize,
         data: g.expert(ti, e)?,
-        act: Act::F32,
+        act: Act::for_weight(ti.ty),
     })
 }
 
@@ -289,28 +294,45 @@ impl Slot {
 /// One forward pass over a whole prompt.
 struct Run<'a> {
     m: &'a InklingRef,
-    /// Tokens in the prompt.
+    /// Tokens in this step.
     n: usize,
     e: usize,
     kv_dim: usize,
-    slots: Vec<Slot>,
+    /// One per cache slot, carried across steps by [`Session`].
+    slots: &'a mut [Slot],
 }
 
 /// The four loop control gates, in the order the messages are indexed.
 const CTRL: [&str; 4] = ["q", "k", "v", "ffn"];
 
-impl<'a> Run<'a> {
-    fn new(m: &'a InklingRef, n: usize) -> Self {
+/// The per-sequence state: one cache slot per layer application, kept between steps so a
+/// generation does not re-run its whole prefix for every token.
+pub struct Session {
+    slots: Vec<Slot>,
+    /// Tokens already through the model; the next step starts at this position.
+    pub pos: usize,
+}
+
+impl Session {
+    pub fn new(m: &InklingRef) -> Self {
         let hp = &m.hp;
         let kv_dim = hp.d_head * hp.n_head_kv;
         // `hparams.n_sconv_channels`: K, V, the attention output and the FFN output.
         let n_chan = 2 * kv_dim + 2 * hp.n_embd;
-        let slots = (0..hp.n_slot()).map(|_| Slot::new(hp, n_chan)).collect();
+        Self {
+            slots: (0..hp.n_slot()).map(|_| Slot::new(hp, n_chan)).collect(),
+            pos: 0,
+        }
+    }
+}
+
+impl<'a> Run<'a> {
+    fn new(m: &'a InklingRef, n: usize, slots: &'a mut [Slot]) -> Self {
         Self {
             m,
             n,
-            e: hp.n_embd,
-            kv_dim,
+            e: m.hp.n_embd,
+            kv_dim: m.hp.d_head * m.hp.n_head_kv,
             slots,
         }
     }
@@ -569,6 +591,7 @@ impl<'a> Run<'a> {
             let q = g.tensor_f32(&t(ip, "attn_res_query.weight"))?;
             let nq = q.len() / e;
             ensure!(nq == if is_swa { 1 } else { 3 }, "attn_res_query: {nq} columns");
+
             let mixed = self.mix(blocks, &cur, &q, nq);
             for (j, inp) in inputs.iter_mut().enumerate() {
                 let col = if is_swa { 0 } else { j };
@@ -704,7 +727,9 @@ impl<'a> Run<'a> {
             let mut p = vec![0f32; n_kv_cells];
             for h in 0..n_head {
                 let qv = &q[(ti * n_head + h) * dh..(ti * n_head + h + 1) * dh];
-                let kvh = h % n_kv;
+                // GQA: ggml's broadcast repeats each KV head over a *contiguous* run of query
+                // heads, so query head `h` reads KV head `h / (n_head / n_kv)` — not `h % n_kv`.
+                let kvh = h / (n_head / n_kv);
                 // Scores, then the sink-stabilized softmax.
                 let mut mx = 0f32;
                 for (c, pv) in p.iter_mut().enumerate() {
@@ -799,6 +824,8 @@ pub fn cli(args: &[String]) -> Result<()> {
     let mut all = false;
     let mut verbose = false;
     let mut logits_out: Option<PathBuf> = None;
+    let mut chat: Option<String> = None;
+    let mut gen = 0usize;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--top" => top = it.next().context("--top K")?.parse().context("--top K")?,
@@ -816,6 +843,8 @@ pub fn cli(args: &[String]) -> Result<()> {
                 }
             }
             "-v" | "--verbose" => verbose = true,
+            "--chat" => chat = Some(it.next().context("--chat TEXT")?.to_string()),
+            "--gen" => gen = it.next().context("--gen N")?.parse().context("--gen N")?,
             "--logits" => logits_out = Some(PathBuf::from(it.next().context("--logits FILE")?)),
             s if s.starts_with("--") => bail!("unknown argument {s}; {usage}"),
             s => ids.push(
@@ -824,13 +853,41 @@ pub fn cli(args: &[String]) -> Result<()> {
             ),
         }
     }
+    // `--chat`: render the checkpoint's template and generate, which is the only honest test of
+    // the port (the logits only ever match llama.cpp to within its f16 accumulation).
+    if let Some(text) = chat {
+        let g = Gguf::open(&path)?;
+        let tok = crate::flash::tokenize::FlashTokenizer::from_gguf(&g)?;
+        let prompt = tok.chat(&text, None)?;
+        let mut ids = tok.encode(&prompt)?;
+        eprintln!("{prompt}");
+        let m = InklingRef::open(&path)?;
+        let mut session = Session::new(&m);
+        let mut stdout = std::io::stdout().lock();
+        // One prefill of the prompt, then one token per step off the session's caches.
+        let mut lg = m.forward(&mut session, &ids, false)?;
+        for _ in 0..gen {
+            let next = top_logprobs(&lg, 1)[0].0;
+            let piece = tok.decode(&[next])?;
+            write!(stdout, "{piece}")?;
+            stdout.flush()?;
+            ids.push(next);
+            if m.hp.eos().contains(&next) {
+                break;
+            }
+            lg = m.forward(&mut session, &[next], false)?;
+        }
+        writeln!(stdout)?;
+        return Ok(());
+    }
     if ids.is_empty() {
         bail!("no token ids; {usage}");
     }
     let mut m = InklingRef::open(&path)?;
     m.verbose = verbose;
     m.logits = logits_out.as_ref().map(|_| Default::default());
-    let lg = m.forward(&ids, all)?;
+    let mut session = Session::new(&m);
+    let lg = m.forward(&mut session, &ids, all)?;
     let n_vocab = m.hp.n_vocab_unpadded;
     let first = if all { 0 } else { ids.len() - 1 };
     let mut out = String::new();
