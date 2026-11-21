@@ -125,3 +125,21 @@ alone.
 `cargo test -p tang-bench --lib ir_inkling` runs the comparison (it asserts < 0.5, not 1e-3,
 until this is fixed). `tang_llm::flash::inkling::tiny` is public now so the bench crate can feed
 the same weights to both paths.
+
+**Next step.** The zero is the whole bug: `attn_out` feeds the block-start residual and the FFN
+mix, so if it is zero the graph is effectively running the FFN alone and still landing near the
+hand path only because the residuals dominate. Bisect inside `layer()` by naming and evaluating
+each stage in turn — `p3` (the softmax), then `attn` (P·V), then the gate, then the post-conv —
+against the hand path's `attn_out`. The first one that is zero localizes it. The likely suspects,
+in order: the `attn` comp's reduce dims not trailing its point dims (`[kvh, T]` after `[T, h, dh]`
+is right, but the views must address the space in that order), and the GQA `pick` comparing an
+iota value against `floor(h / group)` where the iota's own axis is the KV head. With
+`heads == kv_heads` the mapping is the identity, so setting `tiny::N_HEAD = N_HEAD_KV` takes GQA
+out of the picture while bisecting.
+
+## Running it here
+
+This session is cloud-only: no route to `mew` (SSH host key verification fails), so nothing has
+been run on the 3090. The hand path runs on this machine's CPU at ~1.5 s/token, which is enough
+for correctness work but not for throughput. Getting the fast path onto a GPU is the next job
+after the graph matches.
