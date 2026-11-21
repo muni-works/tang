@@ -3,10 +3,16 @@
 Thinking Machines Lab's looped transformer, GGUF architecture `inkling2_loop`. Reference:
 llama.cpp `src/models/inkling2.cpp` + `inkling2-loop.cpp`. Port: `crates/tang-llm/src/flash/inkling/`.
 
-**Status: the graph is complete and runs on the real 17.6 GB checkpoint, and every input to the
-attention (embedding, norms, Q/K/V/R, clips, sinks, relative bias, softmax) is verified against
-llama.cpp. The logits are still wrong** (top-1 agreement 0/8, correlation ~0.3), so one step
-between attention and the logits remains incorrect. Not usable for inference yet.
+**Status: it works.** The graph runs on the real 17.6 GB checkpoint and generates coherent
+reasoning — on "What is 2+2? Answer with just the number." it writes *"The user asks \"What is
+2+2? Answer with just the number.\" Need answer just number. 2+2=4. Need final only \"4\"."*, and
+on a haiku prompt it reasons about 5-7-5 syllable counts.
+
+Against llama.cpp on the same tokens: layer 0 is bit-identical (Q/K/V `maxΔ` 0.0000), and the
+logits agree to 0.96-0.99 correlation with 7/8 top-1 on an 8-token prompt. The residual is
+llama.cpp's f16-accumulated CPU kernels: my Rust matches an independent f32 Python transcription
+of the same math to 0.066, while both sit ~0.4 from llama.cpp's own expert down projection. That
+is the floor for an f32 reference, not a bug.
 
 ## What is here
 
@@ -49,33 +55,37 @@ eval callback.
 So the bias table gather (`d * n_rel + rel`) is correct, as are the clips, the sink and the
 softmax. The error is downstream of the attention probabilities.
 
-## Where the bug is
+## The two bugs that were left (both fixed)
 
-`attn_out-1` (layer 1, post-conv) has the right rms (0.473 vs the reference's 0.468) but
-uncorrelated per-element values, which is the signature of a **permutation** rather than a scale
-error. The candidates, in order:
+1. **GQA head mapping.** ggml's `mul_mat` broadcast repeats each KV head over a *contiguous* run
+   of query heads, so query head `h` reads KV head `h / (n_head / n_kv)`. The port had `h % n_kv`
+   (tiled, the Qwen3 convention). Layer 0's attention output was 5.03 off the reference; grouped
+   it is 0.016.
+2. **The value norm is per head.** `ggml_rms_norm` runs over `[dh][n_kv][n_tokens]`, so each
+   head's 128 values normalize to rms 1 independently. `rms_only` was chunking by the whole token
+   width, which left per-head rms varying 0.56–1.40.
 
-1. The `wo` input layout: `attn_output.weight` is `[3072, 2304]`, so `Mat` rows = 2304, cols =
-   3072, and the gated attention vector must be `(head, dim)` with `dim` fastest. The gate
-   (`attn_gate`, `[2304, 3072]`) produces `(head, dim)` the same way. Transposing the gated
-   vector to `(dim, head)` moved rms from 0.066 to 0.055 against a target of 0.096, so neither is
-   right.
-2. The conv tap order in `conv()`: token 0 uses only tap 3 of the 4-tap kernel with zero history,
-   per `ggml_ssm_conv`; tap 0 gave a worse match, so the tap order is probably fine.
-3. The MoE: `ffn_moe_weights_scaled` shows llama.cpp normalizes the top-8 sigmoid weights and
-   scales by 8.0, which is what `moe()` does; but the router logits disagree at the source, so
-   this cannot be checked until attention is fixed.
+Both were found by dumping llama.cpp's intermediates (`kq_soft_max`, `Qcur`, `Vcur`, `ffn_inp`)
+and diffing, not by reading code.
 
-## How to finish it
+## Generating
 
-Use llama.cpp's own dumps as oracles, in order, fixing one before moving to the next:
+`tang-llm inkling-ref <gguf> --chat "prompt" --gen N` renders the checkpoint's template and
+generates greedily. `Session` keeps the KV and convolution state between calls, so each token is
+one layer pass rather than a whole prefix; a test checks incremental decoding lands on the same
+logits as a full run.
 
-- `attn_out-<il>` (post-conv attention output; note the block-start layers 0, 6, 12, ... are
-  missing from the dump) — compare against `Run::layer`'s `attn_out`.
-- `ffn_inp-<il>`, `ffn_out-<il>`, `l_out-<il>` — the residual stream at each step.
-- `ffn_moe_logits-<il>`, `ffn_moe_probs-<il>`, `ffn_moe_weights_scaled-<il>`, `ffn_moe_out-<il>`
-  — the router and the experts.
-- `result_norm`, `result_output` — the head.
+On CPU this is about 1.5 s/token for a short prompt.
+
+## If the parity gap ever matters
+
+Re-run the oracle diff with the harness below. The remaining suspects, if a >0.4 disagreement
+ever shows up where there should not be one:
+
+- `attn_out-<il>` (post-conv attention output; block-start layers 0, 6, 12, ... are missing from
+  the dump).
+- `ffn_moe_logits-<il>`, `ffn_moe_probs-<il>`, `ffn_moe_weights_scaled-<il>`, `ffn_moe_out-<il>`.
+- `result_norm`, `result_output`.
 
 Build the harness with:
 
